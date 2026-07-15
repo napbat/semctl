@@ -1,0 +1,19 @@
+{
+  "name": "semctx",
+  "description": "Single-plugin marketplace for semctx (semantic code search).",
+  "owner": {
+    "name": "Jon-Luke Biddle",
+    "url": "https://github.com/napbat"
+  },
+  "plugins": [
+    {
+      "name": "semctx",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/napbat/semctl.git"
+      },
+      "description": "MCP server + codebase-retrieval skill + prompt-context hook + a PreToolUse nudge toward the semctx tools.",
+      "homepage": "https://github.com/napbat/semctl"
+    }
+  ]
+}

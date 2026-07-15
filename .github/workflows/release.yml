@@ -1,0 +1,150 @@
+name: release
+
+# Release on version bump. Every push to `main` runs the cheap `check` job below,
+# but a release is built and published ONLY when the `version` in Cargo.toml names
+# a version that hasn't been released yet. To cut a release, bump `version` in
+# Cargo.toml (e.g. 0.1.0 -> 0.1.1) and push; every other push is a ~15s no-op.
+#
+# Cargo.toml is the single source of truth: the tag (`v<version>`), the release
+# name, and the binary's CARGO_PKG_VERSION all come straight from it — no
+# stamping, no separate VERSION file. `semctl upgrade`'s numeric x.y.z check then
+# sees a bumped version as newer.
+#
+# GitHub-hosted runners + the built-in GITHUB_TOKEN only — no secrets, no
+# private-repo access (the crate's dependency graph is entirely public).
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  # Serialize so two near-simultaneous pushes can't both build the same new
+  # version; the second sees the first's release and skips.
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Stamp the binary as a distributed release build (read via option_env! in
+  # upgrade.rs) so it self-updates in place; a `cargo install`/local build has no
+  # stamp and is treated accordingly.
+  SEMCTL_DIST: github-release
+
+jobs:
+  check:
+    name: check version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      release: ${{ steps.v.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(sed -nE 's/^version = "([0-9]+\.[0-9]+\.[0-9]+)"/\1/p' Cargo.toml | head -1)
+          if [ -z "$version" ]; then
+            echo "no x.y.z version found in Cargo.toml" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if gh release view "v$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "v$version is already released — nothing to do"
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "v$version is new — building a release"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.release == 'true'
+    name: build (${{ matrix.tag }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            tag: linux-x64
+            name: semctl
+            asset: semctl-linux-x64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            tag: macos-arm64
+            name: semctl
+            asset: semctl-macos-arm64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            tag: windows-x64
+            name: semctl.exe
+            asset: semctl-windows-x64.exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Pure Rust + rustls (no OpenSSL); only `ring`/`blake3` run build scripts
+      # and both just need a C compiler, which ships on the runner. This is a
+      # cheap no-op that documents the requirement.
+      - name: System dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential clang
+
+      - name: Build
+        run: cargo build --release --bin semctl
+
+      - name: Stage binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/release/${{ matrix.name }}" "dist/${{ matrix.asset }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  publish:
+    needs: [check, build]
+    if: needs.check.outputs.release == 'true'
+    name: publish (GitHub release)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      # download-artifact nests each artifact under dist/<name>/; flatten to rel/
+      # and produce the checksums manifest the server parses for sha256.
+      - name: Collect + checksums
+        run: |
+          set -euo pipefail
+          mkdir -p rel
+          find dist -type f -exec cp {} rel/ \;
+          ( cd rel && sha256sum semctl-* > checksums-sha256.txt )
+          echo "----- rel/ -----"; ls -l rel; echo; cat rel/checksums-sha256.txt
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.check.outputs.version }}
+          name: semctl v${{ needs.check.outputs.version }}
+          generate_release_notes: true
+          files: rel/*

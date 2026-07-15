@@ -1,0 +1,61 @@
+{
+  "$comment": "Evaluation suite for the codebase-retrieval skill, per Anthropic's evaluation-driven skill development guidance. Run each scenario with a fresh agent that has the skill loaded and the semctx MCP server attached to this repo; observe tool routing and the final answer. Baseline (no skill / old skill) results from 2026-07-03: stale `semctx index` advice propagated into answers, and 20/20 agents silently swallowed the 'not logged in' degraded state. The cargo test `mcp::steering_tests` guards this skill's tool inventory against the registry mechanically.",
+  "functional": [
+    {
+      "skills": ["codebase-retrieval"],
+      "query": "Who calls `search_chunks`, and how does a search request travel from the MCP tool layer down to it?",
+      "expected_behavior": [
+        "Routes to who_calls (and call_path or trace) rather than emulating callers via find_references fan-out or host Grep",
+        "Falls back to host tools only after a semctx tool reports a degraded state, and says so",
+        "Names the layers: MCP tool -> HTTP /v1/search -> SearchCodebasesHandler -> FFI Engine::search -> CodeDomain::search_chunks"
+      ]
+    },
+    {
+      "skills": ["codebase-retrieval"],
+      "query": "Find every occurrence of `RERANK_OVERSAMPLE` in this repo — all of them, including any in comments.",
+      "expected_behavior": [
+        "Uses the semctx grep tool, NOT find_references (which skips comments, strings, and repeat uses within a chunk)",
+        "Does not use search_codebase as the primary tool for an exhaustive literal query"
+      ]
+    },
+    {
+      "skills": ["codebase-retrieval"],
+      "query": "Search results for code I edited about 30 seconds ago look stale in this session. What do you check and what do you do about it?",
+      "expected_behavior": [
+        "Checks sync_status and/or points at the per-hit '⚠ stale (edited since indexed)' flag and freshness footer",
+        "Explains the MCP server auto-syncs (filesystem watcher + periodic re-sync)",
+        "Does NOT recommend running `semctx index` while an MCP session is attached (only valid with no MCP session or a pinned read-only codebase)",
+        "Reads the edited file with host Read when current bytes are needed"
+      ]
+    },
+    {
+      "skills": ["codebase-retrieval"],
+      "query": "Where in this repo's documentation (markdown files) is the production reranker configuration described?",
+      "expected_behavior": [
+        "Uses search_codebase (prefer: docs) or semctx grep — does not skip semctx on the false premise that markdown is not indexed",
+        "Falls back to host tools only on a reported degraded state"
+      ]
+    },
+    {
+      "skills": ["codebase-retrieval"],
+      "query": "Any semctx tool call returns 'not logged in — run `semctx login`'.",
+      "expected_behavior": [
+        "Tells the user about the auth state and the `semctx login` remedy instead of silently falling back",
+        "Still answers the immediate question with host tools",
+        "Does not tell the host to reconnect the MCP server (tools recover on retry after login)"
+      ]
+    }
+  ],
+  "triggering": {
+    "should_trigger": [
+      "How does tenant resolution work in this server?",
+      "What would break if I renamed search_chunks?",
+      "Which functions end up calling rrf_merge?",
+      "semctx search keeps showing my file's old contents after I edited it — why?"
+    ],
+    "should_not_trigger": [
+      "Bump the Helm chart image tag to the latest sha.",
+      "Draft a commit message for my staged changes."
+    ]
+  }
+}

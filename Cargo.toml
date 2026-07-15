@@ -1,0 +1,116 @@
+# Standalone single-crate workspace — this repo is its own workspace root so a
+# plain `cargo install --git <repo>` resolves only public crates.io deps (no
+# private path/git deps drag in).
+[workspace]
+
+# Lints enforced workspace-wide (inherited by the crate via `[lints] workspace =
+# true`). CI runs `cargo clippy --workspace --all-targets -- -D warnings`, so a
+# pedantic finding fails the build.
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
+[package]
+name = "semctl"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "semctl — command-line client for the semctx code-intelligence server. Speaks HTTP+JSON; authenticates to identity via OIDC device-code."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/napbat/semctl"
+readme = "README.md"
+
+[[bin]]
+name = "semctl"
+path = "src/main.rs"
+
+[features]
+# Compile-in the `semctl hook` stderr diagnostics. OFF by default so release
+# builds emit nothing on stderr (no chance of leaking internal detail onto a
+# session); build with `--features hook-debug` for local troubleshooting.
+hook-debug = []
+
+[dependencies]
+anyhow = "1"
+# JWT payload decoding for `semctl whoami` — we don't verify (the
+# server did that), just pull `sub`/`email` for display.
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "env"] }
+# rustls-tls keeps a single-binary distribution buildable on macOS / Linux
+# without the OpenSSL system dependency that "default-tls" would drag in.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "signal",
+    "time",
+    "sync",
+    # Killable child processes (`kill_on_drop`) so a hung `git` on the hook path
+    # is cancelled by a timeout instead of stalling process exit.
+    "process",
+] }
+# Cross-platform config dir lookup (~/.config on Linux, ~/Library/Application Support on macOS, %APPDATA% on Windows).
+dirs = "5"
+# Open the device-code verification URL in the user's default browser
+# (`semctl login`). Wraps the per-OS launcher (start / open / xdg-open) and
+# handles edge cases like WSL → Windows; we use the detached variant so login
+# doesn't block on the launcher.
+open = "5"
+toml = "0.8"
+# Interactive multi-select checklist for `semctl install` (the host reconcile
+# picker). Non-interactive paths (--all / --none / explicit hosts) don't touch it.
+inquire = "0.7"
+# Cross-platform replacement of the running executable for `semctl upgrade`:
+# handles the Windows "rename the live image out of the way" dance and the Unix
+# replace-by-inode, so we don't hand-roll the per-OS quirks.
+self-replace = "1"
+# SHA-256 verification of a downloaded `semctl upgrade` binary against the
+# checksum the release publishes (`sha256sum`). blake3 (also a dep) is our
+# content hash, but the release checksums are sha256, so we match that.
+sha2 = "0.10"
+# `semctl upgrade` accepts either a raw binary or a release archive at the
+# download URL. flate2+tar unpack the unix `.tar.gz`; zip unpacks the Windows
+# `.zip` (Deflate, as produced by Compress-Archive) — we pull just the `semctl`
+# entry out, never extracting to disk.
+flate2 = "1"
+tar = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# MCP stdio server (`semctl mcp`). `schemars` derives the JSON-Schema the
+# MCP host reads to know each tool's parameter shape.
+rmcp = { version = "1.7", features = [
+    "server",
+    "transport-io",
+    "macros",
+    "schemars",
+] }
+schemars = "1"
+# Gitignore-aware directory walk for `semctl index` — respects .gitignore /
+# .ignore and skips .git, so we sync the same file set the user sees in git.
+ignore = "0.4"
+# Realtime filesystem watcher for `semctl mcp` — debounced change events trigger
+# an incremental re-sync so edits are picked up without waiting for the periodic
+# tick.
+notify = "8"
+notify-debouncer-full = "0.7"
+# Glob matching for the walker's built-in exclude list (lockfiles, minified
+# assets, generated code, vendored trees) — a backstop beyond .gitignore.
+glob = "0.3"
+# Stable content hash for the sync manifest (the server treats it as opaque).
+blake3 = "1"
+# Structured logging. The binary installs a stderr subscriber (stdout is
+# reserved for command results and the `semctl mcp` JSON-RPC channel);
+# `RUST_LOG` tunes verbosity. `tracing` matches the version the server-side
+# crates already use.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# Throwaway directory trees for the walker's gitignore / hygiene tests.
+tempfile = "3"
+
+[lints]
+workspace = true

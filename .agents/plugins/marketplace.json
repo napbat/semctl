@@ -1,0 +1,19 @@
+{
+  "name": "semctx",
+  "interface": {
+    "displayName": "semctx"
+  },
+  "plugins": [
+    {
+      "name": "semctx",
+      "source": {
+        "source": "local",
+        "path": "./codex-plugin"
+      },
+      "policy": {
+        "installation": "AVAILABLE"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
