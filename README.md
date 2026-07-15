@@ -10,14 +10,17 @@ It's a thin HTTP+JSON client: all indexing and retrieval happen server-side, so
 
 ## Install
 
+The one-liner downloads the prebuilt binary from the latest GitHub release,
+verifies its checksum, and hands off to `semctl install` — which puts the binary
+on your PATH and wires it into the AI tools it finds. No Rust toolchain needed.
+
+**Linux / macOS** (shell):
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/napbat/semctl/main/install-cli.sh | sh
 ```
 
-The one-liner downloads the prebuilt binary from the latest GitHub release,
-verifies its checksum, and hands off to `semctl install` — which puts the binary
-on your PATH and wires it into the AI tools it finds. No Rust toolchain needed.
-Windows PowerShell:
+**Windows** (PowerShell):
 
 ```powershell
 irm https://raw.githubusercontent.com/napbat/semctl/main/install-cli.ps1 | iex
