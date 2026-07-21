@@ -134,8 +134,10 @@ impl Client {
             .text()
             .await
             .with_context(|| format!("GET {url}: read body"))?;
-        let envelope: ApiEnvelope<T> = serde_json::from_str(&body)
-            .with_context(|| format!("GET {url} -> {status}: parse response envelope ({body})"))?;
+        let envelope: ApiEnvelope<T> = match serde_json::from_str(&body) {
+            Ok(e) => e,
+            Err(_) => return Err(gateway_error("GET", &url, status, &body)),
+        };
         if !status.is_success() || !envelope.success {
             bail!("GET {url} -> {status}: {}", envelope.error_summary());
         }
@@ -185,6 +187,36 @@ impl Client {
     }
 }
 
+/// An error for a response that is not the API's JSON envelope at all.
+///
+/// A gateway between the CLI and the server (ingress, proxy, load balancer)
+/// answers failures in ITS format, not the API's — typically an HTML error page.
+/// Parsing that as the envelope produces `expected value at line 1 column 1`,
+/// which names the CLI's own parser rather than the thing that actually went
+/// wrong, and buries the status code that IS the diagnosis.
+///
+/// Reported by status instead, because those statuses have specific meanings a
+/// user can act on: 502/503/504 come from the gateway, not the application, and
+/// mean the request never got a real answer.
+fn gateway_error(
+    method: &str,
+    url: &str,
+    status: reqwest::StatusCode,
+    body: &str,
+) -> anyhow::Error {
+    let hint = match status.as_u16() {
+        504 => "the gateway timed out waiting for the server — the request may still be running",
+        502 => "the gateway could not reach the server, or the server closed the connection",
+        503 => "the server is unavailable behind the gateway (starting, draining, or overloaded)",
+        _ => "the response was not the API's JSON envelope",
+    };
+    // A short excerpt only: an HTML error page is pages long and none of it is
+    // the diagnosis, but a truncated peek still distinguishes "HTML page" from
+    // "empty body" when someone needs it.
+    let excerpt: String = body.trim().chars().take(120).collect();
+    anyhow!("{method} {url} -> {status}: {hint} (response was not JSON: {excerpt:?})")
+}
+
 /// Every server response is an `ApiResponse<T>` envelope
 /// (`{ success, errors, httpStatusCode, data }`); unwrap it to the inner
 /// `data`, surfacing the typed errors on failure rather than a raw body.
@@ -198,8 +230,12 @@ async fn unwrap_envelope<T: DeserializeOwned>(
         .text()
         .await
         .with_context(|| format!("{method} {url}: read body"))?;
-    let envelope: ApiEnvelope<T> = serde_json::from_str(&body)
-        .with_context(|| format!("{method} {url} -> {status}: parse response envelope ({body})"))?;
+    let envelope: ApiEnvelope<T> = match serde_json::from_str(&body) {
+        Ok(e) => e,
+        // Not the envelope: attribute it to whatever answered instead of blaming
+        // the parser. See `gateway_error`.
+        Err(_) => return Err(gateway_error(method, url, status, &body)),
+    };
     if !status.is_success() || !envelope.success {
         bail!("{method} {url} -> {status}: {}", envelope.error_summary());
     }
@@ -328,4 +364,39 @@ pub async fn for_cwd(cli: &crate::cli::Cli) -> Result<Client> {
             )
         })?;
     Ok(client.with_codebase(id))
+}
+
+#[cfg(test)]
+mod gateway_error_tests {
+    use super::gateway_error;
+
+    /// A gateway's HTML error page must be reported as the gateway failure it is,
+    /// not as a JSON parse error.
+    ///
+    /// The reported symptom was `parse response envelope ... expected value at
+    /// line 1 column 1` for a 504 — which names this CLI's parser while the
+    /// actual diagnosis (the gateway timed out) appears nowhere.
+    #[test]
+    fn a_gateway_html_page_is_reported_as_the_gateway_failing() {
+        let msg = gateway_error(
+            "PUT",
+            "https://example/v1/codebases/x/sync/y",
+            reqwest::StatusCode::GATEWAY_TIMEOUT,
+            "<html><head><title>504 Gateway Time-out</title></head><body>...</body></html>",
+        )
+        .to_string();
+
+        assert!(
+            msg.contains("gateway timed out"),
+            "must name the gateway timing out: {msg}"
+        );
+        assert!(
+            msg.contains("504"),
+            "must keep the status, which is the diagnosis: {msg}"
+        );
+        assert!(
+            !msg.contains("expected value at line"),
+            "must not surface the JSON parser's complaint as the headline: {msg}"
+        );
+    }
 }
