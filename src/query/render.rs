@@ -50,8 +50,14 @@ pub(super) fn render_compact(
     }
     let mut out = String::new();
     for h in hits {
-        let sym = h.symbol.as_deref().unwrap_or("-");
-        writeln!(out, "  {} {sym}", hit_location(h, root)).unwrap();
+        writeln!(
+            out,
+            "  {} {}{}",
+            hit_location(h, root),
+            hit_symbol(h),
+            write_marker(h)
+        )
+        .unwrap();
     }
     out
 }
@@ -244,7 +250,7 @@ pub(super) fn render_hits_inner(
         } else {
             String::new()
         };
-        let sym = h.symbol.as_deref().unwrap_or("-");
+        let sym = hit_symbol(h);
         // Kind (container/function/block) lets the reader tell a type/def chunk
         // from a free block at a glance. Omitted when the server didn't send one.
         let kind = if h.kind.is_empty() {
@@ -259,9 +265,10 @@ pub(super) fn render_hits_inner(
         };
         writeln!(
             out,
-            "[{}{lang}] {}  {sym}{kind}{score}{stale_mark}",
+            "[{}{lang}] {}  {sym}{kind}{}{score}{stale_mark}",
             h.domain_id,
-            hit_location(h, root)
+            hit_location(h, root),
+            write_marker(h)
         )
         .unwrap();
         // Skip leading blank lines so the declaration/signature leads the snippet
@@ -287,6 +294,28 @@ pub(super) fn render_hits_inner(
 /// "weaker matches" separator. Relative (not absolute) because raw hybrid
 /// scores aren't calibrated across queries.
 const WEAK_HIT_FRACTION: f64 = 0.5;
+
+/// The symbol column: the MATCHED symbol, qualified by the declaration that
+/// contains it when the server reports one (`dispatch in run_until`). Without
+/// the qualifier a references list reads as the same symbol repeated at
+/// unrelated lines — indistinguishable from a stale index.
+fn hit_symbol(h: &api::SearchHit) -> String {
+    let sym = h.symbol.as_deref().unwrap_or("-");
+    match h.enclosing_symbol.as_deref() {
+        Some(enclosing) => format!("{sym} in {enclosing}"),
+        None => sym.to_string(),
+    }
+}
+
+/// Marks a reference site that WRITES the symbol; empty for a read or for a hit
+/// carrying no classification (search / definition).
+fn write_marker(h: &api::SearchHit) -> &'static str {
+    if h.is_write == Some(true) {
+        " (write)"
+    } else {
+        ""
+    }
+}
 
 /// `path:line-range` for a hit, absolutized against the local checkout when
 /// known. Shared by the hit renderer and the near-miss suggester.
@@ -315,8 +344,11 @@ mod tests {
             path: Some(path.into()),
             line_start: Some(1),
             line_end: Some(2),
+            focus_line: Some(1),
             language: Some("rust".into()),
             symbol: Some(id.into()),
+            enclosing_symbol: None,
+            is_write: None,
             kind: "function".into(),
             snippet: String::new(),
         }
@@ -333,6 +365,24 @@ mod tests {
 
         assert!(dirty.contains("⚠ stale"), "edited file flagged");
         assert!(!clean.contains("⚠ stale"), "untouched file not flagged");
+    }
+
+    #[test]
+    fn render_qualifies_a_reference_and_marks_a_write() {
+        let mut read = node("dispatch", "run.rs");
+        read.enclosing_symbol = Some("run_until".into());
+        read.is_write = Some(false);
+        let mut write = node("dispatch", "run.rs");
+        write.enclosing_symbol = Some("reset".into());
+        write.is_write = Some(true);
+
+        let out = render_hits_inner(&[read, write], "none", None, false, &HashSet::new(), false);
+        let lines: Vec<&str> = out.lines().filter(|l| l.contains("run.rs")).collect();
+
+        assert!(lines[0].contains("dispatch in run_until"), "{out}");
+        assert!(!lines[0].contains("(write)"), "a read isn't marked: {out}");
+        assert!(lines[1].contains("dispatch in reset"), "{out}");
+        assert!(lines[1].contains("(write)"), "{out}");
     }
 
     #[test]

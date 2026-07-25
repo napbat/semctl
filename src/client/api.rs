@@ -65,8 +65,16 @@ pub struct SearchHit {
     pub path: Option<String>,
     pub line_start: Option<u32>,
     pub line_end: Option<u32>,
+    /// Where the cursor belongs inside the match — a declaration's NAME token,
+    /// which a leading attribute or doc comment puts below `line_start`.
+    pub focus_line: Option<u32>,
     pub language: Option<String>,
     pub symbol: Option<String>,
+    /// The declaration CONTAINING the match: `run_until` for a `dispatch` call
+    /// inside it. Absent when the match IS the declaration.
+    pub enclosing_symbol: Option<String>,
+    /// Reference sites only: `true` when the use WRITES the symbol.
+    pub is_write: Option<bool>,
     /// Chunk kind — "block", "container", or "function".
     #[serde(default)]
     pub kind: String,
