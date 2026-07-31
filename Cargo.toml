@@ -108,6 +108,14 @@ blake3 = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[target.'cfg(windows)'.dependencies]
+# Notify Explorer after changing the persistent user PATH so applications
+# launched afterward inherit the new environment without a sign-out.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 [dev-dependencies]
 # Throwaway directory trees for the walker's gitignore / hygiene tests.
 tempfile = "3"

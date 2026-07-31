@@ -41,6 +41,16 @@ pub struct NudgeState {
     /// honored when this matches the current call's cwd.
     #[serde(default)]
     pub avail_cwd: String,
+    /// Last successful advisory CLI-version check for this agent session.
+    #[serde(default)]
+    pub update_checked_at: u64,
+    /// Newer published version from that check; empty means the running CLI was
+    /// current. Kept separate from the timestamp so a current result is cached.
+    #[serde(default)]
+    pub update_latest_version: String,
+    /// Whether this session already received the update instruction.
+    #[serde(default)]
+    pub update_notice_emitted: bool,
 }
 
 impl NudgeState {
@@ -107,8 +117,10 @@ impl Store {
         }
     }
 
-    /// Start a fresh segment: zero the counters and stamp the start. Called on
-    /// `SessionStart` `clear`/`compact`.
+    /// Start a fresh nudge segment: zero search/nudge state while preserving the
+    /// session-wide update cache and one-shot notice flag. Called on
+    /// `SessionStart` `clear`/`compact`; those shrink the context but do not start
+    /// a new agent session, so an update reminder must not repeat afterward.
     ///
     /// Deliberately does NOT remove the lock file: a concurrent `PreToolUse` may
     /// hold it, and deleting a live lock would let a second `PreToolUse` into the
@@ -117,7 +129,16 @@ impl Store {
         if session_id.is_empty() {
             return;
         }
-        self.save(session_id, &NudgeState::default());
+        let previous = self.load(session_id);
+        self.save(
+            session_id,
+            &NudgeState {
+                update_checked_at: previous.update_checked_at,
+                update_latest_version: previous.update_latest_version,
+                update_notice_emitted: previous.update_notice_emitted,
+                ..NudgeState::default()
+            },
+        );
     }
 
     /// Try to take the per-session lock. `None` if another process holds a
@@ -318,13 +339,16 @@ mod tests {
     }
 
     #[test]
-    fn reset_zeroes_counters() {
+    fn reset_zeroes_nudges_but_preserves_session_update_state() {
         let t = temp_store();
         t.store.save(
             "s1",
             &NudgeState {
                 eligible_count: 9,
                 nudges_fired: 3,
+                update_checked_at: 123,
+                update_latest_version: "0.2.0".into(),
+                update_notice_emitted: true,
                 ..Default::default()
             },
         );
@@ -333,6 +357,9 @@ mod tests {
         assert_eq!(st.eligible_count, 0);
         assert_eq!(st.nudges_fired, 0);
         assert!(st.nudged_prompt_ids.is_empty());
+        assert_eq!(st.update_checked_at, 123);
+        assert_eq!(st.update_latest_version, "0.2.0");
+        assert!(st.update_notice_emitted);
     }
 
     #[test]

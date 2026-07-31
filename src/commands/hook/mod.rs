@@ -9,7 +9,8 @@
 //! event where Claude folds compaction into `SessionStart(source=compact)`.
 //!
 //! - **`SessionStart`** — a one-line orientation: which codebase this repo maps
-//!   to, and a nudge to prefer the semctl MCP tools.
+//!   to, a nudge to prefer the semctl MCP tools, and (only when needed) a cached,
+//!   once-per-session instruction to tell the user about a newer CLI.
 //! - **`UserPromptSubmit`** — gated, summary-style retrieval: for a non-trivial
 //!   prompt, search the repo's codebase and inject a compact candidate list
 //!   (path + line range + symbol + score), not full chunk bodies.
@@ -136,7 +137,7 @@ pub async fn run(_args: HookArgs, cli: &Cli) -> Result<()> {
             // emits nothing: Codex's PostCompact schema doesn't accept
             // additionalContext, and orientation re-establishes on the next prompt.
             if input.hook_event_name == "SessionStart" {
-                session_start_context(cli, &input).await
+                session_start_context(cli, &input, &store).await
             } else {
                 None
             }
@@ -229,8 +230,33 @@ async fn user_prompt_context(cli: &Cli, input: &HookInput) -> Option<String> {
     Some(out)
 }
 
+/// Cache a successful version lookup for this long. Every new agent session has
+/// its own state and checks immediately; repeated resume/clear events within one
+/// session reuse the result.
+const UPDATE_CACHE_TTL_SECS: u64 = 6 * 60 * 60;
+/// A version reminder is advisory and must never hold up agent startup.
+const UPDATE_CHECK_TIMEOUT_SECS: u64 = 2;
+/// Local smoke-test override. Keep this `None` in committed/release builds.
+const FORCE_UPDATE_NOTICE_VERSION: Option<&str> = None;
+
+/// Session-start context combines the normal codebase orientation with a
+/// one-shot update instruction. The two checks are independent and concurrent:
+/// an unindexed/logged-out repo can still report a CLI update, and a slow update
+/// endpoint cannot delay the existing orientation path.
+async fn session_start_context(
+    cli: &Cli,
+    input: &HookInput,
+    store: &state::Store,
+) -> Option<String> {
+    let (orientation, update) = tokio::join!(
+        session_orientation_context(cli, input),
+        session_update_context(cli, input, store)
+    );
+    combine_context(orientation, update)
+}
+
 /// One-shot orientation: name the indexed codebase and steer toward the tools.
-async fn session_start_context(cli: &Cli, input: &HookInput) -> Option<String> {
+async fn session_orientation_context(cli: &Cli, input: &HookInput) -> Option<String> {
     let (client, codebase) = connect(cli, &input.cwd).await?;
     // Best-effort: the codebase's slug for a friendlier label.
     let name = client
@@ -244,6 +270,100 @@ async fn session_start_context(cli: &Cli, input: &HookInput) -> Option<String> {
          the semctl MCP tools (search_codebase, find_definition, find_references, \
          imports, symbol_edges) over raw grep / read — see the codebase-retrieval skill.",
     ))
+}
+
+/// Return the cached update instruction at most once for this agent session.
+/// Successful "already current" results are cached too, so repeated `SessionStart`
+/// events add neither network traffic nor model context. Lookup failures stay
+/// uncached and silent.
+async fn session_update_context(
+    cli: &Cli,
+    input: &HookInput,
+    store: &state::Store,
+) -> Option<String> {
+    if let Some(version) = FORCE_UPDATE_NOTICE_VERSION {
+        return Some(update_notice(version));
+    }
+
+    if input.session_id.is_empty()
+        || std::env::var("SEMCTX_HOOK_UPDATE_CHECK").as_deref() == Ok("0")
+    {
+        return None;
+    }
+
+    // SessionStart is normally serial, but use the same best-effort lock as
+    // PreToolUse so parallel resume/startup events cannot both emit.
+    let _lock = store.try_lock(&input.session_id)?;
+    let mut state = store.load(&input.session_id);
+    if state.update_notice_emitted {
+        return None;
+    }
+
+    let now = state::now_secs();
+    if update_cache_is_fresh(&state, now) {
+        let notice = take_update_notice(&mut state);
+        if notice.is_some() {
+            store.save(&input.session_id, &state);
+        }
+        return notice;
+    }
+
+    let checked = tokio::time::timeout(
+        Duration::from_secs(UPDATE_CHECK_TIMEOUT_SECS),
+        crate::commands::upgrade::check_for_update_result(cli.server.as_deref()),
+    )
+    .await;
+    let latest = match checked {
+        Ok(Ok(version)) => version,
+        Ok(Err(e)) => {
+            debug(format_args!("update check failed: {e}"));
+            return None;
+        }
+        Err(_) => {
+            debug(format_args!("update check timed out"));
+            return None;
+        }
+    };
+
+    // `0` is the sentinel for "never checked"; a broken pre-epoch system clock
+    // should not accidentally create a permanent fresh cache entry.
+    state.update_checked_at = now.max(1);
+    state.update_latest_version = latest.unwrap_or_default();
+    let notice = take_update_notice(&mut state);
+    store.save(&input.session_id, &state);
+    notice
+}
+
+fn update_cache_is_fresh(state: &state::NudgeState, now: u64) -> bool {
+    state.update_checked_at != 0
+        && now >= state.update_checked_at
+        && now - state.update_checked_at <= UPDATE_CACHE_TTL_SECS
+}
+
+fn take_update_notice(state: &mut state::NudgeState) -> Option<String> {
+    if state.update_notice_emitted || state.update_latest_version.is_empty() {
+        return None;
+    }
+    state.update_notice_emitted = true;
+    Some(update_notice(&state.update_latest_version))
+}
+
+fn update_notice(latest: &str) -> String {
+    format!(
+        "A newer semctl CLI is available (v{}; this session is running v{}). \
+         Tell the user to run `semctl upgrade`, then restart the agent session \
+         to load the updated MCP server.",
+        latest,
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+fn combine_context(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(format!("{first}\n\n{second}")),
+        (Some(context), None) | (None, Some(context)) => Some(context),
+        (None, None) => None,
+    }
 }
 
 /// Bound on `connect`'s resolve. It may shell out to git and hit the network on
@@ -639,6 +759,60 @@ mod tests {
         assert!(!resets_segment("SessionStart", "resume"));
         assert!(!resets_segment("PreToolUse", ""));
         assert!(!resets_segment("UserPromptSubmit", ""));
+    }
+
+    #[test]
+    fn update_cache_rejects_missing_expired_and_future_timestamps() {
+        let mut state = state::NudgeState::default();
+        assert!(!update_cache_is_fresh(&state, 100));
+
+        state.update_checked_at = 100;
+        assert!(update_cache_is_fresh(&state, 100));
+        assert!(update_cache_is_fresh(&state, 100 + UPDATE_CACHE_TTL_SECS));
+        assert!(!update_cache_is_fresh(&state, 101 + UPDATE_CACHE_TTL_SECS));
+        assert!(!update_cache_is_fresh(&state, 99));
+    }
+
+    #[test]
+    fn update_notice_is_silent_when_current_and_one_shot_when_newer() {
+        let mut current = state::NudgeState {
+            update_checked_at: 100,
+            ..Default::default()
+        };
+        assert!(take_update_notice(&mut current).is_none());
+        assert!(!current.update_notice_emitted);
+
+        let mut outdated = state::NudgeState {
+            update_checked_at: 100,
+            update_latest_version: "9.8.7".into(),
+            ..Default::default()
+        };
+        let notice = take_update_notice(&mut outdated).expect("newer version surfaces");
+        assert!(notice.contains("v9.8.7"));
+        assert!(notice.contains("Tell the user"));
+        assert!(notice.contains("semctl upgrade"));
+        assert!(outdated.update_notice_emitted);
+        assert!(
+            take_update_notice(&mut outdated).is_none(),
+            "same session stays silent after the first notice"
+        );
+    }
+
+    #[test]
+    fn session_context_combines_only_present_parts() {
+        assert_eq!(combine_context(None, None), None);
+        assert_eq!(
+            combine_context(Some("orientation".into()), None).as_deref(),
+            Some("orientation")
+        );
+        assert_eq!(
+            combine_context(None, Some("update".into())).as_deref(),
+            Some("update")
+        );
+        assert_eq!(
+            combine_context(Some("orientation".into()), Some("update".into())).as_deref(),
+            Some("orientation\n\nupdate")
+        );
     }
 
     use std::sync::atomic::{AtomicU64, Ordering};

@@ -148,16 +148,26 @@ async fn resolve_download(server_override: Option<&str>, target: &str) -> Result
     Ok(dl)
 }
 
-/// Best-effort "is a newer CLI published?" check for the background update prompt
-/// in `semctl mcp`. Returns the newer version string when the server advertises
-/// one for this platform, else `None` — already latest, an unsupported platform,
-/// the endpoint unconfigured (before the first release), or any network error all
-/// collapse to `None`, since this is advisory only. It never touches the binary;
-/// applying the update stays the explicit `semctl upgrade`.
+/// "Is a newer CLI published?" check shared by the MCP server and session hook.
+/// A successful current result is `Ok(None)` so the hook can cache it separately
+/// from a transient lookup failure. It never touches the binary; applying the
+/// update stays the explicit `semctl upgrade`.
+pub(crate) async fn check_for_update_result(
+    server_override: Option<&str>,
+) -> Result<Option<String>> {
+    let target = release_target()?;
+    let dl = resolve_download(server_override, target).await?;
+    Ok(is_upgrade(&dl.version, env!("CARGO_PKG_VERSION")).then_some(dl.version))
+}
+
+/// Best-effort wrapper for the detached MCP startup check. Already current, an
+/// unsupported platform, an unconfigured endpoint, and network errors all stay
+/// silent because the prompt is advisory.
 pub(crate) async fn check_for_update(server_override: Option<&str>) -> Option<String> {
-    let target = release_target().ok()?;
-    let dl = resolve_download(server_override, target).await.ok()?;
-    is_upgrade(&dl.version, env!("CARGO_PKG_VERSION")).then_some(dl.version)
+    check_for_update_result(server_override)
+        .await
+        .ok()
+        .flatten()
 }
 
 /// How a published version relates to the running one, by numeric

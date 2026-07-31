@@ -185,8 +185,47 @@ fn windows_add_user_path(dir: &Path) -> Result<bool> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    Ok(String::from_utf8_lossy(&out.stdout).contains("edited"))
+    let edited = String::from_utf8_lossy(&out.stdout).contains("edited");
+    if edited {
+        broadcast_environment_change();
+    }
+    Ok(edited)
 }
+
+/// Tell Explorer and other interested top-level windows to reload the
+/// persistent user environment. This cannot alter existing process environment
+/// blocks, but applications launched after Explorer handles the message inherit
+/// the updated PATH.
+///
+/// Best-effort: the registry edit is already durable, and one hung or
+/// non-responsive window must not turn a successful PATH update into a reported
+/// install failure.
+#[cfg(windows)]
+fn broadcast_environment_change() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        HWND_BROADCAST, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_SETTINGCHANGE,
+    };
+
+    let environment: Vec<u16> = "Environment\0".encode_utf16().collect();
+
+    // SAFETY: `environment` is a live, NUL-terminated UTF-16 buffer for the
+    // duration of this synchronous call. HWND_BROADCAST and the remaining
+    // values follow the documented WM_SETTINGCHANGE contract.
+    unsafe {
+        SendMessageTimeoutW(
+            HWND_BROADCAST,
+            WM_SETTINGCHANGE,
+            0,
+            environment.as_ptr() as isize,
+            SMTO_ABORTIFHUNG,
+            5_000,
+            std::ptr::null_mut(),
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn broadcast_environment_change() {}
 
 /// Persist `dir` onto PATH for POSIX shells by appending an idempotent,
 /// injection-safe block to the user's shell profiles. Returns whether any file
@@ -419,7 +458,11 @@ fn windows_remove_user_path(dir: &Path) -> Result<bool> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    Ok(String::from_utf8_lossy(&out.stdout).contains("edited"))
+    let edited = String::from_utf8_lossy(&out.stdout).contains("edited");
+    if edited {
+        broadcast_environment_change();
+    }
+    Ok(edited)
 }
 
 /// The old `semctx` selfpath install dir: `%LOCALAPPDATA%\semctx\bin` on Windows,

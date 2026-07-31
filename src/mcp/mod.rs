@@ -71,7 +71,7 @@ struct Shared {
     /// [`McpServer::index_freshness`].
     freshness: FreshnessCache,
     /// One-line "a newer semctl is published" prompt, set once by the startup
-    /// update check ([`spawn_update_check`]) and appended to search footers.
+    /// update check ([`spawn_update_check`]) and consumed by one search footer.
     /// `None` until/unless a newer version is seen. Notify-only: applying the
     /// update stays the explicit `semctl upgrade`.
     update_note: Arc<Mutex<Option<String>>>,
@@ -405,8 +405,10 @@ impl McpServer {
             out.push_str("\n\n");
             out.push_str(&footer);
         }
-        // Ride-along prompt when a newer CLI is published (set once at startup).
-        if let Some(note) = self.shared.update_note.lock().await.clone() {
+        // One-shot ride-along fallback when a newer CLI is published. The
+        // SessionStart hook is the primary user-facing notice; consuming this
+        // note prevents repeated search results from spending tokens on it.
+        if let Some(note) = self.shared.update_note.lock().await.take() {
             out.push_str("\n\n");
             out.push_str(&note);
         }
@@ -762,8 +764,8 @@ pub async fn run(cli: &Cli) -> Result<()> {
 }
 
 /// One-shot, best-effort check for a newer published CLI, run detached at
-/// startup. On a hit it records a one-line prompt in `note` (surfaced via search
-/// footers and an stderr line) — it never downloads or swaps the binary; that
+/// startup. On a hit it records a one-line prompt in `note` (surfaced via one
+/// search footer and an stderr line) — it never downloads or swaps the binary; that
 /// stays the explicit `semctl upgrade`. The server caches the release lookup, so
 /// there's no client-side throttle. Set `SEMCTX_MCP_UPDATE_CHECK=0` to skip it.
 fn spawn_update_check(note: Arc<Mutex<Option<String>>>, server_override: Option<String>) {
