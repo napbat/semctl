@@ -20,4 +20,4 @@ Resolve the symbol at a position. Two modes:
 - With a column, a cursor on whitespace/punctuation — or on a word that isn't a known symbol — falls back to the enclosing definition (never worse than the line-only answer).
 - Returns "(no symbol at …)" when nothing is indexed over the position — a normal empty result, not an error.
 - Files outside the symbol-graph languages (Rust, C#, Go, TypeScript/JavaScript) have no symbols to resolve.
-- Scoped to the launched codebase.
+- Scoped to the selected codebase (the launch/current codebase by default).

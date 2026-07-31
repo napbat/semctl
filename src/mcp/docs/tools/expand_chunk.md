@@ -15,4 +15,4 @@ Return the indexed chunks that overlap an inclusive line range in a file — the
 ## Notes
 
 - Half-overlap counts: a chunk is returned if it touches the range at all.
-- Scoped to the launched codebase. Empty result = nothing indexed overlaps that range (or the file isn't in this codebase).
+- Scoped to the selected codebase (the launch/current codebase by default). Empty result = nothing indexed overlaps that range (or the file isn't in this codebase).

@@ -1,0 +1,13 @@
+interface:
+  display_name: "Codebase retrieval"
+  short_description: "Locate, trace, and verify code with the semctx index"
+  default_prompt: "Use semctx to locate and trace the relevant code in this repository."
+
+policy:
+  allow_implicit_invocation: true
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "semctx"
+      description: "Indexed code retrieval and symbol graph tools"

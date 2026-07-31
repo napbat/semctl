@@ -1,6 +1,0 @@
-{
-  "semctx": {
-    "command": "semctl",
-    "args": ["mcp"]
-  }
-}

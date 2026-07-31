@@ -2,11 +2,12 @@
 //! Reads a hook event as JSON on stdin and, when the current repo maps to an
 //! indexed codebase, emits `additionalContext` for the agent to fold into the turn.
 //!
-//! Both hosts send the same `snake_case` payload and accept the same
-//! `hookSpecificOutput.additionalContext` output, so one binary serves both. The
-//! only host differences: Codex names the per-turn id `turn_id` (Claude:
-//! `prompt_id`, reconciled by a serde alias) and fires a separate `PostCompact`
-//! event where Claude folds compaction into `SessionStart(source=compact)`.
+//! Both hosts send the same `snake_case` payload and accept
+//! `hookSpecificOutput.additionalContext`; Codex additionally documents
+//! `systemMessage` for `PreToolUse`, so that event emits both there. The main
+//! input difference is the per-turn id: Codex uses `turn_id`, while Claude uses
+//! `prompt_id`. The parser also accepts `PostCompact` for compatibility, while
+//! the packaged hooks use `SessionStart(source=compact)` as the shared boundary.
 //!
 //! - **`SessionStart`** — a one-line orientation: which codebase this repo maps
 //!   to, a nudge to prefer the semctl MCP tools, and (only when needed) a cached,
@@ -19,8 +20,9 @@
 //!   but non-blocking reminder to prefer the semctl MCP tools. Escalates with
 //!   reliance within a segment, deduped per turn, strictly gated on availability.
 //!
-//! Contract: **never break a session.** Every failure path — not logged in,
-//! repo not indexed, server down, parse error — produces no output and exits 0.
+//! Contract: **never break a session.** An unindexed repo produces an opt-in
+//! notice; every actual failure path — not logged in, server down, parse error —
+//! produces no output and exits 0.
 //! The only thing written to stdout is a well-formed hook-output JSON object.
 
 use std::fmt::Write;
@@ -96,12 +98,18 @@ impl HookInput {
             &self.prompt_id
         }
     }
+
+    fn is_codex(&self) -> bool {
+        !self.turn_id.is_empty()
+    }
 }
 
 #[derive(Serialize)]
 struct HookOutput {
-    #[serde(rename = "hookSpecificOutput")]
-    hook_specific_output: HookSpecific,
+    #[serde(rename = "systemMessage", skip_serializing_if = "Option::is_none")]
+    system_message: Option<String>,
+    #[serde(rename = "hookSpecificOutput", skip_serializing_if = "Option::is_none")]
+    hook_specific_output: Option<HookSpecific>,
 }
 
 #[derive(Serialize)]
@@ -125,9 +133,9 @@ pub async fn run(_args: HookArgs, cli: &Cli) -> Result<()> {
         "SessionStart" | "PostCompact" => {
             // A shrunk-context boundary. Reset the per-session nudge segment (so
             // stale drift pressure never survives it) BEFORE any context work and
-            // regardless of availability; opportunistic cleanup too. Claude folds
-            // this into SessionStart(source=clear|compact); Codex splits it into a
-            // distinct PostCompact — `resets_segment` decides for both.
+            // regardless of availability; opportunistic cleanup too. Hosts use
+            // SessionStart(source=clear|compact), and some configurations may also
+            // send PostCompact — `resets_segment` accepts both.
             let store = state::Store::default_store();
             if resets_segment(&input.hook_event_name, &input.source) {
                 store.reset(&input.session_id);
@@ -146,15 +154,15 @@ pub async fn run(_args: HookArgs, cli: &Cli) -> Result<()> {
         _ => None,
     };
     if let Some(text) = context {
-        emit(&input.hook_event_name, &text);
+        emit(&input, &text);
     }
     Ok(())
 }
 
 /// Whether an event starts a fresh nudge segment because the context genuinely
-/// shrank — accumulated drift pressure should then reset. Claude folds this into
-/// `SessionStart(source=clear|compact)`; Codex splits it into a distinct
-/// `PostCompact` event. `run` consults this for both; the unit test pins it so
+/// shrank — accumulated drift pressure should then reset. The normal shared path
+/// is `SessionStart(source=clear|compact)`; `PostCompact` remains accepted for
+/// compatibility. `run` consults this for both; the unit test pins it so
 /// the dispatch can't silently stop resetting on either host (the JSON wiring
 /// guard in the tests can't see this side).
 fn resets_segment(event: &str, source: &str) -> bool {
@@ -169,9 +177,10 @@ async fn user_prompt_context(cli: &Cli, input: &HookInput) -> Option<String> {
         return None;
     }
     let prompt = input.prompt.trim();
-    // A global UserPromptSubmit hook fires on every message including
-    // "yes" / "go on"; searching those is noise. Require a question-shaped prompt.
-    if prompt.split_whitespace().count() < 3 {
+    // A global UserPromptSubmit hook fires on every message. Keep this path
+    // high-precision: the skill and MCP metadata remain available for other
+    // prompts, while automatic retrieval is reserved for code-navigation intent.
+    if !prompt_wants_retrieval(prompt) {
         return None;
     }
 
@@ -186,13 +195,23 @@ async fn user_prompt_context(cli: &Cli, input: &HookInput) -> Option<String> {
         prefer: None,
         granularity: None,
     };
-    let hits: Vec<api::SearchHit> = match client.post("/v1/search", &body).await {
-        Ok(h) => h,
-        Err(e) => {
-            debug(format_args!("search failed: {e}"));
-            return None;
-        }
+    let search = async {
+        let hits: Vec<api::SearchHit> = client.post("/v1/search", &body).await.ok()?;
+        let stale = crate::query::stale_paths(&client, &hits).await;
+        Some((hits, stale))
     };
+    let (hits, stale) =
+        match tokio::time::timeout(Duration::from_secs(HOOK_SEARCH_TIMEOUT_SECS), search).await {
+            Ok(Some(result)) => result,
+            Ok(None) => {
+                debug(format_args!("prompt search failed"));
+                return None;
+            }
+            Err(_) => {
+                debug(format_args!("prompt search timed out"));
+                return None;
+            }
+        };
     let min_score = env_parse::<f32>("SEMCTX_HOOK_MIN_SCORE");
     let hits: Vec<&api::SearchHit> = hits
         .iter()
@@ -204,7 +223,8 @@ async fn user_prompt_context(cli: &Cli, input: &HookInput) -> Option<String> {
     }
 
     let mut out = String::from(
-        "semctl — likely-relevant code for this prompt. Pull full detail with the \
+        "semctl — candidate locations from the current index for this prompt. \
+         Pull current detail with the \
          semctl MCP tools (search_codebase / find_definition / find_references) \
          rather than re-searching:\n",
     );
@@ -215,6 +235,11 @@ async fn user_prompt_context(cli: &Cli, input: &HookInput) -> Option<String> {
             _ => String::new(),
         };
         let path = h.path.as_deref().unwrap_or("(no path)");
+        let freshness = if stale.contains(path) {
+            "  ⚠ stale; read the local file"
+        } else {
+            ""
+        };
         let sym = h
             .symbol
             .as_deref()
@@ -225,9 +250,78 @@ async fn user_prompt_context(cli: &Cli, input: &HookInput) -> Option<String> {
             .as_deref()
             .map(|l| format!("  ·  {l}"))
             .unwrap_or_default();
-        writeln!(out, "- {path}{loc}{sym}{lang}  ({:.3})", h.score).unwrap();
+        writeln!(out, "- {path}{loc}{sym}{lang}  ({:.3}){freshness}", h.score).unwrap();
     }
     Some(out)
+}
+
+const HOOK_SEARCH_TIMEOUT_SECS: u64 = 6;
+
+fn prompt_wants_retrieval(prompt: &str) -> bool {
+    if prompt.split_whitespace().count() < 3 {
+        return false;
+    }
+    if prompt.contains('`') {
+        return true;
+    }
+
+    let normalized: String = prompt
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    let words: Vec<&str> = normalized.split_whitespace().collect();
+    let has = |candidates: &[&str]| words.iter().any(|word| candidates.contains(word));
+
+    let direct = has(&[
+        "find",
+        "locate",
+        "search",
+        "trace",
+        "explain",
+        "understand",
+        "review",
+    ]);
+    let question = has(&["where", "who", "how", "what", "which"]);
+    let code_subject = has(&[
+        "code",
+        "codebase",
+        "repo",
+        "repository",
+        "function",
+        "method",
+        "type",
+        "trait",
+        "class",
+        "module",
+        "file",
+        "symbol",
+        "implementation",
+        "implemented",
+        "define",
+        "defined",
+        "server",
+        "client",
+        "cli",
+        "calls",
+        "callers",
+        "references",
+        "imports",
+        "flow",
+        "hook",
+        "hooks",
+        "mcp",
+        "tool",
+        "tools",
+        "skill",
+        "skills",
+    ]);
+    direct || (question && code_subject)
 }
 
 /// Cache a successful version lookup for this long. Every new agent session has
@@ -255,9 +349,15 @@ async fn session_start_context(
     combine_context(orientation, update)
 }
 
-/// One-shot orientation: name the indexed codebase and steer toward the tools.
+/// One-shot orientation: name an indexed codebase, or tell the agent that the
+/// repository is unindexed and indexing requires explicit user opt-in.
 async fn session_orientation_context(cli: &Cli, input: &HookInput) -> Option<String> {
-    let (client, codebase) = connect(cli, &input.cwd).await?;
+    let (client, codebase) = match resolve_connection(cli, &input.cwd).await? {
+        HookConnection::Indexed(client, codebase) => (client, codebase),
+        HookConnection::Unindexed(dir) => {
+            return Some(unindexed_notice(&dir));
+        }
+    };
     // Best-effort: the codebase's slug for a friendlier label.
     let name = client
         .get::<api::CodebaseSummary>(&format!("/v1/codebases/{codebase}"))
@@ -270,6 +370,17 @@ async fn session_orientation_context(cli: &Cli, input: &HookInput) -> Option<Str
          the semctl MCP tools (search_codebase, find_definition, find_references, \
          imports, symbol_edges) over raw grep / read — see the codebase-retrieval skill.",
     ))
+}
+
+fn unindexed_notice(dir: &std::path::Path) -> String {
+    format!(
+        "This repository ({}) is not indexed by semctl. Do not index it automatically. Tell \
+         the user it is unindexed and ask whether they want to opt in; only after they agree, \
+         call the semctl `index_codebase` MCP tool. All codebase-scoped tools can instead \
+         target another existing index by passing its codebase id or indexed directory path \
+         in `codebase`.",
+        dir.display()
+    )
 }
 
 /// Return the cached update instruction at most once for this agent session.
@@ -372,10 +483,12 @@ fn combine_context(first: Option<String>, second: Option<String>) -> Option<Stri
 /// resolve can never stall the hook. Timed out → silent (never-break).
 const CONNECT_TIMEOUT_SECS: u64 = 5;
 
-/// Build an authenticated client + resolve the cwd's codebase id. `None`
-/// (silently) for every can't/shouldn't-act case: no login, repo not indexed,
-/// server unreachable, resolve timed out.
-async fn connect(cli: &Cli, cwd: &str) -> Option<(Client, String)> {
+enum HookConnection {
+    Indexed(Client, String),
+    Unindexed(PathBuf),
+}
+
+async fn resolve_connection(cli: &Cli, cwd: &str) -> Option<HookConnection> {
     let client = client::from_cli(cli).ok()?;
     let dir = if cwd.is_empty() {
         std::env::current_dir().ok()?
@@ -400,16 +513,28 @@ async fn connect(cli: &Cli, cwd: &str) -> Option<(Client, String)> {
     match resolved {
         Ok(Some(resolved)) => {
             debug(format_args!("codebase {} ({})", resolved.id, resolved.how));
-            Some((client, resolved.id))
+            let id = resolved.id;
+            let client = client.with_codebase(id.clone()).with_local_root(Some(dir));
+            Some(HookConnection::Indexed(client, id))
         }
         Ok(None) => {
             debug(format_args!("repo {} not indexed", dir.display()));
-            None
+            Some(HookConnection::Unindexed(dir))
         }
         Err(e) => {
             debug(format_args!("resolve failed: {e}"));
             None
         }
+    }
+}
+
+/// Build an authenticated client + resolve the cwd's codebase id. `None`
+/// (silently) for every can't/shouldn't-act case: no login, repo not indexed,
+/// server unreachable, resolve timed out.
+async fn connect(cli: &Cli, cwd: &str) -> Option<(Client, String)> {
+    match resolve_connection(cli, cwd).await? {
+        HookConnection::Indexed(client, id) => Some((client, id)),
+        HookConnection::Unindexed(_) => None,
     }
 }
 
@@ -640,19 +765,28 @@ fn read_input() -> Option<HookInput> {
     serde_json::from_str(&buf).ok()
 }
 
-fn emit(event: &str, context: &str) {
+fn emit(input: &HookInput, context: &str) {
     use std::io::Write;
-    let out = HookOutput {
-        hook_specific_output: HookSpecific {
-            hook_event_name: event.to_string(),
-            additional_context: context.to_string(),
-        },
-    };
+    let out = hook_output(input, context);
     if let Ok(s) = serde_json::to_string(&out) {
         // Ignore a broken pipe (Claude closing the hook's stdout early): a
         // `println!` would panic and exit nonzero, breaking the never-break
         // contract. A failed write just means no context this call.
         let _ = writeln!(std::io::stdout().lock(), "{s}");
+    }
+}
+
+fn hook_output(input: &HookInput, context: &str) -> HookOutput {
+    // Codex documents `systemMessage` for PreToolUse. Keep the additional-context
+    // payload too because current Codex releases surface it to the model and
+    // Claude uses it; host-specific contract tests pin both shapes.
+    let codex_pretooluse = input.hook_event_name == "PreToolUse" && input.is_codex();
+    HookOutput {
+        system_message: codex_pretooluse.then(|| context.to_string()),
+        hook_specific_output: Some(HookSpecific {
+            hook_event_name: input.hook_event_name.clone(),
+            additional_context: context.to_string(),
+        }),
     }
 }
 
@@ -696,6 +830,25 @@ mod tests {
         assert_eq!(input.hook_event_name, "SessionStart");
         assert_eq!(input.prompt, "how does auth work");
         assert_eq!(input.cwd, "/repo");
+    }
+
+    #[test]
+    fn unindexed_startup_notice_requires_opt_in_and_names_the_tool() {
+        let message = unindexed_notice(std::path::Path::new("/repo"));
+        assert!(message.contains("not indexed"), "{message}");
+        assert!(
+            message.contains("Do not index it automatically"),
+            "{message}"
+        );
+        assert!(
+            message.contains("ask whether they want to opt in"),
+            "{message}"
+        );
+        assert!(message.contains("`index_codebase`"), "{message}");
+        assert!(
+            message.contains("codebase id or indexed directory path"),
+            "{message}"
+        );
     }
 
     // Belt-and-suspenders: a camelCase payload (older/other hosts) still binds.
@@ -1047,10 +1200,11 @@ mod tests {
     #[test]
     fn hook_output_never_carries_permission_decision() {
         let out = HookOutput {
-            hook_specific_output: HookSpecific {
+            system_message: Some("prefer semctl".into()),
+            hook_specific_output: Some(HookSpecific {
                 hook_event_name: "PreToolUse".into(),
                 additional_context: "prefer semctl".into(),
-            },
+            }),
         };
         let json = serde_json::to_string(&out).expect("serializes");
         assert!(
@@ -1058,11 +1212,7 @@ mod tests {
             "unexpected permissionDecision: {json}"
         );
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            v.as_object().unwrap().len(),
-            1,
-            "only hookSpecificOutput at top level"
-        );
+        assert_eq!(v["systemMessage"], "prefer semctl");
         let inner = v["hookSpecificOutput"]
             .as_object()
             .expect("hookSpecificOutput object");
@@ -1071,13 +1221,72 @@ mod tests {
         assert!(inner.contains_key("additionalContext"));
     }
 
-    // Drift guard: the hooks.json PreToolUse matcher must stay in lockstep with
-    // the sniffer's handled tools, and all three events must stay wired to the
-    // binary. Adding a tool to one side but not the other silently half-wires
-    // the nudge, with no other failing test.
     #[test]
-    fn hooks_json_pretooluse_is_wired_and_matches_sniffer() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/hooks/hooks.json");
+    fn pretooluse_output_preserves_each_hosts_contract() {
+        let codex = HookInput {
+            hook_event_name: "PreToolUse".into(),
+            turn_id: "turn-1".into(),
+            ..Default::default()
+        };
+        let claude = HookInput {
+            hook_event_name: "PreToolUse".into(),
+            prompt_id: "prompt-1".into(),
+            ..Default::default()
+        };
+        let codex = serde_json::to_value(hook_output(&codex, "prefer semctl")).unwrap();
+        let claude = serde_json::to_value(hook_output(&claude, "prefer semctl")).unwrap();
+
+        assert_eq!(codex["systemMessage"], "prefer semctl");
+        assert_eq!(
+            codex["hookSpecificOutput"]["additionalContext"],
+            "prefer semctl"
+        );
+        assert!(
+            claude.get("systemMessage").is_none(),
+            "Claude keeps its existing additional-context-only output"
+        );
+        assert_eq!(
+            claude["hookSpecificOutput"]["additionalContext"],
+            "prefer semctl"
+        );
+    }
+
+    #[test]
+    fn prompt_retrieval_gate_prefers_precision() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/plugins/semctx/skills/codebase-retrieval/evals.json"
+        );
+        let raw = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        let evals: serde_json::Value = serde_json::from_str(&raw).expect("valid eval JSON");
+        assert_eq!(evals["schema_version"], 1);
+        assert_eq!(evals["hosts"], serde_json::json!(["codex", "claude"]));
+
+        for prompt in evals["hook_injection"]["should_search"]
+            .as_array()
+            .expect("should_search cases")
+        {
+            let prompt = prompt.as_str().expect("prompt string");
+            assert!(prompt_wants_retrieval(prompt), "{prompt}");
+        }
+        for prompt in evals["hook_injection"]["should_not_search"]
+            .as_array()
+            .expect("should_not_search cases")
+        {
+            let prompt = prompt.as_str().expect("prompt string");
+            assert!(!prompt_wants_retrieval(prompt), "{prompt}");
+        }
+    }
+
+    // Drift guard for the cross-host hooks contract. Keep the PreToolUse matcher
+    // in lockstep with the sniffer and keep every event bounded; this file is
+    // shared by every plugin host that supports the common hook schema.
+    #[test]
+    fn shared_hooks_are_wired_and_match_the_sniffer() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/plugins/semctx/hooks/hooks.json"
+        );
         let raw = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
         let v: serde_json::Value = serde_json::from_str(&raw).expect("hooks.json is valid JSON");
 
@@ -1100,42 +1309,25 @@ mod tests {
             "hooks.json PreToolUse matcher drifted from sniffer::HANDLED_TOOLS"
         );
 
-        for event in ["SessionStart", "UserPromptSubmit"] {
-            assert_eq!(
-                v["hooks"][event][0]["hooks"][0]["command"], "semctl hook",
-                "{event} → semctl hook"
-            );
-        }
-    }
-
-    // Codex plugin drift guard — the JSON wiring side only. The codex-plugin
-    // hooks.json must keep all four events wired to `semctl hook`, with PreToolUse
-    // matching Codex's shell tool (`Bash`). The matching dispatch side — that
-    // PostCompact actually resets the segment — is pinned separately by
-    // `resets_segment_covers_both_hosts`; this test can't see `run`.
-    #[test]
-    fn codex_hooks_json_is_wired() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/codex-plugin/hooks/hooks.json");
-        let raw = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-        let v: serde_json::Value =
-            serde_json::from_str(&raw).expect("codex hooks.json is valid JSON");
-
-        let pre = v["hooks"]["PreToolUse"][0]
-            .as_object()
-            .expect("PreToolUse entry");
-        assert_eq!(
-            pre["matcher"], "^Bash$",
-            "PreToolUse matches Codex's Bash tool"
-        );
-
-        for event in [
-            "SessionStart",
-            "PostCompact",
-            "UserPromptSubmit",
-            "PreToolUse",
-        ] {
+        for event in ["SessionStart", "UserPromptSubmit", "PreToolUse"] {
             let cmd = &v["hooks"][event][0]["hooks"][0]["command"];
             assert_eq!(cmd, "semctl hook", "{event} → semctl hook");
+            assert!(
+                v["hooks"][event][0]["hooks"][0]["timeout"]
+                    .as_u64()
+                    .is_some_and(|timeout| timeout <= 12),
+                "{event} must have a bounded timeout"
+            );
+            assert!(
+                v["hooks"][event][0]["hooks"][0]["statusMessage"]
+                    .as_str()
+                    .is_some_and(|message| !message.is_empty()),
+                "{event} should explain its visible work"
+            );
         }
+        assert!(
+            v["hooks"].get("PostCompact").is_none(),
+            "SessionStart(source=compact) already restores context"
+        );
     }
 }

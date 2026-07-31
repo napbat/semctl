@@ -2,14 +2,49 @@
 //!
 //! Three surfaces describe the tool inventory: the per-tool docs
 //! (`docs/tools/*.md`, compiled in via `tool_doc`), the server-level
-//! instructions (`docs/instructions/server.md`), and the Claude Code plugin
-//! skill (`skills/codebase-retrieval/SKILL.md` at the repo root). The last
+//! instructions (`docs/instructions/server.md`), and the shared coding-agent
+//! skill (`plugins/semctx/skills/codebase-retrieval/SKILL.md`). The last
 //! two are hand-written and drift silently — the skill sat at 8 of 23 tools
 //! for a month while the registry grew. These tests pin both files to the
 //! router: adding, renaming, or removing a tool without updating them fails
 //! `cargo test`.
 
-use super::McpServer;
+use super::{
+    BatchArgs, CallPathArgs, ExpandArgs, FlowBetweenArgs, FlowFromArgs, FlowToArgs, GrepArgs,
+    ListFilesArgs, McpServer, NoArgs, OutlineArgs, SearchArgs, SymbolArgs, SymbolAtPositionArgs,
+    TraceArgs,
+};
+
+#[test]
+fn every_codebase_scoped_argument_schema_has_the_selector() {
+    macro_rules! assert_selector {
+        ($($ty:ty),+ $(,)?) => {$(
+            let schema = schemars::schema_for!($ty);
+            let json = serde_json::to_value(schema).expect("schema serializes");
+            assert!(
+                json.pointer("/properties/codebase").is_some(),
+                "{} is missing the optional codebase selector",
+                stringify!($ty)
+            );
+        )+};
+    }
+    assert_selector!(
+        SearchArgs,
+        SymbolArgs,
+        CallPathArgs,
+        FlowFromArgs,
+        FlowToArgs,
+        FlowBetweenArgs,
+        TraceArgs,
+        GrepArgs,
+        OutlineArgs,
+        ExpandArgs,
+        SymbolAtPositionArgs,
+        BatchArgs,
+        NoArgs,
+        ListFilesArgs,
+    );
+}
 
 /// Registered tool names, straight from the router the MCP host sees.
 fn registered_tools() -> Vec<String> {
@@ -27,7 +62,7 @@ fn server_instructions() -> &'static str {
 fn skill_md() -> String {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/skills/codebase-retrieval/SKILL.md"
+        "/plugins/semctx/skills/codebase-retrieval/SKILL.md"
     );
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"))
 }
@@ -146,9 +181,87 @@ fn skill_covers_every_tool() {
     let missing = missing_from(&skill_md(), &registered_tools());
     assert!(
         missing.is_empty(),
-        "skills/codebase-retrieval/SKILL.md never mentions registered tool(s) {missing:?} — \
+        "plugins/semctx/skills/codebase-retrieval/SKILL.md never mentions registered tool(s) {missing:?} — \
          update its routing table"
     );
+}
+
+#[test]
+fn every_tool_has_explicit_safety_annotations() {
+    for tool in McpServer::tool_router()
+        .list_all()
+        .into_iter()
+        .map(McpServer::with_doc)
+    {
+        let annotations = tool
+            .annotations
+            .unwrap_or_else(|| panic!("{} has no annotations", tool.name));
+        assert!(
+            annotations.read_only_hint.is_some(),
+            "{} must declare readOnlyHint",
+            tool.name
+        );
+        assert!(
+            annotations.open_world_hint.is_some(),
+            "{} must declare openWorldHint",
+            tool.name
+        );
+        if tool.name == "index_codebase" {
+            assert_eq!(annotations.read_only_hint, Some(false));
+            assert_eq!(annotations.destructive_hint, Some(false));
+            assert_eq!(annotations.idempotent_hint, Some(true));
+        } else {
+            assert_eq!(annotations.read_only_hint, Some(true));
+        }
+    }
+}
+
+#[test]
+fn retrieval_skill_has_one_repository_source() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for relative in ["SKILL.md", "agents/openai.yaml"] {
+        assert!(
+            root.join("plugins/semctx/skills/codebase-retrieval")
+                .join(relative)
+                .is_file(),
+            "shared retrieval skill is missing {relative}"
+        );
+        for duplicate in [
+            "skills/codebase-retrieval",
+            "codex-plugin/skills/codebase-retrieval",
+        ] {
+            assert!(
+                !root.join(duplicate).join(relative).exists(),
+                "do not copy shared skill assets into a host adapter"
+            );
+        }
+    }
+}
+
+#[test]
+fn prior_index_permission_is_durable_in_agent_guidance() {
+    for (name, text) in [
+        ("server instructions", server_instructions().to_string()),
+        ("retrieval skill", skill_md()),
+    ] {
+        assert!(
+            text.contains("previously indexed") && text.contains("without asking again"),
+            "{name} must say that an existing index is prior consent"
+        );
+    }
+}
+
+#[test]
+fn first_index_gate_is_explained_in_agent_guidance() {
+    for (name, text) in [
+        ("server instructions", server_instructions().to_string()),
+        ("retrieval skill", skill_md()),
+    ] {
+        assert!(
+            text.contains("first-ever") && text.contains("sync_status"),
+            "{name} must explain the first-index readiness gate and progress path"
+        );
+    }
 }
 
 #[test]
@@ -163,7 +276,7 @@ fn steering_docs_name_no_phantom_tools() {
     let phantoms = phantom_tools(&skill_md(), &tools);
     assert!(
         phantoms.is_empty(),
-        "skills/codebase-retrieval/SKILL.md backticks unknown ident(s) {phantoms:?} — \
+        "plugins/semctx/skills/codebase-retrieval/SKILL.md backticks unknown ident(s) {phantoms:?} — \
          a renamed/removed tool, or a new term for ALLOWED_NON_TOOLS"
     );
 }

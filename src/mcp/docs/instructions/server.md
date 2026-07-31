@@ -1,4 +1,4 @@
-Code retrieval and graph navigation over a semctx-indexed codebase, served by the semctx server. This MCP server is scoped to one codebase (set when it was launched); every code tool below operates on that codebase.
+Code retrieval and graph navigation over semctx-indexed codebases. Tools default to the repository this MCP server was launched in, and can be scoped per call to another indexed codebase.
 
 ## Tool selection
 
@@ -21,6 +21,11 @@ Code retrieval and graph navigation over a semctx-indexed codebase, served by th
 - **external_links** — cross-repo "jump to definition": imports that leave this codebase, resolved into the public API of other codebases you can see.
 - **list_domains** — discover what's searchable and which tags are available for filtering.
 - **sync_status** — check the background index job; if `list_files` / `search` are empty right after attaching, this tells you whether indexing is still in progress.
+- **index_codebase** — explicit opt-in indexing. If startup or a tool says the current repository is not indexed, tell the user and ask permission; call this only after they agree.
+
+Every codebase-scoped tool accepts an optional codebase selector. Omit it for the launch/current repository. To work across repositories, pass either a codebase id or an indexed local directory path. A previously indexed local repository already has user consent: activate its initial sync and filesystem watcher immediately without asking again. Ask only when the directory has never been indexed and would need `index_codebase`.
+
+The first-ever `index_codebase` call is a readiness boundary: retrieval, catalog, and graph tools for that codebase wait until server embedding completes successfully. `sync_status` remains callable while they wait. Later re-syncs do not block retrieval and continue to expose the last complete snapshot with freshness warnings.
 
 ## Workflow
 

@@ -14,5 +14,5 @@ Use this when you already know the file and want its shape — the methods/types
 
 ## Notes
 
-- Scoped to the launched codebase — a path shared with another codebase resolves to *this* one's chunks.
+- Scoped to the selected codebase (the launch/current codebase by default) — a path shared with another codebase resolves to the selected one's chunks.
 - Returns "not indexed in this codebase" if the file isn't part of the codebase's index (check `list_files`).

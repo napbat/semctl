@@ -101,6 +101,14 @@ pick by number, or choose non-interactively with
 With nothing configured, `semctl` talks to the hosted server at
 `https://semctx.napbat.ca`.
 
+### Agent integration data flow
+
+The MCP server sends retrieval queries and opted-in repository content to the
+configured semctx server. When trusted plugin hooks are enabled, retrieval-shaped
+user prompts are also sent for a bounded, best-effort candidate search. Set
+`SEMCTX_HOOK_DISABLE=1` to disable all hook behavior or
+`SEMCTX_NUDGE_DISABLE=1` to disable only shell-search reminders.
+
 ## Development
 
 ```sh
@@ -109,6 +117,19 @@ cargo test --workspace
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items
+```
+
+`plugins/semctx/` is the shared plugin root for every supported coding agent.
+Its `skills/codebase-retrieval/` and `hooks/hooks.json` each have one physical
+source; host discovery manifests and incompatible wire formats are thin
+adapters. See [`plugins/semctx/README.md`](plugins/semctx/README.md) before
+adding another agent integration. Do not copy or symlink shared skills.
+
+The deterministic hook cases run under `cargo test`. To record fresh Codex and
+Claude tool-event traces for the model-level golden prompts:
+
+```sh
+python scripts/run_skill_evals.py --host all
 ```
 
 CI (`.github/workflows/ci.yml`) runs the same checks — clippy is `pedantic`, and

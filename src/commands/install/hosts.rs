@@ -238,7 +238,9 @@ impl Host for Codex {
         // version / edited skill / hook / MCP config (Codex has no `plugin
         // update`; re-`add` reinstalls from the upgraded snapshot).
         let _ = codex(&["plugin", "marketplace", "upgrade"]);
-        codex_checked(&["plugin", "add", CODEX_PLUGIN])
+        codex_checked(&["plugin", "add", CODEX_PLUGIN])?;
+        codex_hook_trust_notice();
+        Ok(())
     }
 
     fn uninstall(&self) -> Result<()> {
@@ -376,14 +378,15 @@ mod tests {
         assert!(status.success(), "child saw terminal-attached stdio");
     }
 
-    // Drift guard for the Codex plugin assets and the identity the host drives.
-    // A rename or moved asset here silently breaks `codex plugin add` / status()
-    // at real install time while `cargo test` stays green — unless this fails
-    // first. (hooks.json's own wiring is guarded in hook.rs.)
+    // Drift guard for the shared plugin root and thin host adapters. Shared
+    // skills/hooks live once; each host manifest may point at its own wire
+    // formats without growing another package tree.
     #[test]
-    fn codex_manifest_identity_and_assets_are_consistent() {
+    fn agent_plugin_manifests_share_root_assets() {
         let market = json(".agents/plugins/marketplace.json");
-        let plugin = json("codex-plugin/.codex-plugin/plugin.json");
+        let claude_market = json(".claude-plugin/marketplace.json");
+        let plugin = json("plugins/semctx/.codex-plugin/plugin.json");
+        let claude_plugin = json("plugins/semctx/.claude-plugin/plugin.json");
 
         // marketplace name + plugin name must compose to exactly what install()
         // and status() use (`semctx@semctx`), and the slug must be the git source.
@@ -399,33 +402,66 @@ mod tests {
             plugin_name,
             "plugin.json name must match the marketplace entry"
         );
+        assert_eq!(
+            plugin["version"], claude_plugin["version"],
+            "Codex and Claude packages should release the shared integration together"
+        );
+        assert_eq!(
+            plugin["version"].as_str(),
+            Some(env!("CARGO_PKG_VERSION")),
+            "agent plugin manifests must use the semctl release version"
+        );
+        assert_eq!(
+            market["plugins"][0]["policy"]["authentication"], "ON_INSTALL",
+            "marketplace entries must declare their authentication timing"
+        );
+        assert_eq!(
+            market["plugins"][0]["source"]["path"], "./plugins/semctx",
+            "the Codex marketplace must point at the shared plugin root"
+        );
+        assert_eq!(
+            claude_market["plugins"][0]["source"], "./plugins/semctx",
+            "the Claude marketplace must point at the shared plugin root"
+        );
         assert_eq!(CODEX_MARKETPLACE_SLUG, "napbat/semctl");
 
-        // plugin.json's asset refs must resolve to real files/dirs.
-        let base = repo("codex-plugin");
-        for key in ["mcpServers", "hooks"] {
-            let rel = plugin[key]
-                .as_str()
-                .unwrap_or_else(|| panic!("plugin.json {key}"));
-            assert!(base.join(rel).is_file(), "{key} -> {rel} must be a file");
-        }
-        let skills = plugin["skills"].as_str().expect("plugin.json skills");
+        // Both hosts consume the same physical skill/hook tree and declare the
+        // same MCP server inline. Future hosts can add thin adapters without
+        // growing another package tree.
+        let base = repo("plugins/semctx");
+        let skills = plugin["skills"].as_str().expect("Codex plugin skills");
+        let claude_skills = claude_plugin["skills"]
+            .as_str()
+            .expect("Claude plugin skills");
+        assert_eq!(skills, claude_skills, "host skill paths must stay shared");
+        assert!(base.join(skills).is_dir(), "skills -> {skills} must exist");
         assert!(
-            base.join(skills).is_dir(),
-            "skills -> {skills} must be a dir"
+            base.join("hooks/hooks.json").is_file(),
+            "hosts must discover the shared default hooks/hooks.json"
         );
-
-        // .mcp.json is the direct-map shape codex 0.142.5 accepts (empirically
-        // validated) — the server keyed by name, NOT wrapped in `mcpServers`.
-        let mcp = json("codex-plugin/.mcp.json");
         assert_eq!(
-            mcp["semctx"]["command"].as_str(),
+            plugin["mcpServers"], claude_plugin["mcpServers"],
+            "hosts that accept inline MCP maps should share the same declaration"
+        );
+        assert_eq!(
+            plugin["mcpServers"]["semctx"]["command"].as_str(),
             Some("semctl"),
-            "`.mcp.json` must key the server directly as `semctx` (the MCP namespace), running the `semctl` binary"
+            "the shared MCP declaration must run semctl"
         );
-        assert!(
-            mcp.get("mcpServers").is_none(),
-            "`.mcp.json` must be the direct-map shape, not the wrapped one"
-        );
+        for key in [
+            "displayName",
+            "shortDescription",
+            "longDescription",
+            "developerName",
+            "category",
+            "capabilities",
+            "websiteURL",
+            "defaultPrompt",
+        ] {
+            assert!(
+                !plugin["interface"][key].is_null(),
+                "plugin.json interface.{key} is required"
+            );
+        }
     }
 }

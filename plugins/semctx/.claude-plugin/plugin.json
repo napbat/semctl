@@ -1,0 +1,19 @@
+{
+  "name": "semctx",
+  "description": "Indexed code retrieval and symbol navigation through semctx. Retrieval requests and indexed repository content are sent to the configured semctx service.",
+  "version": "0.1.4",
+  "author": {
+    "name": "Jon-Luke Biddle"
+  },
+  "homepage": "https://github.com/napbat/semctl",
+  "repository": "https://github.com/napbat/semctl",
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["search", "code-search", "rust", "dotnet", "mcp", "tree-sitter", "embeddings"],
+  "skills": "./skills/",
+  "mcpServers": {
+    "semctx": {
+      "command": "semctl",
+      "args": ["mcp"]
+    }
+  }
+}

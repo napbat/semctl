@@ -3,30 +3,57 @@
 //! Keeps the launch directory indexed for the server's lifetime by driving the
 //! [`super::sync`] engine off the serving path: a startup walk + sync, a realtime
 //! FS [`super::watcher`] for low-latency pickup, and a periodic re-sync as the
-//! drift backstop. [`spawn_indexing`] is the single entry point the mcp server
-//! calls once a codebase is bound.
+//! drift backstop.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, oneshot};
 use tracing::{debug, info, warn};
 
-use super::{LastJob, SyncCache, record_job, sync, watcher};
+use super::{JobRegistry, SyncCache, SyncOutcome, record_job, sync, watcher};
 use crate::client::Client;
 
 /// Keep the launch directory indexed for the server's lifetime: a startup walk
 /// and sync, a realtime FS watcher for low-latency pickup, and a periodic
 /// re-sync as the drift backstop — entirely off the serving path so none of it
 /// can stall the JSON-RPC channel. Detached; best-effort.
-pub fn spawn_indexing(client: Client, dir: PathBuf, last_job: Arc<Mutex<Option<LastJob>>>) {
+pub fn spawn_indexing(client: Client, dir: PathBuf, jobs: Arc<JobRegistry>) {
+    spawn(client, dir, jobs, None);
+}
+
+/// Start the normal indexing/watcher lifecycle and return a one-shot result for
+/// its startup sync. The MCP first-index readiness gate awaits this handle, then
+/// polls the queued server job through embedding completion.
+pub fn spawn_indexing_tracked(
+    client: Client,
+    dir: PathBuf,
+    jobs: Arc<JobRegistry>,
+) -> oneshot::Receiver<Result<SyncOutcome, String>> {
+    let (tx, rx) = oneshot::channel();
+    spawn(client, dir, jobs, Some(tx));
+    rx
+}
+
+fn spawn(
+    client: Client,
+    dir: PathBuf,
+    jobs: Arc<JobRegistry>,
+    initial_result: Option<oneshot::Sender<Result<SyncOutcome, String>>>,
+) {
     tokio::spawn(async move {
         // One stamp cache shared across startup / periodic / watch syncs; the
         // Mutex inside also serializes them so only one runs at a time.
         let cache = Arc::new(Mutex::new(SyncCache::default()));
 
-        spawn_initial_index(client.clone(), dir.clone(), cache.clone(), last_job.clone());
+        spawn_initial_index(
+            client.clone(),
+            dir.clone(),
+            cache.clone(),
+            jobs.clone(),
+            initial_result,
+        );
         match resync_secs() {
             0 => info!("periodic re-sync disabled (SEMCTX_MCP_RESYNC_SECS=0)"),
             secs => {
@@ -36,7 +63,7 @@ pub fn spawn_indexing(client: Client, dir: PathBuf, last_job: Arc<Mutex<Option<L
                     dir.clone(),
                     secs,
                     cache.clone(),
-                    last_job.clone(),
+                    jobs.clone(),
                 );
             }
         }
@@ -46,11 +73,10 @@ pub fn spawn_indexing(client: Client, dir: PathBuf, last_job: Arc<Mutex<Option<L
         // the blocking pool rather than a runtime worker. The returned debouncer
         // guard is held here for the task's (and thus the server's) lifetime;
         // dropping it would stop the watch.
-        let watcher =
-            tokio::task::spawn_blocking(move || watcher::spawn(client, dir, cache, last_job))
-                .await
-                .ok()
-                .flatten();
+        let watcher = tokio::task::spawn_blocking(move || watcher::spawn(client, dir, cache, jobs))
+            .await
+            .ok()
+            .flatten();
         if watcher.is_some() {
             std::future::pending::<()>().await;
         }
@@ -64,7 +90,8 @@ fn spawn_initial_index(
     client: Client,
     dir: PathBuf,
     cache: Arc<Mutex<SyncCache>>,
-    last_job: Arc<Mutex<Option<LastJob>>>,
+    jobs: Arc<JobRegistry>,
+    initial_result: Option<oneshot::Sender<Result<SyncOutcome, String>>>,
 ) {
     tokio::spawn(async move {
         match sync(&client, &dir, &cache).await {
@@ -78,9 +105,18 @@ fn spawn_initial_index(
                 );
                 // Always record the first job — it's the one `sync_status`
                 // reports until a later re-sync pushes changes.
-                record_job(&last_job, &o).await;
+                record_job(&jobs, &o).await;
+                if let Some(tx) = initial_result {
+                    let _ = tx.send(Ok(o));
+                }
             }
-            Err(e) => warn!(error = %format!("{e:#}"), "auto-index failed; serving existing index"),
+            Err(e) => {
+                let reason = format!("{e:#}");
+                warn!(error = %reason, "auto-index failed; serving existing index");
+                if let Some(tx) = initial_result {
+                    let _ = tx.send(Err(reason));
+                }
+            }
         }
     });
 }
@@ -106,7 +142,7 @@ fn spawn_periodic_resync(
     dir: PathBuf,
     secs: u64,
     cache: Arc<Mutex<SyncCache>>,
-    last_job: Arc<Mutex<Option<LastJob>>>,
+    jobs: Arc<JobRegistry>,
 ) {
     tokio::spawn(async move {
         let period = Duration::from_secs(secs);
@@ -127,7 +163,7 @@ fn spawn_periodic_resync(
                     );
                     // Only a change-pushing tick advances `sync_status`; a no-op
                     // tick leaves it pointing at the last meaningful job.
-                    record_job(&last_job, &o).await;
+                    record_job(&jobs, &o).await;
                 }
                 Ok(_) => debug!("re-sync: no changes"),
                 Err(e) => warn!(error = %format!("{e:#}"), "periodic re-sync failed"),

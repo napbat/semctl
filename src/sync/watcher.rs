@@ -34,7 +34,7 @@ pub(super) fn spawn(
     client: Client,
     dir: PathBuf,
     cache: Arc<Mutex<SyncCache>>,
-    last_job: Arc<Mutex<Option<super::LastJob>>>,
+    jobs: Arc<super::JobRegistry>,
 ) -> Option<Debouncer<RecommendedWatcher, RecommendedCache>> {
     // Wake-only channel: the re-sync re-walks the whole tree, so we forward
     // "something interesting changed", not which paths.
@@ -83,7 +83,7 @@ pub(super) fn spawn(
                         job = %o.job_id,
                         "watch re-sync pushed changes",
                     );
-                    super::record_job(&last_job, &o).await;
+                    super::record_job(&jobs, &o).await;
                 }
                 Ok(_) => debug!("watch re-sync: no changes"),
                 Err(e) => warn!(error = %format!("{e:#}"), "watch re-sync failed"),

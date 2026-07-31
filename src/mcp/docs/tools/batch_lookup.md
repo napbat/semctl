@@ -14,4 +14,4 @@ Resolve many symbols in one call — for each name, its definitions (or referenc
 ## Notes
 
 - Each result echoes its `symbol`, so you can match results back without re-deriving keys; a name with no match comes back with an empty hit list (not an error).
-- Same symbol graph as `find_definition` — exact, case-sensitive name match, scoped to the launched codebase. Graph coverage: Rust, C#, Go, TypeScript/JavaScript.
+- Same symbol graph as `find_definition` — exact, case-sensitive name match, scoped to the selected codebase (the launch/current codebase by default). Graph coverage: Rust, C#, Go, TypeScript/JavaScript.

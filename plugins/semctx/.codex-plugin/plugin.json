@@ -1,0 +1,33 @@
+{
+  "name": "semctx",
+  "description": "Indexed code retrieval, symbol navigation, and repository synchronization through semctx.",
+  "version": "0.1.4",
+  "author": {
+    "name": "Jon-Luke Biddle"
+  },
+  "homepage": "https://github.com/napbat/semctl",
+  "repository": "https://github.com/napbat/semctl",
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["search", "code-search", "rust", "dotnet", "mcp", "tree-sitter", "embeddings"],
+  "mcpServers": {
+    "semctx": {
+      "command": "semctl",
+      "args": ["mcp"]
+    }
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "semctx",
+    "shortDescription": "Indexed code retrieval and symbol navigation",
+    "longDescription": "Search and trace indexed repositories with semctx. Trusted prompt hooks send retrieval-shaped prompts, and active repository watchers upload indexed file changes to the configured semctx service.",
+    "developerName": "Jon-Luke Biddle",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write"],
+    "websiteURL": "https://github.com/napbat/semctl",
+    "defaultPrompt": [
+      "Find where this behavior is implemented.",
+      "Trace the callers of this function.",
+      "Show the indexed repository structure."
+    ]
+  }
+}

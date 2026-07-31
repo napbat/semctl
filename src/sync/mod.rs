@@ -16,7 +16,7 @@ mod background;
 mod walker;
 mod watcher;
 
-pub use background::spawn_indexing;
+pub use background::{spawn_indexing, spawn_indexing_tracked};
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -62,16 +62,22 @@ pub struct SyncCache {
 /// Identifies the index job `sync_status` reports on.
 #[derive(Clone)]
 pub struct LastJob {
-    pub(crate) codebase_id: String,
     pub(crate) job_id: String,
 }
 
+/// Per-codebase latest jobs queued by this MCP session. Multiple local checkouts
+/// can be active at once, so one global "last job" slot would make status for one
+/// codebase accidentally report another codebase's sync.
+pub type JobRegistry = Mutex<HashMap<String, LastJob>>;
+
 /// Record the job a background sync just queued, so `sync_status` can poll it.
-pub(crate) async fn record_job(slot: &Mutex<Option<LastJob>>, o: &SyncOutcome) {
-    *slot.lock().await = Some(LastJob {
-        codebase_id: o.codebase_id.clone(),
-        job_id: o.job_id.clone(),
-    });
+pub(crate) async fn record_job(registry: &JobRegistry, o: &SyncOutcome) {
+    registry.lock().await.insert(
+        o.codebase_id.clone(),
+        LastJob {
+            job_id: o.job_id.clone(),
+        },
+    );
 }
 
 /// Register (if new) the Local codebase for `dir`, walk it, diff against the

@@ -8,10 +8,7 @@
   "plugins": [
     {
       "name": "semctx",
-      "source": {
-        "source": "url",
-        "url": "https://github.com/napbat/semctl.git"
-      },
+      "source": "./plugins/semctx",
       "description": "MCP server + codebase-retrieval skill + prompt-context hook + a PreToolUse nudge toward the semctx tools.",
       "homepage": "https://github.com/napbat/semctl"
     }

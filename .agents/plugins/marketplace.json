@@ -8,10 +8,11 @@
       "name": "semctx",
       "source": {
         "source": "local",
-        "path": "./codex-plugin"
+        "path": "./plugins/semctx"
       },
       "policy": {
-        "installation": "AVAILABLE"
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
       },
       "category": "Productivity"
     }

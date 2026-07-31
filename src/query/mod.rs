@@ -87,7 +87,7 @@ pub async fn search(
     }
 
     // Staleness is the one shaping the client owns — only it has the local bytes.
-    let stale = staleness(client, &hits).await;
+    let stale = stale_paths(client, &hits).await;
     render_hits_inner(
         &hits,
         "no results",
@@ -104,7 +104,7 @@ pub async fn search(
 /// never be mistaken for "fresh", but a spurious one is worse, so we only flag
 /// a genuine hash mismatch (or a file that's gone). Only the hits' own paths
 /// are hashed, not the whole tree.
-async fn staleness(client: &Client, hits: &[api::SearchHit]) -> HashSet<String> {
+pub(crate) async fn stale_paths(client: &Client, hits: &[api::SearchHit]) -> HashSet<String> {
     let mut stale = HashSet::new();
     let Some(root) = client.local_root() else {
         // Server-pulled codebase with no local bytes — staleness is a
@@ -618,17 +618,115 @@ pub async fn list_files(
     out
 }
 
-/// Status of an index job — the one the MCP server's background sync most
-/// recently queued. Lets the agent see whether the codebase is still indexing
-/// (so empty `list_files` / `search` results are "not done yet", not "nothing
-/// there") without leaving the session.
-pub async fn sync_status(client: &Client, codebase_id: &str, job_id: &str) -> String {
-    match client
-        .get::<api::JobStatus>(&format!("/v1/jobs/{job_id}"))
-        .await
+/// Persisted index totals plus the latest sync run queued by this MCP session.
+/// The catalog totals are deliberately independent of the latest job: a no-op
+/// sync has a 0-file plan even when the codebase already contains thousands of
+/// indexed files.
+pub async fn sync_status(
+    client: &Client,
+    job_id: Option<&str>,
+    local_watch_active: bool,
+) -> String {
+    let codebase_id = match client.codebase() {
+        Ok(id) => id,
+        Err(e) => return format!("sync_status failed: {e}"),
+    };
+    let totals = catalog_totals(client, codebase_id).await;
+    let job = match job_id {
+        Some(id) => Some((
+            id,
+            client
+                .get::<api::JobStatus>(&format!("/v1/jobs/{id}"))
+                .await,
+        )),
+        None => None,
+    };
+
+    let watch = if local_watch_active {
+        "active"
+    } else {
+        "not active (no local checkout selected)"
+    };
+    let mut out =
+        format!("codebase {codebase_id}\nlocal checkout watch: {watch}\ntotal indexed state:");
+    match totals {
+        Ok((files, bytes)) => {
+            write!(
+                out,
+                "\n  files: {files}\n  source bytes: {} ({bytes} bytes)",
+                human_bytes(bytes)
+            )
+            .unwrap();
+        }
+        Err(e) => write!(out, "\n  catalog totals unavailable: {e}").unwrap(),
+    }
+    if let Some((_, Ok(status))) = &job
+        && let Some(chunks) = status.chunk_count
     {
-        Ok(job) => render_job(codebase_id, job_id, &job),
-        Err(e) => format!("sync_status failed: {e}"),
+        write!(out, "\n  chunks: {chunks} (post-sync total)").unwrap();
+    }
+
+    match job {
+        Some((id, Ok(status))) => {
+            out.push_str("\n\n");
+            out.push_str(&render_job(id, &status));
+        }
+        Some((id, Err(e))) => {
+            write!(out, "\n\nlast sync run {id}: status unavailable — {e}").unwrap();
+        }
+        None if local_watch_active => out.push_str(
+            "\n\nlast sync run: no server job queued yet; the active local watcher may still \
+             be scanning/preparing its initial sync. The totals above are the persisted server \
+             state.",
+        ),
+        None => out.push_str(
+            "\n\nlast sync run: none queued by this MCP session; the totals above are the \
+             persisted server state.",
+        ),
+    }
+    out
+}
+
+async fn catalog_totals(
+    client: &Client,
+    codebase_id: &str,
+) -> std::result::Result<(u32, i64), String> {
+    let mut page = 0u32;
+    let mut bytes = 0i64;
+    loop {
+        let p = fetch_files_page(client, codebase_id, page, FILES_PAGE_MAX).await?;
+        let got = p.items.len();
+        let files = p.total;
+        bytes = p
+            .items
+            .iter()
+            .fold(bytes, |sum, f| sum.saturating_add(f.size.max(0)));
+        page += 1;
+        if got == 0 || page.saturating_mul(FILES_PAGE_MAX) >= files {
+            return Ok((files, bytes));
+        }
+    }
+}
+
+fn human_bytes(bytes: i64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let bytes = u64::try_from(bytes).unwrap_or(0);
+    let mut unit = 0;
+    let mut divisor = 1u64;
+    while bytes / divisor >= 1024 && unit + 1 < UNITS.len() {
+        divisor *= 1024;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        let mut whole = bytes / divisor;
+        let mut tenth = ((bytes % divisor) * 10 + divisor / 2) / divisor;
+        if tenth == 10 {
+            whole += 1;
+            tenth = 0;
+        }
+        format!("{whole}.{tenth} {}", UNITS[unit])
     }
 }
 
@@ -930,7 +1028,14 @@ fn urlencode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_stale, local_blake3, normalize_prefer};
+    use super::{human_bytes, is_stale, local_blake3, normalize_prefer};
+
+    #[test]
+    fn total_source_bytes_are_human_readable_without_losing_exactness() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(1536), "1.5 KiB");
+        assert_eq!(human_bytes(2 * 1024 * 1024), "2.0 MiB");
+    }
 
     #[test]
     fn normalize_prefer_maps_to_server_enum_names() {

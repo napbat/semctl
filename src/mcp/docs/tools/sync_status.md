@@ -1,5 +1,7 @@
-Status of the most recent index job the server's background sync queued for this codebase.
+Total indexed state for a codebase, plus the most recent sync job this MCP session queued when one exists.
 
-Use it to tell "still indexing" from "nothing indexed": if `list_files` / `search` come back empty right after attaching, check here — a `queued` or `running` job means the index is still being built, so retry shortly.
+Omit `codebase` for the launch/current repository, or pass either a codebase id or an indexed local directory path. Path-based access also keeps that checkout watched while this MCP session is active.
 
-Reports the phase (`queued` → `running` → `done`, or `failed`), per-file progress (embedded / deleted / failed over the planned total), the post-sync chunk count once done, and any failure reason. Returns a note instead if nothing has been synced this session yet.
+Reports whether a local checkout watcher is active. The total section always reports the catalog's file count and source bytes, so a no-op latest run cannot make an already-populated index look empty. When a latest job is known, it also reports the post-sync total chunk count, phase (`queued` → `running` → `done`, or `failed`), and per-run embedded/deleted/failed progress. While the first local scan is still preparing its server job, status says so rather than claiming nothing is happening.
+
+Unlike retrieval/catalog/graph tools, this tool does not wait on a first-index readiness gate, so it can monitor that initial job.

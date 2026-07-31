@@ -96,7 +96,7 @@ pub(super) fn render_files(files: &[api::CodebaseFile], root: Option<&Path>) -> 
 
 /// Render a job's progress. The phase is derived from timestamps/error rather
 /// than the server's status enum, so it's robust to the enum's wire encoding.
-pub(super) fn render_job(codebase_id: &str, job_id: &str, j: &api::JobStatus) -> String {
+pub(super) fn render_job(job_id: &str, j: &api::JobStatus) -> String {
     let phase = if j.error.is_some() {
         "failed"
     } else if j.completed_at.is_some() {
@@ -109,13 +109,10 @@ pub(super) fn render_job(codebase_id: &str, job_id: &str, j: &api::JobStatus) ->
     let done = j.files_embedded + j.files_deleted + j.files_failed;
     let total = j.files_to_embed + j.files_to_delete;
     let mut out = format!(
-        "codebase {codebase_id}\nlast index job {job_id}: {phase}\n  \
-         files: {done}/{total} processed (embedded {}, deleted {}, failed {})",
+        "last sync run {job_id}: {phase}\n  \
+             files: {done}/{total} processed (embedded {}, deleted {}, failed {})",
         j.files_embedded, j.files_deleted, j.files_failed,
     );
-    if let Some(c) = j.chunk_count {
-        write!(out, "\n  chunks: {c}").unwrap();
-    }
     if let Some(e) = &j.error {
         write!(out, "\n  error: {e}").unwrap();
     }
@@ -428,7 +425,7 @@ mod tests {
             completed_at: None,
         };
 
-        let out = render_job("codebase-1", "job-1", &job);
+        let out = render_job("job-1", &job);
         assert!(out.contains("files: 9/12 processed"), "{out}");
     }
 }

@@ -2,7 +2,7 @@ The codebase's indexed files as a directory tree — built from the catalog by s
 
 ## Parameters
 
-None — returns the whole tree for the launched codebase.
+Pass an optional codebase id or indexed local directory path; omit it for the launch/current codebase.
 
 ## When to use this vs alternatives
 

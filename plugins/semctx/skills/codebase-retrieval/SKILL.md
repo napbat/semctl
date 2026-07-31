@@ -28,8 +28,19 @@ can't see, at a fraction of the context cost of raw reads.
 | file→file / import→definition structure | `imports`, then `symbol_edges` |
 | a dependency defined outside this repo | `external_links` |
 | index job state | `sync_status` |
+| explicitly index an unindexed repo after user opt-in | `index_codebase` |
 
 Parameters and details live in each tool's own description — read them, don't guess.
+
+Every codebase-scoped tool accepts an optional codebase selector. Omit it for
+the launch/current repo; pass either a codebase id or an indexed local directory
+path for cross-repo work. A path-based call keeps that checkout watched for the
+rest of the MCP session. A previously indexed repo already has user consent:
+start syncing/watching it without asking again. Only when a repo has never been
+indexed should you tell the user and call `index_codebase` after explicit opt-in.
+That first-ever index is gated: retrieval/catalog/graph tools wait until embedding
+finishes successfully, while `sync_status` remains available for progress. Later
+re-syncs do not block use of the last complete index.
 
 ## Rules
 
@@ -55,8 +66,9 @@ Parameters and details live in each tool's own description — read them, don't 
 - A hit flagged `⚠ stale (edited since indexed)`, or a freshness footer →
   `Read` that file for current bytes. The MCP server auto-syncs edits
   (filesystem watcher + periodic re-sync); do not tell the user to run
-  `semctx index` unless there is no MCP session, or the codebase is pinned
-  read-only.
+  `semctx index` while a known local checkout is active. If only a codebase id
+  is known, pass its indexed local path as the codebase selector to activate
+  watching.
 - A tool answers "not logged in — run `semctx login`" → answer the immediate
   question with host tools, and end your reply with one line telling the user
   semctx is logged out and `semctx login` restores it (tools recover on

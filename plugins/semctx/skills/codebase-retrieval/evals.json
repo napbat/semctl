@@ -1,0 +1,96 @@
+{
+  "$comment": "Cross-host evaluation suite for the codebase-retrieval skill. Deterministic hook cases run under cargo test; scripts/run_skill_evals.py launches fresh Codex or Claude sessions and records tool events and final output for the model-level cases. Baseline (no skill / old skill) results from 2026-07-03: stale `semctx index` advice propagated into answers, and 20/20 agents silently swallowed the 'not logged in' degraded state.",
+  "schema_version": 1,
+  "hosts": ["codex", "claude"],
+  "functional": [
+    {
+      "skills": ["codebase-retrieval"],
+      "query": "Who calls `pretooluse_nudge`, and how does a PreToolUse event decide whether to emit a semctl retrieval reminder?",
+      "expected_behavior": [
+        "Routes to who_calls (and call_path or trace) rather than emulating callers via find_references fan-out or host Grep",
+        "Falls back to host tools only after a semctx tool reports a degraded state, and says so",
+        "Names the decision flow: hook run -> pretooluse_nudge -> sniffer::eligible_search -> availability check -> escalation::decide -> finalize -> tier1/tier2 message"
+      ]
+    },
+    {
+      "skills": ["codebase-retrieval"],
+      "query": "Find every occurrence of `index_codebase` in this repo — all of them, including documentation, comments, tests, and string literals.",
+      "expected_behavior": [
+        "Uses the semctx grep tool, NOT find_references (which skips comments, strings, and repeat uses within a chunk)",
+        "Does not use search_codebase as the primary tool for an exhaustive literal query"
+      ]
+    },
+    {
+      "skills": ["codebase-retrieval"],
+      "query": "Search results for code I edited about 30 seconds ago look stale in this session. What do you check and what do you do about it?",
+      "expected_behavior": [
+        "Checks sync_status and/or points at the per-hit '⚠ stale (edited since indexed)' flag and freshness footer",
+        "Explains the MCP server auto-syncs (filesystem watcher + periodic re-sync)",
+        "Does NOT recommend running `semctx index` while a known local checkout is active in the MCP session",
+        "Reads the edited file with host Read when current bytes are needed"
+      ]
+    },
+    {
+      "skills": ["codebase-retrieval"],
+      "query": "Where in this repo's documentation is the first-index readiness gate described, including what an agent can call while indexing is still running?",
+      "expected_behavior": [
+        "Uses search_codebase (prefer: docs) or semctx grep — does not skip semctx on the false premise that markdown is not indexed",
+        "Falls back to host tools only on a reported degraded state",
+        "Identifies that retrieval/catalog/graph tools wait for the initial embed job while sync_status remains available"
+      ]
+    },
+    {
+      "skills": ["codebase-retrieval"],
+      "query": "Any semctx tool call returns 'not logged in — run `semctx login`'.",
+      "expected_behavior": [
+        "Tells the user about the auth state and the `semctx login` remedy instead of silently falling back",
+        "Still answers the immediate question with host tools",
+        "Does not tell the host to reconnect the MCP server (tools recover on retry after login)"
+      ]
+    },
+    {
+      "skills": ["codebase-retrieval"],
+      "query": "This other repository was indexed in an earlier session. Do I need to ask before searching it and keeping its index fresh?",
+      "expected_behavior": [
+        "Treats the existing index as prior user consent and does not ask again",
+        "Passes the repository path or codebase id to a scoped tool, which activates its local watcher when a checkout is known",
+        "Reserves the explicit index_codebase opt-in prompt for a directory that has never been indexed"
+      ]
+    },
+    {
+      "skills": ["codebase-retrieval"],
+      "query": "I just opted a brand-new repository into indexing. Can I search it while its first embed job is still running?",
+      "expected_behavior": [
+        "Explains that first-time retrieval/catalog/graph calls wait for successful embedding completion and cannot see a partial initial index",
+        "Uses sync_status to monitor first-index progress because status bypasses the readiness gate",
+        "Distinguishes later background re-syncs, which do not block retrieval from the last complete snapshot"
+      ]
+    }
+  ],
+  "triggering": {
+    "should_trigger": [
+      "How does tenant resolution work in this server?",
+      "What would break if I renamed pretooluse_nudge?",
+      "Which functions end up calling resolve_connection?",
+      "semctx search keeps showing my file's old contents after I edited it — why?"
+    ],
+    "should_not_trigger": [
+      "Bump the Helm chart image tag to the latest sha.",
+      "Draft a commit message for my staged changes."
+    ]
+  },
+  "hook_injection": {
+    "should_search": [
+      "Where is tenant resolution implemented?",
+      "Who calls `pretooluse_nudge`?",
+      "Review the MCP hook implementation.",
+      "Which files define the codebase watcher?"
+    ],
+    "should_not_search": [
+      "yes go ahead",
+      "thanks that works",
+      "Draft a commit message for my staged changes.",
+      "Bump the version to 1.2.3."
+    ]
+  }
+}
