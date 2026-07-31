@@ -172,8 +172,10 @@ pub fn run(args: &InstallArgs) -> Result<()> {
     };
 
     // The hosts wire a plugin that invokes `semctl` by bare name, so the binary
-    // must be resolvable on PATH. Do this once, up front, when enabling anything.
-    if !desired.is_empty() {
+    // must be resolvable on PATH. `--all` is also the release installers'
+    // non-interactive bootstrap path: install the binary even when no supported
+    // host is currently available.
+    if args.all || !desired.is_empty() {
         ensure_semctl_on_path();
     }
 

@@ -54,6 +54,20 @@ try {
     # and wires up the AI tools it finds (Claude Code, Codex).
     Say 'Installing semctl and wiring your AI tools...'
     & $bin install --all
+    if ($LASTEXITCODE -ne 0) {
+        throw "semctl install --all failed with exit code $LASTEXITCODE"
+    }
+
+    # The CLI persists the user PATH, but as a child process it cannot change
+    # this PowerShell process. Refresh the current session so `semctl` works
+    # immediately after `irm ... | iex`, without requiring a shell restart.
+    $installDir = Join-Path ([Environment]::GetFolderPath(
+        [Environment+SpecialFolder]::LocalApplicationData
+    )) 'semctl\bin'
+    $pathEntries = @($env:Path -split ';' | ForEach-Object { $_.Trim().TrimEnd('\') })
+    if ($pathEntries -inotcontains $installDir.TrimEnd('\')) {
+        $env:Path = "$installDir;$env:Path"
+    }
 } finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }
