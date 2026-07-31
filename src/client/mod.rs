@@ -6,10 +6,15 @@
 //! we'll swap [`api`] for a `progenitor`-generated client driven off a
 //! vendored `openapi/v1.json` snapshot.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Serialize, de::DeserializeOwned};
+use tokio::sync::{Mutex, RwLock};
+use tracing::{info, warn};
 
 use crate::auth;
 
@@ -22,7 +27,15 @@ const TENANT_HEADER: &str = "X-Tenant-Id";
 pub struct Client {
     http: reqwest::Client,
     base_url: String,
-    tenant: Option<String>,
+    /// Shared so an MCP server and every codebase-bound clone can recover from
+    /// a persisted tenant that identity no longer lists for this principal.
+    tenant: Arc<RwLock<Option<String>>>,
+    /// Only persisted config is eligible for automatic replacement. An
+    /// explicit `--tenant` / `SEMCTX_TENANT` remains authoritative.
+    repair_configured_tenant: bool,
+    /// Serialize recovery so concurrent MCP requests do not all query identity
+    /// and rewrite config after the same rejection.
+    tenant_repair: Arc<Mutex<()>>,
     codebase: Option<String>,
     /// Local checkout root of `codebase`, when known (recorded by
     /// `semctl index`). Lets path-rendering absolutize the server's
@@ -32,7 +45,12 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(base_url: &str, tenant: Option<String>, codebase: Option<String>) -> Self {
+    fn new(
+        base_url: &str,
+        tenant: Option<String>,
+        codebase: Option<String>,
+        repair_configured_tenant: bool,
+    ) -> Self {
         let http = reqwest::Client::builder()
             .user_agent(concat!("semctx-cli/", env!("CARGO_PKG_VERSION")))
             .build()
@@ -40,7 +58,9 @@ impl Client {
         Self {
             http,
             base_url: base_url.trim_end_matches('/').to_string(),
-            tenant,
+            tenant: Arc::new(RwLock::new(tenant)),
+            repair_configured_tenant,
+            tenant_repair: Arc::new(Mutex::new(())),
             codebase,
             local_root: None,
         }
@@ -93,21 +113,142 @@ impl Client {
         &self,
         method: reqwest::Method,
         path: &str,
-    ) -> Result<(reqwest::RequestBuilder, String)> {
+    ) -> Result<(reqwest::RequestBuilder, String, Option<String>)> {
         let token = auth::get_valid_access_token(&self.http).await?;
         let url = self.url(path);
         let mut req = self.http.request(method, &url).bearer_auth(&token);
-        if let Some(t) = &self.tenant {
+        let tenant = self.tenant.read().await.clone();
+        if let Some(t) = &tenant {
             req = req.header(TENANT_HEADER, t);
         }
-        Ok((req, url))
+        Ok((req, url, tenant))
+    }
+
+    /// Send one request, repairing a stale persisted tenant and retrying once
+    /// when the resource server reports `TenantBindingDenied`.
+    async fn send(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<(reqwest::Response, String)> {
+        let mut retried = false;
+        loop {
+            let (mut req, url, rejected_tenant) = self.authed(method.clone(), path).await?;
+            if let Some(json) = &body {
+                req = req.json(json);
+            }
+            let resp = req
+                .send()
+                .await
+                .with_context(|| format!("{method} {url}"))?;
+
+            if resp.status() != reqwest::StatusCode::FORBIDDEN {
+                return Ok((resp, url));
+            }
+
+            let status = resp.status();
+            let response_body = resp
+                .text()
+                .await
+                .with_context(|| format!("{method} {url}: read body"))?;
+            if !retried
+                && tenant_binding_denied(&response_body)
+                && self
+                    .repair_tenant_after_denial(rejected_tenant.as_deref())
+                    .await
+            {
+                retried = true;
+                continue;
+            }
+            return Err(response_body_error(
+                method.as_str(),
+                &url,
+                status,
+                &response_body,
+            ));
+        }
+    }
+
+    /// Replace a rejected persisted tenant when identity has exactly one
+    /// membership. Best-effort: any discovery/config error leaves the original
+    /// denial as the user-facing result.
+    async fn repair_tenant_after_denial(&self, rejected: Option<&str>) -> bool {
+        if !self.repair_configured_tenant {
+            return false;
+        }
+        let Some(rejected) = rejected else {
+            return false;
+        };
+
+        let _guard = self.tenant_repair.lock().await;
+
+        // A concurrent request may already have repaired the shared selection.
+        let current = self.tenant.read().await.clone();
+        if current.as_deref() != Some(rejected) {
+            return current.is_some();
+        }
+
+        let mut cfg = match crate::config::load() {
+            Ok(cfg) => cfg,
+            Err(error) => {
+                warn!(%error, "couldn't load config while repairing stale tenant");
+                return false;
+            }
+        };
+
+        // Honour a validated switch performed by another process while this MCP
+        // server was running before making another identity round-trip.
+        if let Some(configured) = cfg.active_tenant.clone()
+            && configured != rejected
+        {
+            *self.tenant.write().await = Some(configured.clone());
+            info!(tenant = %configured, "adopted updated active tenant");
+            return true;
+        }
+
+        let token = match auth::get_valid_access_token(&self.http).await {
+            Ok(token) => token,
+            Err(error) => {
+                warn!(%error, "couldn't get token while repairing stale tenant");
+                return false;
+            }
+        };
+        let identity_url = match auth::discover_authority(&self.http, &self.base_url).await {
+            Ok(url) => url,
+            Err(error) => {
+                warn!(%error, "couldn't discover identity while repairing stale tenant");
+                return false;
+            }
+        };
+        let memberships = match auth::fetch_tenants(&self.http, &identity_url, &token).await {
+            Ok(memberships) => memberships,
+            Err(error) => {
+                warn!(%error, "couldn't list memberships while repairing stale tenant");
+                return false;
+            }
+        };
+        let [only] = memberships.as_slice() else {
+            return false;
+        };
+
+        cfg.active_tenant = Some(only.slug.clone());
+        if let Err(error) = crate::config::save(&cfg) {
+            warn!(%error, tenant = %only.slug, "repaired tenant for this session but couldn't save it");
+        }
+        *self.tenant.write().await = Some(only.slug.clone());
+        info!(
+            rejected_tenant = %rejected,
+            tenant = %only.slug,
+            "repaired stale active tenant; retrying request"
+        );
+        true
     }
 
     /// GET `path`, parse the JSON response as `T`. The path is appended
     /// to the base URL — pass it WITH leading slash (`/v1/domains`).
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        let (req, url) = self.authed(reqwest::Method::GET, path).await?;
-        let resp = req.send().await.with_context(|| format!("GET {url}"))?;
+        let (resp, url) = self.send(reqwest::Method::GET, path, None).await?;
         unwrap_envelope(resp, "GET", &url).await
     }
 
@@ -115,8 +256,7 @@ impl Client {
     /// for "does this still exist?" probes (e.g. validating a cached codebase id
     /// before trusting it against the current server).
     pub async fn get_opt<T: DeserializeOwned>(&self, path: &str) -> Result<Option<T>> {
-        let (req, url) = self.authed(reqwest::Method::GET, path).await?;
-        let resp = req.send().await.with_context(|| format!("GET {url}"))?;
+        let (resp, url) = self.send(reqwest::Method::GET, path, None).await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -127,8 +267,7 @@ impl Client {
     /// `Ok(None)` instead of erroring. For endpoints that 200 with no payload to
     /// mean "nothing here" (e.g. hover at a position with no symbol).
     pub async fn get_maybe<T: DeserializeOwned>(&self, path: &str) -> Result<Option<T>> {
-        let (req, url) = self.authed(reqwest::Method::GET, path).await?;
-        let resp = req.send().await.with_context(|| format!("GET {url}"))?;
+        let (resp, url) = self.send(reqwest::Method::GET, path, None).await?;
         let status = resp.status();
         let body = resp
             .text()
@@ -149,32 +288,23 @@ impl Client {
     /// inline the page (`items`/`total`/`page`/`pageSize`) beside `success` with
     /// no `data` wrapper (see [`unwrap_page`]).
     pub async fn get_page<T: DeserializeOwned>(&self, path: &str) -> Result<api::Page<T>> {
-        let (req, url) = self.authed(reqwest::Method::GET, path).await?;
-        let resp = req.send().await.with_context(|| format!("GET {url}"))?;
+        let (resp, url) = self.send(reqwest::Method::GET, path, None).await?;
         unwrap_page(resp, "GET", &url).await
     }
 
     /// POST `path` with `body` serialised as JSON, parse the response
     /// as `T`. Same path semantics as [`Self::get`].
     pub async fn post<B: Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> Result<T> {
-        let (req, url) = self.authed(reqwest::Method::POST, path).await?;
-        let resp = req
-            .json(body)
-            .send()
-            .await
-            .with_context(|| format!("POST {url}"))?;
+        let body = serde_json::to_value(body).context("serialize POST body")?;
+        let (resp, url) = self.send(reqwest::Method::POST, path, Some(body)).await?;
         unwrap_envelope(resp, "POST", &url).await
     }
 
     /// PUT `path` with `body` serialised as JSON, parse the response as `T`.
     /// Same path / envelope semantics as [`Self::post`].
     pub async fn put<B: Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> Result<T> {
-        let (req, url) = self.authed(reqwest::Method::PUT, path).await?;
-        let resp = req
-            .json(body)
-            .send()
-            .await
-            .with_context(|| format!("PUT {url}"))?;
+        let body = serde_json::to_value(body).context("serialize PUT body")?;
+        let (resp, url) = self.send(reqwest::Method::PUT, path, Some(body)).await?;
         unwrap_envelope(resp, "PUT", &url).await
     }
 
@@ -184,6 +314,40 @@ impl Client {
         } else {
             format!("{}/{}", self.base_url, path)
         }
+    }
+}
+
+fn tenant_binding_denied(body: &str) -> bool {
+    fn contains_code(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Object(fields) => fields.iter().any(|(key, value)| {
+                (key.eq_ignore_ascii_case("code")
+                    && value
+                        .as_str()
+                        .is_some_and(|code| code.eq_ignore_ascii_case("TenantBindingDenied")))
+                    || contains_code(value)
+            }),
+            serde_json::Value::Array(values) => values.iter().any(contains_code),
+            _ => false,
+        }
+    }
+
+    serde_json::from_str(body).is_ok_and(|value| contains_code(&value))
+}
+
+/// Preserve a structured JSON denial even when it is not wrapped in the
+/// resource server's usual API envelope. Tenant binding failures can be emitted
+/// by middleware before controller envelope handling runs.
+fn response_body_error(
+    method: &str,
+    url: &str,
+    status: reqwest::StatusCode,
+    body: &str,
+) -> anyhow::Error {
+    if serde_json::from_str::<serde_json::Value>(body).is_ok() {
+        anyhow!("{method} {url} -> {status}: {body}")
+    } else {
+        gateway_error(method, url, status, body)
     }
 }
 
@@ -336,13 +500,28 @@ pub fn is_local_source(v: &serde_json::Value) -> bool {
 
 pub mod api;
 
+fn tenant_selection(configured: Option<String>, explicit: Option<&str>) -> (Option<String>, bool) {
+    if let Some(tenant) = explicit {
+        (Some(tenant.to_string()), false)
+    } else {
+        let repairable = configured.is_some();
+        (configured, repairable)
+    }
+}
+
 /// Build an authenticated `Client` from the loaded config + the global CLI flags.
 pub fn from_cli(cli: &crate::cli::Cli) -> Result<Client> {
     let cfg = crate::config::load()?;
     let server = cfg.server_url(cli.server.as_deref());
-    let tenant = cfg.active_tenant(cli.tenant.as_deref());
+    let (tenant, repair_configured_tenant) =
+        tenant_selection(cfg.active_tenant.clone(), cli.tenant.as_deref());
     let codebase = cfg.active_codebase(cli.codebase.as_deref());
-    Ok(Client::new(&server, tenant, codebase))
+    Ok(Client::new(
+        &server,
+        tenant,
+        codebase,
+        repair_configured_tenant,
+    ))
 }
 
 /// Like [`from_cli`], but ensures a codebase is set — resolving the working
@@ -368,7 +547,7 @@ pub async fn for_cwd(cli: &crate::cli::Cli) -> Result<Client> {
 
 #[cfg(test)]
 mod gateway_error_tests {
-    use super::gateway_error;
+    use super::{gateway_error, tenant_binding_denied, tenant_selection};
 
     /// A gateway's HTML error page must be reported as the gateway failure it is,
     /// not as a JSON parse error.
@@ -398,5 +577,32 @@ mod gateway_error_tests {
             !msg.contains("expected value at line"),
             "must not surface the JSON parser's complaint as the headline: {msg}"
         );
+    }
+
+    #[test]
+    fn tenant_denial_is_detected_in_direct_and_enveloped_errors() {
+        assert!(tenant_binding_denied(
+            r#"{"code":"TenantBindingDenied","message":"denied"}"#
+        ));
+        assert!(tenant_binding_denied(
+            r#"{"success":false,"errors":[{"code":"TenantBindingDenied"}]}"#
+        ));
+        assert!(!tenant_binding_denied(
+            r#"{"code":"InsufficientPermission","message":"denied"}"#
+        ));
+        assert!(!tenant_binding_denied("<html>forbidden</html>"));
+    }
+
+    #[test]
+    fn only_persisted_tenants_are_eligible_for_automatic_repair() {
+        assert_eq!(
+            tenant_selection(Some("saved".into()), None),
+            (Some("saved".into()), true)
+        );
+        assert_eq!(
+            tenant_selection(Some("saved".into()), Some("override")),
+            (Some("override".into()), false)
+        );
+        assert_eq!(tenant_selection(None, None), (None, false));
     }
 }

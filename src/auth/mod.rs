@@ -12,7 +12,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use std::time::{Duration, Instant};
 
-use crate::config::{self, SCOPES};
+use crate::{
+    client::api,
+    config::{self, SCOPES},
+};
 
 mod store;
 
@@ -81,6 +84,34 @@ pub async fn discover_authority(http: &reqwest::Client, server_url: &str) -> Res
         .into_iter()
         .next()
         .ok_or_else(|| anyhow!("{url}: server advertised no authorization_servers"))
+}
+
+/// Fetch the caller's tenant memberships directly from identity.
+///
+/// This request deliberately carries no tenant header: identity membership is
+/// the source of truth used both after login and to recover from a stale
+/// `X-Tenant-Id` rejected by the semctx resource server.
+pub async fn fetch_tenants(
+    http: &reqwest::Client,
+    identity_url: &str,
+    token: &str,
+) -> Result<Vec<api::TenantDto>> {
+    let url = format!("{}/v1/tenants", identity_url.trim_end_matches('/'));
+    let resp = http
+        .get(&url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        bail!("identity {url} -> {status}: {body}");
+    }
+
+    let envelope: api::TenantsEnvelope = resp.json().await.context("parse tenants response")?;
+    Ok(envelope.data.map(|page| page.items).unwrap_or_default())
 }
 
 /// Step 1: request a device + user code from identity. Returns the

@@ -3,7 +3,6 @@ use std::io::{IsTerminal, Write};
 use anyhow::{Context, Result};
 use clap::Args;
 
-use super::tenants;
 use crate::auth;
 use crate::cli::Cli;
 use crate::client::api;
@@ -76,7 +75,8 @@ pub async fn run(args: LoginArgs, cli: &Cli) -> Result<()> {
 
 /// Pick the active tenant after login and persist it to the config.
 ///
-/// - active tenant already set → leave it (just report it);
+/// - active tenant still belongs to this principal → leave it;
+/// - stale active tenant → discard it and select again;
 /// - exactly one membership → auto-select;
 /// - several, interactive shell → prompt;
 /// - several, non-interactive → list them and point at `tenants --switch`.
@@ -86,24 +86,32 @@ async fn select_tenant(
     token: &str,
     cfg: &mut config::Config,
 ) {
-    if let Some(active) = cfg.active_tenant(None) {
-        println!("Active tenant: {active} (change with `semctl auth tenants --switch <slug>`).");
-        return;
-    }
-
-    let tenants = match tenants::fetch(http, identity_url, token).await {
+    let tenants = match auth::fetch_tenants(http, identity_url, token).await {
         Ok(t) => t,
         Err(e) => {
-            // Don't derail a successful login; the user can run `semctl auth tenants`.
+            // Don't derail a successful login or discard a tenant we couldn't
+            // validate because identity was temporarily unavailable.
             eprintln!(
-                "note: couldn't list tenants ({e}); set one with `semctl auth tenants --switch`."
+                "note: couldn't validate tenant memberships ({e}); \
+                 check with `semctl auth tenants`."
             );
             return;
         }
     };
 
+    if let Some(active) = cfg.active_tenant(None) {
+        if membership_named(&tenants, &active).is_some() {
+            println!(
+                "Active tenant: {active} (change with `semctl auth tenants --switch <slug>`)."
+            );
+            return;
+        }
+        println!("Configured tenant '{active}' is no longer in your memberships; selecting again.");
+    }
+
     let chosen = match tenants.as_slice() {
         [] => {
+            clear_active_tenant(cfg);
             println!("No tenant memberships yet.");
             return;
         }
@@ -112,6 +120,7 @@ async fn select_tenant(
             if let Some(i) = prompt_tenant(many) {
                 &many[i]
             } else {
+                clear_active_tenant(cfg);
                 println!(
                     "No tenant set. Choose one later with `semctl auth tenants --switch <slug>`."
                 );
@@ -119,6 +128,7 @@ async fn select_tenant(
             }
         }
         _ => {
+            clear_active_tenant(cfg);
             println!(
                 "You belong to multiple tenants — pick one with `semctl auth tenants --switch <slug>`."
             );
@@ -132,6 +142,20 @@ async fn select_tenant(
         return;
     }
     println!("Active tenant -> {} ({}).", chosen.slug, chosen.name);
+}
+
+fn membership_named<'a>(tenants: &'a [api::TenantDto], active: &str) -> Option<&'a api::TenantDto> {
+    tenants.iter().find(|tenant| {
+        tenant.slug.eq_ignore_ascii_case(active) || tenant.id.eq_ignore_ascii_case(active)
+    })
+}
+
+fn clear_active_tenant(cfg: &mut config::Config) {
+    if cfg.active_tenant.take().is_some()
+        && let Err(e) = config::save(cfg)
+    {
+        eprintln!("note: couldn't clear the stale active tenant ({e}).");
+    }
 }
 
 /// Interactive numbered picker. Returns the chosen index, or `None` if the
@@ -157,4 +181,28 @@ fn prompt_tenant(tenants: &[api::TenantDto]) -> Option<usize> {
 /// already printed above for manual use.
 fn open_browser(url: &str) {
     let _ = open::that_detached(url);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::membership_named;
+    use crate::client::api::TenantDto;
+
+    fn tenant(id: &str, slug: &str) -> TenantDto {
+        TenantDto {
+            id: id.to_string(),
+            name: slug.to_string(),
+            slug: slug.to_string(),
+            role_name: None,
+        }
+    }
+
+    #[test]
+    fn configured_tenant_is_validated_by_slug_or_id() {
+        let tenants = vec![tenant("tenant-id", "acme")];
+
+        assert!(membership_named(&tenants, "ACME").is_some());
+        assert!(membership_named(&tenants, "tenant-id").is_some());
+        assert!(membership_named(&tenants, "former-tenant").is_none());
+    }
 }

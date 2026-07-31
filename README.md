@@ -90,6 +90,14 @@ re-login.
 | Active tenant | `--tenant` | `SEMCTX_TENANT` |
 | Active codebase | `--codebase` | `SEMCTX_CODEBASE` |
 
+Login validates the saved active tenant against the new account's memberships
+and automatically selects a sole membership. If a saved tenant later becomes
+invalid, an authenticated request repairs it the same way and retries once.
+Explicit `--tenant` / `SEMCTX_TENANT` overrides are never replaced; with
+multiple memberships, run `semctl auth tenants` in an interactive terminal to
+pick by number, or choose non-interactively with
+`semctl auth tenants --switch <slug>`.
+
 With nothing configured, `semctl` talks to the hosted server at
 `https://semctx.napbat.ca`.
 

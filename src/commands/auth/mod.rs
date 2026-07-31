@@ -25,8 +25,8 @@ pub enum AuthCommand {
     /// valid and the server is reachable.
     Whoami,
 
-    /// List the tenants you're a member of. `--switch` sets one as active for
-    /// subsequent invocations.
+    /// List the tenants you're a member of and pick one interactively on a
+    /// terminal. `--switch` selects one non-interactively.
     Tenants(tenants::TenantsArgs),
 }
 
