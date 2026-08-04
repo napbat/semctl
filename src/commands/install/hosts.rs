@@ -345,6 +345,10 @@ impl Host for Omp {
 
     fn update(&self) -> Result<()> {
         let _ = omp(&["plugin", "marketplace", "update", MARKETPLACE_NAME]);
+        // OMP preserves a plugin's disabled state across upgrades. A checked
+        // host is the desired active wiring, so repair that state first; the
+        // subsequent upgrade then carries the enabled state forward.
+        omp_checked(&["plugin", "enable", "--scope", "user", PLUGIN])?;
         omp_checked(&["plugin", "upgrade", "--scope", "user", PLUGIN])
     }
 
@@ -495,6 +499,12 @@ mod tests {
     fn omp_status_requires_a_user_scope_install() {
         let user = br#"{"npm":[],"marketplace":[{"id":"semctx@semctx","scope":"user","entries":[{"scope":"user"}]}]}"#;
         assert!(omp_user_plugin_installed(user).expect("parse user install"));
+
+        let disabled = br#"{"npm":[],"marketplace":[{"id":"semctx@semctx","scope":"user","entries":[{"scope":"user","enabled":false}]}]}"#;
+        assert!(
+            omp_user_plugin_installed(disabled).expect("parse disabled user install"),
+            "a disabled install must take the update path, which re-enables it"
+        );
 
         let project = br#"{"npm":[],"marketplace":[{"id":"semctx@semctx","scope":"project","entries":[{"scope":"project"}]}]}"#;
         assert!(
