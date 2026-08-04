@@ -9,17 +9,18 @@ at their conventional root locations:
 
 Each coding agent keeps only the adapter material that cannot be shared:
 
-- its required discovery manifest (for example `.codex-plugin/plugin.json` or
-  `.claude-plugin/plugin.json`);
+- its required discovery manifest (`.codex-plugin/plugin.json`,
+  `.claude-plugin/plugin.json`, or OMP's `package.json`);
 - its marketplace metadata; and
-- its host-specific install/update commands and configuration syntax.
+- its host-specific lifecycle adapter, install/update commands, and configuration
+  syntax.
 
 To add another coding agent, point its marketplace at this plugin root and its
-adapter at `skills/` and the shared hooks wherever its plugin format allows. Add
-an `adapters/<host>/` directory only when its required files have no conventional
-location at the plugin root. Do not manually copy shared skills; when a host
-requires a projected format, generate it from the canonical skill and verify
-parity in CI.
+adapter at `skills/` and the shared hooks wherever its plugin format allows. OMP
+instead loads `adapters/omp/index.ts`: its native events invoke `semctl hook` and
+inject the returned context without duplicating retrieval policy in TypeScript.
+Do not manually copy shared skills; when a host requires a projected format,
+generate it from the canonical skill and verify parity in CI.
 
 Then add the host in three registries:
 

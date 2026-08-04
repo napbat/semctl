@@ -72,10 +72,10 @@ pub enum Command {
     #[command(subcommand)]
     Inspect(commands::inspect::InspectCommand),
 
-    /// Wire semctl into your AI coding tools (Claude Code, Codex). Interactive by
-    /// default — the checklist shows the current wiring; check a tool to install
-    /// it, uncheck to remove it. Scriptable: `semctl install claude`, `--all`,
-    /// or `--none`.
+    /// Wire semctl into your AI coding tools (Claude Code, Codex CLI, Oh My Pi).
+    /// Interactive by default — the checklist shows the current wiring; check a
+    /// tool to install it, uncheck to remove it. Scriptable:
+    /// `semctl install claude`, `semctl install omp`, `--all`, or `--none`.
     #[command(alias = "setup")]
     Install(commands::install::InstallArgs),
 
@@ -95,9 +95,9 @@ pub enum Command {
     /// first). Speaks JSON-RPC over stdin/stdout — don't redirect them.
     Mcp,
 
-    /// Claude Code / Codex plugin hook entry point: reads a hook event as JSON on
-    /// stdin and emits prompt/session context when the repo is indexed. Invoked
-    /// by the plugin's hooks.json, not run by hand.
+    /// Claude Code / Codex hook and OMP extension entry point: reads a hook event
+    /// as JSON on stdin and emits prompt/session context when the repo is indexed.
+    /// Invoked by the packaged integration, not run by hand.
     #[command(hide = true)]
     Hook(commands::hook::HookArgs),
 }

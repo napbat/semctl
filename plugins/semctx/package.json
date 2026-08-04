@@ -1,0 +1,9 @@
+{
+  "name": "semctx",
+  "version": "0.1.4",
+  "private": true,
+  "type": "module",
+  "omp": {
+    "extensions": ["./adapters/omp/index.ts"]
+  }
+}

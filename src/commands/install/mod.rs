@@ -22,7 +22,7 @@ use crate::term::{ok, print_hint, say, warn};
 mod hosts;
 mod selfpath;
 
-use hosts::{ClaudeCode, Codex};
+use hosts::{ClaudeCode, Codex, Omp};
 use selfpath::BinaryRemoval;
 
 /// How this `semctl` binary got onto the machine — decides whether `upgrade`
@@ -135,7 +135,7 @@ pub enum HostStatus {
 
 /// The registry. Append a host here and the rest of the command picks it up.
 fn hosts() -> Vec<Box<dyn Host>> {
-    vec![Box::new(ClaudeCode), Box::new(Codex)]
+    vec![Box::new(ClaudeCode), Box::new(Codex), Box::new(Omp)]
 }
 
 pub fn run(args: &InstallArgs) -> Result<()> {

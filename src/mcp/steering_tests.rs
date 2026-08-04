@@ -131,11 +131,14 @@ fn phantom_tools(text: &str, tools: &[String]) -> Vec<String> {
         "search",
         "stale",
     ];
-    // A tool reference is valid either bare (`grep`) or fully-qualified as the
-    // host sees it (`mcp__semctx__grep`) — the PreToolUse nudge copy uses the
-    // latter to disambiguate from the built-in Grep tool and shell grep.
+    // A tool reference is valid either bare (`grep`) or fully-qualified as a
+    // supported host sees it. Claude/Codex use `mcp__semctx__grep`; OMP
+    // namespaces the marketplace server and uses `mcp__semctx_semctx_grep`.
     let is_registered_tool = |t: &str| -> bool {
-        let bare = t.strip_prefix("mcp__semctx__").unwrap_or(t);
+        let bare = ["mcp__semctx__", "mcp__semctx_semctx_"]
+            .iter()
+            .find_map(|prefix| t.strip_prefix(prefix))
+            .unwrap_or(t);
         tools.iter().any(|n| n == bare)
     };
     let mut out: Vec<String> = backticked_idents(text)
@@ -293,36 +296,41 @@ fn phantom_detection_actually_fires() {
 }
 
 #[test]
-fn phantom_guard_understands_mcp_prefix() {
+fn phantom_guard_understands_host_mcp_prefixes() {
     let tools = registered_tools();
     // Fully-qualified names map to their bare registered tool.
-    assert!(phantom_tools("use `mcp__semctx__grep`", &tools).is_empty());
+    for name in ["mcp__semctx__grep", "mcp__semctx_semctx_grep"] {
+        assert!(phantom_tools(&format!("use `{name}`"), &tools).is_empty());
+    }
     // A bogus qualified name is still caught.
     assert_eq!(
-        phantom_tools("use `mcp__semctx__made_up`", &tools),
-        vec!["mcp__semctx__made_up".to_string()]
+        phantom_tools("use `mcp__semctx_semctx_made_up`", &tools),
+        vec!["mcp__semctx_semctx_made_up".to_string()]
     );
 }
 
 #[test]
 fn nudge_copy_names_no_phantom_tools() {
-    use crate::commands::hook::message::{self, SearchKind};
+    use crate::commands::hook::message::{self, SearchKind, ToolNameStyle};
     let tools = registered_tools();
-    // Exercise EVERY message branch — tier1 plus all four tier2 tails (symbol,
-    // concept, literal, filename) — so a phantom tool hiding in any single
-    // branch is caught. The symbol case uses `symbol` (already allowed vocab) so
-    // the dynamically-backticked identifier doesn't trip the guard itself.
-    let copy = format!(
-        "{} {} {} {} {}",
-        message::tier1(),
-        message::tier2(SearchKind::Content, 5, Some("symbol")), // Symbol tail
-        message::tier2(SearchKind::Content, 5, Some("how retry works")), // Concept tail
-        message::tier2(SearchKind::Content, 5, Some("foo|bar")), // Literal tail
-        message::tier2(SearchKind::Filename, 5, None),          // Filename tail
-    );
-    let phantoms = phantom_tools(&copy, &tools);
-    assert!(
-        phantoms.is_empty(),
-        "PreToolUse nudge copy names unknown tool(s) {phantoms:?} — a renamed/removed tool"
-    );
+    // Exercise EVERY message branch for both host naming styles — tier1 plus
+    // all four tier2 tails (symbol, concept, literal, filename).
+    for names in [
+        ToolNameStyle::ClaudeCompatible,
+        ToolNameStyle::OmpMarketplace,
+    ] {
+        let copy = format!(
+            "{} {} {} {} {}",
+            message::tier1(names),
+            message::tier2(names, SearchKind::Content, 5, Some("symbol")), // Symbol tail
+            message::tier2(names, SearchKind::Content, 5, Some("how retry works")), // Concept tail
+            message::tier2(names, SearchKind::Content, 5, Some("foo|bar")), // Literal tail
+            message::tier2(names, SearchKind::Filename, 5, None),          // Filename tail
+        );
+        let phantoms = phantom_tools(&copy, &tools);
+        assert!(
+            phantoms.is_empty(),
+            "PreToolUse nudge copy names unknown tool(s) {phantoms:?} for {names:?}"
+        );
+    }
 }
