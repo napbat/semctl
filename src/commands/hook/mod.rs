@@ -64,6 +64,10 @@ struct HookInput {
     prompt: String,
     #[serde(default)]
     cwd: String,
+    // Host-specific adapter identity. Absent for Claude/Codex; OMP sends
+    // `"omp"` so guidance uses its marketplace-namespaced MCP tool names.
+    #[serde(default)]
+    host: String,
     // PreToolUse: the tool being called and its arguments.
     #[serde(default, alias = "toolName")]
     tool_name: String,
@@ -101,6 +105,14 @@ impl HookInput {
 
     fn is_codex(&self) -> bool {
         !self.turn_id.is_empty()
+    }
+
+    fn tool_name_style(&self) -> message::ToolNameStyle {
+        if self.host.eq_ignore_ascii_case("omp") {
+            message::ToolNameStyle::OmpMarketplace
+        } else {
+            message::ToolNameStyle::ClaudeCompatible
+        }
     }
 }
 
@@ -599,7 +611,15 @@ async fn pretooluse_nudge(cli: &Cli, input: &HookInput) -> Option<String> {
     // logged out / not indexed / server down → silent. Updates the cache fields
     // on `st`, which `finalize` then persists regardless of the verdict.
     let available = availability::is_available_cached(cli, &input.cwd, &mut st).await;
-    let (message, st) = finalize(st, tier, call.kind, call.pattern, turn, available);
+    let (message, st) = finalize(
+        st,
+        tier,
+        input.tool_name_style(),
+        call.kind,
+        call.pattern,
+        turn,
+        available,
+    );
     store.save(&input.session_id, &st);
     match &message {
         Some(_) => debug(format_args!("nudge: emitting {tier:?}")),
@@ -618,6 +638,7 @@ async fn pretooluse_nudge(cli: &Cli, input: &HookInput) -> Option<String> {
 fn finalize(
     mut st: state::NudgeState,
     tier: escalation::Tier,
+    tool_names: message::ToolNameStyle,
     kind: message::SearchKind,
     pattern: Option<&str>,
     prompt_id: &str,
@@ -627,8 +648,8 @@ fn finalize(
         return (None, st);
     }
     let message = match tier {
-        escalation::Tier::One => message::tier1(),
-        escalation::Tier::Two => message::tier2(kind, st.eligible_count, pattern),
+        escalation::Tier::One => message::tier1(tool_names),
+        escalation::Tier::Two => message::tier2(tool_names, kind, st.eligible_count, pattern),
     };
     st.nudges_fired = st.nudges_fired.saturating_add(1);
     st.last_nudge_at_count = st.eligible_count;
@@ -859,6 +880,18 @@ mod tests {
         assert_eq!(input.hook_event_name, "UserPromptSubmit");
     }
 
+    #[test]
+    fn parses_omp_host_and_selects_marketplace_tool_names() {
+        let raw = r#"{"host":"omp","hook_event_name":"PreToolUse","session_id":"s","prompt_id":"p1","cwd":"/repo","tool_name":"Grep","tool_input":{"pattern":"needle"}}"#;
+        let input: HookInput = serde_json::from_str(raw).expect("OMP payload parses");
+        assert_eq!(input.host, "omp");
+        assert_eq!(input.turn_key(), "p1");
+        assert_eq!(
+            input.tool_name_style(),
+            message::ToolNameStyle::OmpMarketplace
+        );
+    }
+
     // Codex sends the same snake_case shape as Claude but names the per-turn id
     // `turn_id` and its shell tool is `Bash` carrying `tool_input.command`. The
     // alias must bind turn_id to the dedup key, and the existing sniffer must
@@ -1084,6 +1117,7 @@ mod tests {
         let (msg, out) = finalize(
             st,
             escalation::Tier::Two,
+            message::ToolNameStyle::ClaudeCompatible,
             message::SearchKind::Content,
             Some("x"),
             "p1",
@@ -1111,6 +1145,7 @@ mod tests {
         let (msg, out) = finalize(
             st,
             escalation::Tier::Two,
+            message::ToolNameStyle::ClaudeCompatible,
             message::SearchKind::Content,
             Some("parse_config"),
             "p1",
@@ -1135,6 +1170,7 @@ mod tests {
         let (msg, _) = finalize(
             st,
             escalation::Tier::Two,
+            message::ToolNameStyle::ClaudeCompatible,
             message::SearchKind::Filename,
             None,
             "p1",
@@ -1260,7 +1296,10 @@ mod tests {
         let raw = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
         let evals: serde_json::Value = serde_json::from_str(&raw).expect("valid eval JSON");
         assert_eq!(evals["schema_version"], 1);
-        assert_eq!(evals["hosts"], serde_json::json!(["codex", "claude"]));
+        assert_eq!(
+            evals["hosts"],
+            serde_json::json!(["codex", "claude", "omp"])
+        );
 
         for prompt in evals["hook_injection"]["should_search"]
             .as_array()

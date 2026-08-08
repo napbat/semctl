@@ -86,6 +86,22 @@ def claude_command(query: str) -> list[str]:
         query,
     ]
 
+def omp_command(query: str) -> list[str]:
+    return [
+        "omp",
+        "--mode",
+        "json",
+        "--print",
+        "--no-session",
+        "--approval-mode",
+        "yolo",
+        "--tools",
+        "read,grep,glob,lsp",
+        "--plugin-dir",
+        str(PLUGIN_ROOT),
+        query,
+    ]
+
 
 def codex_plugin_is_current() -> tuple[bool, str]:
     expected = json.loads(
@@ -117,6 +133,7 @@ def codex_plugin_is_current() -> tuple[bool, str]:
 HOST_ADAPTERS = {
     "codex": HostAdapter("codex", codex_command, codex_plugin_is_current),
     "claude": HostAdapter("claude", claude_command),
+    "omp": HostAdapter("omp", omp_command),
 }
 
 

@@ -1,7 +1,7 @@
-//! The concrete `Host` implementations: the Claude Code and Codex CLI plugin
-//! integrations that [`super::run`] reconciles. The generic framework — the
-//! `Host` trait, the interactive picker, the reconcile loop — lives in the
-//! parent module; this file is just the two drivers and their per-CLI quirks.
+//! The concrete `Host` implementations for Claude Code, Codex CLI, and Oh My
+//! Pi. The generic framework — the [`Host`] trait, interactive picker, and
+//! reconcile loop — lives in the parent module; this file contains only the
+//! host drivers and their per-CLI quirks.
 
 use std::{
     io::Write,
@@ -262,6 +262,123 @@ impl Host for Codex {
     }
 }
 
+/// Oh My Pi, wired through its marketplace so semctl arrives as the shared MCP
+/// server + retrieval skill plus the native OMP lifecycle extension. OMP may be
+/// installed through Bun/npm, so every invocation goes through [`tool_cmd`].
+pub struct Omp;
+
+#[derive(serde::Deserialize)]
+struct OmpPluginEntry {
+    scope: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct OmpPluginSummary {
+    id: Option<String>,
+    scope: Option<String>,
+    #[serde(default)]
+    entries: Vec<OmpPluginEntry>,
+}
+
+#[derive(serde::Deserialize)]
+struct OmpPluginList {
+    #[serde(default)]
+    marketplace: Vec<OmpPluginSummary>,
+}
+
+fn omp_user_plugin_installed(json: &[u8]) -> serde_json::Result<bool> {
+    let list: OmpPluginList = serde_json::from_slice(json)?;
+    Ok(list.marketplace.iter().any(|plugin| {
+        plugin.id.as_deref() == Some(PLUGIN)
+            && (plugin.scope.as_deref() == Some("user")
+                || plugin
+                    .entries
+                    .iter()
+                    .any(|entry| entry.scope.as_deref() == Some("user")))
+    }))
+}
+
+impl Host for Omp {
+    fn id(&self) -> &'static str {
+        "omp"
+    }
+
+    fn label(&self) -> &'static str {
+        "Oh My Pi"
+    }
+
+    fn status(&self) -> Result<HostStatus> {
+        if !is_on_path("omp") {
+            return Ok(HostStatus::Unavailable(
+                "`omp` CLI not on PATH — install Oh My Pi".into(),
+            ));
+        }
+        let Ok(out) = tool_cmd("omp").args(["plugin", "list", "--json"]).output() else {
+            return Ok(HostStatus::Unavailable(
+                "`omp plugin list` could not be run — check the Oh My Pi install".into(),
+            ));
+        };
+        if !out.status.success() {
+            return Ok(HostStatus::Unavailable(
+                "`omp plugin list` failed — update Oh My Pi".into(),
+            ));
+        }
+        let Ok(installed) = omp_user_plugin_installed(&out.stdout) else {
+            return Ok(HostStatus::Unavailable(
+                "unexpected `omp plugin list --json` output — update Oh My Pi".into(),
+            ));
+        };
+        Ok(if installed {
+            HostStatus::Installed
+        } else {
+            HostStatus::NotInstalled
+        })
+    }
+
+    fn install(&self) -> Result<()> {
+        // `marketplace add` rejects an existing source; tolerate it, then refresh
+        // the catalog so a re-run always sees the current plugin version.
+        let _ = omp(&["plugin", "marketplace", "add", MARKETPLACE_SLUG]);
+        let _ = omp(&["plugin", "marketplace", "update", MARKETPLACE_NAME]);
+        omp_checked(&["plugin", "install", PLUGIN, "--scope", "user"])
+    }
+
+    fn update(&self) -> Result<()> {
+        let _ = omp(&["plugin", "marketplace", "update", MARKETPLACE_NAME]);
+        // OMP preserves a plugin's disabled state across upgrades. A checked
+        // host is the desired active wiring, so repair that state first; the
+        // subsequent upgrade then carries the enabled state forward.
+        omp_checked(&["plugin", "enable", "--scope", "user", PLUGIN])?;
+        omp_checked(&["plugin", "upgrade", "--scope", "user", PLUGIN])
+    }
+
+    fn uninstall(&self) -> Result<()> {
+        omp_checked(&["plugin", "uninstall", "--scope", "user", PLUGIN])
+    }
+
+    fn manual_install_hint(&self) -> Option<String> {
+        Some(format!(
+            "Install Oh My Pi, then:\n    omp plugin marketplace add {MARKETPLACE_SLUG}\n    \
+             omp plugin install {PLUGIN} --scope user"
+        ))
+    }
+}
+
+fn omp(args: &[&str]) -> Result<std::process::ExitStatus> {
+    tool_cmd("omp")
+        .args(args)
+        .status()
+        .context("run `omp` — is the CLI on PATH?")
+}
+
+fn omp_checked(args: &[&str]) -> Result<()> {
+    let st = omp(args)?;
+    if !st.success() {
+        bail!("`omp {}` failed ({st})", args.join(" "));
+    }
+    Ok(())
+}
+
 /// Print the one manual step Codex needs after install: trusting the plugin's
 /// hooks. The MCP server and skill are live immediately; the prompt-context and
 /// nudge hooks stay dormant until trusted. (The `hooks` feature is on by default,
@@ -378,6 +495,28 @@ mod tests {
         assert!(status.success(), "child saw terminal-attached stdio");
     }
 
+    #[test]
+    fn omp_status_requires_a_user_scope_install() {
+        let user = br#"{"npm":[],"marketplace":[{"id":"semctx@semctx","scope":"user","entries":[{"scope":"user"}]}]}"#;
+        assert!(omp_user_plugin_installed(user).expect("parse user install"));
+
+        let disabled = br#"{"npm":[],"marketplace":[{"id":"semctx@semctx","scope":"user","entries":[{"scope":"user","enabled":false}]}]}"#;
+        assert!(
+            omp_user_plugin_installed(disabled).expect("parse disabled user install"),
+            "a disabled install must take the update path, which re-enables it"
+        );
+
+        let project = br#"{"npm":[],"marketplace":[{"id":"semctx@semctx","scope":"project","entries":[{"scope":"project"}]}]}"#;
+        assert!(
+            !omp_user_plugin_installed(project).expect("parse project install"),
+            "a project-only install must not satisfy semctl's user-scope wiring"
+        );
+
+        let unrelated =
+            br#"{"npm":[],"marketplace":[{"id":"other@tools","scope":"user","entries":[]}]}"#;
+        assert!(!omp_user_plugin_installed(unrelated).expect("parse unrelated install"));
+    }
+
     // Drift guard for the shared plugin root and thin host adapters. Shared
     // skills/hooks live once; each host manifest may point at its own wire
     // formats without growing another package tree.
@@ -387,6 +526,7 @@ mod tests {
         let claude_market = json(".claude-plugin/marketplace.json");
         let plugin = json("plugins/semctx/.codex-plugin/plugin.json");
         let claude_plugin = json("plugins/semctx/.claude-plugin/plugin.json");
+        let omp_package = json("plugins/semctx/package.json");
 
         // marketplace name + plugin name must compose to exactly what install()
         // and status() use (`semctx@semctx`), and the slug must be the git source.
@@ -410,6 +550,22 @@ mod tests {
             plugin["version"].as_str(),
             Some(env!("CARGO_PKG_VERSION")),
             "agent plugin manifests must use the semctl release version"
+        );
+        assert_eq!(
+            omp_package["version"].as_str(),
+            Some(env!("CARGO_PKG_VERSION")),
+            "OMP and semctl must release together"
+        );
+        assert_eq!(
+            omp_package["name"], plugin["name"],
+            "OMP package must keep the shared plugin name"
+        );
+        let omp_extension = omp_package["omp"]["extensions"][0]
+            .as_str()
+            .expect("OMP extension entry");
+        assert!(
+            repo("plugins/semctx").join(omp_extension).is_file(),
+            "OMP extension -> {omp_extension} must exist"
         );
         assert_eq!(
             market["plugins"][0]["policy"]["authentication"], "ON_INSTALL",

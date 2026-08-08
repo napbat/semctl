@@ -1,7 +1,7 @@
 {
-  "$comment": "Cross-host evaluation suite for the codebase-retrieval skill. Deterministic hook cases run under cargo test; scripts/run_skill_evals.py launches fresh Codex or Claude sessions and records tool events and final output for the model-level cases. Baseline (no skill / old skill) results from 2026-07-03: stale `semctx index` advice propagated into answers, and 20/20 agents silently swallowed the 'not logged in' degraded state.",
+  "$comment": "Cross-host evaluation suite for the codebase-retrieval skill. Deterministic hook cases run under cargo test; scripts/run_skill_evals.py launches fresh Codex, Claude, or OMP sessions and records tool events and final output for the model-level cases. Baseline (no skill / old skill) results from 2026-07-03: stale `semctx index` advice propagated into answers, and 20/20 agents silently swallowed the 'not logged in' degraded state.",
   "schema_version": 1,
-  "hosts": ["codex", "claude"],
+  "hosts": ["codex", "claude", "omp"],
   "functional": [
     {
       "skills": ["codebase-retrieval"],

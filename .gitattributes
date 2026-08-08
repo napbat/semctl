@@ -1,0 +1,2 @@
+# Keep text files consistent across platforms.
+* text=auto eol=lf

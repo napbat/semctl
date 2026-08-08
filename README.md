@@ -38,25 +38,25 @@ cargo install --git https://github.com/napbat/semctl --locked semctl
 Then sign in and index a repo:
 
 ```sh
-semctl install      # interactive: adds the MCP server + skill + hooks to Claude Code / Codex
+semctl install      # interactive: integrates Claude Code, Codex CLI, and Oh My Pi
 semctl auth login   # OIDC device-code sign-in
 semctl index        # register + sync the current repo for indexing
 ```
 
 ## Commands
 
-| Command | What it does |
-| --- | --- |
-| `semctl search <query>` | Cross-domain semantic search. |
-| `semctl index` | Register the current folder as a codebase and sync its files. |
-| `semctl graph …` | Exact code intelligence: definitions, references, callers, implementations, call/value-flow paths. |
-| `semctl files …` | The codebase's file catalog (`tree` / filtered `list`). |
-| `semctl inspect …` | Detected `projects` graph and registered `domains`. |
-| `semctl mcp` | Run as an MCP stdio server (launched by the host, not by hand). |
-| `semctl install` | Add/remove the editor/agent integrations. |
-| `semctl uninstall` | Reverse `install`: unwire the tools, remove from PATH, delete the binary (`--purge` also drops config + credentials). |
-| `semctl upgrade` | Update the `semctl` binary in place. |
-| `semctl auth login` / `logout` / `whoami` / `tenants` | Account & session. |
+| Command                                               | What it does                                                                                                          |
+| ----------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `semctl search <query>`                               | Cross-domain semantic search.                                                                                         |
+| `semctl index`                                        | Register the current folder as a codebase and sync its files.                                                         |
+| `semctl graph …`                                      | Exact code intelligence: definitions, references, callers, implementations, call/value-flow paths.                    |
+| `semctl files …`                                      | The codebase's file catalog (`tree` / filtered `list`).                                                               |
+| `semctl inspect …`                                    | Detected `projects` graph and registered `domains`.                                                                   |
+| `semctl mcp`                                          | Run as an MCP stdio server (launched by the host, not by hand).                                                       |
+| `semctl install`                                      | Add/remove the editor/agent integrations.                                                                             |
+| `semctl uninstall`                                    | Reverse `install`: unwire the tools, remove from PATH, delete the binary (`--purge` also drops config + credentials). |
+| `semctl upgrade`                                      | Update the `semctl` binary in place.                                                                                  |
+| `semctl auth login` / `logout` / `whoami` / `tenants` | Account & session.                                                                                                    |
 
 ### Coming from the old `semctx` CLI
 
@@ -84,10 +84,10 @@ Config lives at `~/.config/semctl/config.toml` (credentials in a sibling
 `~/.config/semctx/` install is read as a fallback so a rename doesn't force a
 re-login.
 
-| Setting | Flag | Env |
-| --- | --- | --- |
-| Server base URL | `--server` | `SEMCTX_SERVER` |
-| Active tenant | `--tenant` | `SEMCTX_TENANT` |
+| Setting         | Flag         | Env               |
+| --------------- | ------------ | ----------------- |
+| Server base URL | `--server`   | `SEMCTX_SERVER`   |
+| Active tenant   | `--tenant`   | `SEMCTX_TENANT`   |
 | Active codebase | `--codebase` | `SEMCTX_CODEBASE` |
 
 Login validates the saved active tenant against the new account's memberships
@@ -104,8 +104,11 @@ With nothing configured, `semctl` talks to the hosted server at
 ### Agent integration data flow
 
 The MCP server sends retrieval queries and opted-in repository content to the
-configured semctx server. When trusted plugin hooks are enabled, retrieval-shaped
-user prompts are also sent for a bounded, best-effort candidate search. Set
+configured semctx server. When trusted Claude/Codex hooks or the native Oh My Pi
+extension are enabled, retrieval-shaped user prompts are also sent to `semctl
+hook` for a bounded, best-effort candidate search. The OMP extension runs
+in-process but delegates retrieval, authentication, and nudge state to the
+`semctl` subprocess; it does not make network requests itself. Set
 `SEMCTX_HOOK_DISABLE=1` to disable all hook behavior or
 `SEMCTX_NUDGE_DISABLE=1` to disable only shell-search reminders.
 
@@ -120,13 +123,15 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items
 ```
 
 `plugins/semctx/` is the shared plugin root for every supported coding agent.
-Its `skills/codebase-retrieval/` and `hooks/hooks.json` each have one physical
-source; host discovery manifests and incompatible wire formats are thin
-adapters. See [`plugins/semctx/README.md`](plugins/semctx/README.md) before
-adding another agent integration. Do not copy or symlink shared skills.
+Its `skills/codebase-retrieval/` has one physical source. Claude/Codex consume
+the shared hook manifest; OMP loads `adapters/omp/index.ts`, which maps native
+lifecycle events onto the same `semctl hook` wire contract. See
+[`plugins/semctx/README.md`](plugins/semctx/README.md) before adding another
+agent integration. Do not copy or symlink shared skills.
 
-The deterministic hook cases run under `cargo test`. To record fresh Codex and
-Claude tool-event traces for the model-level golden prompts:
+The deterministic hook and OMP-extension cases run under the normal Rust and Bun
+test commands. To record fresh Codex, Claude, and OMP tool-event traces for the
+model-level golden prompts:
 
 ```sh
 python scripts/run_skill_evals.py --host all
