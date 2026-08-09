@@ -5,17 +5,21 @@
 //! on each burst of edits and we trigger a full manifest re-sync — the same
 //! reconcile path as the periodic timer, just event-driven. Re-walking and
 //! diffing the whole tree handles creates, edits, deletes and renames uniformly,
-//! with no event classification or incremental delete endpoint needed.
+//! with no incremental delete endpoint needed.
 //!
-//! Events under the VCS dir or matched by the root gitignore are filtered out so
-//! a `cargo build` / `git` operation doesn't spin the sync.
+//! Read/open access events are ignored because the re-sync itself walks and opens
+//! the watched tree. Letting those events through makes each completed sync queue
+//! its successor forever on platforms whose watcher reports file access. Events
+//! under the VCS dir or matched by the root gitignore are filtered out too, so a
+//! `cargo build` / `git` operation doesn't spin the sync.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
-use notify::{RecommendedWatcher, RecursiveMode};
+use notify::event::{AccessKind, AccessMode};
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebouncedEvent, Debouncer, RecommendedCache, new_debouncer};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -46,7 +50,7 @@ pub(super) fn spawn(
         None,
         move |result: Result<Vec<DebouncedEvent>, Vec<notify::Error>>| match result {
             Ok(events) => {
-                if events.iter().any(|e| is_interesting(&e.paths, &gi)) {
+                if events.iter().any(|e| is_interesting(&e.event, &gi)) {
                     let _ = tx.send(());
                 }
             }
@@ -103,17 +107,71 @@ fn build_ignore(root: &Path) -> Gitignore {
     b.build().unwrap_or_else(|_| Gitignore::empty())
 }
 
-/// Whether a debounced event touches anything worth re-syncing for: a path
-/// outside the VCS dir that the root gitignore doesn't exclude. Coarser than the
-/// walker (it doesn't chase nested gitignores), but enough to keep build-artifact
-/// churn from spinning the sync — anything that slips through costs only one
-/// no-op walk.
-fn is_interesting(paths: &[PathBuf], gi: &Gitignore) -> bool {
-    paths.iter().any(|p| {
-        if p.components().any(|c| c.as_os_str() == ".git") {
-            return false;
+/// Whether a debounced event can have changed a path worth re-syncing.
+///
+/// A close-after-write is the sole access event that can signal new bytes. All
+/// other access events are observations, including the directory/file opens made
+/// by the manifest walk itself, and must not feed back into another sync.
+fn is_interesting(event: &Event, gi: &Gitignore) -> bool {
+    let can_change_tree = !matches!(event.kind, EventKind::Access(_))
+        || matches!(
+            event.kind,
+            EventKind::Access(AccessKind::Close(AccessMode::Write))
+        );
+    can_change_tree
+        && event.paths.iter().any(|p| {
+            if p.components().any(|c| c.as_os_str() == ".git") {
+                return false;
+            }
+            let is_dir = p.is_dir();
+            !gi.matched_path_or_any_parents(p, is_dir).is_ignore()
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use notify::event::{CreateKind, ModifyKind, RemoveKind};
+
+    use super::*;
+
+    fn event(kind: EventKind) -> Event {
+        Event::new(kind).add_path(PathBuf::from("src/lib.rs"))
+    }
+
+    #[test]
+    fn scan_access_does_not_schedule_another_sync() {
+        let gi = Gitignore::empty();
+
+        for kind in [
+            EventKind::Access(AccessKind::Read),
+            EventKind::Access(AccessKind::Open(AccessMode::Read)),
+            EventKind::Access(AccessKind::Open(AccessMode::Write)),
+            EventKind::Access(AccessKind::Close(AccessMode::Read)),
+        ] {
+            assert!(!is_interesting(&event(kind), &gi), "accepted {kind:?}");
         }
-        let is_dir = p.is_dir();
-        !gi.matched_path_or_any_parents(p, is_dir).is_ignore()
-    })
+    }
+
+    #[test]
+    fn mutations_still_schedule_a_sync() {
+        let gi = Gitignore::empty();
+
+        for kind in [
+            EventKind::Access(AccessKind::Close(AccessMode::Write)),
+            EventKind::Create(CreateKind::File),
+            EventKind::Modify(ModifyKind::Any),
+            EventKind::Remove(RemoveKind::File),
+        ] {
+            assert!(is_interesting(&event(kind), &gi), "rejected {kind:?}");
+        }
+    }
+
+    #[test]
+    fn vcs_events_remain_ignored() {
+        let gi = Gitignore::empty();
+        let event =
+            Event::new(EventKind::Modify(ModifyKind::Any)).add_path(PathBuf::from(".git/index"));
+
+        assert!(!is_interesting(&event, &gi));
+    }
 }
