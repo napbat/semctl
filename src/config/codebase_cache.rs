@@ -12,6 +12,14 @@ use anyhow::Result;
 use super::Config;
 
 impl Config {
+    /// The codebase explicitly recorded for this exact canonical checkout root.
+    /// Unlike [`Self::cached_codebase_for`], this never inherits an umbrella
+    /// ancestor. Registration uses this stricter lookup: explicitly indexing a
+    /// child path means creating/reusing that child's own codebase.
+    pub fn cached_codebase_exact(&self, dir: &Path) -> Option<String> {
+        self.codebase_cache.get(&cache_key(dir)).cloned()
+    }
+
     /// Resolve `dir` to a cached codebase. An **exact** match (the folder
     /// `semctl index` recorded) always wins. Otherwise a cached *ancestor* is
     /// used ONLY when it's opted in as an umbrella root ([`super::Config::umbrella_roots`] /
@@ -27,8 +35,8 @@ impl Config {
     pub fn cached_codebase_for(&self, dir: &Path) -> Option<(String, &'static str)> {
         let dir = canonical(dir);
 
-        if let Some(id) = self.codebase_cache.get(&dir.to_string_lossy().into_owned()) {
-            return Some((id.clone(), "cache"));
+        if let Some(id) = self.cached_codebase_exact(&dir) {
+            return Some((id, "cache"));
         }
         // Ancestor resolution is opt-in: the cached parent must be declared an
         // umbrella root. `dir.starts_with(k)` is component-wise, so only true
@@ -159,6 +167,14 @@ mod tests {
         let mut c = cfg(&[("/x", "id-umbrella"), ("/x/repo", "id-repo")]);
         c.umbrella_roots = vec!["/x".into()];
         assert_eq!(resolved(&c, "/x/repo"), Some("id-repo".into()));
+    }
+
+    #[test]
+    fn exact_lookup_never_inherits_an_umbrella_parent() {
+        let mut c = cfg(&[("/x", "id-umbrella")]);
+        c.umbrella_roots = vec!["/x".into()];
+        assert_eq!(c.cached_codebase_exact(Path::new("/x/repo")), None);
+        assert_eq!(resolved(&c, "/x/repo"), Some("id-umbrella".into()));
     }
 
     #[test]

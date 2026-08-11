@@ -1,5 +1,6 @@
-//! Git-subprocess layer backing codebase resolution: read the working copy's
-//! `origin` remote, HEAD revision/branch, and dirty state via `git -C dir`.
+//! Git-subprocess layer for checkout metadata and root discovery: read the
+//! working copy's `origin` remote, HEAD revision/branch, and dirty state via
+//! `git -C dir`.
 
 use std::path::Path;
 
@@ -36,26 +37,4 @@ pub(super) async fn git_is_dirty(dir: &Path) -> bool {
     git_capture(dir, &["status", "--porcelain"])
         .await
         .is_some_and(|s| !s.is_empty())
-}
-
-/// Reduce the common remote-URL forms to a comparable `host/path` shape:
-/// `https://github.com/org/repo.git`, `git@github.com:org/repo.git`, and
-/// `ssh://git@github.com/org/repo` all become `github.com/org/repo`.
-pub(super) fn normalize_remote(url: &str) -> String {
-    let mut s = url.trim();
-    for scheme in ["ssh://", "https://", "http://", "git://"] {
-        if let Some(rest) = s.strip_prefix(scheme) {
-            s = rest;
-            break;
-        }
-    }
-    // Drop any `user@` (e.g. scp-style `git@host:org/repo`).
-    let mut s = s.rsplit('@').next().unwrap_or(s).to_string();
-    // scp-style separates host from path with `:`; normalize to `/`.
-    if let Some(colon) = s.find(':').filter(|&c| !s[..c].contains('/')) {
-        s.replace_range(colon..=colon, "/");
-    }
-    s = s.trim_end_matches('/').to_string();
-    s = s.strip_suffix(".git").unwrap_or(&s).to_string();
-    s.to_ascii_lowercase()
 }

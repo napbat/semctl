@@ -238,11 +238,11 @@ pub struct ProjectGroupDto {
     pub children: Vec<String>,
 }
 
-/// A `GET /v1/codebases` row — enough to match the working directory to
-/// its codebase by remote URL or slug, and to restrict the match to the
-/// caller's *local* working copies. `source_kind` is captured raw (the
-/// server serializes the enum as a number, `0` = Local) and tested with
-/// [`is_local_source`](super::is_local_source).
+/// A `GET /v1/codebases` row. Registration uses `slug` to recover a concurrent
+/// deterministic checkout registration and `source_kind` to ensure it only
+/// adopts a Local codebase. The server serializes that enum as the number `0`
+/// today; [`is_local_source`](super::is_local_source) also tolerates a future
+/// string representation.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodebaseSummary {

@@ -33,9 +33,9 @@ pub struct Cli {
     pub tenant: Option<String>,
 
     /// The codebase id (Guid) the code/graph tools operate on. Optional —
-    /// `semctl mcp` otherwise resolves the codebase from the working
-    /// directory (its git remote, else its name). Set this (or
-    /// `SEMCTX_CODEBASE`) to override that.
+    /// `semctl mcp` otherwise resolves the codebase from the canonical working
+    /// directory recorded by `semctl index`. Set this (or `SEMCTX_CODEBASE`) to
+    /// override that.
     #[arg(long, env = "SEMCTX_CODEBASE", global = true)]
     pub codebase: Option<String>,
 

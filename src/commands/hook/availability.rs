@@ -16,10 +16,7 @@
 //!   (scoped to the cwd) so a down/logged-out server isn't re-probed on every
 //!   fire, and the timeout cost isn't paid repeatedly.
 //! - **No git on this path.** The probe only trusts an already-cached codebase
-//!   id (verified by one GET). It never falls back to `codebase::resolve()`'s
-//!   git remote lookup — a `spawn_blocking` git that outlives the timeout would
-//!   still delay process exit (the runtime joins blocking tasks at shutdown),
-//!   which would hang the hook. Keeping the probe a pure async GET means the
+//!   id (verified by one GET). Keeping the probe a pure async GET means the
 //!   timeout can actually preempt it. `SessionStart` caches the id, so it is
 //!   present by the time `PreToolUse` fires; if it isn't, we stay silent.
 

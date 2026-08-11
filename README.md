@@ -82,9 +82,11 @@ re-run `cargo install … --force` instead of clobbering it.
 Config lives at `~/.config/semctl/config.toml` (credentials in a sibling
 `0600 credentials.json`); `XDG_CONFIG_HOME` overrides the base. A non-secret
 `installation-id` in the same directory lets the server distinguish concurrent
-local checkouts without receiving a host name or local path. An older
-`~/.config/semctx/` install is read as a fallback so a rename doesn't force a
-re-login.
+local checkouts without receiving a host name or local path. Local codebases are
+mapped by canonical checkout path, not guessed from Git remote or folder name:
+two clones with the same display name therefore get separate UUIDs and opaque,
+collision-safe slugs. An older `~/.config/semctx/` install is read as a fallback
+so a rename doesn't force a re-login.
 
 | Setting         | Flag         | Env               |
 | --------------- | ------------ | ----------------- |

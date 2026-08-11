@@ -1,23 +1,23 @@
-//! Resolve which server codebase the current working directory maps to, so
-//! `semctl mcp` can be launched in a project folder without being told the
-//! codebase id.
+//! Resolve which server codebase a local checkout maps to.
 //!
-//! Only the caller's *local* codebases (`SourceKind == Local`) are considered:
-//! a folder on disk is a working copy, so it must resolve to the user's own
-//! local index, never a shared canonical one (Personal/Org/Global) that merely
-//! shares the same git remote. Among those, the match is the folder's git
-//! `origin` remote against a codebase's `remote_url`, then the folder name
-//! against its `slug`. Best-effort — a miss leaves the MCP server running with
-//! search/domains but the code tools reporting "no codebase".
+//! Local path identity is explicit: only the canonical directory cache written
+//! by `semctl index` may bind a checkout (plus an explicitly configured umbrella
+//! ancestor for read-time resolution). Git remote and folder name are metadata,
+//! never identity. Two clones can have both in common while carrying different
+//! complete manifests, so guessing by either would collapse two independently
+//! indexable codebases into one destructive writer stream.
 
 mod git;
+mod identity;
 
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
 use crate::client::{Client, api, is_local_source};
-use git::{git_capture, git_is_dirty, git_remote, normalize_remote};
+use git::{git_capture, git_is_dirty, git_remote};
+
+pub(crate) use identity::source_id as checkout_source_id;
 
 /// A resolved codebase + how it matched, for a one-line stderr note.
 pub struct Resolved {
@@ -40,72 +40,54 @@ pub async fn working_copy_root(dir: &Path) -> PathBuf {
     std::fs::canonicalize(&root).unwrap_or(root)
 }
 
-/// Resolve the codebase for `dir`: the on-disk cache first (a folder
-/// `semctl index` has seen), then a server lookup among the caller's *local*
-/// codebases. `Ok(None)` when nothing matches — the server has no local
-/// codebase for this folder yet. A server hit is written back to the cache.
+/// Resolve the codebase for `dir` from the on-disk path cache. An explicitly
+/// configured umbrella ancestor may satisfy a child lookup. `Ok(None)` means
+/// this path has never been indexed locally; callers must not guess by Git
+/// remote or folder name.
 pub async fn resolve(client: &Client, dir: &Path) -> Result<Option<Resolved>> {
-    if let Some((id, how)) = crate::config::load()
+    let cached = crate::config::load()
         .ok()
-        .and_then(|c| c.cached_codebase_for(dir))
-    {
-        // The cache is keyed by directory, not by server, and a codebase can be
-        // deleted/expired — so verify the id still exists on THIS server before
-        // trusting it. A definitive miss purges the stale mapping and falls
-        // through to a server lookup / (for `index`) a fresh registration; a
-        // transient error keeps the cache rather than punishing a flaky network.
-        match client
-            .get_opt::<api::CodebaseSummary>(&format!("/v1/codebases/{id}"))
-            .await
-        {
-            Ok(None) => {
-                let _ = crate::config::uncache_codebase_id(&id);
-            }
-            Ok(Some(_)) | Err(_) => return Ok(Some(Resolved { id, how })),
-        }
-    }
+        .and_then(|config| config.cached_codebase_for(dir));
+    validate_cached(client, cached).await
+}
 
-    let codebases: Vec<api::CodebaseSummary> = client
-        .get_page::<api::CodebaseSummary>("/v1/codebases?page=0&pageSize=500")
-        .await?
-        .items
-        .into_iter()
-        // A working copy maps to a Local index, never a shared canonical one.
-        .filter(|c| is_local_source(&c.source_kind))
-        .collect();
+/// Registration's stricter lookup: an explicit `semctl index PATH` reuses only
+/// PATH's own cache entry, never an umbrella ancestor.
+pub(crate) async fn resolve_exact(client: &Client, dir: &Path) -> Result<Option<Resolved>> {
+    let cached = crate::config::load()
+        .ok()
+        .and_then(|config| config.cached_codebase_exact(dir))
+        .map(|id| (id, "cache"));
+    validate_cached(client, cached).await
+}
 
-    let by_remote = match git_remote(dir).await {
-        Some(remote) => {
-            let want = normalize_remote(&remote);
-            codebases
-                .iter()
-                .find(|c| c.remote_url.as_deref().map(normalize_remote).as_deref() == Some(&want))
-        }
-        None => None,
+async fn validate_cached(
+    client: &Client,
+    cached: Option<(String, &'static str)>,
+) -> Result<Option<Resolved>> {
+    let Some((id, how)) = cached else {
+        return Ok(None);
     };
-    let by_name = dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .and_then(|name| codebases.iter().find(|c| c.slug.eq_ignore_ascii_case(name)));
-
-    if let Some((c, how)) = by_remote
-        .map(|c| (c, "git remote"))
-        .or_else(|| by_name.map(|c| (c, "folder name")))
+    // The cache is not server-scoped and a codebase can be deleted. A
+    // definitive miss purges the stale mapping; a transient error keeps it
+    // rather than turning a network wobble into duplicate registration.
+    match client
+        .get_opt::<api::CodebaseSummary>(&format!("/v1/codebases/{id}"))
+        .await
     {
-        let _ = crate::config::cache_codebase(dir, &c.id);
-        return Ok(Some(Resolved {
-            id: c.id.clone(),
-            how,
-        }));
+        Ok(None) => {
+            let _ = crate::config::uncache_codebase_id(&id);
+            Ok(None)
+        }
+        Ok(Some(_)) | Err(_) => Ok(Some(Resolved { id, how })),
     }
-    Ok(None)
 }
 
 /// The codebase id for `dir`, creating a **Local** codebase (the working-copy
 /// kind) if none exists yet. Used by `semctl index` so a fresh folder gets
 /// registered before its first sync. The id is cached for later resolution.
 pub async fn ensure(client: &Client, dir: &Path) -> Result<String> {
-    if let Some(resolved) = resolve(client, dir).await? {
+    if let Some(resolved) = resolve_exact(client, dir).await? {
         return Ok(resolved.id);
     }
     let id = create_local(client, dir).await?;
@@ -113,10 +95,10 @@ pub async fn ensure(client: &Client, dir: &Path) -> Result<String> {
     Ok(id)
 }
 
-/// Register a new Local codebase for `dir`. Slug/name come from the folder;
-/// VCS metadata (remote, revision, branch, dirty) is attached for a git
-/// checkout. `sourceKind`/`visibility` are left to the server defaults
-/// (`Local` / `Personal`).
+/// Register or recover the deterministic Local codebase for `dir`. The friendly
+/// name comes from the folder; its slug includes the opaque checkout identity,
+/// so another same-named clone is a separate catalog row. VCS metadata is still
+/// attached for display and source navigation, never matching.
 async fn create_local(client: &Client, dir: &Path) -> Result<String> {
     let name = dir
         .file_name()
@@ -132,34 +114,53 @@ async fn create_local(client: &Client, dir: &Path) -> Result<String> {
         }),
         None => None,
     };
+    let source_id = identity::source_id(dir)?;
+    let slug = identity::slug(&name, &source_id);
+    if let Some(existing) = find_local_by_slug(client, &slug).await? {
+        return Ok(existing.id);
+    }
     let body = api::CreateCodebaseRequest {
-        slug: &slugify(&name),
+        slug: &slug,
         display_name: &name,
         vcs,
     };
-    let created: api::CodebaseSummary = client.post("/v1/codebases", &body).await?;
-    Ok(created.id)
-}
-
-/// A URL/slug-safe form of the folder name: lowercase, non-alphanumerics → `-`,
-/// collapsed and trimmed.
-fn slugify(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    let mut prev_dash = false;
-    for ch in name.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-            prev_dash = false;
-        } else if !prev_dash {
-            out.push('-');
-            prev_dash = true;
+    match client
+        .post::<_, api::CodebaseSummary>("/v1/codebases", &body)
+        .await
+    {
+        Ok(created) => Ok(created.id),
+        Err(create_error) => {
+            // Two processes may index the same new path concurrently. The slug
+            // is deterministic, so the loser of the unique-slug race adopts the
+            // winner instead of inventing a second codebase.
+            if let Ok(Some(existing)) = find_local_by_slug(client, &slug).await {
+                return Ok(existing.id);
+            }
+            Err(create_error)
         }
     }
-    let slug = out.trim_matches('-').to_string();
-    if slug.is_empty() {
-        "codebase".to_string()
-    } else {
-        slug
+}
+
+async fn find_local_by_slug(client: &Client, slug: &str) -> Result<Option<api::CodebaseSummary>> {
+    let mut page_number = 0_u32;
+    loop {
+        let page = client
+            .get_page::<api::CodebaseSummary>(&format!(
+                "/v1/codebases?page={page_number}&pageSize=500"
+            ))
+            .await?;
+        if let Some(found) = page
+            .items
+            .into_iter()
+            .find(|codebase| codebase.slug == slug && is_local_source(&codebase.source_kind))
+        {
+            return Ok(Some(found));
+        }
+        let consumed = page.number.saturating_add(1).saturating_mul(page.size);
+        if page.size == 0 || consumed >= page.total {
+            return Ok(None);
+        }
+        page_number = page_number.saturating_add(1);
     }
 }
 

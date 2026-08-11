@@ -102,7 +102,7 @@ pub async fn sync(client: &Client, dir: &Path, cache: &Mutex<SyncCache>) -> Resu
             .await
             .context("register codebase")?,
     };
-    let source_id = sync_source_id(&dir).context("identify local checkout")?;
+    let source_id = crate::codebase::checkout_source_id(&dir).context("identify local checkout")?;
     let mut cache = cache.lock().await;
     debug!(%codebase_id, dir = %dir.display(), "indexing codebase");
 
@@ -300,60 +300,11 @@ async fn upload_needed(
     Ok(uploaded)
 }
 
-/// Opaque stable identity for one local checkout. Different semctl processes
-/// in the same checkout intentionally produce the same value; another clone
-/// produces a different value even when it points at the same git remote.
-fn sync_source_id(dir: &Path) -> Result<String> {
-    let installation_id = crate::config::installation_id()?;
-    Ok(sync_source_id_for(&installation_id, dir))
-}
-
-fn sync_source_id_for(installation_id: &str, dir: &Path) -> String {
-    let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-    let mut path = canonical.to_string_lossy().replace('\\', "/");
-    if cfg!(windows) {
-        path.make_ascii_lowercase();
-    }
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"semctl-sync-source-v1\0");
-    hasher.update(installation_id.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(path.as_bytes());
-    hasher.finalize().to_hex().to_string()
-}
-
 /// Await the next finished upload task, flattening the join error and the task's
 /// own result into one `Result`.
 async fn join_one(set: &mut tokio::task::JoinSet<Result<usize>>) -> Result<usize> {
     match set.join_next().await {
         Some(joined) => joined.map_err(|e| anyhow::anyhow!("upload task: {e}"))?,
         None => Ok(0),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::sync_source_id_for;
-    use std::path::Path;
-
-    #[test]
-    fn source_identity_is_stable_for_the_same_checkout() {
-        let first = sync_source_id_for("install-a", Path::new("/work/repo"));
-        let second = sync_source_id_for("install-a", Path::new("/work/repo"));
-        assert_eq!(first, second);
-        assert_eq!(first.len(), 64);
-    }
-
-    #[test]
-    fn source_identity_separates_installations_and_checkouts() {
-        let baseline = sync_source_id_for("install-a", Path::new("/work/repo"));
-        assert_ne!(
-            baseline,
-            sync_source_id_for("install-a", Path::new("/work/other-clone"))
-        );
-        assert_ne!(
-            baseline,
-            sync_source_id_for("install-b", Path::new("/work/repo"))
-        );
     }
 }

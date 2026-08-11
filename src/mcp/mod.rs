@@ -961,9 +961,10 @@ impl McpServer {
             };
         }
 
-        // Existing server index == prior permission. It gets the normal detached
-        // re-sync/watcher path and does not need the first-index readiness gate.
-        match crate::codebase::resolve(&self.shared.base, &dir).await {
+        // Only this exact path's recorded index is prior permission. An umbrella
+        // ancestor may serve read requests, but explicitly indexing the child is
+        // a request for an independently writable codebase.
+        match crate::codebase::resolve_exact(&self.shared.base, &dir).await {
             Ok(Some(resolved)) => {
                 let client = self
                     .shared
@@ -1242,11 +1243,12 @@ impl ServerHandler for McpServer {
 /// host disconnects.
 ///
 /// When no codebase is set explicitly (`SEMCTX_CODEBASE` / `--codebase`), it's
-/// resolved from the host's launch directory (exact cache hit, else git remote /
-/// name); a cached *parent* counts only when declared an umbrella root, and an
-/// unindexed folder resolves to nothing so the startup hook/tools ask for user
-/// opt-in to `index_codebase` rather than auto-registering it (see `bound`). A
-/// resolved codebase is then kept indexed in the background (see `spawn_indexing`).
+/// resolved from the host's launch directory cache; a cached *parent* counts
+/// only when declared an umbrella root, and an unindexed folder resolves to
+/// nothing so the startup hook/tools ask for user opt-in to `index_codebase`
+/// rather than guessing by Git remote/name or auto-registering it (see
+/// `bound`). A resolved codebase is then kept indexed in the background (see
+/// `spawn_indexing`).
 ///
 /// We do NOT abort the process when that binding fails. A failure (not logged
 /// in, server down) is reported honestly by the code tools and retried on a
