@@ -700,13 +700,14 @@ fn read_history(path: &Path) -> Result<EditHistory> {
     Ok(history)
 }
 
-fn restrict_history_permissions(_path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(_path, fs::Permissions::from_mode(0o600));
-    }
+#[cfg(unix)]
+fn restrict_history_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
 }
+
+#[cfg(not(unix))]
+fn restrict_history_permissions(_path: &Path) {}
 
 fn sidecars(target: &Path, plan_id: &str, index: usize) -> (PathBuf, PathBuf) {
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
