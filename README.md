@@ -48,7 +48,7 @@ semctl index        # register + sync the current repo for indexing
 | Command                                               | What it does                                                                                                          |
 | ----------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
 | `semctl search <query>`                               | Cross-domain semantic search.                                                                                         |
-| `semctl index`                                        | Register the current folder as a codebase and sync its files.                                                         |
+| `semctl index`                                        | Register the current Git worktree (or selected non-Git folder) and sync its files.                                    |
 | `semctl graph …`                                      | Exact code intelligence: definitions, references, callers, implementations, call/value-flow paths.                    |
 | `semctl files …`                                      | The codebase's file catalog (`tree` / filtered `list`).                                                               |
 | `semctl inspect …`                                    | Detected `projects` graph and registered `domains`.                                                                   |
@@ -80,7 +80,9 @@ re-run `cargo install … --force` instead of clobbering it.
 ## Configuration
 
 Config lives at `~/.config/semctl/config.toml` (credentials in a sibling
-`0600 credentials.json`); `XDG_CONFIG_HOME` overrides the base. An older
+`0600 credentials.json`); `XDG_CONFIG_HOME` overrides the base. A non-secret
+`installation-id` in the same directory lets the server distinguish concurrent
+local checkouts without receiving a host name or local path. An older
 `~/.config/semctx/` install is read as a fallback so a rename doesn't force a
 re-login.
 

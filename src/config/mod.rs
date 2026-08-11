@@ -6,8 +6,10 @@
 //! Config dir is `~/.config/semctl/` on every platform (XDG-style, overridable
 //! with `XDG_CONFIG_HOME`).
 
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{ErrorKind, Write};
 use std::path::PathBuf;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -145,6 +147,75 @@ pub fn save(cfg: &Config) -> Result<()> {
 
 fn config_path() -> Result<PathBuf> {
     Ok(config_dir()?.join("config.toml"))
+}
+
+/// Stable, opaque identity for this semctl installation.
+///
+/// Sync combines this value with the canonical checkout path before sending a
+/// hash to the server. The installation id itself never leaves this machine.
+/// A separate file avoids rewriting `config.toml` (and racing another semctl
+/// process) merely to establish the identity.
+pub(crate) fn installation_id() -> Result<String> {
+    let dir = config_dir()?;
+    fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let path = dir.join("installation-id");
+
+    match read_installation_id(&path) {
+        Ok(id) => return Ok(id),
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    }
+
+    let seed = format!(
+        "semctl-installation-id-v1\0{}\0{}\0{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+        std::process::id(),
+        dir.display()
+    );
+    let id = blake3::hash(seed.as_bytes()).to_hex().to_string();
+
+    match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut file) => {
+            file.write_all(id.as_bytes())
+                .and_then(|()| file.write_all(b"\n"))
+                .and_then(|()| file.flush())
+                .with_context(|| format!("write {}", path.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+            }
+            Ok(id)
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            // Another semctl process won first-run creation. It may still be
+            // finishing its tiny write, so give it a bounded moment to publish.
+            for _ in 0..20 {
+                if let Ok(id) = read_installation_id(&path) {
+                    return Ok(id);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            read_installation_id(&path)
+                .with_context(|| format!("read concurrently-created {}", path.display()))
+        }
+        Err(error) => Err(error).with_context(|| format!("create {}", path.display())),
+    }
+}
+
+fn read_installation_id(path: &std::path::Path) -> std::io::Result<String> {
+    let id = fs::read_to_string(path)?.trim().to_string();
+    if id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(id)
+    } else {
+        Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "installation id must be 64 hexadecimal characters",
+        ))
+    }
 }
 
 /// Delete the semctl config directory (config + stored credentials) for

@@ -90,21 +90,26 @@ pub(crate) async fn record_job(registry: &JobRegistry, o: &SyncOutcome) {
 /// Step-by-step progress is logged at `debug`; callers emit the `info`-level
 /// summary so a no-op periodic tick stays quiet.
 pub async fn sync(client: &Client, dir: &Path, cache: &Mutex<SyncCache>) -> Result<SyncOutcome> {
+    // A manifest is complete desired state. Always lift a path inside a Git
+    // checkout to its worktree root so launching from `src/` cannot delete
+    // everything outside `src/` from the server index.
+    let dir = crate::codebase::working_copy_root(dir).await;
     // An explicit --codebase / SEMCTX_CODEBASE indexes into that codebase;
     // otherwise resolve the folder's Local codebase, creating it if new.
     let codebase_id = match client.codebase_raw() {
         Some(id) => id.to_string(),
-        None => crate::codebase::ensure(client, dir)
+        None => crate::codebase::ensure(client, &dir)
             .await
             .context("register codebase")?,
     };
+    let source_id = sync_source_id(&dir).context("identify local checkout")?;
     let mut cache = cache.lock().await;
     debug!(%codebase_id, dir = %dir.display(), "indexing codebase");
 
     // Stat-walk the tree, then read+hash only the files whose stamp changed.
     // Content for changed files is kept for the upload phase; unchanged files
     // contribute their cached hash without a read.
-    let candidates = walker::walk(dir, &walker::WalkOptions::default());
+    let candidates = walker::walk(&dir, &walker::WalkOptions::default());
     let mut manifest = Vec::with_capacity(candidates.len());
     let mut changed: HashMap<String, String> = HashMap::new();
     let mut seen: HashSet<String> = HashSet::with_capacity(candidates.len());
@@ -158,12 +163,15 @@ pub async fn sync(client: &Client, dir: &Path, cache: &Mutex<SyncCache>) -> Resu
     let plan: api::SyncPlan = client
         .post(
             &format!("/v1/codebases/{codebase_id}/sync"),
-            &api::SyncManifestRequest { files: manifest },
+            &api::SyncManifestRequest {
+                files: manifest,
+                source_id: source_id.clone(),
+            },
         )
         .await
         .context("sync plan")?;
 
-    let uploaded = upload_needed(client, &codebase_id, &plan, dir, &changed).await?;
+    let uploaded = upload_needed(client, &codebase_id, &plan, &dir, &changed, &source_id).await?;
     Ok(SyncOutcome {
         codebase_id,
         job_id: plan.job_id,
@@ -182,6 +190,7 @@ async fn upload_needed(
     plan: &api::SyncPlan,
     dir: &Path,
     changed: &HashMap<String, String>,
+    source_id: &str,
 ) -> Result<usize> {
     if plan.need_content.is_empty() {
         return Ok(0);
@@ -238,6 +247,7 @@ async fn upload_needed(
                 &url,
                 &api::SyncContentRequest {
                     files: batch,
+                    source_id: source_id.to_string(),
                     r#final: None,
                 },
             )
@@ -255,6 +265,7 @@ async fn upload_needed(
         }
         let client = client.clone();
         let url = url.clone();
+        let source_id = source_id.to_string();
         set.spawn(async move {
             let n = batch.len();
             client
@@ -262,6 +273,7 @@ async fn upload_needed(
                     &url,
                     &api::SyncContentRequest {
                         files: batch,
+                        source_id,
                         r#final: Some(false),
                     },
                 )
@@ -279,6 +291,7 @@ async fn upload_needed(
             &url,
             &api::SyncContentRequest {
                 files: Vec::new(),
+                source_id: source_id.to_string(),
                 r#final: Some(true),
             },
         )
@@ -287,11 +300,60 @@ async fn upload_needed(
     Ok(uploaded)
 }
 
+/// Opaque stable identity for one local checkout. Different semctl processes
+/// in the same checkout intentionally produce the same value; another clone
+/// produces a different value even when it points at the same git remote.
+fn sync_source_id(dir: &Path) -> Result<String> {
+    let installation_id = crate::config::installation_id()?;
+    Ok(sync_source_id_for(&installation_id, dir))
+}
+
+fn sync_source_id_for(installation_id: &str, dir: &Path) -> String {
+    let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let mut path = canonical.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) {
+        path.make_ascii_lowercase();
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"semctl-sync-source-v1\0");
+    hasher.update(installation_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(path.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
 /// Await the next finished upload task, flattening the join error and the task's
 /// own result into one `Result`.
 async fn join_one(set: &mut tokio::task::JoinSet<Result<usize>>) -> Result<usize> {
     match set.join_next().await {
         Some(joined) => joined.map_err(|e| anyhow::anyhow!("upload task: {e}"))?,
         None => Ok(0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sync_source_id_for;
+    use std::path::Path;
+
+    #[test]
+    fn source_identity_is_stable_for_the_same_checkout() {
+        let first = sync_source_id_for("install-a", Path::new("/work/repo"));
+        let second = sync_source_id_for("install-a", Path::new("/work/repo"));
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 64);
+    }
+
+    #[test]
+    fn source_identity_separates_installations_and_checkouts() {
+        let baseline = sync_source_id_for("install-a", Path::new("/work/repo"));
+        assert_ne!(
+            baseline,
+            sync_source_id_for("install-a", Path::new("/work/other-clone"))
+        );
+        assert_ne!(
+            baseline,
+            sync_source_id_for("install-b", Path::new("/work/repo"))
+        );
     }
 }

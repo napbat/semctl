@@ -12,7 +12,7 @@
 
 mod git;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
@@ -23,6 +23,21 @@ use git::{git_capture, git_is_dirty, git_remote, normalize_remote};
 pub struct Resolved {
     pub id: String,
     pub how: &'static str,
+}
+
+/// Canonical root of the working copy containing `dir`.
+///
+/// A sync manifest is complete desired state, so walking an arbitrary launch
+/// subdirectory would mean "delete everything outside this subtree". Git
+/// checkouts therefore always sync from `--show-toplevel`; non-git directories
+/// remain independently indexable at the path the caller selected.
+pub async fn working_copy_root(dir: &Path) -> PathBuf {
+    let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let Some(root) = git_capture(&canonical, &["rev-parse", "--show-toplevel"]).await else {
+        return canonical;
+    };
+    let root = PathBuf::from(root);
+    std::fs::canonicalize(&root).unwrap_or(root)
 }
 
 /// Resolve the codebase for `dir`: the on-disk cache first (a folder
@@ -145,5 +160,37 @@ fn slugify(name: &str) -> String {
         "codebase".to_string()
     } else {
         slug
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::working_copy_root;
+
+    #[tokio::test]
+    async fn nested_git_directory_resolves_to_the_worktree_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(temp.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let nested = temp.path().join("src").join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(
+            working_copy_root(&nested).await,
+            std::fs::canonicalize(temp.path()).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn non_git_directory_remains_its_own_root() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            working_copy_root(temp.path()).await,
+            std::fs::canonicalize(temp.path()).unwrap()
+        );
     }
 }

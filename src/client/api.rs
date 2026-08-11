@@ -294,6 +294,8 @@ pub struct ManifestEntry {
 #[serde(rename_all = "camelCase")]
 pub struct SyncManifestRequest {
     pub files: Vec<ManifestEntry>,
+    /// Opaque identity of the local checkout issuing this full manifest.
+    pub source_id: String,
 }
 
 /// The diff the server computed — paths whose content must be uploaded, and
@@ -326,6 +328,8 @@ pub struct SyncFileContent {
 #[serde(rename_all = "camelCase")]
 pub struct SyncContentRequest {
     pub files: Vec<SyncFileContent>,
+    /// Must match the source that created the sync plan.
+    pub source_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub r#final: Option<bool>,
 }
