@@ -30,6 +30,9 @@ pub enum GraphCommand {
     References {
         /// Exact symbol name.
         symbol: String,
+        /// Optional grammar namespace: Type, Value, Macro, or Module.
+        #[arg(long)]
+        namespace: Option<String>,
     },
     /// Incoming callers of a symbol — the definitions that call it (call graph).
     WhoCalls {
@@ -97,6 +100,59 @@ pub enum GraphCommand {
         #[arg(long)]
         references: bool,
     },
+    /// Search declaration names and qualified name paths.
+    SearchSymbols {
+        query: String,
+        #[arg(long, default_value = "Substring")]
+        mode: String,
+        #[arg(long = "kind")]
+        kinds: Vec<String>,
+        #[arg(long)]
+        path_prefix: Option<String>,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        language: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+    },
+    /// Traverse declared/structural type relations.
+    TypeHierarchy {
+        symbol: String,
+        #[arg(long, default_value = "Both")]
+        direction: String,
+        #[arg(long, default_value_t = 4)]
+        depth: u32,
+    },
+    /// Complete bounded caller/callee graph around a symbol.
+    CallGraph {
+        symbol: String,
+        #[arg(long, default_value_t = 2)]
+        depth: u32,
+        #[arg(long, default_value = "Both")]
+        direction: String,
+    },
+    /// Strongly connected call-cycle groups.
+    Cycles,
+    /// Definitions with no resolved incoming references.
+    Unused {
+        #[arg(long, default_value_t = 0)]
+        page: u32,
+        #[arg(long, default_value_t = 100)]
+        page_size: u32,
+    },
+    /// Byte-identical chunk groups and hashes.
+    Duplicates,
+    /// Grammar-nested file outline.
+    Outline {
+        path: String,
+        #[arg(long)]
+        max_depth: Option<u32>,
+        #[arg(long = "kind")]
+        kinds: Vec<String>,
+        #[arg(long)]
+        include_body: bool,
+    },
 }
 
 pub async fn run(command: GraphCommand, cli: &Cli) -> Result<()> {
@@ -106,7 +162,9 @@ pub async fn run(command: GraphCommand, cli: &Cli) -> Result<()> {
         GraphCommand::SymbolEdges => query::symbol_edges(&client).await,
         GraphCommand::ExternalLinks => query::external_links(&client).await,
         GraphCommand::Definitions { symbol } => query::find_definition(&client, &symbol).await,
-        GraphCommand::References { symbol } => query::find_references(&client, &symbol).await,
+        GraphCommand::References { symbol, namespace } => {
+            query::find_references(&client, &symbol, namespace.as_deref()).await
+        }
         GraphCommand::WhoCalls { symbol } => query::who_calls(&client, &symbol).await,
         GraphCommand::Implementations { symbol } => {
             query::implementations_of(&client, &symbol).await
@@ -123,6 +181,48 @@ pub async fn run(command: GraphCommand, cli: &Cli) -> Result<()> {
             symbols,
             references,
         } => query::batch_lookup(&client, &symbols, references).await,
+        GraphCommand::SearchSymbols {
+            query: symbol_query,
+            mode,
+            kinds,
+            path_prefix,
+            project,
+            language,
+            limit,
+        } => {
+            query::search_symbols(
+                &client,
+                &query::SymbolSearchOptions {
+                    query: &symbol_query,
+                    mode: &mode,
+                    kinds: &kinds,
+                    path_prefix: path_prefix.as_deref(),
+                    project: project.as_deref(),
+                    language: language.as_deref(),
+                    limit,
+                },
+            )
+            .await
+        }
+        GraphCommand::TypeHierarchy {
+            symbol,
+            direction,
+            depth,
+        } => query::type_hierarchy(&client, &symbol, &direction, depth).await,
+        GraphCommand::CallGraph {
+            symbol,
+            depth,
+            direction,
+        } => query::call_graph(&client, &symbol, depth, &direction).await,
+        GraphCommand::Cycles => query::cycles(&client).await,
+        GraphCommand::Unused { page, page_size } => query::unused(&client, page, page_size).await,
+        GraphCommand::Duplicates => query::duplicates(&client).await,
+        GraphCommand::Outline {
+            path,
+            max_depth,
+            kinds,
+            include_body,
+        } => query::file_outline(&client, &path, max_depth, &kinds, include_body).await,
     };
     print!("{out}");
     if !out.ends_with('\n') {

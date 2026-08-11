@@ -3,6 +3,7 @@
 //! (`uninstall` lives in [`install`], next to the install logic it reverses.)
 
 pub mod auth;
+pub mod edit;
 pub mod files;
 pub mod graph;
 pub mod hook;

@@ -18,6 +18,7 @@ mod client;
 mod codebase;
 mod commands;
 mod config;
+mod editing;
 mod mcp;
 mod query;
 mod sync;

@@ -11,7 +11,7 @@ pedantic = { level = "warn", priority = -1 }
 
 [package]
 name = "semctl"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 publish = false
 description = "semctl — command-line client for the semctx code-intelligence server. Speaks HTTP+JSON; authenticates to identity via OIDC device-code."

@@ -15,20 +15,26 @@ can't see, at a fraction of the context cost of raw reads.
 
 | You want | Call |
 | --- | --- |
-| fuzzy / conceptual — "how does X work" | `search_codebase` — raise `top_k` (default 20) for more; `expand: true` returns full symbol bodies (skips the follow-up read); `prefer: "docs"` for markdown-first, `"code"` for implementation-first |
-| where is X defined / where is it used | `find_definition` / `find_references` (exact, case-sensitive names) |
+| fuzzy / conceptual — "how does X work" | `search_codebase` — raise `top_k` (default 20) for more; `expand: true` returns full symbol bodies; `prefer: "docs"` or `"code"`; use `scope` or `codebase_ids` for an authorized multi-codebase lens |
+| declaration-name discovery | `search_symbols` — exact/prefix/substring/glob/fuzzy qualified-name search with kind/path/project/language filters |
+| where is X defined / where is every resolved use | `find_definition` / `find_references` (exact, case-sensitive names; references include exact occurrences, read/write, namespace, kind, and resolved identity) |
 | who calls X / what implements Y | `who_calls` / `implementations_of` |
-| how does A reach B | `call_path`; one-call neighbourhood (definition + callers + callees) → `trace` |
+| how does A reach B | `call_path`; compact neighbourhood → `trace`; complete bounded caller/callee graph → `call_graph` |
+| super/subtype relations | `type_hierarchy` — declared/structural origin, external targets, bounded direction/depth |
+| call cycles / unused definitions / exact duplicates | `cycles` / `unused` / `duplicates` (unused results include reason + completeness caveat; duplicates include hashes) |
 | where does a value flow | `reaches` (forward), `flows_into` (backward), `flows_between` (witness path) |
 | every literal occurrence, incl. strings/comments | `grep` — semctx's own, over indexed content (regex, ignore_case, path filter) |
-| a file's shape / more context around a hit | `file_outline` / `expand_chunk` |
+| a file's nested shape / more context around a hit | `file_outline` (depth/kind/body controls) / `expand_chunk` |
+| exact indexed source bytes, including remote-only repos | `read_source` — pin by content revision and request a line/byte range |
 | what is at path:line | `symbol_at_position` |
 | many symbols at once | `batch_lookup` (≤256 per call) — one round-trip, not N `find_definition` calls |
-| orientation | `list_files`, `file_tree`, `list_projects`, `list_domains` |
+| orientation / effective binding | `list_codebases`, `current_context`, `list_files`, `file_tree`, `list_projects`, `list_domains` |
 | file→file / import→definition structure | `imports`, then `symbol_edges` |
 | a dependency defined outside this repo | `external_links` |
 | index job state | `sync_status` |
 | explicitly index an unindexed repo after user opt-in | `index_codebase` |
+| perform a symbolic edit | `rename_symbol`, `safe_delete_symbol`, `replace_symbol_body`, `insert_before_symbol`, or `insert_after_symbol` — immediate local actions that internally consume the server's grammar-validated plan and use the normal approval path |
+| reverse a symbolic edit | `undo_edit` — restore hash-guarded private preimages using the returned edit id |
 
 Parameters and details live in each tool's own description — read them, don't guess.
 
@@ -50,9 +56,14 @@ re-syncs do not block use of the last complete index.
   TypeScript/JS) → symbol-graph tools (`find_definition` / `find_references` /
   `who_calls`), not search.
 - Use `grep` instead of `find_references` when you need EVERY occurrence:
-  `find_references` returns resolved code references only — it skips strings,
-  comments, markdown, repeat uses within a chunk, and any symbol whose
+  `find_references` returns every resolved code occurrence (including repeated
+  same-line uses) but still skips strings, comments, markdown, and any symbol whose
   definition lives outside this repo (std / dependencies return nothing).
+- Symbolic edit tools are immediate local mutations. Call one only when the user
+  requested that edit and let the host enforce its normal write/destructive
+  approval. The server plan stays internal to the action; report the returned
+  changed files and edit id. Use `undo_edit` only while its recorded postimage
+  hashes still match.
 - Repo language outside the graph set (Python, Java, C++, …)? The symbol-graph
   tools return nothing there — use `search_codebase` + `grep`.
 - A prompt hook may already have injected likely-relevant hits — pull detail

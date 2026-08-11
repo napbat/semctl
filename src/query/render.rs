@@ -306,11 +306,30 @@ fn hit_symbol(h: &api::SearchHit) -> String {
 
 /// Marks a reference site that WRITES the symbol; empty for a read or for a hit
 /// carrying no classification (search / definition).
-fn write_marker(h: &api::SearchHit) -> &'static str {
-    if h.is_write == Some(true) {
-        " (write)"
+fn write_marker(h: &api::SearchHit) -> String {
+    let mut parts = Vec::new();
+    if let Some(is_write) = h.is_write {
+        parts.push(if is_write {
+            "write".to_string()
+        } else {
+            "read".to_string()
+        });
+    }
+    if let Some(namespace) = &h.reference_namespace {
+        parts.push(namespace.to_ascii_lowercase());
+    }
+    if let Some(kind) = &h.reference_kind {
+        parts.push(kind.clone());
+    }
+    if let Some(target) = &h.qualified_symbol {
+        parts.push(format!("-> {target}"));
+    } else if let Some(target) = &h.external_target {
+        parts.push(format!("-> {target}"));
+    }
+    if parts.is_empty() {
+        String::new()
     } else {
-        ""
+        format!(" ({})", parts.join("; "))
     }
 }
 
@@ -341,11 +360,23 @@ mod tests {
             path: Some(path.into()),
             line_start: Some(1),
             line_end: Some(2),
+            byte_start: Some(0),
+            byte_end: Some(1),
             focus_line: Some(1),
+            focus_byte: Some(0),
+            snippet_line_start: Some(1),
+            snippet_line_end: Some(2),
+            snippet_byte_start: Some(0),
+            snippet_byte_end: Some(1),
             language: Some("rust".into()),
             symbol: Some(id.into()),
+            qualified_symbol: None,
             enclosing_symbol: None,
             is_write: None,
+            reference_namespace: None,
+            reference_kind: None,
+            external_target: None,
+            codebase_id: None,
             kind: "function".into(),
             snippet: String::new(),
         }

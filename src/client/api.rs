@@ -6,6 +6,7 @@
 //! mirror of the server) even when no command prints them yet.
 #![allow(dead_code)]
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// `GET /v1/domains` row. `#[serde(rename_all = "camelCase")]`
@@ -40,6 +41,10 @@ pub struct SearchRequestBody<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codebase_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub codebase_ids: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub domains: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filters: Option<Vec<serde_json::Value>>,
@@ -65,16 +70,40 @@ pub struct SearchHit {
     pub path: Option<String>,
     pub line_start: Option<u32>,
     pub line_end: Option<u32>,
+    #[serde(default)]
+    pub byte_start: Option<u32>,
+    #[serde(default)]
+    pub byte_end: Option<u32>,
     /// Where the cursor belongs inside the match — a declaration's NAME token,
     /// which a leading attribute or doc comment puts below `line_start`.
     pub focus_line: Option<u32>,
+    #[serde(default)]
+    pub focus_byte: Option<u32>,
+    #[serde(default)]
+    pub snippet_line_start: Option<u32>,
+    #[serde(default)]
+    pub snippet_line_end: Option<u32>,
+    #[serde(default)]
+    pub snippet_byte_start: Option<u32>,
+    #[serde(default)]
+    pub snippet_byte_end: Option<u32>,
     pub language: Option<String>,
     pub symbol: Option<String>,
+    #[serde(default)]
+    pub qualified_symbol: Option<String>,
     /// The declaration CONTAINING the match: `run_until` for a `dispatch` call
     /// inside it. Absent when the match IS the declaration.
     pub enclosing_symbol: Option<String>,
     /// Reference sites only: `true` when the use WRITES the symbol.
     pub is_write: Option<bool>,
+    #[serde(default)]
+    pub reference_namespace: Option<String>,
+    #[serde(default)]
+    pub reference_kind: Option<String>,
+    #[serde(default)]
+    pub external_target: Option<String>,
+    #[serde(default)]
+    pub codebase_id: Option<String>,
     /// Chunk kind — "block", "container", or "function".
     #[serde(default)]
     pub kind: String,
@@ -94,10 +123,35 @@ pub struct FileOutline {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileOutlineEntry {
+    pub chunk_id: String,
     pub line_start: u32,
     pub line_end: u32,
     pub kind: String,
     pub symbol: Option<String>,
+    #[serde(default)]
+    pub qualified_symbol: Option<String>,
+    #[serde(default)]
+    pub symbol_kind: Option<String>,
+    #[serde(default)]
+    pub depth: u32,
+    #[serde(default)]
+    pub body: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileContent {
+    pub path: String,
+    pub content_hash: String,
+    pub content: String,
+    pub encoding: String,
+    pub is_binary: bool,
+    pub size: i64,
+    pub byte_start: i64,
+    pub byte_end: i64,
+    pub line_start: Option<u32>,
+    pub line_end: Option<u32>,
+    pub truncated: bool,
 }
 
 /// One `POST .../graph/batch` result — a requested symbol + its hits.
@@ -170,6 +224,89 @@ pub struct TraceResult {
     pub definition: Vec<SearchHit>,
     pub callers: Vec<SearchHit>,
     pub callees: Vec<SearchHit>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallEdge {
+    pub from: String,
+    pub to: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallGraph {
+    pub nodes: Vec<SearchHit>,
+    pub edges: Vec<CallEdge>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphCluster {
+    pub index: u32,
+    pub size: u32,
+    pub chunks: Vec<SearchHit>,
+    pub hash: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnusedDefinition {
+    pub definition: SearchHit,
+    pub reason: String,
+    pub completeness_caveat: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SymbolSearchHit {
+    pub codebase_id: String,
+    pub path: String,
+    pub line_start: u32,
+    pub line_end: u32,
+    pub byte_start: u32,
+    pub byte_end: u32,
+    pub name: String,
+    pub qualified_name: String,
+    pub kind: String,
+    pub project: Option<String>,
+    pub language: String,
+    pub score: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TypeHierarchyNode {
+    pub identity: String,
+    pub name: String,
+    pub qualified_name: String,
+    pub path: Option<String>,
+    pub line_start: Option<u32>,
+    pub line_end: Option<u32>,
+    pub byte_start: Option<u32>,
+    pub byte_end: Option<u32>,
+    pub kind: String,
+    pub external: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TypeHierarchyEdge {
+    pub subtype: String,
+    pub supertype: String,
+    pub relation: String,
+    pub origin: String,
+    pub depth: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TypeHierarchy {
+    pub roots: Vec<String>,
+    pub nodes: Vec<TypeHierarchyNode>,
+    pub edges: Vec<TypeHierarchyEdge>,
+    pub complete: bool,
+    pub caveat: Option<String>,
 }
 
 /// One file→file import edge — `GET .../graph/imports`.
@@ -248,9 +385,136 @@ pub struct ProjectGroupDto {
 pub struct CodebaseSummary {
     pub id: String,
     pub slug: String,
+    #[serde(default)]
+    pub display_name: String,
     pub remote_url: Option<String>,
     #[serde(default)]
+    pub revision: Option<String>,
+    #[serde(default)]
+    pub visibility: serde_json::Value,
+    #[serde(default)]
     pub source_kind: serde_json::Value,
+    #[serde(default)]
+    pub local_sync_source_id: Option<String>,
+    #[serde(default)]
+    pub graph_generation: i64,
+    #[serde(default)]
+    pub graph_materialized_generation: i64,
+    #[serde(default)]
+    pub graph_artifact_manifest_hash: Option<String>,
+    #[serde(default)]
+    pub graph_fresh: bool,
+    #[serde(default)]
+    pub local_checkout_bound: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SymbolTargetRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qualified_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub column: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(clippy::struct_excessive_bools)] // Independent server protocol options.
+pub struct RenameSymbolRequest {
+    pub target: SymbolTargetRequest,
+    pub new_name: String,
+    pub include_comments: bool,
+    pub include_strings: bool,
+    pub include_unresolved_text: bool,
+    pub allow_uncertain: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SafeDeleteSymbolRequest {
+    pub target: SymbolTargetRequest,
+    pub allow_uncertain: bool,
+    pub allow_public_without_known_consumers: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reflection_patterns: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplaceSymbolBodyRequest {
+    pub target: SymbolTargetRequest,
+    pub replacement: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InsertSymbolRequest {
+    pub target: SymbolTargetRequest,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EditSite {
+    pub path: String,
+    pub line_start: u32,
+    pub line_end: u32,
+    pub byte_start: u64,
+    pub byte_end: u64,
+    pub category: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ByteEdit {
+    pub start: u64,
+    pub end: u64,
+    pub replacement: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FileEditPlan {
+    pub path: String,
+    pub preimage_hash: String,
+    pub edits: Vec<ByteEdit>,
+    pub expected_postimage_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FormatterStep {
+    pub program: String,
+    pub arguments: Vec<String>,
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceEditPlan {
+    pub schema_version: u32,
+    pub plan_id: String,
+    pub operation: String,
+    pub codebase_id: String,
+    pub graph_generation: u64,
+    pub source_identity: String,
+    pub graph_complete: bool,
+    pub provider_generations_current: bool,
+    pub dependent_codebases: Vec<String>,
+    pub applicable: bool,
+    pub confidence: String,
+    pub files: Vec<FileEditPlan>,
+    pub warnings: Vec<String>,
+    pub refusal_reasons: Vec<String>,
+    pub unresolved_sites: Vec<EditSite>,
+    pub uncertain_sites: Vec<EditSite>,
+    pub formatter: Option<FormatterStep>,
+    pub rendered_diff: String,
 }
 
 /// `POST /v1/codebases` body. `sourceKind` and `visibility` are omitted on

@@ -10,9 +10,11 @@
 //! `cargo test`.
 
 use super::{
-    BatchArgs, CallPathArgs, ExpandArgs, FlowBetweenArgs, FlowFromArgs, FlowToArgs, GrepArgs,
-    ListFilesArgs, McpServer, NoArgs, OutlineArgs, SearchArgs, SymbolArgs, SymbolAtPositionArgs,
-    TraceArgs,
+    AnalysisPageArgs, BatchArgs, CallGraphArgs, CallPathArgs, DIRECT_EDIT_TOOLS, ExpandArgs,
+    FlowBetweenArgs, FlowFromArgs, FlowToArgs, GrepArgs, InsertSymbolArgs, ListFilesArgs,
+    McpServer, NoArgs, OutlineArgs, ReadSourceArgs, ReferenceArgs, RenameSymbolArgs,
+    ReplaceBodyArgs, SafeDeleteSymbolArgs, SearchArgs, SymbolArgs, SymbolAtPositionArgs,
+    SymbolSearchArgs, TraceArgs, TypeHierarchyArgs, UndoEditArgs,
 };
 
 #[test]
@@ -31,6 +33,7 @@ fn every_codebase_scoped_argument_schema_has_the_selector() {
     assert_selector!(
         SearchArgs,
         SymbolArgs,
+        ReferenceArgs,
         CallPathArgs,
         FlowFromArgs,
         FlowToArgs,
@@ -43,6 +46,16 @@ fn every_codebase_scoped_argument_schema_has_the_selector() {
         BatchArgs,
         NoArgs,
         ListFilesArgs,
+        ReadSourceArgs,
+        SymbolSearchArgs,
+        TypeHierarchyArgs,
+        CallGraphArgs,
+        AnalysisPageArgs,
+        RenameSymbolArgs,
+        SafeDeleteSymbolArgs,
+        ReplaceBodyArgs,
+        InsertSymbolArgs,
+        UndoEditArgs,
     );
 }
 
@@ -98,6 +111,8 @@ fn phantom_tools(text: &str, tools: &[String]) -> Vec<String> {
         "kinds",
         "expand",
         "domains",
+        "scope",
+        "codebase_ids",
         "depth",
         "regex",
         "ignore_case",
@@ -213,9 +228,30 @@ fn every_tool_has_explicit_safety_annotations() {
             assert_eq!(annotations.read_only_hint, Some(false));
             assert_eq!(annotations.destructive_hint, Some(false));
             assert_eq!(annotations.idempotent_hint, Some(true));
+        } else if DIRECT_EDIT_TOOLS.contains(&tool.name.as_ref()) {
+            assert_eq!(annotations.read_only_hint, Some(false));
+            assert_eq!(annotations.destructive_hint, Some(true));
+            assert_eq!(annotations.idempotent_hint, Some(tool.name == "undo_edit"));
         } else {
             assert_eq!(annotations.read_only_hint, Some(true));
         }
+    }
+}
+
+#[test]
+fn symbolic_edits_are_direct_actions_not_plan_transport() {
+    let tools = registered_tools();
+    for name in DIRECT_EDIT_TOOLS {
+        assert!(
+            tools.iter().any(|tool| tool == name),
+            "missing direct edit tool {name}"
+        );
+    }
+    for removed in ["apply_edit_plan", "undo_edit_plan"] {
+        assert!(
+            !tools.iter().any(|tool| tool == removed),
+            "raw plan transport tool {removed} must not be exposed over MCP"
+        );
     }
 }
 

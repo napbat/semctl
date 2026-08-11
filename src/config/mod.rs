@@ -252,6 +252,13 @@ fn config_dir() -> Result<PathBuf> {
     Ok(base.join("semctl"))
 }
 
+/// Private local history for verified workspace edit plans. It stores
+/// preimages needed by MCP `undo_edit` and CLI `edit undo`; nothing here is sent to
+/// the server.
+pub(crate) fn edit_history_dir() -> Result<PathBuf> {
+    Ok(config_dir()?.join("edit-history"))
+}
+
 /// The legacy `~/.config/semctx/` directory this CLI shipped under before it was
 /// renamed to `semctl`. Read-only fallback so an existing login/config survives
 /// the rename; nothing is ever written here.

@@ -35,3 +35,10 @@ are implemented and its eval session passes. MCP-only agents should launch
 `semctl mcp`; agents that support the Agent Skills layout should consume the
 canonical skill directly. Host-native rules or instruction files are generated
 projections, not new sources of truth.
+
+The MCP server exposes symbolic edits as immediate, approved checkout actions.
+Each action consumes the server-generated plan internally at semctl's verified
+local mutation boundary; raw plans are not MCP tools. Rename, delete, body
+replacement, insertion, and `undo_edit` all carry write/destructive annotations.
+Keep those annotations and the canonical skill/server tool lists in sync—the
+steering tests reject missing docs, phantom tools, and safety drift.

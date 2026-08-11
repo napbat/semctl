@@ -7,8 +7,9 @@
 //! `semctl auth login` stashed in the credentials file — the MCP host launches
 //! `semctl mcp` and inherits that session.
 //!
-//! Tool bodies live in [`crate::query`] so this file stays an index: adding a
-//! tool is one method here + one function there.
+//! Retrieval bodies live in [`crate::query`]. Symbolic edit tools also consume
+//! the server's immutable plan through [`crate::editing`] and apply it to the
+//! bound checkout in the same approved MCP action.
 
 use anyhow::Result;
 use rmcp::{
@@ -32,6 +33,15 @@ use crate::cli::Cli;
 use crate::client::{self, Client};
 use crate::query;
 use crate::sync::{self, JobRegistry};
+
+const DIRECT_EDIT_TOOLS: &[&str] = &[
+    "rename_symbol",
+    "safe_delete_symbol",
+    "replace_symbol_body",
+    "insert_before_symbol",
+    "insert_after_symbol",
+    "undo_edit",
+];
 
 #[derive(Clone)]
 pub struct McpServer {
@@ -455,6 +465,57 @@ impl McpServer {
             self.shared.jobs.clone(),
         ))
     }
+
+    async fn watcher_active(&self, client: &Client) -> bool {
+        let Some(codebase_id) = client.codebase_raw() else {
+            return false;
+        };
+        self.shared
+            .watched
+            .lock()
+            .await
+            .values()
+            .any(|candidate| candidate == codebase_id)
+    }
+
+    async fn apply_server_plan(
+        &self,
+        client: &Client,
+        plan: client::api::WorkspaceEditPlan,
+        run_formatter: bool,
+        operation: &str,
+    ) -> String {
+        let watching = self.watcher_active(client).await;
+        match crate::editing::apply(client, &plan, run_formatter, watching).await {
+            Ok(outcome) => render_edit_action_outcome(&outcome)
+                .unwrap_or_else(|error| format!("{operation} result render failed: {error}")),
+            Err(error) => format!("{operation} refused: {error:#}"),
+        }
+    }
+
+    async fn execute_insert(&self, args: InsertSymbolArgs, before: bool) -> String {
+        let operation = if before {
+            "insert_before_symbol"
+        } else {
+            "insert_after_symbol"
+        };
+        let client = match self.client_for(args.codebase.as_deref()).await {
+            Ok(client) => client,
+            Err(error) => return format!("{operation} unavailable — {error}"),
+        };
+        let run_formatter = args.run_formatter.unwrap_or(false);
+        let request = client::api::InsertSymbolRequest {
+            target: args.target,
+            source: args.source,
+        };
+        match query::plan_insert(&client, &request, before).await {
+            Ok(plan) => {
+                self.apply_server_plan(&client, plan, run_formatter, operation)
+                    .await
+            }
+            Err(error) => format!("{operation} planning failed: {error:#}"),
+        }
+    }
 }
 
 async fn wait_for_initial_job(client: &Client, job_id: &str) -> std::result::Result<(), String> {
@@ -521,6 +582,11 @@ pub struct SearchArgs {
     /// Return the full enclosing-symbol body for each hit instead of a 4-line
     /// snippet — usually removes the follow-up `Read`. Defaults to false.
     pub expand: Option<bool>,
+    /// Server scope lens: `local`, `personal`, `organization`, or `global`.
+    /// Mutually exclusive with `codebase_ids`.
+    pub scope: Option<String>,
+    /// Explicit visible codebase ids to search. Mutually exclusive with `scope`.
+    pub codebase_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -529,6 +595,16 @@ pub struct SymbolArgs {
     pub codebase: Option<String>,
     /// Exact symbol name to look up.
     pub symbol: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ReferenceArgs {
+    /// Codebase id or indexed local directory path. Omit for the current codebase.
+    pub codebase: Option<String>,
+    /// Exact symbol name to look up.
+    pub symbol: String,
+    /// Optional grammar namespace: `Type`, `Value`, `Macro`, or `Module`.
+    pub namespace: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -623,6 +699,178 @@ pub struct OutlineArgs {
     pub codebase: Option<String>,
     /// Codebase-relative path of the file to outline (e.g. `server/Startup.cs`).
     pub path: String,
+    /// Maximum grammar nesting depth to return. Omit for every depth.
+    pub max_depth: Option<u32>,
+    /// Restrict entries to grammar symbol kinds. Omit for every kind.
+    pub kinds: Option<Vec<String>>,
+    /// Include each declaration's exact body. Defaults to false.
+    pub include_body: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ReadSourceArgs {
+    /// Codebase id or indexed local directory path. Omit for the current codebase.
+    pub codebase: Option<String>,
+    /// Codebase-relative source path.
+    pub path: String,
+    /// Strong content hash to pin. A stale revision is rejected atomically.
+    pub revision: Option<String>,
+    /// 0-based byte-range start; requires `byte_end`.
+    pub byte_start: Option<u64>,
+    /// 0-based, end-exclusive byte-range end.
+    pub byte_end: Option<u64>,
+    /// 1-based line-range start; requires `line_end`.
+    pub line_start: Option<u32>,
+    /// 1-based inclusive line-range end.
+    pub line_end: Option<u32>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct SymbolSearchArgs {
+    /// Codebase id or indexed local directory path. Omit for the current codebase.
+    pub codebase: Option<String>,
+    /// Declaration name or qualified-name pattern.
+    pub query: String,
+    /// `Exact`, `Prefix`, `Substring`, `Glob`, or `Fuzzy`. Defaults to Substring.
+    pub mode: Option<String>,
+    /// Grammar symbol kinds to retain.
+    pub kinds: Option<Vec<String>>,
+    /// Optional codebase-relative path prefix.
+    pub path_prefix: Option<String>,
+    /// Optional detected project name.
+    pub project: Option<String>,
+    /// Optional language id.
+    pub language: Option<String>,
+    /// Maximum results, 1–500. Defaults to 50.
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct TypeHierarchyArgs {
+    /// Codebase id or indexed local directory path. Omit for the current codebase.
+    pub codebase: Option<String>,
+    /// Exact or qualified type identity.
+    pub symbol: String,
+    /// `Supertypes`, `Subtypes`, or `Both`. Defaults to Both.
+    pub direction: Option<String>,
+    /// Relation hops, 1–16. Defaults to 4.
+    pub depth: Option<u32>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct CallGraphArgs {
+    /// Codebase id or indexed local directory path. Omit for the current codebase.
+    pub codebase: Option<String>,
+    /// Exact or qualified seed symbol.
+    pub symbol: String,
+    /// Call hops, 1–10. Defaults to 2.
+    pub depth: Option<u32>,
+    /// `Callers`, `Callees`, or `Both`. Defaults to Both.
+    pub direction: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct AnalysisPageArgs {
+    /// Codebase id or indexed local directory path. Omit for the current codebase.
+    pub codebase: Option<String>,
+    /// Zero-based page. Defaults to 0.
+    pub page: Option<u32>,
+    /// Rows per page, 1–500. Defaults to 100.
+    pub page_size: Option<u32>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct RenameSymbolArgs {
+    /// Codebase id or indexed local directory path. Omit for the current codebase.
+    pub codebase: Option<String>,
+    /// Qualified identity or path/line/column target.
+    pub target: client::api::SymbolTargetRequest,
+    /// New identifier spelling.
+    pub new_name: String,
+    /// Include grammar-classified comments containing the old spelling.
+    pub include_comments: Option<bool>,
+    /// Include grammar-classified string literals containing the old spelling.
+    pub include_strings: Option<bool>,
+    /// Include unresolved textual candidates. Unsafe unless reviewed.
+    pub include_unresolved_text: Option<bool>,
+    /// Permit uncertain candidates. Defaults to false.
+    pub allow_uncertain: Option<bool>,
+    /// Explicitly approve the server plan's bounded formatter step, if any.
+    pub run_formatter: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct SafeDeleteSymbolArgs {
+    /// Codebase id or indexed local directory path. Omit for the current codebase.
+    pub codebase: Option<String>,
+    /// Qualified identity or path/line/column target.
+    pub target: client::api::SymbolTargetRequest,
+    /// Permit uncertain dynamic sites. Defaults to false.
+    pub allow_uncertain: Option<bool>,
+    /// Permit a public declaration only when no durable consumers are known.
+    pub allow_public_without_known_consumers: Option<bool>,
+    /// Configured reflection/dynamic-use patterns to check conservatively.
+    pub reflection_patterns: Option<Vec<String>>,
+    /// Explicitly approve the server plan's bounded formatter step, if any.
+    pub run_formatter: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ReplaceBodyArgs {
+    /// Codebase id or indexed local directory path. Omit for the current codebase.
+    pub codebase: Option<String>,
+    /// Qualified identity or path/line/column target.
+    pub target: client::api::SymbolTargetRequest,
+    /// Replacement body source, including the grammar-owned delimiters.
+    pub replacement: String,
+    /// Explicitly approve the server plan's bounded formatter step, if any.
+    pub run_formatter: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct InsertSymbolArgs {
+    /// Codebase id or indexed local directory path. Omit for the current codebase.
+    pub codebase: Option<String>,
+    /// Qualified identity or path/line/column target declaration.
+    pub target: client::api::SymbolTargetRequest,
+    /// Complete declaration source to insert.
+    pub source: String,
+    /// Explicitly approve the server plan's bounded formatter step, if any.
+    pub run_formatter: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct UndoEditArgs {
+    /// Codebase id or indexed local directory path. Omit for the current codebase.
+    pub codebase: Option<String>,
+    /// Edit id returned by a completed symbolic edit action.
+    pub edit_id: String,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EditActionOutcome<'a> {
+    edit_id: &'a str,
+    operation: &'a str,
+    changed_files: &'a [crate::editing::AppliedFile],
+    already_applied: bool,
+    already_undone: bool,
+    watcher_active: bool,
+    sync_state: &'a str,
+}
+
+fn render_edit_action_outcome(
+    outcome: &crate::editing::ApplyOutcome,
+) -> std::result::Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(&EditActionOutcome {
+        edit_id: &outcome.plan_id,
+        operation: &outcome.operation,
+        changed_files: &outcome.changed_files,
+        already_applied: outcome.already_applied,
+        already_undone: outcome.already_undone,
+        watcher_active: outcome.watcher_active,
+        sync_state: &outcome.sync_state,
+    })
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -711,6 +959,8 @@ impl McpServer {
             prefer: args.prefer,
             kinds: args.kinds.unwrap_or_default(),
             expand: args.expand.unwrap_or(false),
+            scope: args.scope,
+            codebase_ids: args.codebase_ids.unwrap_or_default(),
         };
         let mut out = query::search(
             &client,
@@ -744,9 +994,11 @@ impl McpServer {
     }
 
     #[tool]
-    async fn find_references(&self, Parameters(args): Parameters<SymbolArgs>) -> String {
+    async fn find_references(&self, Parameters(args): Parameters<ReferenceArgs>) -> String {
         match self.client_for(args.codebase.as_deref()).await {
-            Ok(client) => query::find_references(&client, &args.symbol).await,
+            Ok(client) => {
+                query::find_references(&client, &args.symbol, args.namespace.as_deref()).await
+            }
             Err(e) => format!("find_references unavailable — {e}"),
         }
     }
@@ -828,7 +1080,16 @@ impl McpServer {
     #[tool]
     async fn file_outline(&self, Parameters(args): Parameters<OutlineArgs>) -> String {
         match self.client_for(args.codebase.as_deref()).await {
-            Ok(client) => query::file_outline(&client, &args.path).await,
+            Ok(client) => {
+                query::file_outline(
+                    &client,
+                    &args.path,
+                    args.max_depth,
+                    &args.kinds.unwrap_or_default(),
+                    args.include_body.unwrap_or(false),
+                )
+                .await
+            }
             Err(e) => format!("file_outline unavailable — {e}"),
         }
     }
@@ -921,6 +1182,251 @@ impl McpServer {
         // Domains aren't codebase-scoped, and listing them is the natural probe
         // when nothing else works — so always use the plain client.
         query::list_domains(&self.shared.base).await
+    }
+
+    #[tool]
+    async fn list_codebases(&self, Parameters(_): Parameters<EmptyArgs>) -> String {
+        let client = self
+            .shared
+            .bound
+            .lock()
+            .await
+            .clone()
+            .unwrap_or_else(|| self.shared.base.clone());
+        query::list_codebases(&client).await
+    }
+
+    #[tool]
+    async fn current_context(&self, Parameters(args): Parameters<NoArgs>) -> String {
+        let client = match self.client_for_unchecked(args.codebase.as_deref()).await {
+            Ok(client) => client,
+            Err(error) => return format!("current_context unavailable — {error}"),
+        };
+        let codebase_id = client.codebase_raw().map(str::to_string);
+        let watching = self.watcher_active(&client).await;
+        let job = if let Some(id) = &codebase_id {
+            self.shared.jobs.lock().await.get(id).cloned()
+        } else {
+            None
+        };
+        query::current_context(
+            &client,
+            watching,
+            job.as_ref().map(|job| job.job_id.as_str()),
+        )
+        .await
+    }
+
+    #[tool]
+    async fn read_source(&self, Parameters(args): Parameters<ReadSourceArgs>) -> String {
+        let client = match self.client_for(args.codebase.as_deref()).await {
+            Ok(client) => client,
+            Err(error) => return format!("read_source unavailable — {error}"),
+        };
+        let byte_range = match (args.byte_start, args.byte_end) {
+            (Some(start), Some(end)) => Some((start, end)),
+            (None, None) => None,
+            _ => {
+                return "read_source failed: byte_start and byte_end must be supplied together"
+                    .into();
+            }
+        };
+        let line_range = match (args.line_start, args.line_end) {
+            (Some(start), Some(end)) => Some((start, end)),
+            (None, None) => None,
+            _ => {
+                return "read_source failed: line_start and line_end must be supplied together"
+                    .into();
+            }
+        };
+        if byte_range.is_some() && line_range.is_some() {
+            return "read_source failed: request either bytes or lines, not both".into();
+        }
+        query::read_source(
+            &client,
+            &args.path,
+            args.revision.as_deref(),
+            byte_range,
+            line_range,
+        )
+        .await
+    }
+
+    #[tool]
+    async fn search_symbols(&self, Parameters(args): Parameters<SymbolSearchArgs>) -> String {
+        let client = match self.client_for(args.codebase.as_deref()).await {
+            Ok(client) => client,
+            Err(error) => return format!("search_symbols unavailable — {error}"),
+        };
+        query::search_symbols(
+            &client,
+            &query::SymbolSearchOptions {
+                query: &args.query,
+                mode: args.mode.as_deref().unwrap_or("Substring"),
+                kinds: &args.kinds.unwrap_or_default(),
+                path_prefix: args.path_prefix.as_deref(),
+                project: args.project.as_deref(),
+                language: args.language.as_deref(),
+                limit: args.limit.unwrap_or(50),
+            },
+        )
+        .await
+    }
+
+    #[tool]
+    async fn type_hierarchy(&self, Parameters(args): Parameters<TypeHierarchyArgs>) -> String {
+        let client = match self.client_for(args.codebase.as_deref()).await {
+            Ok(client) => client,
+            Err(error) => return format!("type_hierarchy unavailable — {error}"),
+        };
+        query::type_hierarchy(
+            &client,
+            &args.symbol,
+            args.direction.as_deref().unwrap_or("Both"),
+            args.depth.unwrap_or(4),
+        )
+        .await
+    }
+
+    #[tool]
+    async fn call_graph(&self, Parameters(args): Parameters<CallGraphArgs>) -> String {
+        let client = match self.client_for(args.codebase.as_deref()).await {
+            Ok(client) => client,
+            Err(error) => return format!("call_graph unavailable — {error}"),
+        };
+        query::call_graph(
+            &client,
+            &args.symbol,
+            args.depth.unwrap_or(2),
+            args.direction.as_deref().unwrap_or("Both"),
+        )
+        .await
+    }
+
+    #[tool]
+    async fn cycles(&self, Parameters(args): Parameters<NoArgs>) -> String {
+        match self.client_for(args.codebase.as_deref()).await {
+            Ok(client) => query::cycles(&client).await,
+            Err(error) => format!("cycles unavailable — {error}"),
+        }
+    }
+
+    #[tool]
+    async fn unused(&self, Parameters(args): Parameters<AnalysisPageArgs>) -> String {
+        match self.client_for(args.codebase.as_deref()).await {
+            Ok(client) => {
+                query::unused(
+                    &client,
+                    args.page.unwrap_or(0),
+                    args.page_size.unwrap_or(100),
+                )
+                .await
+            }
+            Err(error) => format!("unused unavailable — {error}"),
+        }
+    }
+
+    #[tool]
+    async fn duplicates(&self, Parameters(args): Parameters<NoArgs>) -> String {
+        match self.client_for(args.codebase.as_deref()).await {
+            Ok(client) => query::duplicates(&client).await,
+            Err(error) => format!("duplicates unavailable — {error}"),
+        }
+    }
+
+    #[tool]
+    async fn rename_symbol(&self, Parameters(args): Parameters<RenameSymbolArgs>) -> String {
+        let client = match self.client_for(args.codebase.as_deref()).await {
+            Ok(client) => client,
+            Err(error) => return format!("rename_symbol unavailable — {error}"),
+        };
+        let run_formatter = args.run_formatter.unwrap_or(false);
+        let request = client::api::RenameSymbolRequest {
+            target: args.target,
+            new_name: args.new_name,
+            include_comments: args.include_comments.unwrap_or(false),
+            include_strings: args.include_strings.unwrap_or(false),
+            include_unresolved_text: args.include_unresolved_text.unwrap_or(false),
+            allow_uncertain: args.allow_uncertain.unwrap_or(false),
+        };
+        match query::plan_rename(&client, &request).await {
+            Ok(plan) => {
+                self.apply_server_plan(&client, plan, run_formatter, "rename_symbol")
+                    .await
+            }
+            Err(error) => format!("rename_symbol planning failed: {error:#}"),
+        }
+    }
+
+    #[tool]
+    async fn safe_delete_symbol(
+        &self,
+        Parameters(args): Parameters<SafeDeleteSymbolArgs>,
+    ) -> String {
+        let client = match self.client_for(args.codebase.as_deref()).await {
+            Ok(client) => client,
+            Err(error) => return format!("safe_delete_symbol unavailable — {error}"),
+        };
+        let run_formatter = args.run_formatter.unwrap_or(false);
+        let request = client::api::SafeDeleteSymbolRequest {
+            target: args.target,
+            allow_uncertain: args.allow_uncertain.unwrap_or(false),
+            allow_public_without_known_consumers: args
+                .allow_public_without_known_consumers
+                .unwrap_or(false),
+            reflection_patterns: args.reflection_patterns,
+        };
+        match query::plan_safe_delete(&client, &request).await {
+            Ok(plan) => {
+                self.apply_server_plan(&client, plan, run_formatter, "safe_delete_symbol")
+                    .await
+            }
+            Err(error) => format!("safe_delete_symbol planning failed: {error:#}"),
+        }
+    }
+
+    #[tool]
+    async fn replace_symbol_body(&self, Parameters(args): Parameters<ReplaceBodyArgs>) -> String {
+        let client = match self.client_for(args.codebase.as_deref()).await {
+            Ok(client) => client,
+            Err(error) => return format!("replace_symbol_body unavailable — {error}"),
+        };
+        let run_formatter = args.run_formatter.unwrap_or(false);
+        let request = client::api::ReplaceSymbolBodyRequest {
+            target: args.target,
+            replacement: args.replacement,
+        };
+        match query::plan_replace_body(&client, &request).await {
+            Ok(plan) => {
+                self.apply_server_plan(&client, plan, run_formatter, "replace_symbol_body")
+                    .await
+            }
+            Err(error) => format!("replace_symbol_body planning failed: {error:#}"),
+        }
+    }
+
+    #[tool]
+    async fn insert_before_symbol(&self, Parameters(args): Parameters<InsertSymbolArgs>) -> String {
+        self.execute_insert(args, true).await
+    }
+
+    #[tool]
+    async fn insert_after_symbol(&self, Parameters(args): Parameters<InsertSymbolArgs>) -> String {
+        self.execute_insert(args, false).await
+    }
+
+    #[tool]
+    async fn undo_edit(&self, Parameters(args): Parameters<UndoEditArgs>) -> String {
+        let client = match self.client_for(args.codebase.as_deref()).await {
+            Ok(client) => client,
+            Err(error) => return format!("undo_edit unavailable — {error}"),
+        };
+        let watching = self.watcher_active(&client).await;
+        match crate::editing::undo(&client, &args.edit_id, watching).await {
+            Ok(outcome) => render_edit_action_outcome(&outcome)
+                .unwrap_or_else(|error| format!("undo_edit result render failed: {error}")),
+            Err(error) => format!("undo_edit refused: {error:#}"),
+        }
     }
 
     #[tool]
@@ -1115,6 +1621,21 @@ impl McpServer {
             "list_domains" => include_str!("docs/tools/list_domains.md"),
             "index_codebase" => include_str!("docs/tools/index_codebase.md"),
             "sync_status" => include_str!("docs/tools/sync_status.md"),
+            "list_codebases" => include_str!("docs/tools/list_codebases.md"),
+            "current_context" => include_str!("docs/tools/current_context.md"),
+            "read_source" => include_str!("docs/tools/read_source.md"),
+            "search_symbols" => include_str!("docs/tools/search_symbols.md"),
+            "type_hierarchy" => include_str!("docs/tools/type_hierarchy.md"),
+            "call_graph" => include_str!("docs/tools/call_graph.md"),
+            "cycles" => include_str!("docs/tools/cycles.md"),
+            "unused" => include_str!("docs/tools/unused.md"),
+            "duplicates" => include_str!("docs/tools/duplicates.md"),
+            "rename_symbol" => include_str!("docs/tools/rename_symbol.md"),
+            "safe_delete_symbol" => include_str!("docs/tools/safe_delete_symbol.md"),
+            "replace_symbol_body" => include_str!("docs/tools/replace_symbol_body.md"),
+            "insert_before_symbol" => include_str!("docs/tools/insert_before_symbol.md"),
+            "insert_after_symbol" => include_str!("docs/tools/insert_after_symbol.md"),
+            "undo_edit" => include_str!("docs/tools/undo_edit.md"),
             _ => return None,
         })
     }
@@ -1129,6 +1650,12 @@ impl McpServer {
                 .read_only(false)
                 .destructive(false)
                 .idempotent(true)
+                .open_world(false)
+        } else if DIRECT_EDIT_TOOLS.contains(&tool.name.as_ref()) {
+            ToolAnnotations::new()
+                .read_only(false)
+                .destructive(true)
+                .idempotent(tool.name == "undo_edit")
                 .open_world(false)
         } else {
             ToolAnnotations::new().read_only(true).open_world(false)
@@ -1194,6 +1721,33 @@ mod initial_index_tests {
                 .unwrap_err()
                 .contains("worker died")
         );
+    }
+}
+
+#[cfg(test)]
+mod edit_action_tests {
+    use super::render_edit_action_outcome;
+
+    #[test]
+    fn action_result_exposes_an_edit_id_without_transporting_the_plan() {
+        let outcome = crate::editing::ApplyOutcome {
+            plan_id: "a".repeat(64),
+            operation: "rename_symbol".into(),
+            changed_files: vec![crate::editing::AppliedFile {
+                path: "src/lib.rs".into(),
+                content_hash: "b".repeat(64),
+            }],
+            already_applied: false,
+            already_undone: false,
+            watcher_active: true,
+            sync_state: "watcher will enqueue sync".into(),
+        };
+
+        let rendered = render_edit_action_outcome(&outcome).expect("render action result");
+        let value: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+        assert_eq!(value["editId"], outcome.plan_id);
+        assert!(value.get("planId").is_none());
+        assert!(value.get("plan").is_none());
     }
 }
 

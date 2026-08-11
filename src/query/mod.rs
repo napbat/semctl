@@ -14,7 +14,10 @@ use std::path::Path;
 
 use crate::client::{Client, api};
 
+mod advanced;
 mod render;
+
+pub use advanced::*;
 
 pub use render::render_projects;
 use render::{
@@ -45,6 +48,10 @@ pub struct SearchOpts {
     pub kinds: Vec<String>,
     /// Ask the server for full enclosing-symbol bodies, and render them in full.
     pub expand: bool,
+    /// Server scope lens (`local`, `personal`, `organization`, `global`).
+    pub scope: Option<String>,
+    /// Explicit authorized codebase ids. Suppresses the current-codebase lens.
+    pub codebase_ids: Vec<String>,
 }
 
 /// Cross-domain search, scoped to the launched codebase when one is set. The
@@ -60,7 +67,15 @@ pub async fn search(
     let body = api::SearchRequestBody {
         query,
         top_k,
-        codebase_id: client.codebase().ok(),
+        codebase_id: (opts.scope.is_none() && opts.codebase_ids.is_empty())
+            .then(|| client.codebase().ok())
+            .flatten(),
+        codebase_ids: (!opts.codebase_ids.is_empty()).then(|| opts.codebase_ids.clone()),
+        scope: opts
+            .scope
+            .as_deref()
+            .and_then(normalize_scope)
+            .map(str::to_string),
         domains: if domains.is_empty() {
             None
         } else {
@@ -96,6 +111,16 @@ pub async fn search(
         &stale,
         opts.expand,
     )
+}
+
+fn normalize_scope(scope: &str) -> Option<&'static str> {
+    match scope.trim().to_ascii_lowercase().as_str() {
+        "local" => Some("Local"),
+        "personal" => Some("Personal"),
+        "organization" | "organisation" | "org" => Some("Organization"),
+        "global" => Some("Global"),
+        _ => None,
+    }
 }
 
 /// The set of hit paths whose local file no longer matches what the index
@@ -224,15 +249,18 @@ pub async fn find_definition(client: &Client, symbol: &str) -> String {
 }
 
 /// Symbol-graph: references to `symbol` in the codebase.
-pub async fn find_references(client: &Client, symbol: &str) -> String {
+pub async fn find_references(client: &Client, symbol: &str, namespace: Option<&str>) -> String {
     let cb = match client.codebase() {
         Ok(c) => c,
         Err(e) => return format!("find_references failed: {e}"),
     };
-    let path = format!(
+    let mut path = format!(
         "/v1/codebases/{cb}/graph/references?symbol={}",
         urlencode(symbol)
     );
+    if let Some(namespace) = namespace.filter(|value| !value.is_empty()) {
+        write!(path, "&referenceNamespace={}", urlencode(namespace)).unwrap();
+    }
     match client.get::<Vec<api::SearchHit>>(&path).await {
         Ok(hits) if hits.is_empty() => near_miss(client, symbol, "references").await,
         Ok(hits) => render_hits(&hits, "", client.local_root(), false),
@@ -416,12 +444,27 @@ pub async fn grep(
 
 /// A file's table of contents — every indexed chunk (kind, symbol, line range)
 /// in source order. Cheaper than reading the file when you only want its shape.
-pub async fn file_outline(client: &Client, path: &str) -> String {
+pub async fn file_outline(
+    client: &Client,
+    path: &str,
+    max_depth: Option<u32>,
+    kinds: &[String],
+    include_body: bool,
+) -> String {
     let cb = match client.codebase() {
         Ok(c) => c,
         Err(e) => return format!("file_outline failed: {e}"),
     };
-    let url = format!("/v1/codebases/{cb}/graph/outline?path={}", urlencode(path));
+    let mut url = format!(
+        "/v1/codebases/{cb}/graph/outline?path={}&includeBody={include_body}",
+        urlencode(path)
+    );
+    if let Some(depth) = max_depth {
+        write!(url, "&maxDepth={depth}").unwrap();
+    }
+    for kind in kinds {
+        write!(url, "&kinds={}", urlencode(kind)).unwrap();
+    }
     match client.get::<api::FileOutline>(&url).await {
         Ok(outline) if outline.entries.is_empty() => {
             format!("{path} is indexed but has no chunks")
@@ -430,8 +473,26 @@ pub async fn file_outline(client: &Client, path: &str) -> String {
             let local = local_path(client.local_root(), &outline.path);
             let mut out = format!("{local}\n");
             for e in &outline.entries {
-                let sym = e.symbol.as_deref().unwrap_or("-");
-                writeln!(out, "  {}-{}  {} {sym}", e.line_start, e.line_end, e.kind).unwrap();
+                let sym = e
+                    .qualified_symbol
+                    .as_deref()
+                    .or(e.symbol.as_deref())
+                    .unwrap_or("-");
+                let symbol_kind = e.symbol_kind.as_deref().unwrap_or(&e.kind);
+                writeln!(
+                    out,
+                    "  {}{}-{}  {} {sym}",
+                    "  ".repeat(e.depth as usize),
+                    e.line_start,
+                    e.line_end,
+                    symbol_kind
+                )
+                .unwrap();
+                if let Some(body) = &e.body {
+                    for line in body.lines() {
+                        writeln!(out, "      {line}").unwrap();
+                    }
+                }
             }
             out
         }
@@ -971,6 +1032,8 @@ async fn near_miss(client: &Client, symbol: &str, what: &str) -> String {
         query: symbol,
         top_k: 10,
         codebase_id: client.codebase().ok(),
+        codebase_ids: None,
+        scope: None,
         domains: None,
         filters: None,
         kinds: None,

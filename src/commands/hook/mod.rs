@@ -201,6 +201,8 @@ async fn user_prompt_context(cli: &Cli, input: &HookInput) -> Option<String> {
         query: prompt,
         top_k: u32::try_from(top_k).unwrap_or(u32::MAX),
         codebase_id: Some(&codebase),
+        codebase_ids: None,
+        scope: None,
         domains: None,
         filters: None,
         kinds: None,

@@ -63,6 +63,10 @@ pub enum Command {
     #[command(subcommand)]
     Graph(commands::graph::GraphCommand),
 
+    /// Grammar-native symbolic edit planning plus verified local apply/undo.
+    #[command(subcommand)]
+    Edit(commands::edit::EditCommand),
+
     /// The codebase's file catalog — the directory `tree`, or a filtered `list`.
     #[command(subcommand)]
     Files(commands::files::FilesCommand),
@@ -114,6 +118,7 @@ impl Cli {
             Command::Search(args) => commands::search::run(args, &self).await,
             Command::Index(args) => commands::index::run(args, &self).await,
             Command::Graph(cmd) => commands::graph::run(cmd, &self).await,
+            Command::Edit(cmd) => commands::edit::run(cmd, &self).await,
             Command::Files(cmd) => commands::files::run(cmd, &self).await,
             Command::Inspect(cmd) => commands::inspect::run(cmd, &self).await,
             Command::Install(args) => commands::install::run(&args),

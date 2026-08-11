@@ -33,6 +33,15 @@ pub struct SearchArgs {
     /// Render the full enclosing-symbol body per hit instead of a short snippet.
     #[arg(long)]
     pub expand: bool,
+
+    /// Search the server's local/personal/organization/global scope lens instead
+    /// of the current checkout.
+    #[arg(long, conflicts_with = "codebase_ids")]
+    pub scope: Option<String>,
+
+    /// Search an explicit visible codebase id. Repeatable.
+    #[arg(long = "codebase-id", value_name = "ID", conflicts_with = "scope")]
+    pub codebase_ids: Vec<String>,
 }
 
 pub async fn run(args: SearchArgs, cli: &Cli) -> Result<()> {
@@ -58,6 +67,8 @@ pub async fn run(args: SearchArgs, cli: &Cli) -> Result<()> {
         prefer: args.prefer.clone(),
         kinds: args.kinds.clone(),
         expand: args.expand,
+        scope: args.scope.clone(),
+        codebase_ids: args.codebase_ids.clone(),
     };
     let out = query::search(&client, &args.query, args.top_k, &args.domains, &opts).await;
     print!("{out}");

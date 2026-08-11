@@ -49,14 +49,51 @@ semctl index        # register + sync the current repo for indexing
 | ----------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
 | `semctl search <query>`                               | Cross-domain semantic search.                                                                                         |
 | `semctl index`                                        | Register the current Git worktree (or selected non-Git folder) and sync its files.                                    |
-| `semctl graph …`                                      | Exact code intelligence: definitions, references, callers, implementations, call/value-flow paths.                    |
-| `semctl files …`                                      | The codebase's file catalog (`tree` / filtered `list`).                                                               |
-| `semctl inspect …`                                    | Detected `projects` graph and registered `domains`.                                                                   |
+| `semctl graph …`                                      | Exact code intelligence plus symbol search, type hierarchy, call graphs, cycles, unused, duplicates, and rich outlines. |
+| `semctl edit …`                                       | Grammar-native rename/delete/body/insertion planning and verified local apply/undo.                                   |
+| `semctl files …`                                      | File catalog (`tree` / filtered `list`) and revision-pinned line/byte source reads.                                    |
+| `semctl inspect …`                                    | Projects/domains plus visible codebases and the effective server/tenant/index/graph context.                          |
 | `semctl mcp`                                          | Run as an MCP stdio server (launched by the host, not by hand).                                                       |
 | `semctl install`                                      | Add/remove the editor/agent integrations.                                                                             |
 | `semctl uninstall`                                    | Reverse `install`: unwire the tools, remove from PATH, delete the binary (`--purge` also drops config + credentials). |
 | `semctl upgrade`                                      | Update the `semctl` binary in place.                                                                                  |
 | `semctl auth login` / `logout` / `whoami` / `tenants` | Account & session.                                                                                                    |
+
+## Grammar-native editing
+
+The server's edit operations are planners: they resolve one qualified or
+positional symbol through semctx's grammar graph, reparse and re-resolve the
+proposed postimages, then return a JSON `WorkspaceEditPlan`. They never write a
+repository. For example:
+
+```sh
+semctl edit rename --path src/lib.rs --line 42 --column 8 NewName > plan.json
+semctl edit apply plan.json
+semctl edit undo <plan-id>
+```
+
+`edit apply` is the only normal mutation boundary. Before touching the bound
+checkout it refreshes the server's checkout lease and graph generation,
+canonicalizes every planned path, verifies every preimage, edit range, and
+expected postimage, and stages the whole multi-file plan with rollback
+sidecars. Reapplying an unchanged completed plan is idempotent. Undo succeeds
+only while all current files still match the retained postimage hashes.
+
+Private preimages live only under the local config directory's `edit-history/`
+folder and are never sent back to the server. A plan-supplied formatter is not
+run unless `--run-formatter` is explicit; formatter commands, arguments, and
+paths are bounded to the approved plan.
+
+The MCP surface exposes edits as immediate actions. `rename_symbol`,
+`safe_delete_symbol`, `replace_symbol_body`, `insert_before_symbol`, and
+`insert_after_symbol` ask the server for its internal plan and consume it inside
+the same call; callers never shuttle plan JSON through MCP. Each action is
+write/destructive in the host approval UI, returns an `editId`, and can be
+reversed with the hash-guarded `undo_edit` action. Read-only additions include
+`list_codebases`, `current_context`, `read_source`, `search_symbols`,
+`type_hierarchy`, `call_graph`, `cycles`, `unused`, and `duplicates`; existing
+reference/search/outline tools expose the richer occurrence, scope, and nesting
+options instead of gaining aliases.
 
 ### Coming from the old `semctx` CLI
 

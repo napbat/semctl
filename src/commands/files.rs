@@ -18,6 +18,26 @@ pub enum FilesCommand {
     /// searched across the whole catalog; otherwise one page is returned with a
     /// footer telling you how to fetch the next.
     List(ListArgs),
+
+    /// Read a revision-pinned source line or byte range.
+    Read(ReadArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ReadArgs {
+    /// Codebase-relative path.
+    path: String,
+    /// Strong indexed content hash.
+    #[arg(long)]
+    revision: Option<String>,
+    #[arg(long, requires = "byte_end", conflicts_with = "line_start")]
+    byte_start: Option<u64>,
+    #[arg(long, requires = "byte_start", conflicts_with = "line_end")]
+    byte_end: Option<u64>,
+    #[arg(long, requires = "line_end", conflicts_with = "byte_start")]
+    line_start: Option<u32>,
+    #[arg(long, requires = "line_start", conflicts_with = "byte_end")]
+    line_end: Option<u32>,
 }
 
 #[derive(Debug, Args)]
@@ -42,6 +62,16 @@ pub async fn run(cmd: FilesCommand, cli: &Cli) -> Result<()> {
         FilesCommand::Tree => query::file_tree(&client).await,
         FilesCommand::List(a) => {
             query::list_files(&client, a.filter.as_deref(), a.page, a.page_size).await
+        }
+        FilesCommand::Read(a) => {
+            query::read_source(
+                &client,
+                &a.path,
+                a.revision.as_deref(),
+                a.byte_start.zip(a.byte_end),
+                a.line_start.zip(a.line_end),
+            )
+            .await
         }
     };
     print!("{out}");

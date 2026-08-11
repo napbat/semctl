@@ -105,6 +105,17 @@ impl Client {
         self.local_root.as_deref()
     }
 
+    /// Effective resource-server base URL. Contains no credentials.
+    pub fn server_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// Effective active tenant selector. Contains only the configured slug/id,
+    /// never an access token.
+    pub async fn tenant(&self) -> Option<String> {
+        self.tenant.read().await.clone()
+    }
+
     /// Build an authenticated request for `method path`: attaches the bearer
     /// token and the `X-Tenant-Id` header, returning the builder alongside the
     /// resolved URL (for error context). The verb-specific body shaping
