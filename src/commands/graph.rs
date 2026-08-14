@@ -224,6 +224,7 @@ pub async fn run(command: GraphCommand, cli: &Cli) -> Result<()> {
             include_body,
         } => query::file_outline(&client, &path, max_depth, &kinds, include_body).await,
     };
+    let out = query::cli_result(out)?;
     print!("{out}");
     if !out.ends_with('\n') {
         println!();

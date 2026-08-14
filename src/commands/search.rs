@@ -71,6 +71,7 @@ pub async fn run(args: SearchArgs, cli: &Cli) -> Result<()> {
         codebase_ids: args.codebase_ids.clone(),
     };
     let out = query::search(&client, &args.query, args.top_k, &args.domains, &opts).await;
+    let out = query::cli_result(out)?;
     print!("{out}");
     if !out.ends_with('\n') {
         println!();

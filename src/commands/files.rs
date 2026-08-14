@@ -74,6 +74,7 @@ pub async fn run(cmd: FilesCommand, cli: &Cli) -> Result<()> {
             .await
         }
     };
+    let out = query::cli_result(out)?;
     print!("{out}");
     if !out.ends_with('\n') {
         println!();
