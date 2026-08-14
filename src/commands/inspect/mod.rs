@@ -32,7 +32,8 @@ pub async fn run(cmd: InspectCommand, cli: &Cli) -> Result<()> {
         InspectCommand::Domains => domains::run(cli).await,
         InspectCommand::Codebases => {
             let client = crate::client::from_cli(cli)?;
-            println!("{}", crate::query::list_codebases(&client).await.trim_end());
+            let out = crate::query::cli_result(crate::query::list_codebases(&client).await)?;
+            println!("{}", out.trim_end());
             Ok(())
         }
         InspectCommand::Context => {

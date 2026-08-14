@@ -25,6 +25,29 @@ use render::{
     render_hits_inner, render_job, render_tree, truncation_note,
 };
 
+/// Turn the MCP renderer's inline failure convention into a real CLI error.
+///
+/// MCP tools deliberately return failures as text so a model receives the
+/// server's explanation instead of an opaque protocol error. The human CLI
+/// shares those renderers, but must not report exit status zero after printing
+/// the same failure. Every hard renderer failure starts its first line with the
+/// stable `<operation> failed:` form; successful output never does.
+pub fn cli_result(output: String) -> anyhow::Result<String> {
+    let first_line = output.lines().next().unwrap_or_default();
+    let hard_failure = first_line
+        .split_once(" failed:")
+        .is_some_and(|(operation, _)| {
+            !operation.is_empty()
+                && operation
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        });
+    if hard_failure {
+        anyhow::bail!(output);
+    }
+    Ok(output)
+}
+
 /// Map the user's `--prefer` value to the server's `SearchPreference` enum name
 /// (`"Code"` / `"Docs"`). `None` for an unrecognised value — a typo means "no
 /// preference" rather than a failed search.
@@ -1091,7 +1114,16 @@ fn urlencode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{human_bytes, is_stale, local_blake3, normalize_prefer};
+    use super::{cli_result, human_bytes, is_stale, local_blake3, normalize_prefer};
+
+    #[test]
+    fn cli_turns_inline_query_failures_into_process_errors() {
+        let error = cli_result("call_graph failed: 409 GraphLoading".into()).unwrap_err();
+        assert_eq!(error.to_string(), "call_graph failed: 409 GraphLoading");
+
+        let success = "nodes (1)\nsource text mentioning call_graph failed: is still data";
+        assert_eq!(cli_result(success.into()).unwrap(), success);
+    }
 
     #[test]
     fn total_source_bytes_are_human_readable_without_losing_exactness() {
