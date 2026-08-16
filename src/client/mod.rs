@@ -9,16 +9,19 @@
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{Mutex, RwLock};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::auth;
 
 const TENANT_HEADER: &str = "X-Tenant-Id";
+const LOADING_RETRY_BUDGET: Duration = Duration::from_mins(1);
+const LOADING_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
 
 /// Cheap to clone — `reqwest::Client` is internally `Arc`'d and the
 /// other fields are small strings. The MCP server handler holds a
@@ -135,15 +138,17 @@ impl Client {
         Ok((req, url, tenant))
     }
 
-    /// Send one request, repairing a stale persisted tenant and retrying once
-    /// when the resource server reports `TenantBindingDenied`.
+    /// Send one request, repairing a stale persisted tenant once and honoring
+    /// the server's bounded `Retry-After` contract for transient graph/file
+    /// projection restores.
     async fn send(
         &self,
         method: reqwest::Method,
         path: &str,
         body: Option<serde_json::Value>,
     ) -> Result<(reqwest::Response, String)> {
-        let mut retried = false;
+        let mut tenant_retried = false;
+        let loading_deadline = Instant::now() + LOADING_RETRY_BUDGET;
         loop {
             let (mut req, url, rejected_tenant) = self.authed(method.clone(), path).await?;
             if let Some(json) = &body {
@@ -154,6 +159,19 @@ impl Client {
                 .await
                 .with_context(|| format!("{method} {url}"))?;
 
+            if let Some(delay) = loading_retry_delay(resp.status(), resp.headers()) {
+                if delay > loading_deadline.saturating_duration_since(Instant::now()) {
+                    return Ok((resp, url));
+                }
+                debug!(
+                    status = %resp.status(),
+                    retry_after_ms = delay.as_millis(),
+                    "server projection is restoring; retrying request"
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+
             if resp.status() != reqwest::StatusCode::FORBIDDEN {
                 return Ok((resp, url));
             }
@@ -163,13 +181,13 @@ impl Client {
                 .text()
                 .await
                 .with_context(|| format!("{method} {url}: read body"))?;
-            if !retried
+            if !tenant_retried
                 && tenant_binding_denied(&response_body)
                 && self
                     .repair_tenant_after_denial(rejected_tenant.as_deref())
                     .await
             {
-                retried = true;
+                tenant_retried = true;
                 continue;
             }
             return Err(response_body_error(
@@ -326,6 +344,26 @@ impl Client {
             format!("{}/{}", self.base_url, path)
         }
     }
+}
+
+/// The server uses `409 + Retry-After` only for typed, request-safe loading
+/// states (`GraphLoading` / `FileLoading`). Bound each advertised delay so a
+/// malformed or hostile response cannot park the CLI for an arbitrary period;
+/// the overall retry loop has its own deadline as well.
+fn loading_retry_delay(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+) -> Option<Duration> {
+    if status != reqwest::StatusCode::CONFLICT {
+        return None;
+    }
+    let seconds = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .parse::<u64>()
+        .ok()?;
+    Some(Duration::from_secs(seconds.max(1)).min(LOADING_RETRY_MAX_DELAY))
 }
 
 fn tenant_binding_denied(body: &str) -> bool {
@@ -558,7 +596,9 @@ pub async fn for_cwd(cli: &crate::cli::Cli) -> Result<Client> {
 
 #[cfg(test)]
 mod gateway_error_tests {
-    use super::{gateway_error, tenant_binding_denied, tenant_selection};
+    use std::time::Duration;
+
+    use super::{gateway_error, loading_retry_delay, tenant_binding_denied, tenant_selection};
 
     /// A gateway's HTML error page must be reported as the gateway failure it is,
     /// not as a JSON parse error.
@@ -615,5 +655,33 @@ mod gateway_error_tests {
             (Some("override".into()), false)
         );
         assert_eq!(tenant_selection(None, None), (None, false));
+    }
+
+    #[test]
+    fn only_typed_loading_responses_receive_a_bounded_retry_delay() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "1".parse().unwrap());
+        assert_eq!(
+            loading_retry_delay(reqwest::StatusCode::CONFLICT, &headers),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            loading_retry_delay(reqwest::StatusCode::OK, &headers),
+            None,
+            "a successful response must never be replayed"
+        );
+
+        headers.insert(reqwest::header::RETRY_AFTER, "3600".parse().unwrap());
+        assert_eq!(
+            loading_retry_delay(reqwest::StatusCode::CONFLICT, &headers),
+            Some(Duration::from_secs(5)),
+            "one server response cannot stall the client beyond the delay cap"
+        );
+        headers.insert(reqwest::header::RETRY_AFTER, "invalid".parse().unwrap());
+        assert_eq!(
+            loading_retry_delay(reqwest::StatusCode::CONFLICT, &headers),
+            None,
+            "malformed retry instructions are surfaced normally"
+        );
     }
 }
