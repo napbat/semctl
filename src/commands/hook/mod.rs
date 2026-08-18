@@ -10,15 +10,17 @@
 //! the packaged hooks use `SessionStart(source=compact)` as the shared boundary.
 //!
 //! - **`SessionStart`** — a one-line orientation: which codebase this repo maps
-//!   to, a nudge to prefer the semctl MCP tools, and (only when needed) a cached,
-//!   once-per-session instruction to tell the user about a newer CLI.
-//! - **`UserPromptSubmit`** — gated, summary-style retrieval: for a non-trivial
-//!   prompt, search the repo's codebase and inject a compact candidate list
-//!   (path + line range + symbol + score), not full chunk bodies.
-//! - **`PreToolUse`** — when the agent reaches for built-in `Grep`/`Glob` or a
-//!   Bash/PowerShell `grep`/`rg`/`find`, and this repo is indexed, emit a firm
-//!   but non-blocking reminder to prefer the semctl MCP tools. Escalates with
-//!   reliance within a segment, deduped per turn, strictly gated on availability.
+//!   to, how to route missing evidence between semctx and local context, and
+//!   (only when needed) a cached, once-per-session instruction to tell the user
+//!   about a newer CLI.
+//! - **`UserPromptSubmit`** — gated, summary-style retrieval for fuzzy discovery
+//!   prompts: search the repo's codebase and inject a compact candidate list
+//!   (path + line range + symbol + score), not full chunk bodies. Exact graph or
+//!   tool-shaped prompts are left for the model to route directly.
+//! - **`PreToolUse`** — when the agent repeatedly reaches for broad built-in
+//!   `Grep`/`Glob` or Bash/PowerShell search, and this repo is indexed, emit
+//!   balanced guidance about semctx's discovery strengths and valid local-tool
+//!   cases. Narrow single-file searches do not count toward escalation.
 //!
 //! Contract: **never break a session.** An unindexed repo produces an opt-in
 //! notice; every actual failure path — not logged in, server down, parse error —
@@ -181,8 +183,9 @@ fn resets_segment(event: &str, source: &str) -> bool {
     event == "PostCompact" || (event == "SessionStart" && matches!(source, "clear" | "compact"))
 }
 
-/// Per-prompt retrieval: skip trivial prompts, search the repo's codebase,
-/// return a capped summary-style hit list.
+/// Per-prompt retrieval: run generic candidate search only for fuzzy discovery
+/// prompts. Direct graph/tool requests and prompts that can rely on supplied
+/// context remain model-routed, avoiding a generic search before a precise call.
 async fn user_prompt_context(cli: &Cli, input: &HookInput) -> Option<String> {
     let top_k = env_parse::<usize>("SEMCTX_HOOK_TOP_K").unwrap_or(5);
     if top_k == 0 {
@@ -190,9 +193,9 @@ async fn user_prompt_context(cli: &Cli, input: &HookInput) -> Option<String> {
     }
     let prompt = input.prompt.trim();
     // A global UserPromptSubmit hook fires on every message. Keep this path
-    // high-precision: the skill and MCP metadata remain available for other
-    // prompts, while automatic retrieval is reserved for code-navigation intent.
-    if !prompt_wants_retrieval(prompt) {
+    // high-precision: the skill and MCP metadata route exact operations, while
+    // automatic retrieval is reserved for fuzzy code-navigation intent.
+    if prompt_route(prompt) != PromptRoute::CandidateSearch {
         return None;
     }
 
@@ -238,9 +241,9 @@ async fn user_prompt_context(cli: &Cli, input: &HookInput) -> Option<String> {
 
     let mut out = String::from(
         "semctl — candidate locations from the current index for this prompt. \
-         Pull current detail with the \
-         semctl MCP tools (search_codebase / find_definition / find_references) \
-         rather than re-searching:\n",
+         Use them when additional repository evidence is needed. Existing fresh \
+         context may already support the task; read a known local path directly \
+         when current working-tree bytes matter:\n",
     );
     for h in hits {
         let loc = match (h.line_start, h.line_end) {
@@ -271,12 +274,19 @@ async fn user_prompt_context(cli: &Cli, input: &HookInput) -> Option<String> {
 
 const HOOK_SEARCH_TIMEOUT_SECS: u64 = 6;
 
-fn prompt_wants_retrieval(prompt: &str) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptRoute {
+    /// Fuzzy repository discovery benefits from a generic candidate search.
+    CandidateSearch,
+    /// An exact graph/literal/symbol operation should become one precise MCP call.
+    ModelRouted,
+    /// The prompt does not justify automatic repository retrieval.
+    None,
+}
+
+fn prompt_route(prompt: &str) -> PromptRoute {
     if prompt.split_whitespace().count() < 3 {
-        return false;
-    }
-    if prompt.contains('`') {
-        return true;
+        return PromptRoute::None;
     }
 
     let normalized: String = prompt
@@ -292,15 +302,43 @@ fn prompt_wants_retrieval(prompt: &str) -> bool {
     let words: Vec<&str> = normalized.split_whitespace().collect();
     let has = |candidates: &[&str]| words.iter().any(|word| candidates.contains(word));
 
-    let direct = has(&[
-        "find",
-        "locate",
-        "search",
+    let graph_operation = has(&[
+        "calls",
+        "callers",
+        "calling",
+        "reference",
+        "references",
+        "import",
+        "imports",
+        "implement",
+        "implements",
         "trace",
-        "explain",
-        "understand",
-        "review",
+        "flow",
+        "flows",
+        "subtypes",
+        "supertypes",
     ]);
+    let implementation_query =
+        has(&["what", "which"]) && has(&["implementation", "implementations"]);
+    let exhaustive_literal =
+        has(&["all", "every"]) && has(&["occurrence", "occurrences", "literal", "literals"]);
+    let definition_query = has(&["defined", "definition", "declaration"])
+        || (prompt.contains('`') && has(&["find", "where"]));
+    let exact_operation =
+        graph_operation || implementation_query || exhaustive_literal || definition_query;
+    if exact_operation {
+        return PromptRoute::ModelRouted;
+    }
+
+    let supplied_context = has(&[
+        "above", "below", "pasted", "provided", "supplied", "attached", "snippet",
+    ]) || (has(&["this", "current"])
+        && has(&["code", "body", "function", "method", "file", "content"]));
+    if supplied_context {
+        return PromptRoute::None;
+    }
+
+    let discovery = has(&["find", "locate", "search"]);
     let question = has(&["where", "who", "how", "what", "which"]);
     let code_subject = has(&[
         "code",
@@ -318,15 +356,9 @@ fn prompt_wants_retrieval(prompt: &str) -> bool {
         "implementation",
         "implemented",
         "define",
-        "defined",
         "server",
         "client",
         "cli",
-        "calls",
-        "callers",
-        "references",
-        "imports",
-        "flow",
         "hook",
         "hooks",
         "mcp",
@@ -335,7 +367,11 @@ fn prompt_wants_retrieval(prompt: &str) -> bool {
         "skill",
         "skills",
     ]);
-    direct || (question && code_subject)
+    if discovery || (question && code_subject) {
+        PromptRoute::CandidateSearch
+    } else {
+        PromptRoute::None
+    }
 }
 
 /// Cache a successful version lookup for this long. Every new agent session has
@@ -363,8 +399,8 @@ async fn session_start_context(
     combine_context(orientation, update)
 }
 
-/// One-shot orientation: name an indexed codebase, or tell the agent that the
-/// repository is unindexed and indexing requires explicit user opt-in.
+/// One-shot orientation: name an indexed codebase and describe the evidence-based
+/// routing boundary, or tell the agent that an unindexed repo requires opt-in.
 async fn session_orientation_context(cli: &Cli, input: &HookInput) -> Option<String> {
     let (client, codebase) = match resolve_connection(cli, &input.cwd).await? {
         HookConnection::Indexed(client, codebase) => (client, codebase),
@@ -379,10 +415,13 @@ async fn session_orientation_context(cli: &Cli, input: &HookInput) -> Option<Str
         .ok()
         .map_or_else(|| codebase.clone(), |c| c.slug);
     Some(format!(
-        "This repository is indexed by semctl as \"{name}\". For any \
-         \"find / explain / where is / who imports\" question about this repo, prefer \
-         the semctl MCP tools (search_codebase, find_definition, find_references, \
-         imports, symbol_edges) over raw grep / read — see the codebase-retrieval skill.",
+        "This repository is indexed by semctl as \"{name}\". Begin with relevant, \
+         fresh evidence already available in the conversation. Use the semctl MCP \
+         tools (`search_codebase`, `find_definition`, `find_references`, `who_calls`, \
+         `imports`) for repository discovery, unknown locations, cross-file \
+         relationships, symbol graphs, and broad indexed searches. Use local file \
+         tools for current bytes at a known path or range and for narrow, file-scoped \
+         checks — see the codebase-retrieval skill.",
     ))
 }
 
@@ -552,10 +591,10 @@ async fn connect(cli: &Cli, cwd: &str) -> Option<(Client, String)> {
     }
 }
 
-/// `PreToolUse`: when the agent reaches for built-in `Grep`/`Glob` or a
-/// Bash/PowerShell search, and semctl has this repo indexed, emit a firm but
-/// non-blocking reminder to prefer the semctl tools. Escalates with reliance
-/// within a segment; deduped per turn; strictly gated on availability.
+/// `PreToolUse`: when the agent repeatedly reaches for broad built-in search in
+/// an indexed repo, emit balanced routing guidance. Single-file and outside-repo
+/// searches stay silent; eligible broad searches escalate within a segment,
+/// deduped per turn and strictly gated on availability.
 async fn pretooluse_nudge(cli: &Cli, input: &HookInput) -> Option<String> {
     if std::env::var_os("SEMCTX_NUDGE_DISABLE").is_some() {
         return None;
@@ -589,10 +628,19 @@ async fn pretooluse_nudge(cli: &Cli, input: &HookInput) -> Option<String> {
         input.tool_name
     ));
 
-    // Don't steer toward the index for a search provably outside the repo.
-    if target_outside_repo(&input.tool_input, &input.cwd) {
-        debug(format_args!("nudge: target outside repo — silent"));
-        return None;
+    // Scope needs cwd/repo awareness, so keep the sniffer pure and decide here.
+    // Known single-file work is a valid local operation and must not build drift
+    // pressure; provably outside-repo searches are unrelated to this index.
+    match search_scope(&input.tool_name, &input.tool_input, &input.cwd) {
+        SearchScope::SingleFile => {
+            debug(format_args!("nudge: single-file target — silent"));
+            return None;
+        }
+        SearchScope::OutsideRepo => {
+            debug(format_args!("nudge: target outside repo — silent"));
+            return None;
+        }
+        SearchScope::BroadOrUnknown => {}
     }
 
     // Critical section under the per-session lock: read → decide → write.
@@ -663,7 +711,7 @@ fn load_thresholds() -> escalation::Thresholds {
     escalation::Thresholds {
         grace: env_parse("SEMCTX_NUDGE_GRACE").unwrap_or(1),
         cooldown: env_parse("SEMCTX_NUDGE_COOLDOWN").unwrap_or(3),
-        max: env_parse("SEMCTX_NUDGE_MAX").unwrap_or(12),
+        max: env_parse("SEMCTX_NUDGE_MAX").unwrap_or(4),
     }
 }
 
@@ -708,35 +756,179 @@ fn advance(
     }
 }
 
-/// Best-effort: suppress the nudge when a search provably targets a path OUTSIDE
-/// the repo. Covers the Grep/Glob `path` field and absolute-path operands inside
-/// a Bash/PowerShell command. The repo root is the nearest `.git` ancestor of
-/// `cwd` (so launching Claude in a subdirectory doesn't wrongly suppress an
-/// in-repo search). Only suppresses when a path both canonicalizes AND lands
-/// outside the root — when unsure, don't suppress.
-fn target_outside_repo(tool_input: &serde_json::Value, cwd: &str) -> bool {
+/// Observable scope of an eligible search. The hook cannot know the provider's
+/// active context, but it can distinguish a current single-file operation from
+/// broad repository discovery without guessing about model state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchScope {
+    BroadOrUnknown,
+    SingleFile,
+    OutsideRepo,
+}
+
+/// Resolve tool paths against the repository. Missing/non-existent/ambiguous
+/// paths stay broad so a malformed or complex command never gains a false
+/// single-file exemption.
+fn search_scope(tool_name: &str, tool_input: &serde_json::Value, cwd: &str) -> SearchScope {
     let Some(root) = repo_root(cwd) else {
-        return false;
+        return SearchScope::BroadOrUnknown;
     };
-    // Grep/Glob: the explicit absolute `path` field.
+    let cwd = std::path::Path::new(cwd);
+
     if let Some(path) = tool_input.get("path").and_then(|v| v.as_str()) {
-        let p = std::path::Path::new(path);
-        if p.is_absolute() && path_is_outside(p, &root) {
-            return true;
+        let scope = path_scope(std::path::Path::new(path), cwd, &root);
+        if scope != SearchScope::BroadOrUnknown {
+            return scope;
         }
     }
-    // Bash/PowerShell: any absolute-path operand that lands outside the repo
-    // (e.g. `rg password C:\Users\me\Downloads`). Best-effort token scan; a
-    // relative operand or one that can't be resolved is left to nudge.
-    if let Some(cmd) = tool_input.get("command").and_then(|v| v.as_str()) {
-        for tok in cmd.split_whitespace() {
-            let tok = tok.trim_matches(|c| c == '"' || c == '\'');
-            if is_abs_path_token(tok) && path_is_outside(std::path::Path::new(tok), &root) {
-                return true;
-            }
+
+    // Glob's `path` is normally a directory; an exact non-glob pattern can still
+    // identify one file beneath it. Wildcards remain repository/directory work.
+    if tool_name == "Glob"
+        && let Some(pattern) = tool_input.get("pattern").and_then(|v| v.as_str())
+        && !has_glob_meta(pattern)
+    {
+        let base = tool_input
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(std::path::PathBuf::from)
+            .map_or_else(
+                || cwd.to_path_buf(),
+                |path| {
+                    if path.is_absolute() {
+                        path
+                    } else {
+                        cwd.join(path)
+                    }
+                },
+            );
+        let pattern = std::path::Path::new(pattern);
+        let candidate = if pattern.is_absolute() {
+            pattern.to_path_buf()
+        } else {
+            base.join(pattern)
+        };
+        let scope = resolved_path_scope(&candidate, &root);
+        if scope != SearchScope::BroadOrUnknown {
+            return scope;
         }
     }
-    false
+
+    tool_input
+        .get("command")
+        .and_then(|v| v.as_str())
+        .map_or(SearchScope::BroadOrUnknown, |command| {
+            shell_search_scope(command, cwd, &root)
+        })
+}
+
+fn has_glob_meta(path: &str) -> bool {
+    path.contains(['*', '?', '[', ']', '{', '}'])
+}
+
+fn path_scope(
+    path: &std::path::Path,
+    cwd: &std::path::Path,
+    root: &std::path::Path,
+) -> SearchScope {
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    resolved_path_scope(&candidate, root)
+}
+
+fn resolved_path_scope(path: &std::path::Path, root: &std::path::Path) -> SearchScope {
+    let (Ok(path), Ok(root)) = (std::fs::canonicalize(path), std::fs::canonicalize(root)) else {
+        return SearchScope::BroadOrUnknown;
+    };
+    if !path.starts_with(root) {
+        SearchScope::OutsideRepo
+    } else if path.is_file() {
+        SearchScope::SingleFile
+    } else {
+        SearchScope::BroadOrUnknown
+    }
+}
+
+/// Recognize simple shell forms whose path operand is unambiguous:
+/// `rg pattern file`, `grep pattern file`, `find path`, or `fd pattern path`.
+/// A small no-argument flag allowlist is safe; unknown options, pipelines,
+/// sequences, multiple positional targets, and missing paths remain broad.
+fn shell_search_scope(command: &str, cwd: &std::path::Path, root: &std::path::Path) -> SearchScope {
+    if command.contains(['|', '&', ';']) {
+        return SearchScope::BroadOrUnknown;
+    }
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let Some(command_index) = tokens.iter().position(|token| is_shell_search_bin(token)) else {
+        return SearchScope::BroadOrUnknown;
+    };
+    let command_name = shell_basename(tokens[command_index]).to_ascii_lowercase();
+    let args = &tokens[command_index + 1..];
+    let target = if command_name == "find" {
+        args.first().copied().filter(|arg| !arg.starts_with('-'))
+    } else {
+        if args
+            .iter()
+            .any(|arg| arg.starts_with('-') && !is_no_arg_search_flag(arg))
+        {
+            return SearchScope::BroadOrUnknown;
+        }
+        let mut positional = args.iter().copied().filter(|arg| !arg.starts_with('-'));
+        match (positional.next(), positional.next(), positional.next()) {
+            (Some(_pattern), Some(target), None) => Some(target),
+            _ => None,
+        }
+    };
+    let Some(target) = target else {
+        return SearchScope::BroadOrUnknown;
+    };
+    let target = target.trim_matches(|c| c == '"' || c == '\'');
+    if target.is_empty() || has_glob_meta(target) {
+        return SearchScope::BroadOrUnknown;
+    }
+    path_scope(std::path::Path::new(target), cwd, root)
+}
+
+fn is_no_arg_search_flag(arg: &str) -> bool {
+    matches!(
+        arg,
+        "-n" | "--line-number"
+            | "-i"
+            | "--ignore-case"
+            | "-F"
+            | "--fixed-strings"
+            | "-w"
+            | "--word-regexp"
+    )
+}
+
+fn is_shell_search_bin(token: &str) -> bool {
+    matches!(
+        shell_basename(token).to_ascii_lowercase().as_str(),
+        "grep"
+            | "egrep"
+            | "fgrep"
+            | "rg"
+            | "ripgrep"
+            | "ag"
+            | "ack"
+            | "find"
+            | "fd"
+            | "fdfind"
+            | "select-string"
+            | "sls"
+            | "findstr"
+    )
+}
+
+fn shell_basename(token: &str) -> &str {
+    let base = token.rsplit(['/', '\\']).next().unwrap_or(token);
+    match base.rfind('.') {
+        Some(dot) if base[dot..].eq_ignore_ascii_case(".exe") => &base[..dot],
+        _ => base,
+    }
 }
 
 /// The repo root for `cwd`: the nearest ancestor containing a `.git` entry (a
@@ -756,29 +948,6 @@ fn repo_root(cwd: &str) -> Option<PathBuf> {
         cur = p;
     }
     Some(start)
-}
-
-/// Whether a token looks like an absolute path: POSIX `/…`, a rooted/UNC `\…`,
-/// or a Windows drive `C:\…` / `C:/…`.
-fn is_abs_path_token(tok: &str) -> bool {
-    let b = tok.as_bytes();
-    tok.starts_with('/')
-        || tok.starts_with('\\')
-        || (b.len() >= 3
-            && b[0].is_ascii_alphabetic()
-            && b[1] == b':'
-            && (b[2] == b'/' || b[2] == b'\\'))
-}
-
-/// Whether `path` provably resolves outside `root`. Requires BOTH to
-/// canonicalize (same prefix form for a valid `starts_with`); if either fails —
-/// a non-existent path, a permissions error, or a Windows `\\?\` mismatch — we
-/// cannot be sure, so it is treated as NOT outside (don't suppress).
-fn path_is_outside(path: &std::path::Path, root: &std::path::Path) -> bool {
-    match (std::fs::canonicalize(path), std::fs::canonicalize(root)) {
-        (Ok(cp), Ok(cr)) => !cp.starts_with(&cr),
-        _ => false,
-    }
 }
 
 fn read_input() -> Option<HookInput> {
@@ -1009,7 +1178,7 @@ mod tests {
     const T: escalation::Thresholds = escalation::Thresholds {
         grace: 1,
         cooldown: 3,
-        max: 12,
+        max: 4,
     };
 
     /// A store rooted at a unique temp dir, auto-removed on drop.
@@ -1186,50 +1355,155 @@ mod tests {
         );
     }
 
-    #[test]
-    fn outside_repo_uses_git_root_and_scans_shell_operands() {
-        use serde_json::json;
+    struct ScopeFixture {
+        base: PathBuf,
+        repo: PathBuf,
+        cwd: PathBuf,
+        inrepo_dir: PathBuf,
+        inrepo_file: PathBuf,
+        outside_file: PathBuf,
+    }
+
+    impl Drop for ScopeFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+
+    fn scope_fixture() -> ScopeFixture {
         let base = std::env::temp_dir().join(format!(
-            "semctl-tor-{}-{}",
+            "semctl-scope-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         let repo = base.join("repo");
-        let sub = repo.join("crate").join("src"); // Claude launched in a subdir
-        let inrepo = repo.join("server"); // in-repo, but outside cwd
-        let outside = base.join("elsewhere");
-        for d in [
+        let cwd = repo.join("crate").join("src"); // host launched in a subdir
+        let inrepo_dir = repo.join("server");
+        let outside_dir = base.join("elsewhere");
+        for dir in [
             repo.join(".git"),
-            sub.clone(),
-            inrepo.clone(),
-            outside.clone(),
+            cwd.clone(),
+            inrepo_dir.clone(),
+            outside_dir.clone(),
         ] {
-            std::fs::create_dir_all(&d).unwrap();
+            std::fs::create_dir_all(&dir).unwrap();
         }
-        let cwd = sub.to_str().unwrap();
-        let abs = |p: &std::path::Path| p.to_str().unwrap().to_string();
+        let inrepo_file = repo.join("server.rs");
+        let outside_file = outside_dir.join("notes.txt");
+        for file in [
+            cwd.join("lib.rs"),
+            inrepo_file.clone(),
+            outside_file.clone(),
+        ] {
+            std::fs::write(file, "needle").unwrap();
+        }
+        ScopeFixture {
+            base,
+            repo,
+            cwd,
+            inrepo_dir,
+            inrepo_file,
+            outside_file,
+        }
+    }
 
-        // relative / missing path → never suppress
-        assert!(!target_outside_repo(&json!({}), cwd));
-        assert!(!target_outside_repo(&json!({ "path": "src" }), cwd));
-        // absolute in-repo path OUTSIDE cwd but inside the repo → not suppressed (#4)
-        assert!(!target_outside_repo(&json!({ "path": abs(&inrepo) }), cwd));
-        // absolute path outside the repo → suppressed
-        assert!(target_outside_repo(&json!({ "path": abs(&outside) }), cwd));
-        // shell search of an outside absolute path → suppressed (#7)
-        assert!(target_outside_repo(
-            &json!({ "command": format!("rg password {}", abs(&outside)) }),
-            cwd
-        ));
-        // shell search of an in-repo absolute path → not suppressed
-        assert!(!target_outside_repo(
-            &json!({ "command": format!("rg foo {}", abs(&inrepo)) }),
-            cwd
-        ));
-        // empty cwd → never suppress
-        assert!(!target_outside_repo(&json!({ "path": abs(&outside) }), ""));
+    #[test]
+    fn search_scope_distinguishes_broad_single_file_and_outside_targets() {
+        use serde_json::json;
+        let fixture = scope_fixture();
+        let cwd = fixture.cwd.to_str().unwrap();
+        let repo = fixture.repo.clone();
+        let inrepo_dir = fixture.inrepo_dir.clone();
+        let inrepo_file = fixture.inrepo_file.clone();
+        let outside_file = fixture.outside_file.clone();
+        let abs = |path: &std::path::Path| path.to_str().unwrap().to_string();
 
-        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(
+            search_scope("Grep", &json!({}), cwd),
+            SearchScope::BroadOrUnknown
+        );
+        assert_eq!(
+            search_scope("Grep", &json!({ "path": "missing.rs" }), cwd),
+            SearchScope::BroadOrUnknown
+        );
+        assert_eq!(
+            search_scope("Grep", &json!({ "path": abs(&inrepo_dir) }), cwd),
+            SearchScope::BroadOrUnknown
+        );
+        assert_eq!(
+            search_scope("Grep", &json!({ "path": "lib.rs" }), cwd),
+            SearchScope::SingleFile
+        );
+        assert_eq!(
+            search_scope("Grep", &json!({ "path": abs(&inrepo_file) }), cwd),
+            SearchScope::SingleFile
+        );
+        assert_eq!(
+            search_scope("Grep", &json!({ "path": abs(&outside_file) }), cwd),
+            SearchScope::OutsideRepo
+        );
+        assert_eq!(
+            search_scope(
+                "Bash",
+                &json!({ "command": format!("rg needle {}", abs(&inrepo_file)) }),
+                cwd,
+            ),
+            SearchScope::SingleFile
+        );
+        assert_eq!(
+            search_scope(
+                "Bash",
+                &json!({ "command": format!("rg -n needle {}", abs(&inrepo_file)) }),
+                cwd,
+            ),
+            SearchScope::SingleFile
+        );
+        assert_eq!(
+            search_scope(
+                "Bash",
+                &json!({
+                    "command": format!("rg --glob '*.rs' {}", abs(&outside_file))
+                }),
+                cwd,
+            ),
+            SearchScope::BroadOrUnknown
+        );
+        assert_eq!(
+            search_scope(
+                "Bash",
+                &json!({ "command": format!("rg needle {}", abs(&outside_file)) }),
+                cwd,
+            ),
+            SearchScope::OutsideRepo
+        );
+        assert_eq!(
+            search_scope(
+                "Bash",
+                &json!({ "command": format!("rg needle {} | sort", abs(&inrepo_file)) }),
+                cwd,
+            ),
+            SearchScope::BroadOrUnknown
+        );
+        assert_eq!(
+            search_scope(
+                "Glob",
+                &json!({ "path": abs(&repo), "pattern": "server.rs" }),
+                cwd,
+            ),
+            SearchScope::SingleFile
+        );
+        assert_eq!(
+            search_scope(
+                "Glob",
+                &json!({ "path": abs(&repo), "pattern": "*.rs" }),
+                cwd,
+            ),
+            SearchScope::BroadOrUnknown
+        );
+        assert_eq!(
+            search_scope("Grep", &json!({ "path": abs(&outside_file) }), ""),
+            SearchScope::BroadOrUnknown
+        );
     }
 
     // Safety-critical: the nudge output must never carry a `permissionDecision`.
@@ -1290,7 +1564,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_retrieval_gate_prefers_precision() {
+    fn prompt_retrieval_gate_routes_generic_and_precise_intents() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/plugins/semctx/skills/codebase-retrieval/evals.json"
@@ -1308,14 +1582,25 @@ mod tests {
             .expect("should_search cases")
         {
             let prompt = prompt.as_str().expect("prompt string");
-            assert!(prompt_wants_retrieval(prompt), "{prompt}");
+            assert_eq!(
+                prompt_route(prompt),
+                PromptRoute::CandidateSearch,
+                "{prompt}"
+            );
+        }
+        for prompt in evals["hook_injection"]["model_routed"]
+            .as_array()
+            .expect("model_routed cases")
+        {
+            let prompt = prompt.as_str().expect("prompt string");
+            assert_eq!(prompt_route(prompt), PromptRoute::ModelRouted, "{prompt}");
         }
         for prompt in evals["hook_injection"]["should_not_search"]
             .as_array()
             .expect("should_not_search cases")
         {
             let prompt = prompt.as_str().expect("prompt string");
-            assert!(!prompt_wants_retrieval(prompt), "{prompt}");
+            assert_eq!(prompt_route(prompt), PromptRoute::None, "{prompt}");
         }
     }
 

@@ -7,7 +7,8 @@
       "skills": ["codebase-retrieval"],
       "query": "Who calls `pretooluse_nudge`, and how does a PreToolUse event decide whether to emit a semctl retrieval reminder?",
       "expected_behavior": [
-        "Routes to who_calls (and call_path or trace) rather than emulating callers via find_references fan-out or host Grep",
+        "Routes to one who_calls lookup (and call_path or trace only if needed) rather than emulating callers via find_references fan-out or host Grep",
+        "Does not precede the precise graph lookup with a generic search_codebase call",
         "Falls back to host tools only after a semctx tool reports a degraded state, and says so",
         "Names the decision flow: hook run -> pretooluse_nudge -> sniffer::eligible_search -> availability check -> escalation::decide -> finalize -> tier1/tier2 message"
       ]
@@ -65,6 +66,22 @@
         "Uses sync_status to monitor first-index progress because status bypasses the readiness gate",
         "Distinguishes later background re-syncs, which do not block retrieval from the last complete snapshot"
       ]
+    },
+    {
+      "skills": ["codebase-retrieval"],
+      "query": "Use this complete current function body to explain what it returns: `fn enabled(flag: bool) -> bool { flag }`.",
+      "expected_behavior": [
+        "Uses the supplied code directly without a semctx or host retrieval call",
+        "Scopes the answer to the evidence provided instead of inventing repository-wide relationships"
+      ]
+    },
+    {
+      "skills": ["codebase-retrieval"],
+      "query": "In the already-known file src/commands/hook/message.rs, check whether the exact literal `fallback, not the default` appears in the current working-tree bytes.",
+      "expected_behavior": [
+        "Uses host Read or Grep scoped to the known file because current local bytes and one literal are requested",
+        "Does not issue a broad semctx search or graph lookup"
+      ]
     }
   ],
   "triggering": {
@@ -82,11 +99,21 @@
   "hook_injection": {
     "should_search": [
       "Where is tenant resolution implemented?",
-      "Who calls `pretooluse_nudge`?",
-      "Review the MCP hook implementation.",
+      "How does the codebase watcher start in this server?",
+      "Find the code responsible for repository watcher startup.",
       "Which files define the codebase watcher?"
     ],
+    "model_routed": [
+      "Who calls `pretooluse_nudge`?",
+      "Find every occurrence of `index_codebase`, including docs and comments.",
+      "Which modules import `state::Store`?",
+      "Trace `run` to `pretooluse_nudge`.",
+      "Where is pretooluse_nudge defined?"
+    ],
     "should_not_search": [
+      "Use this complete current function body to explain what it returns: `fn enabled(flag: bool) -> bool { flag }`.",
+      "Review the MCP hook implementation.",
+      "Explain `pretooluse_nudge` using the code above.",
       "yes go ahead",
       "thanks that works",
       "Draft a commit message for my staged changes.",

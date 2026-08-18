@@ -2,12 +2,12 @@
 //! this eligible search should fire a nudge and at which tier. Pure — no IO,
 //! no clock — so it is exhaustively unit-testable.
 //!
-//! With defaults (`grace 1`, `cooldown 3`) nudges land at eligible-search
-//! `n = 2` (Tier 1), then `n = 5, 8, 11, …` (Tier 2), capped at `max` per
-//! segment. The cooldown is the steady-state anti-spam guarantee; `max = 0`
-//! means unlimited (cooldown-only).
+//! With defaults (`grace 1`, `cooldown 3`, `max 4`) nudges land at eligible-search
+//! `n = 2` (Tier 1), then `n = 5, 8, 11` (Tier 2), and stop until the segment
+//! resets. The cooldown is the steady-state anti-spam guarantee; `max = 0` means
+//! unlimited (cooldown-only).
 
-/// Eligible-search count at which Tier 2 (firm + tailored) begins.
+/// Eligible-search count at which tailored Tier 2 guidance begins.
 const TIER2_AT: u32 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,7 +88,7 @@ mod tests {
     const DEFAULTS: Thresholds = Thresholds {
         grace: 1,
         cooldown: 3,
-        max: 12,
+        max: 4,
     };
 
     /// Replay a whole segment with the default thresholds and collect the
@@ -119,7 +119,7 @@ mod tests {
 
     #[test]
     fn default_ladder_fires_at_2_5_8_11() {
-        let fires: Vec<u32> = replay(12, &DEFAULTS)
+        let fires: Vec<u32> = replay(30, &DEFAULTS)
             .into_iter()
             .filter(|(_, d)| matches!(d, Decision::Fire(_)))
             .map(|(c, _)| c)
@@ -201,7 +201,7 @@ mod tests {
         let eager = Thresholds {
             grace: 0,
             cooldown: 3,
-            max: 12,
+            max: 4,
         };
         assert_eq!(decide(1, 0, 0, &eager), Decision::Fire(Tier::One));
     }

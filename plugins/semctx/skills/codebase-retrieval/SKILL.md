@@ -1,15 +1,15 @@
 ---
 name: codebase-retrieval
-description: Use when answering codebase questions in a semctx-indexed repo — "how does X work", "where is X defined", "who calls X", "what implements Y", "find references to Z", "trace through", or any other "find code in this repo" task — and when semctx tools return stale, empty, or erroring results. Routes retrieval through the semctx MCP tools before host-side Read / Grep / Glob and covers the degraded states (still indexing, stale hits, not logged in, unsupported language).
+description: Use when answering codebase questions in a semctx-indexed repo — "how does X work", "where is X defined", "who calls X", "what implements Y", "find references to Z", "trace through", or any other "find code in this repo" task — and when semctx tools return stale, empty, or erroring results. Routes missing repository evidence to semantic and graph tools while preserving fresh conversation context, current known-file reads, and narrow local checks.
 ---
 
 # codebase-retrieval
 
-When the semctx MCP server is attached, any "find code in this repo" question
-goes through the semctx tools BEFORE host `Read` / `Grep` / `Glob`. The index
-is server-side hybrid retrieval (dense + lexical, fused and reranked) plus a
-symbol graph with call and data-flow edges — cross-file structure host tools
-can't see, at a fraction of the context cost of raw reads.
+When the semctx MCP server is attached, begin with the freshest relevant
+evidence already available. Use semctx for repository discovery, unknown
+locations, cross-file relationships, symbol graphs, and broad indexed searches.
+Existing context can support an answer directly; host `Read` / `Grep` / `Glob`
+fit current bytes at a known path or a narrow file-scoped check.
 
 ## Route by question
 
@@ -50,8 +50,10 @@ re-syncs do not block use of the last complete index.
 
 ## Rules
 
-- Start with a semctx tool for any find-code question; host tools are the
-  fallback (below), not the default. Batch independent lookups in one message.
+- Use relevant context directly when it is sufficient and fresh; retrieve the
+  missing evidence rather than reacquiring material already available.
+- Choose semctx for repository discovery, graph relationships, and broad indexed
+  coverage. Batch independent lookups in one message.
 - Exact symbol, defined in this repo, in a graph language (Rust, C#, Go,
   TypeScript/JS) → symbol-graph tools (`find_definition` / `find_references` /
   `who_calls`), not search.
@@ -66,8 +68,9 @@ re-syncs do not block use of the last complete index.
   hashes still match.
 - Repo language outside the graph set (Python, Java, C++, …)? The symbol-graph
   tools return nothing there — use `search_codebase` + `grep`.
-- A prompt hook may already have injected likely-relevant hits — pull detail
-  on those (`expand_chunk`, `file_outline`) before issuing a fresh search.
+- A prompt hook may already have injected likely-relevant hits. Treat them as
+  leads when additional repository evidence is needed, and pull focused detail
+  with `expand_chunk` / `file_outline` rather than issuing a fresh broad search.
 
 ## Degraded states — read the signals, don't guess
 
@@ -89,11 +92,13 @@ re-syncs do not block use of the last complete index.
 - `who_calls` / `implementations_of` empty on a graph language ≠ no callers —
   cross-check with `grep`.
 
-## Fall back to host Read / Grep / Glob only when
+## Use host Read / Grep / Glob when
 
-- No semctx tools are attached at all (plugin not installed or disabled).
-- You need a file's exact current bytes to edit it — hits are indexed
-  snapshots, and stale ones are flagged.
+- The relevant code is already present and fresh enough for the task; continue
+  from that evidence without another retrieval call.
+- A known local file or range needs current working-tree bytes.
+- A narrow literal or filename check targets one known file.
+- Semctx tools are unavailable (plugin not installed, disabled, or degraded).
 - The target is excluded from the index: gitignored, `.semctxignore` matches,
-  lockfiles, build output, generated/minified files, test fixtures, files
-  over 1 MB. Markdown docs ARE indexed — search them with `prefer: "docs"`.
+  lockfiles, build output, generated/minified files, test fixtures, or files over
+  1 MB. Markdown docs ARE indexed — search them with `prefer: "docs"`.
