@@ -111,7 +111,10 @@ pub async fn fetch_tenants(
     }
 
     let envelope: api::TenantsEnvelope = resp.json().await.context("parse tenants response")?;
-    Ok(envelope.data.map(api::TenantsPage::into_rows).unwrap_or_default())
+    Ok(envelope
+        .data
+        .map(api::TenantsPage::into_rows)
+        .unwrap_or_default())
 }
 
 /// Step 1: request a device + user code from identity. Returns the
