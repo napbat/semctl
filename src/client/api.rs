@@ -185,10 +185,19 @@ pub struct GrepMatch {
     pub line: String,
 }
 
-/// One page of `GET /v1/codebases/{id}/files` (the catalog file list).
+/// One page of a paged endpoint — the rows plus where they sit.
+///
+/// `items` reads both shapes the server may send. semctx is moving its list
+/// endpoints onto the standard napbat envelope, where the rows are `data`; the
+/// older shape called them `items`. Accepting both is what lets a semctl that
+/// is already installed keep working across that change — this binary cannot be
+/// upgraded in lockstep with the server, so it has to be the tolerant side.
+///
+/// Drop the alias once no server sends the old name.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Page<T> {
+    #[serde(rename = "data", alias = "items")]
     pub items: Vec<T>,
     pub total: u32,
     #[serde(rename = "page")]
@@ -623,18 +632,41 @@ pub struct JobStatus {
     pub completed_at: Option<String>,
 }
 
-/// Identity's `GET /v1/tenants` envelope. We hit identity directly
-/// for tenant discovery — tenant membership is identity's
-/// source-of-truth, not the semctx server's surface.
+/// Identity's `GET /v1/tenants` response. We hit identity directly for tenant
+/// discovery — tenant membership is identity's source of truth, not the semctx
+/// server's surface.
 #[derive(Debug, Deserialize)]
 pub struct TenantsEnvelope {
     pub success: bool,
     pub data: Option<TenantsPage>,
 }
 
+/// The tenants Identity returned, in whichever shape it sent them.
+///
+/// Identity is moving its list endpoints onto the standard napbat envelope,
+/// where `data` is the rows; before that `data` was an object holding `items`.
+///
+/// semctl is installed on machines and cannot be upgraded in step with the
+/// server, so it reads both. Without this, an older binary fails at login —
+/// tenant selection is part of `semctl auth login` — and the only fix available
+/// to the person holding it is to upgrade before they can authenticate.
+///
+/// Drop `Legacy` once no deployed Identity sends it.
 #[derive(Debug, Deserialize)]
-pub struct TenantsPage {
-    pub items: Vec<TenantDto>,
+#[serde(untagged)]
+pub enum TenantsPage {
+    Rows(Vec<TenantDto>),
+    Legacy { items: Vec<TenantDto> },
+}
+
+impl TenantsPage {
+    /// The rows, however they arrived.
+    pub fn into_rows(self) -> Vec<TenantDto> {
+        match self {
+            Self::Rows(rows) => rows,
+            Self::Legacy { items } => items,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -645,4 +677,73 @@ pub struct TenantDto {
     pub slug: String,
     #[serde(default)]
     pub role_name: Option<String>,
+}
+
+#[cfg(test)]
+mod envelope_tests {
+    use super::*;
+
+    /// A row shape shared by both cases below, so the assertions differ only in
+    /// where the rows were found.
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct Row {
+        id: u32,
+    }
+
+    #[test]
+    fn a_page_reads_the_standard_envelope() {
+        let page: Page<Row> = serde_json::from_str(
+            r#"{"success":true,"httpStatusCode":200,"errors":null,
+                "data":[{"id":1}],"page":0,"pageSize":25,"count":1,"total":1,
+                "totalPages":1,"remainingItems":0,"remainingPages":0,"hasMore":false}"#,
+        )
+        .expect("the standard envelope must parse");
+
+        assert_eq!(page.items, vec![Row { id: 1 }]);
+        assert_eq!(page.total, 1);
+        assert_eq!(page.size, 25);
+    }
+
+    #[test]
+    fn a_page_still_reads_the_older_shape() {
+        // An installed semctl talks to whatever server it finds. Until every
+        // deployment has moved, that is sometimes one that still says `items`.
+        let page: Page<Row> = serde_json::from_str(
+            r#"{"success":true,"items":[{"id":1}],"total":1,"page":0,"pageSize":25}"#,
+        )
+        .expect("the older shape must still parse");
+
+        assert_eq!(page.items, vec![Row { id: 1 }]);
+    }
+
+    #[test]
+    fn tenants_read_the_standard_envelope() {
+        let envelope: TenantsEnvelope = serde_json::from_str(
+            r#"{"success":true,"data":[{"id":"t1","name":"Napbat","slug":"napbat"}],
+                "page":0,"pageSize":1000,"total":1}"#,
+        )
+        .expect("the standard envelope must parse");
+
+        let rows = envelope.data.map(TenantsPage::into_rows).unwrap_or_default();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].slug, "napbat");
+    }
+
+    #[test]
+    fn tenants_still_read_the_older_shape() {
+        // Tenant selection happens during `semctl auth login`. If this stopped
+        // parsing, the only fix available to the person holding the binary
+        // would be to upgrade it before they could authenticate.
+        let envelope: TenantsEnvelope = serde_json::from_str(
+            r#"{"success":true,"data":{"items":[{"id":"t1","name":"Napbat","slug":"napbat"}],
+                "total":1,"page":0,"pageSize":1000}}"#,
+        )
+        .expect("the older shape must still parse");
+
+        let rows = envelope.data.map(TenantsPage::into_rows).unwrap_or_default();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].slug, "napbat");
+    }
 }
