@@ -544,6 +544,24 @@ pub struct CodebaseVersionSummary {
     pub files: i64,
 }
 
+/// `GET /v1/whoami` — who the caller is, and what this server can do.
+///
+/// Only the capability list is read here; the identity half is what the auth
+/// commands use. A server too old to report capabilities sends no such field,
+/// and the empty default is the honest answer for it.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Whoami {
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+/// A codebase holds copies, so clones of a repository belong in one codebase
+/// rather than needing one each. Without it, resolving by project would put
+/// two checkouts on one codebase of a server that keeps only one manifest —
+/// and they would delete each other's files on every sync.
+pub const CAPABILITY_CODEBASE_VERSIONS: &str = "codebase-versions";
+
 /// `POST /v1/codebases` body. `sourceKind` and `visibility` are omitted on
 /// purpose — the server defaults them to `Local` / `Personal`, exactly what
 /// a locally-indexed working copy should be. `vcs` is sent only for a git

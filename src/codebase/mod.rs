@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use crate::client::{Client, api, is_local_source};
+use crate::client::{Client, api, api::CAPABILITY_CODEBASE_VERSIONS, is_local_source};
 use git::{git_capture, git_is_dirty, git_remote};
 
 pub(crate) use identity::source_id as checkout_source_id;
@@ -139,15 +139,25 @@ async fn create_local(client: &Client, dir: &Path) -> Result<String> {
     };
     let source_id = identity::source_id(dir)?;
 
+    // A server that keeps one manifest per codebase cannot hold two checkouts,
+    // so against one of those this stays what it always was: a codebase per
+    // checkout, slugged with its own digest. Putting them together there would
+    // have them delete each other's files on every sync.
+    let versioned = client.supports(CAPABILITY_CODEBASE_VERSIONS).await;
+
     // Already known? Then this checkout has synced before, under a project it
     // may since have been merged into.
-    if let Some(existing) = find_by_source(client, &source_id).await? {
+    if versioned
+        && let Some(existing) = find_by_source(client, &source_id).await?
+    {
         return Ok(existing.id);
     }
 
     // The project this checkout belongs under, or — with no remote to say what
     // that project is — a codebase of its own.
-    let project = identity::project_slug(remote.as_deref());
+    let project = versioned
+        .then(|| identity::project_slug(remote.as_deref()))
+        .flatten();
     let slug = match &project {
         Some(slug) => slug.clone(),
         None => identity::slug(&name, &source_id),

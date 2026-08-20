@@ -45,6 +45,11 @@ pub struct Client {
     /// codebase-relative hit paths into Read-ready absolute paths. `None`
     /// for canonical / server-pulled codebases that have no local bytes.
     local_root: Option<PathBuf>,
+    /// What the server said it can do, read once per process and shared by
+    /// every clone — a capability does not change under a running command,
+    /// and asking again per call would put a round-trip in front of work
+    /// that has nothing to do with it.
+    capabilities: Arc<tokio::sync::OnceCell<Vec<String>>>,
 }
 
 impl Client {
@@ -66,6 +71,7 @@ impl Client {
             tenant_repair: Arc::new(Mutex::new(())),
             codebase,
             local_root: None,
+            capabilities: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -272,6 +278,26 @@ impl Client {
             "repaired stale active tenant; retrying request"
         );
         true
+    }
+
+    /// Whether the server reports `capability`.
+    ///
+    /// Asked, never inferred. An old server ignores a query parameter it does
+    /// not know and answers as though it had applied it, so "the filter came
+    /// back with rows" says nothing about whether the filter ran. A server too
+    /// old to answer at all reports nothing, which is the right answer for it.
+    pub async fn supports(&self, capability: &str) -> bool {
+        let capabilities = self
+            .capabilities
+            .get_or_init(|| async {
+                self.get::<api::Whoami>("/v1/whoami")
+                    .await
+                    .map(|whoami| whoami.capabilities)
+                    .unwrap_or_default()
+            })
+            .await;
+
+        capabilities.iter().any(|name| name == capability)
     }
 
     /// GET `path`, parse the JSON response as `T`. The path is appended
