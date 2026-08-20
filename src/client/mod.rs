@@ -20,6 +20,10 @@ use tracing::{debug, info, warn};
 use crate::auth;
 
 const TENANT_HEADER: &str = "X-Tenant-Id";
+/// The checkout a request is made from. The server prefers that copy of a
+/// codebase for any read that is about one, so an agent working in a checkout
+/// is answered about the tree it is looking at.
+const CHECKOUT_HEADER: &str = "X-Semctx-Source-Id";
 const LOADING_RETRY_BUDGET: Duration = Duration::from_mins(1);
 const LOADING_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
 
@@ -45,6 +49,11 @@ pub struct Client {
     /// codebase-relative hit paths into Read-ready absolute paths. `None`
     /// for canonical / server-pulled codebases that have no local bytes.
     local_root: Option<PathBuf>,
+    /// Opaque identity of the checkout this process is running in, when it is
+    /// running in one. Sent with every request so a read about a codebase
+    /// resolves to THIS working copy rather than to what the server pulled —
+    /// the code in front of you, not the code on the trunk.
+    checkout_source_id: Option<String>,
     /// What the server said it can do, read once per process and shared by
     /// every clone — a capability does not change under a running command,
     /// and asking again per call would put a round-trip in front of work
@@ -71,6 +80,7 @@ impl Client {
             tenant_repair: Arc::new(Mutex::new(())),
             codebase,
             local_root: None,
+            checkout_source_id: None,
             capabilities: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
@@ -104,6 +114,12 @@ impl Client {
     /// Return a copy with the codebase's local checkout root set — used by
     /// `semctl mcp` so hit paths can be absolutized for the host.
     pub fn with_local_root(mut self, root: Option<PathBuf>) -> Self {
+        // Derived here, once, rather than per request: it hashes the
+        // installation id with the path, and every read would otherwise pay
+        // for a file read it does not need.
+        self.checkout_source_id = root
+            .as_deref()
+            .and_then(|dir| crate::codebase::checkout_source_id(dir).ok());
         self.local_root = root;
         self
     }
@@ -140,6 +156,9 @@ impl Client {
         let tenant = self.tenant.read().await.clone();
         if let Some(t) = &tenant {
             req = req.header(TENANT_HEADER, t);
+        }
+        if let Some(source) = &self.checkout_source_id {
+            req = req.header(CHECKOUT_HEADER, source);
         }
         Ok((req, url, tenant))
     }
