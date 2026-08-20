@@ -26,6 +26,23 @@ use git::{git_capture, git_is_dirty, git_remote};
 
 pub(crate) use identity::source_id as checkout_source_id;
 
+/// Where the checkout at `dir` is standing: its branch, its revision, and
+/// whether the tree is clean. `None` when the folder is not a git checkout,
+/// which is a thing to say nothing about rather than a thing to guess at.
+pub(crate) async fn checkout_state(dir: &Path) -> Option<api::CheckoutVcsInfo> {
+    let ref_name = git_capture(dir, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
+    let revision = git_capture(dir, &["rev-parse", "HEAD"]).await;
+    if ref_name.is_none() && revision.is_none() {
+        return None;
+    }
+
+    Some(api::CheckoutVcsInfo {
+        ref_name,
+        revision,
+        dirty: git_is_dirty(dir).await,
+    })
+}
+
 /// A resolved codebase + how it matched, for a one-line stderr note.
 pub struct Resolved {
     pub id: String,

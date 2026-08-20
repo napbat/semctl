@@ -608,6 +608,22 @@ pub struct SyncManifestRequest {
     pub files: Vec<ManifestEntry>,
     /// Opaque identity of the local checkout issuing this full manifest.
     pub source_id: String,
+    /// Where this checkout is standing right now. Sent every sync, because a
+    /// working copy is one directory that moves between branches — the copy
+    /// the server keeps for it should say where it is, not where it started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vcs: Option<CheckoutVcsInfo>,
+}
+
+/// What a checkout reports about itself on a sync.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckoutVcsInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ref_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    pub dirty: bool,
 }
 
 /// The diff the server computed — paths whose content must be uploaded, and

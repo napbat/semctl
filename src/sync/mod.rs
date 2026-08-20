@@ -166,6 +166,7 @@ pub async fn sync(client: &Client, dir: &Path, cache: &Mutex<SyncCache>) -> Resu
             &api::SyncManifestRequest {
                 files: manifest,
                 source_id: source_id.clone(),
+                vcs: crate::codebase::checkout_state(&dir).await,
             },
         )
         .await
