@@ -634,6 +634,15 @@ pub struct CheckoutVcsInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revision: Option<String>,
     pub dirty: bool,
+    /// The remote this working copy tracks right now.
+    ///
+    /// Sent every sync rather than only at registration, because it moves: a
+    /// repository is renamed or transferred, and a remote is re-pointed. The
+    /// project a codebase belongs to is derived from this server-side, so a
+    /// server told once and never again holds an identity that has drifted away
+    /// from what the checkout actually tracks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_url: Option<String>,
 }
 
 /// The diff the server computed — paths whose content must be uploaded, and
