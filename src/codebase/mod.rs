@@ -147,9 +147,7 @@ async fn create_local(client: &Client, dir: &Path) -> Result<String> {
 
     // Already known? Then this checkout has synced before, under a project it
     // may since have been merged into.
-    if versioned
-        && let Some(existing) = find_by_source(client, &source_id).await?
-    {
+    if versioned && let Some(existing) = find_by_source(client, &source_id).await? {
         return Ok(existing.id);
     }
 
@@ -209,13 +207,9 @@ async fn find_by_slug(
                 "/v1/codebases?page={page_number}&pageSize=500"
             ))
             .await?;
-        if let Some(found) = page
-            .items
-            .into_iter()
-            .find(|codebase| {
-                codebase.slug == slug && (!local_only || is_local_source(&codebase.source_kind))
-            })
-        {
+        if let Some(found) = page.items.into_iter().find(|codebase| {
+            codebase.slug == slug && (!local_only || is_local_source(&codebase.source_kind))
+        }) {
             return Ok(Some(found));
         }
         let consumed = page.number.saturating_add(1).saturating_mul(page.size);

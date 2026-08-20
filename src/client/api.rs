@@ -525,7 +525,6 @@ pub struct WorkspaceEditPlan {
     pub rendered_diff: String,
 }
 
-
 /// One row of `GET /v1/codebases/{id}/versions` — an indexed copy of a
 /// codebase. A project holds the copy the server pulls plus one per checkout
 /// syncing to it, and `is_canonical` marks the one a search reads by default.

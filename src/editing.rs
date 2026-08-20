@@ -153,7 +153,10 @@ pub async fn apply(
 // the checkout owns its own files — but stays async: it is half of the
 // apply/undo pair the command and MCP surfaces both await, and a signature that
 // disagrees with its twin is a papercut for every caller.
-#[allow(clippy::unused_async, reason = "pairs with apply on the command surface")]
+#[allow(
+    clippy::unused_async,
+    reason = "pairs with apply on the command surface"
+)]
 pub async fn undo(client: &Client, plan_id: &str, watcher_active: bool) -> Result<ApplyOutcome> {
     validate_plan_id(plan_id)?;
     let root = checkout_root(client)?;

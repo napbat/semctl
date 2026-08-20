@@ -28,9 +28,7 @@ async fn codebases_for_source(client: &Client, source_id: &str) -> Vec<String> {
 /// How this codebase's copies relate to the checkout we are standing in.
 async fn describe_copies(client: &Client, codebase_id: &str, source_id: &str) -> String {
     let Ok(copies) = client
-        .get::<Vec<api::CodebaseVersionSummary>>(&format!(
-            "/v1/codebases/{codebase_id}/versions"
-        ))
+        .get::<Vec<api::CodebaseVersionSummary>>(&format!("/v1/codebases/{codebase_id}/versions"))
         .await
     else {
         return "unknown".into();
