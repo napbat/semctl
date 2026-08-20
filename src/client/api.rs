@@ -561,6 +561,16 @@ pub struct Whoami {
 /// and they would delete each other's files on every sync.
 pub const CAPABILITY_CODEBASE_VERSIONS: &str = "codebase-versions";
 
+/// The server decides what project a registration belongs to, from the remote
+/// the request already carries, and answers with the codebase that owns it.
+///
+/// Against a server reporting this, the client MUST NOT pick a codebase by
+/// slug. A slug is a label there — two codebases may share one — so a match is
+/// no longer evidence of anything, and adopting on it is how a checkout ends up
+/// pushing its manifest into an unrelated repository that happened to be
+/// cloned into a directory of the same name.
+pub const CAPABILITY_PROJECT_KEYS: &str = "project-keys";
+
 /// `POST /v1/codebases` body. `sourceKind` and `visibility` are omitted on
 /// purpose — the server defaults them to `Local` / `Personal`, exactly what
 /// a locally-indexed working copy should be. `vcs` is sent only for a git
