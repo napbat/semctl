@@ -26,6 +26,25 @@ pub(crate) fn source_id(dir: &Path) -> Result<String> {
 /// folder name; the slug carries the opaque checkout identity so two folders
 /// with that same name can coexist in one tenant. Using the full digest makes a
 /// collision a cryptographic event rather than a naming race.
+/// The label a codebase is shown under, from the checkout's folder name.
+///
+/// Only for a server that derives projects itself. There the slug carries no
+/// identity and needs no uniqueness, so it can be the readable thing a person
+/// expects to see — `semctx`, not `semctx-4f1c9e...` — and two of them
+/// colliding costs nothing.
+pub(super) fn label(display_name: &str) -> String {
+    let mut base = slugify(display_name);
+    base.truncate(MAX_SLUG_LEN);
+
+    let trimmed = base.trim_matches('-');
+
+    if trimmed.is_empty() {
+        "codebase".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// The slug for the PROJECT a checkout belongs to, when there is a remote to
 /// say what that project is.
 ///
@@ -96,7 +115,7 @@ fn slugify(name: &str) -> String {
 mod tests {
     use std::path::Path;
 
-    use super::{MAX_SLUG_LEN, project_slug, slug, source_id_for};
+    use super::{MAX_SLUG_LEN, label, project_slug, slug, source_id_for};
 
     #[test]
     fn source_identity_is_stable_for_the_same_checkout() {
@@ -133,6 +152,38 @@ mod tests {
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
         );
         assert!(value.ends_with(&source));
+    }
+
+    #[test]
+    fn a_label_is_the_readable_folder_name() {
+        // Against a server that derives projects itself the slug identifies
+        // nothing, so it is what a person would expect to read rather than a
+        // digest they have to look past.
+        assert_eq!(label("semctx"), "semctx");
+        assert_eq!(label("My Repo!"), "my-repo");
+        assert_eq!(label("  "), "codebase");
+        assert_eq!(label(""), "codebase");
+    }
+
+    #[test]
+    fn a_label_is_valid_and_bounded() {
+        let value = label(&"A Very Long Name!".repeat(20));
+
+        assert!(value.len() <= MAX_SLUG_LEN);
+        assert!(!value.starts_with('-') && !value.ends_with('-'));
+        assert!(
+            value
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        );
+    }
+
+    #[test]
+    fn two_checkouts_of_the_same_name_may_share_a_label() {
+        // The collision the digest used to prevent is allowed now, because the
+        // server no longer decides anything by the slug. Two of them meeting is
+        // two rows with one name, not one row with two checkouts in it.
+        assert_eq!(label("hv"), label("hv"));
     }
 
     #[test]

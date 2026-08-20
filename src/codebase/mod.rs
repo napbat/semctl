@@ -21,7 +21,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use crate::client::{Client, api, api::CAPABILITY_CODEBASE_VERSIONS, is_local_source};
+use crate::client::{
+    Client, api, api::CAPABILITY_CODEBASE_VERSIONS, api::CAPABILITY_PROJECT_KEYS, is_local_source,
+};
 use git::{git_capture, git_is_dirty, git_remote};
 
 pub(crate) use identity::source_id as checkout_source_id;
@@ -168,16 +170,34 @@ async fn create_local(client: &Client, dir: &Path) -> Result<String> {
         return Ok(existing.id);
     }
 
+    // A server that derives the project itself needs nothing guessed on its
+    // behalf: it reads the remote out of the request below, finds or creates
+    // the codebase that owns it, and answers with the id. The slug is only a
+    // label there, so this asks for a readable one and accepts whatever comes
+    // back — including a different one, when the project already existed.
+    let derives_projects = client.supports(CAPABILITY_PROJECT_KEYS).await;
+
     // The project this checkout belongs under, or — with no remote to say what
     // that project is — a codebase of its own.
-    let project = versioned
+    //
+    // Only ever consulted against an older server. The slug is the remote's
+    // LAST path component, and two unrelated repositories can share one, so
+    // matching on it adopts somebody else's codebase — napbat/semctx#8. There
+    // is no fixing that here: the client cannot tell those two apart from what
+    // a listing shows it. What it can do is not guess when it does not have to.
+    let project = (versioned && !derives_projects)
         .then(|| identity::project_slug(remote.as_deref()))
         .flatten();
     let slug = match &project {
         Some(slug) => slug.clone(),
+        // A label where the server keeps identity elsewhere, and a
+        // collision-proof slug where the slug still has to be unique.
+        None if derives_projects => identity::label(&name),
         None => identity::slug(&name, &source_id),
     };
-    if let Some(existing) = find_by_slug(client, &slug, project.is_none()).await? {
+    if !derives_projects
+        && let Some(existing) = find_by_slug(client, &slug, project.is_none()).await?
+    {
         return Ok(existing.id);
     }
     let body = api::CreateCodebaseRequest {
@@ -196,7 +216,15 @@ async fn create_local(client: &Client, dir: &Path) -> Result<String> {
             // clones of one repository race for its project slug. Either way the
             // slug is deterministic, so the loser adopts the winner instead of
             // inventing a second codebase.
-            if let Ok(Some(existing)) = find_by_slug(client, &slug, project.is_none()).await {
+            //
+            // Not against a server that derives projects: there the race is
+            // settled by a unique key in its database and both callers are
+            // answered with the winner, so a create that still failed failed for
+            // a real reason and must be reported rather than papered over with
+            // whatever shares the slug.
+            if !derives_projects
+                && let Ok(Some(existing)) = find_by_slug(client, &slug, project.is_none()).await
+            {
                 return Ok(existing.id);
             }
             Err(create_error)
