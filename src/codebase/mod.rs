@@ -2,10 +2,17 @@
 //!
 //! Local path identity is explicit: only the canonical directory cache written
 //! by `semctl index` may bind a checkout (plus an explicitly configured umbrella
-//! ancestor for read-time resolution). Git remote and folder name are metadata,
-//! never identity. Two clones can have both in common while carrying different
-//! complete manifests, so guessing by either would collapse two independently
-//! indexable codebases into one destructive writer stream.
+//! ancestor for read-time resolution), and the server is asked which project
+//! holds THIS checkout's copy before anything is registered.
+//!
+//! A git remote does now decide which project a checkout belongs under. It did
+//! not use to: two clones carry different complete manifests, and one codebase
+//! could only hold one of them, so sharing a remote meant deleting each other's
+//! files. The server keeps a copy per checkout now, so clones of one repository
+//! belong in one catalog entry — the thing a tenant holding ten of them for one
+//! repository was missing. A folder with NO remote still gets a slug of its
+//! own: a bare folder name is not a project identity, and two unrelated `src`
+//! directories must not be fused on that guess.
 
 mod git;
 mod identity;
@@ -95,6 +102,21 @@ pub async fn ensure(client: &Client, dir: &Path) -> Result<String> {
     Ok(id)
 }
 
+/// The codebase already holding this checkout's copy, asked of the server
+/// rather than remembered.
+///
+/// The source id is recomputed on every run and never stored, so this survives
+/// what a cached id does not: a project merged into another keeps the copy, and
+/// the answer here is simply the codebase that now holds it.
+async fn find_by_source(client: &Client, source_id: &str) -> Result<Option<api::CodebaseSummary>> {
+    let page = client
+        .get_page::<api::CodebaseSummary>(&format!(
+            "/v1/codebases?sourceId={source_id}&page=0&pageSize=2"
+        ))
+        .await?;
+    Ok(page.items.into_iter().next())
+}
+
 /// Register or recover the deterministic Local codebase for `dir`. The friendly
 /// name comes from the folder; its slug includes the opaque checkout identity,
 /// so another same-named clone is a separate catalog row. VCS metadata is still
@@ -105,9 +127,10 @@ async fn create_local(client: &Client, dir: &Path) -> Result<String> {
         .and_then(|n| n.to_str())
         .unwrap_or("codebase")
         .to_string();
-    let vcs = match git_remote(dir).await {
+    let remote = git_remote(dir).await;
+    let vcs = match &remote {
         Some(remote) => Some(api::CodebaseVcsInfo {
-            remote_url: Some(remote),
+            remote_url: Some(remote.clone()),
             revision: git_capture(dir, &["rev-parse", "HEAD"]).await,
             ref_name: git_capture(dir, &["rev-parse", "--abbrev-ref", "HEAD"]).await,
             dirty: git_is_dirty(dir).await,
@@ -115,13 +138,27 @@ async fn create_local(client: &Client, dir: &Path) -> Result<String> {
         None => None,
     };
     let source_id = identity::source_id(dir)?;
-    let slug = identity::slug(&name, &source_id);
-    if let Some(existing) = find_local_by_slug(client, &slug).await? {
+
+    // Already known? Then this checkout has synced before, under a project it
+    // may since have been merged into.
+    if let Some(existing) = find_by_source(client, &source_id).await? {
+        return Ok(existing.id);
+    }
+
+    // The project this checkout belongs under, or — with no remote to say what
+    // that project is — a codebase of its own.
+    let project = identity::project_slug(remote.as_deref());
+    let slug = match &project {
+        Some(slug) => slug.clone(),
+        None => identity::slug(&name, &source_id),
+    };
+    if let Some(existing) = find_by_slug(client, &slug, project.is_none()).await? {
         return Ok(existing.id);
     }
     let body = api::CreateCodebaseRequest {
         slug: &slug,
         display_name: &name,
+        source_id: &source_id,
         vcs,
     };
     match client
@@ -130,10 +167,11 @@ async fn create_local(client: &Client, dir: &Path) -> Result<String> {
     {
         Ok(created) => Ok(created.id),
         Err(create_error) => {
-            // Two processes may index the same new path concurrently. The slug
-            // is deterministic, so the loser of the unique-slug race adopts the
-            // winner instead of inventing a second codebase.
-            if let Ok(Some(existing)) = find_local_by_slug(client, &slug).await {
+            // Two processes may index the same new path concurrently, and two
+            // clones of one repository race for its project slug. Either way the
+            // slug is deterministic, so the loser adopts the winner instead of
+            // inventing a second codebase.
+            if let Ok(Some(existing)) = find_by_slug(client, &slug, project.is_none()).await {
                 return Ok(existing.id);
             }
             Err(create_error)
@@ -141,7 +179,19 @@ async fn create_local(client: &Client, dir: &Path) -> Result<String> {
     }
 }
 
-async fn find_local_by_slug(client: &Client, slug: &str) -> Result<Option<api::CodebaseSummary>> {
+/// The codebase with this slug, if any.
+///
+/// `local_only` is the no-remote case: that slug carries a checkout digest and
+/// means one specific working copy, so adopting a server-pulled codebase that
+/// happened to take the name would point a full manifest at a corpus the server
+/// maintains. A project slug has no such worry — attaching a working copy to the
+/// project's pulled codebase is the intent, and the server keeps the two apart
+/// as separate copies.
+async fn find_by_slug(
+    client: &Client,
+    slug: &str,
+    local_only: bool,
+) -> Result<Option<api::CodebaseSummary>> {
     let mut page_number = 0_u32;
     loop {
         let page = client
@@ -152,7 +202,9 @@ async fn find_local_by_slug(client: &Client, slug: &str) -> Result<Option<api::C
         if let Some(found) = page
             .items
             .into_iter()
-            .find(|codebase| codebase.slug == slug && is_local_source(&codebase.source_kind))
+            .find(|codebase| {
+                codebase.slug == slug && (!local_only || is_local_source(&codebase.source_kind))
+            })
         {
             return Ok(Some(found));
         }

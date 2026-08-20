@@ -384,11 +384,11 @@ pub struct ProjectGroupDto {
     pub children: Vec<String>,
 }
 
-/// A `GET /v1/codebases` row. Registration uses `slug` to recover a concurrent
-/// deterministic checkout registration and `source_kind` to ensure it only
-/// adopts a Local codebase. The server serializes that enum as the number `0`
-/// today; [`is_local_source`](super::is_local_source) also tolerates a future
-/// string representation.
+/// A `GET /v1/codebases` row. Registration matches on `slug`, and uses
+/// `source_kind` to keep a checkout-specific slug from adopting a codebase the
+/// server pulls. The server serializes that enum as the number `0` today;
+/// [`is_local_source`](super::is_local_source) also tolerates a future string
+/// representation.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodebaseSummary {
@@ -403,8 +403,7 @@ pub struct CodebaseSummary {
     pub visibility: serde_json::Value,
     #[serde(default)]
     pub source_kind: serde_json::Value,
-    #[serde(default)]
-    pub local_sync_source_id: Option<String>,
+
     #[serde(default)]
     pub graph_generation: i64,
     #[serde(default)]
@@ -526,6 +525,25 @@ pub struct WorkspaceEditPlan {
     pub rendered_diff: String,
 }
 
+
+/// One row of `GET /v1/codebases/{id}/versions` — an indexed copy of a
+/// codebase. A project holds the copy the server pulls plus one per checkout
+/// syncing to it, and `is_canonical` marks the one a search reads by default.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodebaseVersionSummary {
+    pub id: String,
+    pub source_id: String,
+    #[serde(default)]
+    pub is_canonical: bool,
+    #[serde(default)]
+    pub source_kind: serde_json::Value,
+    #[serde(default)]
+    pub revision: Option<String>,
+    #[serde(default)]
+    pub files: i64,
+}
+
 /// `POST /v1/codebases` body. `sourceKind` and `visibility` are omitted on
 /// purpose — the server defaults them to `Local` / `Personal`, exactly what
 /// a locally-indexed working copy should be. `vcs` is sent only for a git
@@ -535,6 +553,10 @@ pub struct WorkspaceEditPlan {
 pub struct CreateCodebaseRequest<'a> {
     pub slug: &'a str,
     pub display_name: &'a str,
+    /// Opaque identity of the checkout registering it. The server files the
+    /// first copy under this, so the checkout owns it from the start rather
+    /// than adopting a placeholder on its first sync.
+    pub source_id: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vcs: Option<CodebaseVcsInfo>,
 }

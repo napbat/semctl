@@ -1,4 +1,5 @@
-//! Stable, opaque identity for one local checkout.
+//! Stable, opaque identity for one local checkout, and the project slug it
+//! belongs under.
 //!
 //! The server must distinguish two working copies even when their folder names
 //! and Git remotes are identical: each submits a complete desired-state
@@ -25,6 +26,27 @@ pub(crate) fn source_id(dir: &Path) -> Result<String> {
 /// folder name; the slug carries the opaque checkout identity so two folders
 /// with that same name can coexist in one tenant. Using the full digest makes a
 /// collision a cryptographic event rather than a naming race.
+/// The slug for the PROJECT a checkout belongs to, when there is a remote to
+/// say what that project is.
+///
+/// A remote is a real project identity — every clone of it is the same
+/// project, which is exactly what a catalog should hold one entry for. The
+/// server gives each checkout a copy of its own inside that entry, so clones
+/// no longer have to be separate codebases to avoid deleting each other's
+/// files — which is what used to leave a tenant holding ten of them for one
+/// repository.
+///
+/// `None` when the folder has no remote: a bare folder name is not a project
+/// identity, and merging two unrelated `src` directories on that guess is the
+/// expensive mistake. Those keep a slug of their own.
+pub(super) fn project_slug(remote_url: Option<&str>) -> Option<String> {
+    let remote = remote_url?.trim().trim_end_matches('/');
+    let remote = remote.strip_suffix(".git").unwrap_or(remote);
+    let name = remote.rsplit(['/', ':']).next()?;
+    let slug = slugify(name);
+
+    (!slug.is_empty() && slug != "codebase").then_some(slug)
+}
 pub(super) fn slug(display_name: &str, source_id: &str) -> String {
     let suffix_len = source_id.len().min(MAX_SLUG_LEN.saturating_sub(2));
     let suffix = &source_id[..suffix_len];
@@ -74,7 +96,7 @@ fn slugify(name: &str) -> String {
 mod tests {
     use std::path::Path;
 
-    use super::{MAX_SLUG_LEN, slug, source_id_for};
+    use super::{MAX_SLUG_LEN, project_slug, slug, source_id_for};
 
     #[test]
     fn source_identity_is_stable_for_the_same_checkout() {
@@ -111,5 +133,26 @@ mod tests {
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
         );
         assert!(value.ends_with(&source));
+    }
+
+    #[test]
+    fn every_clone_of_one_repository_resolves_to_one_project() {
+        let https = project_slug(Some("https://github.com/napbat/semctx.git"));
+        let ssh = project_slug(Some("git@github.com:napbat/semctx"));
+        let trailing = project_slug(Some("https://github.com/napbat/semctx/"));
+
+        assert_eq!(https.as_deref(), Some("semctx"));
+        assert_eq!(ssh, https);
+        assert_eq!(trailing, https);
+    }
+
+    #[test]
+    fn a_folder_with_no_remote_keeps_a_slug_of_its_own() {
+        // Nothing says two unrelated folders of this name are one project, so
+        // nothing may fuse them: the checkout digest stays in the slug.
+        assert_eq!(project_slug(None), None);
+
+        let source = source_id_for("install-a", Path::new("/work/src"));
+        assert!(slug("src", &source).ends_with(&source));
     }
 }

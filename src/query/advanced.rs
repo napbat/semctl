@@ -12,6 +12,38 @@ use super::{local_path, render_hits, urlencode};
 const CODEBASE_PAGE_SIZE: u32 = 500;
 const MAX_CODEBASE_PAGES: u32 = 100;
 
+/// The codebases holding a copy of `source_id`. Empty when the server cannot
+/// answer — a diagnostic must not fail the command it is describing.
+async fn codebases_for_source(client: &Client, source_id: &str) -> Vec<String> {
+    client
+        .get_page::<api::CodebaseSummary>(&format!(
+            "/v1/codebases?sourceId={}&page=0&pageSize={CODEBASE_PAGE_SIZE}",
+            urlencode(source_id)
+        ))
+        .await
+        .map(|page| page.items.into_iter().map(|row| row.id).collect())
+        .unwrap_or_default()
+}
+
+/// How this codebase's copies relate to the checkout we are standing in.
+async fn describe_copies(client: &Client, codebase_id: &str, source_id: &str) -> String {
+    let Ok(copies) = client
+        .get::<Vec<api::CodebaseVersionSummary>>(&format!(
+            "/v1/codebases/{codebase_id}/versions"
+        ))
+        .await
+    else {
+        return "unknown".into();
+    };
+    let mine = copies.iter().any(|copy| copy.source_id == source_id);
+    match (mine, copies.len()) {
+        (true, 1) => "this checkout".into(),
+        (true, n) => format!("this checkout, of {n}"),
+        (false, 0) => "none".into(),
+        (false, n) => format!("{n} other copy/copies"),
+    }
+}
+
 pub async fn list_codebases(client: &Client) -> String {
     match fetch_codebases(client).await {
         Ok(codebases) if codebases.is_empty() => "no visible codebases".into(),
@@ -19,13 +51,19 @@ pub async fn list_codebases(client: &Client) -> String {
             let local_source = client
                 .local_root()
                 .and_then(|root| crate::codebase::checkout_source_id(root).ok());
+            // Which of them hold a copy of THIS checkout. Asked of the
+            // server: a project can hold several copies, and only it knows
+            // whose is whose.
+            let mine = match &local_source {
+                Some(source) => codebases_for_source(client, source).await,
+                None => Vec::new(),
+            };
             let mut out = String::new();
             for codebase in &codebases {
-                let this_checkout =
-                    local_source.as_deref() == codebase.local_sync_source_id.as_deref();
+                let this_checkout = mine.iter().any(|id| id == &codebase.id);
                 writeln!(
                     out,
-                    "{}  {}  {}\n  source={} access={} revision={} graph={}/{} fresh={} local_bound={} this_checkout={}",
+                    "{}  {}  {}\n  source={} access={} revision={} graph={}/{} fresh={} this_checkout={}",
                     codebase.id,
                     codebase.slug,
                     if codebase.display_name.is_empty() {
@@ -42,7 +80,6 @@ pub async fn list_codebases(client: &Client) -> String {
                     codebase.graph_generation,
                     codebase.graph_materialized_generation,
                     codebase.graph_fresh,
-                    codebase.local_checkout_bound,
                     this_checkout,
                 )
                 .unwrap();
@@ -93,13 +130,7 @@ pub async fn current_context(
                     summary.graph_generation,
                     summary.graph_materialized_generation,
                     summary.graph_fresh,
-                    if summary.local_sync_source_id.as_deref() == Some(source.as_str()) {
-                        "this checkout"
-                    } else if summary.local_checkout_bound {
-                        "another checkout"
-                    } else {
-                        "none"
-                    }
+                    describe_copies(client, &codebase, &source).await
                 )
                 .unwrap();
             }

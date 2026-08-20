@@ -149,13 +149,18 @@ pub async fn apply(
 
 /// Restore retained preimages while every current file still matches the
 /// postimage recorded by [`apply`].
+// Undo restores backups on THIS disk. It no longer asks the server anything —
+// the checkout owns its own files — but stays async: it is half of the
+// apply/undo pair the command and MCP surfaces both await, and a signature that
+// disagrees with its twin is a papercut for every caller.
+#[allow(clippy::unused_async, reason = "pairs with apply on the command surface")]
 pub async fn undo(client: &Client, plan_id: &str, watcher_active: bool) -> Result<ApplyOutcome> {
     validate_plan_id(plan_id)?;
     let root = checkout_root(client)?;
     let path = history_path(plan_id)?;
     let mut history = read_history(&path)
         .with_context(|| format!("no retained edit history for plan {plan_id}"))?;
-    validate_history_context(client, &root, &history).await?;
+    validate_history_context(client, &root, &history)?;
 
     if history.undone {
         ensure!(
@@ -232,10 +237,6 @@ async fn validate_server_context(
         .await
         .context("refresh codebase state before apply")?;
     ensure!(
-        summary.local_sync_source_id.as_deref() == Some(plan.source_identity.as_str()),
-        "the server's checkout lease no longer belongs to this source"
-    );
-    ensure!(
         u64::try_from(summary.graph_generation).ok() == Some(plan.graph_generation),
         "the server graph advanced after this plan was created"
     );
@@ -243,11 +244,7 @@ async fn validate_server_context(
     Ok(())
 }
 
-async fn validate_history_context(
-    client: &Client,
-    root: &Path,
-    history: &EditHistory,
-) -> Result<()> {
+fn validate_history_context(client: &Client, root: &Path, history: &EditHistory) -> Result<()> {
     ensure!(
         client.codebase()? == history.codebase_id,
         "undo history belongs to another codebase"
@@ -257,14 +254,8 @@ async fn validate_history_context(
         source == history.source_identity,
         "undo history belongs to another checkout source"
     );
-    let summary: api::CodebaseSummary = client
-        .get(&format!("/v1/codebases/{}", history.codebase_id))
-        .await
-        .context("refresh codebase state before undo")?;
-    ensure!(
-        summary.local_sync_source_id.as_deref() == Some(history.source_identity.as_str()),
-        "the server's checkout lease no longer belongs to this source"
-    );
+    // The checkout identity above is the whole check: undo rewrites files on
+    // THIS disk, and the server holds no claim over them to re-read.
     Ok(())
 }
 
