@@ -218,8 +218,8 @@ fn read_installation_id(path: &std::path::Path) -> std::io::Result<String> {
     }
 }
 
-/// Delete the semctl config directory (config + stored credentials) for
-/// `semctl uninstall --purge`. Returns whether it existed. The legacy
+/// Delete the semctl config directory (config, credentials, and local caches)
+/// for `semctl uninstall --purge`. Returns whether it existed. The legacy
 /// `~/.config/semctx/` dir is left untouched.
 pub fn remove_all() -> Result<bool> {
     let dir = config_dir()?;
@@ -257,6 +257,12 @@ fn config_dir() -> Result<PathBuf> {
 /// the server.
 pub(crate) fn edit_history_dir() -> Result<PathBuf> {
     Ok(config_dir()?.join("edit-history"))
+}
+
+/// Non-secret per-checkout file stamps, hashes, and content-filter decisions
+/// used to avoid rereading unchanged files across `semctl index` runs.
+pub(crate) fn sync_cache_dir() -> Result<PathBuf> {
+    Ok(config_dir()?.join("sync-cache"))
 }
 
 /// The legacy `~/.config/semctx/` directory this CLI shipped under before it was

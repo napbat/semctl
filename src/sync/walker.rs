@@ -4,11 +4,11 @@
 //! traversal (no content read) so the caller can decide, via its hash cache,
 //! which files actually need reading. Conventions:
 //!   - `.gitignore` honored even outside a git checkout (`require_git(false)`),
-//!     so a non-repo workspace still excludes `target/`, `node_modules/`, etc.;
+//!     including nested ignore files in non-repository workspaces;
 //!   - a project-local `.semctlignore`;
-//!   - a built-in exclude-glob backstop ([`DEFAULT_EXCLUDE_GLOBS`]) for junk
-//!     that often isn't gitignored — lockfiles, minified/map assets, generated
-//!     protobuf code, snapshots, vendored trees;
+//!   - a built-in file-glob backstop ([`DEFAULT_EXCLUDE_FILE_GLOBS`]) for junk
+//!     that often isn't gitignored — lockfiles, minified/map assets, and
+//!     generated protobuf code;
 //!   - a byte-size cap.
 //!
 //! Content-level hygiene (empty / generated / minified) is [`is_indexable`],
@@ -16,8 +16,7 @@
 
 use std::path::{Path, PathBuf};
 
-use glob::Pattern;
-use ignore::WalkBuilder;
+use ignore::{WalkBuilder, overrides::OverrideBuilder};
 
 /// A file the walker accepted, with the stamp needed to tell whether it changed
 /// since the last sync. No content is read here — that's the caller's job, only
@@ -32,22 +31,22 @@ pub struct Candidate {
 }
 
 /// Tunables for [`walk`]. [`Default`] matches what the server can embed.
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct WalkOptions {
     /// Skip files larger than this — almost always assets/binaries, not source.
     /// Sized to admit the occasional big source file (generated code, large
     /// fixtures) while staying under the server's ~30 MB request-body limit; a
     /// file this size uploads in its own PUT (see `UPLOAD_BATCH_BYTES`).
     pub max_file_bytes: u64,
-    /// Path globs to exclude on top of gitignore (see [`DEFAULT_EXCLUDE_GLOBS`]).
-    pub excludes: Vec<Pattern>,
+    /// Gitignore-style file globs to exclude on top of project ignore files.
+    pub excludes: &'static [&'static str],
 }
 
 impl Default for WalkOptions {
     fn default() -> Self {
         Self {
             max_file_bytes: 16 * 1024 * 1024,
-            excludes: default_excludes(),
+            excludes: DEFAULT_EXCLUDE_FILE_GLOBS,
         }
     }
 }
@@ -61,7 +60,8 @@ pub fn walk(root: &Path, opts: &WalkOptions) -> Vec<Candidate> {
         .standard_filters(true)
         .hidden(true)
         .require_git(false)
-        .add_custom_ignore_filename(".semctlignore");
+        .add_custom_ignore_filename(".semctlignore")
+        .overrides(exclude_overrides(root, opts.excludes));
 
     let mut out = Vec::new();
     for entry in builder.build() {
@@ -69,91 +69,72 @@ pub fn walk(root: &Path, opts: &WalkOptions) -> Vec<Candidate> {
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
-        let path = entry.path();
         let Ok(meta) = entry.metadata() else {
             continue;
         };
         if meta.len() > opts.max_file_bytes {
             continue;
         }
-        if matches_any(&opts.excludes, path) {
-            continue;
-        }
-        let Some(rel) = rel_path(root, path) else {
+        let path = entry.into_path();
+        let Some(rel) = rel_path(root, &path) else {
             continue;
         };
         out.push(Candidate {
             rel,
-            path: path.to_path_buf(),
+            path,
             mtime_ns: mtime_ns(&meta),
             size: meta.len(),
         });
     }
-    out.sort_by(|a, b| a.rel.cmp(&b.rel));
+    out.sort_unstable_by(|a, b| a.rel.cmp(&b.rel));
     out
 }
 
-/// Whether a file's *content* is worth indexing: non-empty, not machine-
-/// generated, not minified. The empty check also matters operationally — the
-/// server's upload `Content` field is `[Required]` and 400s on an empty string.
+/// Whether a file's *content* is worth indexing: non-blank, not machine-
+/// generated, and not minified.
 pub fn is_indexable(content: &str) -> bool {
-    !content.is_empty() && !looks_generated(content) && !looks_minified(content)
+    has_uploadable_content(content) && !looks_generated(content) && !looks_minified(content)
 }
 
-/// Path globs excluded on top of gitignore — junk that frequently isn't
-/// gitignored but adds noise (or bloat) to a code index.
-pub const DEFAULT_EXCLUDE_GLOBS: &[&str] = &[
-    "**/node_modules/**",
-    "**/vendor/**",
-    "**/third_party/**",
-    "**/target/**",
-    "**/dist/**",
-    "**/build/**",
-    "**/__pycache__/**",
-    "**/.next/**",
-    "**/.nuxt/**",
-    "**/.gradle/**",
-    "**/testdata/**",
-    "**/test_fixtures/**",
-    "**/__fixtures__/**",
-    "**/__snapshots__/**",
-    "**/mocks/**",
-    "**/__mocks__/**",
-    "**/*.lock",
-    "**/package-lock.json",
-    "**/yarn.lock",
-    "**/pnpm-lock.yaml",
-    "**/Cargo.lock",
-    "**/composer.lock",
-    "**/poetry.lock",
-    "**/Pipfile.lock",
-    "**/Gemfile.lock",
-    "**/mix.lock",
-    "**/*.svg",
-    "**/*.min.js",
-    "**/*.min.css",
-    "**/*.map",
-    "**/*.pb.go",
-    "**/*.pb.py",
-    "**/*_pb2.py",
-    "**/*.pb.cc",
-    "**/*_generated.go",
-    "**/*.gen.go",
+/// The server validates uploaded `Content` with a required-string rule, which
+/// rejects whitespace-only strings as well as `""`.
+pub(super) fn has_uploadable_content(content: &str) -> bool {
+    !content.trim().is_empty()
+}
+
+/// File globs excluded on top of project ignore files. Directories are never
+/// excluded by default: users opt into that policy with `.gitignore`, `.ignore`,
+/// or `.semctlignore` so potentially useful vendored/test source stays visible.
+pub const DEFAULT_EXCLUDE_FILE_GLOBS: &[&str] = &[
+    "*.lock",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "*.svg",
+    "*.min.js",
+    "*.min.css",
+    "*.map",
+    "*.pb.go",
+    "*.pb.py",
+    "*_pb2.py",
+    "*.pb.cc",
+    "*_generated.go",
+    "*.gen.go",
 ];
 
-fn default_excludes() -> Vec<Pattern> {
-    DEFAULT_EXCLUDE_GLOBS
-        .iter()
-        .filter_map(|g| Pattern::new(g).ok())
-        .collect()
-}
-
-fn matches_any(patterns: &[Pattern], path: &Path) -> bool {
-    if patterns.is_empty() {
-        return false;
+/// Compile the built-in backstop into the walker's native matcher. Overrides
+/// run before entries are yielded, so matching files are never statted by our
+/// scan loop. The default list intentionally contains no directory patterns.
+fn exclude_overrides(root: &Path, patterns: &[&str]) -> ignore::overrides::Override {
+    let mut builder = OverrideBuilder::new(root);
+    for pattern in patterns {
+        // Override syntax inverts gitignore's `!`: a leading `!` means ignore.
+        builder
+            .add(&format!("!{pattern}"))
+            .expect("built-in exclude glob must be valid");
     }
-    let s = path.to_string_lossy().replace('\\', "/");
-    patterns.iter().any(|p| p.matches(&s))
+    builder
+        .build()
+        .expect("built-in exclude matcher must compile")
 }
 
 fn mtime_ns(meta: &std::fs::Metadata) -> u128 {
@@ -167,12 +148,14 @@ fn mtime_ns(meta: &std::fs::Metadata) -> u128 {
 /// on. `None` if `file` isn't under `root`.
 fn rel_path(root: &Path, file: &Path) -> Option<String> {
     let rel = file.strip_prefix(root).ok()?;
-    Some(
-        rel.components()
-            .map(|c| c.as_os_str().to_string_lossy())
-            .collect::<Vec<_>>()
-            .join("/"),
-    )
+    let mut normalized = String::new();
+    for component in rel.components() {
+        if !normalized.is_empty() {
+            normalized.push('/');
+        }
+        normalized.push_str(&component.as_os_str().to_string_lossy());
+    }
+    Some(normalized)
 }
 
 /// Conservative generated-file detection: scan the first few lines for the
@@ -230,17 +213,29 @@ mod tests {
     }
 
     #[test]
-    fn excludes_default_globs() {
+    fn excludes_default_file_globs_without_hiding_source_directories() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         fs::write(root.join("real.rs"), "fn a() {}\n").unwrap();
         fs::create_dir_all(root.join("node_modules/dep")).unwrap();
         fs::write(root.join("node_modules/dep/index.js"), "x\n").unwrap();
+        fs::create_dir_all(root.join("vendor/lib")).unwrap();
+        fs::write(root.join("vendor/lib/source.go"), "package lib\n").unwrap();
+        fs::create_dir_all(root.join("testdata/case")).unwrap();
+        fs::write(root.join("testdata/case/input.rs"), "fn input() {}\n").unwrap();
         fs::write(root.join("Cargo.lock"), "[[package]]\n").unwrap();
         fs::write(root.join("app.min.js"), "a\n").unwrap();
 
         let files = walk(root, &WalkOptions::default());
-        assert_eq!(rels(&files), vec!["real.rs"], "got {:?}", rels(&files));
+        assert_eq!(
+            rels(&files),
+            vec![
+                "node_modules/dep/index.js",
+                "real.rs",
+                "testdata/case/input.rs",
+                "vendor/lib/source.go"
+            ]
+        );
     }
 
     #[test]
@@ -262,6 +257,7 @@ mod tests {
     fn is_indexable_rejects_empty_generated_minified() {
         assert!(is_indexable("fn main() {}\n"));
         assert!(!is_indexable(""), "empty");
+        assert!(!is_indexable(" \n\t\r\n"), "whitespace-only");
         assert!(
             !is_indexable("// @generated by prost\nstruct X;\n"),
             "generated"

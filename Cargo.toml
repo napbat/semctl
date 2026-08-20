@@ -11,7 +11,7 @@ pedantic = { level = "warn", priority = -1 }
 
 [package]
 name = "semctl"
-version = "0.1.13"
+version = "0.1.14"
 edition = "2024"
 publish = false
 description = "semctl — command-line client for the semctx code-intelligence server. Speaks HTTP+JSON; authenticates to identity via OIDC device-code."
@@ -96,8 +96,8 @@ ignore = "0.4"
 # tick.
 notify = "8"
 notify-debouncer-full = "0.7"
-# Glob matching for the walker's built-in exclude list (lockfiles, minified
-# assets, generated code, vendored trees) — a backstop beyond .gitignore.
+# Glob matching for configured umbrella workspaces. Sync file exclusions use
+# `ignore`'s native matcher so they run before the scan loop stats each file.
 glob = "0.3"
 # Stable content hash for the sync manifest (the server treats it as opaque).
 blake3 = "1"

@@ -3,9 +3,9 @@
 //! embed job to finish.
 //!
 //! This is the thin one-shot wrapper: it delegates the walk / manifest-diff /
-//! upload to the shared [`crate::sync`] engine (with a throwaway cache, so every
-//! file is read fresh), then polls the queued job to completion. The `semctl mcp`
-//! auto-index drives the same engine in the background.
+//! upload to the shared [`crate::sync`] engine (with a persistent stamp/hash
+//! cache), then polls the queued job to completion. The `semctl mcp` auto-index
+//! drives the same engine in the background.
 
 use std::path::PathBuf;
 
@@ -16,6 +16,7 @@ use tracing::{debug, info};
 
 use crate::cli::Cli;
 use crate::client::{self, Client, api};
+use crate::sync::SyncProgress;
 
 #[derive(Debug, Args)]
 pub struct IndexArgs {
@@ -84,9 +85,11 @@ pub async fn run(args: IndexArgs, cli: &Cli) -> Result<()> {
     let dir = std::fs::canonicalize(&args.path)
         .with_context(|| format!("resolve path {}", args.path.display()))?;
 
-    // One-shot command: a throwaway cache (every file is a miss → a full read).
-    let cache = Mutex::new(crate::sync::SyncCache::default());
-    let outcome = crate::sync::sync(&client, &dir, &cache).await?;
+    // Persist stamps/hashes before upload so a restarted command only reads
+    // files that changed while it was away. Source contents are not cached.
+    let cache = Mutex::new(crate::sync::SyncCache::persistent());
+    let outcome =
+        crate::sync::sync_with_progress(&client, &dir, &cache, report_sync_progress).await?;
     if outcome.uploaded == 0 && outcome.to_delete == 0 {
         info!(codebase = %outcome.codebase_id, "up to date — nothing to upload");
     } else {
@@ -103,6 +106,26 @@ pub async fn run(args: IndexArgs, cli: &Cli) -> Result<()> {
         return Ok(());
     }
     wait_for_job(&client, &outcome.job_id).await
+}
+
+fn report_sync_progress(progress: &SyncProgress) {
+    info!("{}", sync_progress_message(progress));
+}
+
+fn sync_progress_message(progress: &SyncProgress) -> String {
+    match progress {
+        SyncProgress::Preparing => "preparing index".to_string(),
+        SyncProgress::Scanning { root } => format!("scanning files in {}", root.display()),
+        SyncProgress::Planning {
+            files,
+            cached_files,
+        } => format!("scanned {files} files ({cached_files} hashes reused) — checking for changes"),
+        SyncProgress::Uploading {
+            uploaded_files,
+            total_files,
+        } => format!("uploading: {uploaded_files}/{total_files} files"),
+        SyncProgress::Finalizing => "finalizing upload".to_string(),
+    }
 }
 
 /// Poll the index job until the worker finishes embedding, reporting the
@@ -161,7 +184,9 @@ async fn wait_for_job(client: &Client, job_id: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{JobProgress, api, terminal_result};
+    use std::path::PathBuf;
+
+    use super::{JobProgress, SyncProgress, api, sync_progress_message, terminal_result};
 
     fn job(completed: bool, failed: i64, error: Option<&str>) -> api::JobStatus {
         api::JobStatus {
@@ -203,5 +228,34 @@ mod tests {
         let progress = JobProgress::from(&job(false, 3, None));
         assert_eq!(progress.processed, 12);
         assert_eq!(progress.total, 15);
+    }
+
+    #[test]
+    fn upload_progress_reports_completed_and_total_files() {
+        let message = sync_progress_message(&SyncProgress::Uploading {
+            uploaded_files: 3,
+            total_files: 8,
+        });
+        assert_eq!(message, "uploading: 3/8 files");
+    }
+
+    #[test]
+    fn scan_summary_reports_reused_hashes() {
+        let message = sync_progress_message(&SyncProgress::Planning {
+            files: 80,
+            cached_files: 73,
+        });
+        assert_eq!(
+            message,
+            "scanned 80 files (73 hashes reused) — checking for changes"
+        );
+    }
+
+    #[test]
+    fn scan_progress_names_the_effective_root() {
+        let message = sync_progress_message(&SyncProgress::Scanning {
+            root: PathBuf::from("repo"),
+        });
+        assert_eq!(message, "scanning files in repo");
     }
 }

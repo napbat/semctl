@@ -125,6 +125,11 @@ two clones with the same display name therefore get separate UUIDs and opaque,
 collision-safe slugs. An older `~/.config/semctx/` install is read as a fallback
 so a rename doesn't force a re-login.
 
+`sync-cache/` stores non-secret per-checkout file stamps, hashes, and content-
+filter decisions so repeated `semctl index` runs do not reread unchanged files.
+Source contents are never written to this cache, and `semctl uninstall --purge`
+removes it with the rest of the semctl config directory.
+
 | Setting         | Flag         | Env               |
 | --------------- | ------------ | ----------------- |
 | Server base URL | `--server`   | `SEMCTX_SERVER`   |
