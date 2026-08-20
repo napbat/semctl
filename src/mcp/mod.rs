@@ -320,6 +320,24 @@ impl McpServer {
         self.client_for_unchecked(Some(raw)).await
     }
 
+    /// [`Self::client_for`], answering about the copy `copy` names.
+    ///
+    /// `"canonical"` asks about what the project publishes; anything else —
+    /// including nothing — asks about the checkout this MCP is running in,
+    /// which is the tree the caller is looking at.
+    async fn client_for_copy(
+        &self,
+        selector: Option<&str>,
+        copy: Option<&str>,
+    ) -> std::result::Result<Client, String> {
+        let client = self.client_for(selector).await?;
+
+        Ok(match copy.map(str::trim) {
+            Some(value) if value.eq_ignore_ascii_case("canonical") => client.for_canonical(),
+            _ => client,
+        })
+    }
+
     /// Resolve a selector without waiting for first-index readiness. Only status
     /// calls use this; retrieval calls must go through [`Self::client_for`].
     async fn client_for_unchecked(
@@ -567,6 +585,13 @@ pub struct SearchArgs {
     /// Codebase to search: an id or an indexed local directory path. Omit for
     /// the launch/current codebase. A local path is watched while this MCP runs.
     pub codebase: Option<String>,
+    /// Which copy to read: `"checkout"` (default) answers about the working
+    /// tree this MCP is running in, including edits that are not committed or
+    /// pushed; `"canonical"` answers about what the project publishes — the
+    /// branch the server pulls. Use `canonical` to ask what is on the trunk
+    /// rather than in front of you. Ignored outside a checkout, where the two
+    /// are the same thing.
+    pub copy: Option<String>,
     /// Natural-language query.
     pub query: String,
     /// Max hits to return. Defaults to 20.
@@ -660,6 +685,13 @@ pub struct TraceArgs {
 pub struct GrepArgs {
     /// Codebase id or indexed local directory path. Omit for the current codebase.
     pub codebase: Option<String>,
+    /// Which copy to read: `"checkout"` (default) answers about the working
+    /// tree this MCP is running in, including edits that are not committed or
+    /// pushed; `"canonical"` answers about what the project publishes — the
+    /// branch the server pulls. Use `canonical` to ask what is on the trunk
+    /// rather than in front of you. Ignored outside a checkout, where the two
+    /// are the same thing.
+    pub copy: Option<String>,
     /// The pattern to search for — a **regular expression** by default (Rust
     /// `regex`-crate syntax, matched per line; no look-around or backreferences),
     /// so `fn \w+\(` finds function definitions. Set `literal: true` to match it
@@ -711,6 +743,13 @@ pub struct OutlineArgs {
 pub struct ReadSourceArgs {
     /// Codebase id or indexed local directory path. Omit for the current codebase.
     pub codebase: Option<String>,
+    /// Which copy to read: `"checkout"` (default) answers about the working
+    /// tree this MCP is running in, including edits that are not committed or
+    /// pushed; `"canonical"` answers about what the project publishes — the
+    /// branch the server pulls. Use `canonical` to ask what is on the trunk
+    /// rather than in front of you. Ignored outside a checkout, where the two
+    /// are the same thing.
+    pub copy: Option<String>,
     /// Codebase-relative source path.
     pub path: String,
     /// Strong content hash to pin. A stale revision is rejected atomically.
@@ -922,6 +961,13 @@ pub struct EmptyArgs {}
 pub struct ListFilesArgs {
     /// Codebase id or indexed local directory path. Omit for the current codebase.
     pub codebase: Option<String>,
+    /// Which copy to read: `"checkout"` (default) answers about the working
+    /// tree this MCP is running in, including edits that are not committed or
+    /// pushed; `"canonical"` answers about what the project publishes — the
+    /// branch the server pulls. Use `canonical` to ask what is on the trunk
+    /// rather than in front of you. Ignored outside a checkout, where the two
+    /// are the same thing.
+    pub copy: Option<String>,
     /// Optional case-insensitive substring; only files whose codebase-relative
     /// path contains it are listed (e.g. `src/auth` or `.rs`),
     /// searched across the whole catalog. Omit to list every indexed file.
@@ -951,7 +997,10 @@ pub struct IndexCodebaseArgs {
 impl McpServer {
     #[tool]
     async fn search_codebase(&self, Parameters(args): Parameters<SearchArgs>) -> String {
-        let client = match self.client_for(args.codebase.as_deref()).await {
+        let client = match self
+            .client_for_copy(args.codebase.as_deref(), args.copy.as_deref())
+            .await
+        {
             Ok(client) => client,
             Err(e) => return format!("search_codebase unavailable — {e}"),
         };
@@ -1061,7 +1110,10 @@ impl McpServer {
 
     #[tool]
     async fn grep(&self, Parameters(args): Parameters<GrepArgs>) -> String {
-        match self.client_for(args.codebase.as_deref()).await {
+        match self
+            .client_for_copy(args.codebase.as_deref(), args.copy.as_deref())
+            .await
+        {
             Ok(client) => {
                 query::grep(
                     &client,
@@ -1137,7 +1189,10 @@ impl McpServer {
 
     #[tool]
     async fn list_files(&self, Parameters(args): Parameters<ListFilesArgs>) -> String {
-        match self.client_for(args.codebase.as_deref()).await {
+        match self
+            .client_for_copy(args.codebase.as_deref(), args.copy.as_deref())
+            .await
+        {
             Ok(client) => {
                 query::list_files(&client, args.path.as_deref(), args.page, args.page_size).await
             }
@@ -1219,7 +1274,10 @@ impl McpServer {
 
     #[tool]
     async fn read_source(&self, Parameters(args): Parameters<ReadSourceArgs>) -> String {
-        let client = match self.client_for(args.codebase.as_deref()).await {
+        let client = match self
+            .client_for_copy(args.codebase.as_deref(), args.copy.as_deref())
+            .await
+        {
             Ok(client) => client,
             Err(error) => return format!("read_source unavailable — {error}"),
         };

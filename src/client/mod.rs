@@ -124,6 +124,19 @@ impl Client {
         self
     }
 
+    /// The same client, asking about the project rather than about the
+    /// checkout it is standing in.
+    ///
+    /// Dropping the header IS the request: the server prefers the copy a
+    /// caller names, then theirs, then canonical — so saying nothing about
+    /// where you are standing asks for what the project publishes.
+    #[must_use]
+    pub fn for_canonical(&self) -> Self {
+        let mut client = self.clone();
+        client.checkout_source_id = None;
+        client
+    }
+
     /// The codebase's local checkout root, if known. See [`Self::local_root`]
     /// field docs for when this is `None`.
     pub fn local_root(&self) -> Option<&Path> {
@@ -728,5 +741,35 @@ mod gateway_error_tests {
             None,
             "malformed retry instructions are surfaced normally"
         );
+    }
+}
+
+#[cfg(test)]
+mod checkout_scope_tests {
+    use super::Client;
+
+    /// A checkout answers about itself; asking for canonical drops the claim
+    /// that the caller is standing anywhere, which is how the server hears
+    /// "tell me what the project publishes".
+    #[test]
+    fn asking_for_canonical_stops_claiming_a_checkout() {
+        let mut client = Client::new("https://example.invalid", None, None, false);
+        client.checkout_source_id = Some("digest".into());
+
+        assert_eq!(client.for_canonical().checkout_source_id, None);
+
+        // A view, not a move: the checkout client stays usable, so one
+        // canonical lookup cannot silently redirect the rest of a session to
+        // the trunk.
+        assert_eq!(client.checkout_source_id.as_deref(), Some("digest"));
+    }
+
+    /// Outside a checkout there is nothing to drop, and canonical is already
+    /// what every read resolves to.
+    #[test]
+    fn canonical_is_a_no_op_when_no_checkout_is_claimed() {
+        let client = Client::new("https://example.invalid", None, None, false);
+
+        assert_eq!(client.for_canonical().checkout_source_id, None);
     }
 }
