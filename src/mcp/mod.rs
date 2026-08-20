@@ -618,6 +618,13 @@ pub struct SearchArgs {
 pub struct SymbolArgs {
     /// Codebase id or indexed local directory path. Omit for the current codebase.
     pub codebase: Option<String>,
+    /// Which copy to read: `"checkout"` (default) answers about the working
+    /// tree this MCP is running in, including edits that are not committed or
+    /// pushed; `"canonical"` answers about what the project publishes — the
+    /// branch the server pulls. Use `canonical` to ask what is on the trunk
+    /// rather than in front of you. Ignored outside a checkout, where the two
+    /// are the same thing.
+    pub copy: Option<String>,
     /// Exact symbol name to look up.
     pub symbol: String,
 }
@@ -674,6 +681,13 @@ pub struct FlowBetweenArgs {
 pub struct TraceArgs {
     /// Codebase id or indexed local directory path. Omit for the current codebase.
     pub codebase: Option<String>,
+    /// Which copy to read: `"checkout"` (default) answers about the working
+    /// tree this MCP is running in, including edits that are not committed or
+    /// pushed; `"canonical"` answers about what the project publishes — the
+    /// branch the server pulls. Use `canonical` to ask what is on the trunk
+    /// rather than in front of you. Ignored outside a checkout, where the two
+    /// are the same thing.
+    pub copy: Option<String>,
     /// Exact symbol name to centre the neighbourhood on.
     pub symbol: String,
     /// How many call-graph hops out to include. Defaults to 1 (direct callers
@@ -729,6 +743,13 @@ fn pattern_needs_regex(pattern: &str) -> bool {
 pub struct OutlineArgs {
     /// Codebase id or indexed local directory path. Omit for the current codebase.
     pub codebase: Option<String>,
+    /// Which copy to read: `"checkout"` (default) answers about the working
+    /// tree this MCP is running in, including edits that are not committed or
+    /// pushed; `"canonical"` answers about what the project publishes — the
+    /// branch the server pulls. Use `canonical` to ask what is on the trunk
+    /// rather than in front of you. Ignored outside a checkout, where the two
+    /// are the same thing.
+    pub copy: Option<String>,
     /// Codebase-relative path of the file to outline (e.g. `server/Startup.cs`).
     pub path: String,
     /// Maximum grammar nesting depth to return. Omit for every depth.
@@ -768,6 +789,13 @@ pub struct ReadSourceArgs {
 pub struct SymbolSearchArgs {
     /// Codebase id or indexed local directory path. Omit for the current codebase.
     pub codebase: Option<String>,
+    /// Which copy to read: `"checkout"` (default) answers about the working
+    /// tree this MCP is running in, including edits that are not committed or
+    /// pushed; `"canonical"` answers about what the project publishes — the
+    /// branch the server pulls. Use `canonical` to ask what is on the trunk
+    /// rather than in front of you. Ignored outside a checkout, where the two
+    /// are the same thing.
+    pub copy: Option<String>,
     /// Declaration name or qualified-name pattern.
     pub query: String,
     /// `Exact`, `Prefix`, `Substring`, `Glob`, or `Fuzzy`. Defaults to Substring.
@@ -1036,7 +1064,10 @@ impl McpServer {
 
     #[tool]
     async fn find_definition(&self, Parameters(args): Parameters<SymbolArgs>) -> String {
-        match self.client_for(args.codebase.as_deref()).await {
+        match self
+            .client_for_copy(args.codebase.as_deref(), args.copy.as_deref())
+            .await
+        {
             Ok(client) => query::find_definition(&client, &args.symbol).await,
             Err(e) => format!("find_definition unavailable — {e}"),
         }
@@ -1054,7 +1085,10 @@ impl McpServer {
 
     #[tool]
     async fn who_calls(&self, Parameters(args): Parameters<SymbolArgs>) -> String {
-        match self.client_for(args.codebase.as_deref()).await {
+        match self
+            .client_for_copy(args.codebase.as_deref(), args.copy.as_deref())
+            .await
+        {
             Ok(client) => query::who_calls(&client, &args.symbol).await,
             Err(e) => format!("who_calls unavailable — {e}"),
         }
@@ -1062,7 +1096,10 @@ impl McpServer {
 
     #[tool]
     async fn implementations_of(&self, Parameters(args): Parameters<SymbolArgs>) -> String {
-        match self.client_for(args.codebase.as_deref()).await {
+        match self
+            .client_for_copy(args.codebase.as_deref(), args.copy.as_deref())
+            .await
+        {
             Ok(client) => query::implementations_of(&client, &args.symbol).await,
             Err(e) => format!("implementations_of unavailable — {e}"),
         }
@@ -1102,7 +1139,10 @@ impl McpServer {
 
     #[tool]
     async fn trace(&self, Parameters(args): Parameters<TraceArgs>) -> String {
-        match self.client_for(args.codebase.as_deref()).await {
+        match self
+            .client_for_copy(args.codebase.as_deref(), args.copy.as_deref())
+            .await
+        {
             Ok(client) => query::trace(&client, &args.symbol, args.depth.unwrap_or(1)).await,
             Err(e) => format!("trace unavailable — {e}"),
         }
@@ -1131,7 +1171,10 @@ impl McpServer {
 
     #[tool]
     async fn file_outline(&self, Parameters(args): Parameters<OutlineArgs>) -> String {
-        match self.client_for(args.codebase.as_deref()).await {
+        match self
+            .client_for_copy(args.codebase.as_deref(), args.copy.as_deref())
+            .await
+        {
             Ok(client) => {
                 query::file_outline(
                     &client,
@@ -1312,7 +1355,10 @@ impl McpServer {
 
     #[tool]
     async fn search_symbols(&self, Parameters(args): Parameters<SymbolSearchArgs>) -> String {
-        let client = match self.client_for(args.codebase.as_deref()).await {
+        let client = match self
+            .client_for_copy(args.codebase.as_deref(), args.copy.as_deref())
+            .await
+        {
             Ok(client) => client,
             Err(error) => return format!("search_symbols unavailable — {error}"),
         };
