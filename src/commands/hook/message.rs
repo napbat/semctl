@@ -71,24 +71,22 @@ fn is_identifier(p: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// Tier 1: assertive, generic. "prefer semctl" as the stated default. Names the
-/// file-listing tools too, so a Glob nudge isn't steered purely at content search.
+/// Tier 1: balanced and generic. It names semctx's discovery strengths while
+/// keeping existing context and narrow local work first-class.
 pub fn tier1(names: ToolNameStyle) -> String {
     let prefix = names.prefix();
     format!(
-        "semctl — prefer the semctl tools for code in this indexed repo. For a known \
-         symbol use `{prefix}find_definition` / `{prefix}find_references` / \
-         `{prefix}who_calls`; for a concept use `{prefix}search_codebase`; to \
-         list or explore files use `{prefix}list_files` / `{prefix}file_tree`; \
-         for an exhaustive literal sweep use `{prefix}grep`. They return ranked, \
-         focused results (cheaper on context) and answer graph questions raw search \
-         can't. Raw grep/find stays fine for non-code or a one-off literal check. See \
-         the codebase-retrieval skill."
+        "semctl — use the freshest relevant evidence already available. When more \
+         repository evidence is needed, use `{prefix}find_definition` / \
+         `{prefix}find_references` / `{prefix}who_calls` for known symbols, \
+         `{prefix}search_codebase` for concepts, `{prefix}list_files` / \
+         `{prefix}file_tree` for repository-wide file discovery, and `{prefix}grep` \
+         for exhaustive indexed literals. Local Read/Grep/Glob fits current bytes \
+         at a known path or a narrow file-scoped check. See the codebase-retrieval skill."
     )
 }
 
-/// Tier 2: firm, and tailored to the kind of search and (for content) what the
-/// query looks like.
+/// Tier 2: balanced, tailored guidance after repeated broad built-in searches.
 pub fn tier2(
     names: ToolNameStyle,
     kind: SearchKind,
@@ -96,33 +94,37 @@ pub fn tier2(
     pattern: Option<&str>,
 ) -> String {
     let prefix = names.prefix();
-    let lead = format!("semctl — {eligible_count} built-in searches this segment. ");
+    let lead = format!(
+        "semctl — {eligible_count} broad built-in searches this segment. Continue \
+         from existing context or available tool results when they supply the needed evidence. "
+    );
     let tail = match kind {
         SearchKind::Filename => format!(
-            "You're enumerating files — `{prefix}list_files` / `{prefix}file_tree` \
-             list and explore the indexed tree directly (filtered, paged). Reach for \
-             semctl first; raw find/glob is the fallback, not the default."
+            "For unresolved repository-wide file discovery, `{prefix}list_files` / \
+             `{prefix}file_tree` provide the indexed tree directly. Local glob/find \
+             fits a known path or narrow check."
         ),
         SearchKind::Content => match classify(pattern) {
             QueryKind::Symbol => {
                 let sym = pattern.map(str::trim).unwrap_or_default();
                 format!(
-                    "`{sym}` is a symbol — `{prefix}find_definition` / \
-                     `{prefix}find_references` / `{prefix}who_calls` resolve it \
-                     precisely, with callers and impls, in one ranked call. Reach for semctl \
-                     first; raw grep is the fallback, not the default."
+                    "For unresolved cross-file evidence about `{sym}`, \
+                     `{prefix}find_definition` / `{prefix}find_references` / \
+                     `{prefix}who_calls` provide precise graph results. Local reads \
+                     and file-scoped search fit current bytes or narrow checks."
                 )
             }
             QueryKind::Concept => format!(
-                "That reads like a concept — `{prefix}search_codebase` returns ranked, \
-                 focused hits across the whole index instead of raw lines. Reach for \
-                 semctl first; raw grep is the fallback, not the default."
+                "For unresolved repository concepts, `{prefix}search_codebase` \
+                 provides ranked, focused hits across the index. Existing context \
+                 and known-file reads remain valid when they supply the needed detail."
             ),
             QueryKind::Literal | QueryKind::Unknown => format!(
-                "Prefer semctl for code here — `{prefix}search_codebase` for concepts, \
-                 the graph tools (`{prefix}find_definition` / `{prefix}find_references` / \
-                 `{prefix}who_calls`) for a known symbol, or `{prefix}grep` for an indexed \
-                 literal sweep. Raw grep is the fallback, not the default."
+                "Route missing repository evidence by shape: `{prefix}search_codebase` \
+                 for concepts, `{prefix}find_definition` / `{prefix}find_references` / \
+                 `{prefix}who_calls` for known symbols, and `{prefix}grep` for an \
+                 exhaustive indexed literal sweep. Local tools fit known paths, \
+                 current bytes, and narrow checks."
             ),
         },
     };
@@ -154,7 +156,7 @@ mod tests {
         );
         assert!(m.contains("parse_config"));
         assert!(m.contains("mcp__semctx__find_definition"));
-        assert!(m.contains("5 built-in searches"));
+        assert!(m.contains("5 broad built-in searches"));
     }
 
     #[test]
@@ -236,6 +238,39 @@ mod tests {
         assert!(!lc.contains("unopened"));
         assert!(!lc.contains("already read"));
         assert!(!lc.contains("files you haven't"));
+    }
+
+    #[test]
+    fn messages_keep_context_and_local_tools_first_class() {
+        let messages = [
+            tier1(ToolNameStyle::ClaudeCompatible),
+            tier2(
+                ToolNameStyle::ClaudeCompatible,
+                SearchKind::Content,
+                5,
+                Some("x"),
+            ),
+            tier2(
+                ToolNameStyle::ClaudeCompatible,
+                SearchKind::Filename,
+                5,
+                None,
+            ),
+        ];
+        let all = messages.join(" ");
+        assert!(all.contains("existing context") || all.contains("already available"));
+        assert!(all.contains("known path"));
+        assert!(all.contains("Local"));
+        assert!(!all.contains("fallback, not the default"));
+        for sentence in all.split(['.', '!', '?']) {
+            let sentence = sentence.trim_start().to_ascii_lowercase();
+            assert!(
+                !["do not", "don't", "never", "avoid"]
+                    .iter()
+                    .any(|prefix| sentence.starts_with(prefix)),
+                "instruction starts negatively: {sentence}"
+            );
+        }
     }
 
     #[test]

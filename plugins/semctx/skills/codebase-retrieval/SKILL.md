@@ -1,21 +1,21 @@
 ---
 name: codebase-retrieval
-description: Use when answering codebase questions in a semctx-indexed repo — "how does X work", "where is X defined", "who calls X", "what implements Y", "find references to Z", "trace through", or any other "find code in this repo" task — and when semctx tools return stale, empty, or erroring results. Routes retrieval through the semctx MCP tools before host-side Read / Grep / Glob and covers the degraded states (still indexing, stale hits, not logged in, unsupported language).
+description: Use when answering codebase questions in a semctx-indexed repo — "how does X work", "where is X defined", "who calls X", "what implements Y", "find references to Z", "trace through", or any other "find code in this repo" task — and when semctx tools return stale, empty, or erroring results. Routes missing repository evidence to semantic and graph tools while preserving fresh conversation context, current known-file reads, and narrow local checks.
 ---
 
 # codebase-retrieval
 
-When the semctx MCP server is attached, any "find code in this repo" question
-goes through the semctx tools BEFORE host `Read` / `Grep` / `Glob`. The index
-is server-side hybrid retrieval (dense + lexical, fused and reranked) plus a
-symbol graph with call and data-flow edges — cross-file structure host tools
-can't see, at a fraction of the context cost of raw reads.
+When the semctx MCP server is attached, begin with the freshest relevant
+evidence already available. Use semctx for repository discovery, unknown
+locations, cross-file relationships, symbol graphs, and broad indexed searches.
+Existing context can support an answer directly; host `Read` / `Grep` / `Glob`
+fit current bytes at a known path or a narrow file-scoped check.
 
 ## Route by question
 
 | You want | Call |
 | --- | --- |
-| fuzzy / conceptual — "how does X work" | `search_codebase` — raise `top_k` (default 20) for more; `expand: true` returns full symbol bodies; `prefer: "docs"` or `"code"`; use `scope` or `codebase_ids` for an authorized multi-codebase lens |
+| fuzzy / conceptual — "how does X work" | `search_codebase` — start with snippets and a focused `top_k` (usually 5–8); the server bounds total result content; use `expand: true` only for the most relevant hit or small set, then reason from those bodies; `prefer: "docs"` or `"code"`; use `scope` or `codebase_ids` for an authorized multi-codebase lens |
 | declaration-name discovery | `search_symbols` — exact/prefix/substring/glob/fuzzy qualified-name search with kind/path/project/language filters |
 | where is X defined / where is every resolved use | `find_definition` / `find_references` (exact, case-sensitive names; references include exact occurrences, read/write, namespace, kind, and resolved identity) |
 | who calls X / what implements Y | `who_calls` / `implementations_of` |
@@ -25,7 +25,7 @@ can't see, at a fraction of the context cost of raw reads.
 | where does a value flow | `reaches` (forward), `flows_into` (backward), `flows_between` (witness path) |
 | every literal occurrence, incl. strings/comments | `grep` — semctx's own, over indexed content (regex, ignore_case, path filter) |
 | a file's nested shape / more context around a hit | `file_outline` (depth/kind/body controls) / `expand_chunk` |
-| exact indexed source bytes, including remote-only repos | `read_source` — pin by content revision and request a line/byte range |
+| exact source bytes from a remote-only or revision-pinned codebase | `read_source` — request a focused line/byte range; use host `Read` for current bytes at a known local path |
 | what is at path:line | `symbol_at_position` |
 | many symbols at once | `batch_lookup` (≤256 per call) — one round-trip, not N `find_definition` calls |
 | orientation / effective binding | `list_codebases`, `current_context`, `list_files`, `file_tree`, `list_projects`, `list_domains` |
@@ -39,22 +39,29 @@ can't see, at a fraction of the context cost of raw reads.
 Parameters and details live in each tool's own description — read them, don't guess.
 
 Every codebase-scoped tool accepts an optional codebase selector. Omit it for
-the launch/current repo; pass either a codebase id or an indexed local directory
-path for cross-repo work. A path-based call keeps that checkout watched for the
-rest of the MCP session. A previously indexed repo already has user consent:
-start syncing/watching it without asking again. Only when a repo has never been
-indexed should you tell the user and call `index_codebase` after explicit opt-in.
-That first-ever index is gated: retrieval/catalog/graph tools wait until embedding
-finishes successfully, while `sync_status` remains available for progress. Later
-re-syncs do not block use of the last complete index.
+the launch/current repo; pass either an immutable codebase id or an indexed local
+directory path for cross-repo work. A path-based call keeps that checkout watched
+for the rest of the MCP session. A previously indexed repo already has consent
+for retrieval and watcher activation, so use it without asking again; that consent
+does not authorize edits outside the user's requested repository set. Only when a
+repo has never been indexed should you tell the user and call `index_codebase`
+after explicit opt-in. That first-ever index is gated:
+retrieval/catalog/graph tools wait until embedding finishes successfully, while
+`sync_status` remains available for progress. Later re-syncs do not block use of
+the last complete index.
 
 ## Rules
 
-- Start with a semctx tool for any find-code question; host tools are the
-  fallback (below), not the default. Batch independent lookups in one message.
+- Use relevant context directly when it is sufficient and fresh; retrieve the
+  missing evidence rather than reacquiring material already available.
+- Choose semctx for repository discovery, graph relationships, and broad indexed
+  coverage. Batch independent exact lookups; avoid overlapping semantic queries.
 - Exact symbol, defined in this repo, in a graph language (Rust, C#, Go,
   TypeScript/JS) → symbol-graph tools (`find_definition` / `find_references` /
   `who_calls`), not search.
+- Semantic search responses share a server-enforced result-content budget.
+  Start unexpanded, refine from ranked snippets, and expand only the relevant hit
+  or small set. An expanded body normally replaces a follow-up file read.
 - Use `grep` instead of `find_references` when you need EVERY occurrence:
   `find_references` returns every resolved code occurrence (including repeated
   same-line uses) but still skips strings, comments, markdown, and any symbol whose
@@ -64,10 +71,13 @@ re-syncs do not block use of the last complete index.
   approval. The server plan stays internal to the action; report the returned
   changed files and edit id. Use `undo_edit` only while its recorded postimage
   hashes still match.
+- Cross-repository retrieval supplies evidence only. Modify another checkout or
+  open a PR there only when it belongs to the user-requested edit scope.
 - Repo language outside the graph set (Python, Java, C++, …)? The symbol-graph
   tools return nothing there — use `search_codebase` + `grep`.
-- A prompt hook may already have injected likely-relevant hits — pull detail
-  on those (`expand_chunk`, `file_outline`) before issuing a fresh search.
+- A prompt hook may already have injected likely-relevant hits. Treat them as
+  leads when additional repository evidence is needed, and pull focused detail
+  with `expand_chunk` / `file_outline` rather than issuing a fresh broad search.
 
 ## Degraded states — read the signals, don't guess
 
@@ -89,11 +99,13 @@ re-syncs do not block use of the last complete index.
 - `who_calls` / `implementations_of` empty on a graph language ≠ no callers —
   cross-check with `grep`.
 
-## Fall back to host Read / Grep / Glob only when
+## Use host Read / Grep / Glob when
 
-- No semctx tools are attached at all (plugin not installed or disabled).
-- You need a file's exact current bytes to edit it — hits are indexed
-  snapshots, and stale ones are flagged.
+- The relevant code is already present and fresh enough for the task; continue
+  from that evidence without another retrieval call.
+- A known local file or range needs current working-tree bytes.
+- A narrow literal or filename check targets one known file.
+- Semctx tools are unavailable (plugin not installed, disabled, or degraded).
 - The target is excluded from the index: gitignored, `.semctxignore` matches,
-  lockfiles, build output, generated/minified files, test fixtures, files
-  over 1 MB. Markdown docs ARE indexed — search them with `prefer: "docs"`.
+  lockfiles, build output, generated/minified files, test fixtures, or files over
+  1 MB. Markdown docs ARE indexed — search them with `prefer: "docs"`.

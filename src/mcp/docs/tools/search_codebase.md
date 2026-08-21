@@ -15,11 +15,19 @@ Hybrid (dense + lexical) retrieval over the indexed codebase. Returns ranked hit
 ## Parameters
 
 - `query` (required) — the natural-language search.
-- `top_k` — max hits to return (default 20; values above 1000 are clamped server-side).
+- `top_k` — max hits to return (default 20; values above 1000 are clamped server-side). For initial discovery, a focused 5–8 hits is usually enough.
 - `domains` — restrict to specific registered domain ids. Omit to fan out across every registered domain (run `list_domains` to see what's available).
 - `prefer` — ranking bias: `"code"` demotes documentation (markdown) so the implementation leads; `"docs"` does the reverse. Omit for the unbiased hybrid ranking. Use `"code"` for "how is X implemented", leave off for "explain X conceptually".
 - `kinds` — restrict to chunk kinds: `function`, `container` (type/class/module), or `block` (free text, incl. prose). Omit for every kind.
-- `expand` — return the **full enclosing-symbol body** per hit instead of a 4-line snippet, so you usually don't need a follow-up `Read`. Block hits snap to their enclosing function/type (the server does this in-process). Default false.
+- `expand` — return the **full enclosing-symbol body** per hit instead of a 4-line snippet. Block hits snap to their enclosing function/type. Default false; expand only the most relevant hit or small set rather than combining expansion with a broad `top_k`.
+
+## Server result budget
+
+The server enforces a total result-content budget, especially for expanded searches.
+`top_k` is an upper bound, not a promise that every expanded body will fit in
+one response. Start with snippets, then refine the query or use `expand_chunk`
+for the relevant path/range. When using `expand: true`, reason from those bodies
+instead of immediately fetching the same files again.
 
 ## Result freshness
 

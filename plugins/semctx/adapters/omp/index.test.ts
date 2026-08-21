@@ -161,7 +161,7 @@ describe("semctx OMP extension", () => {
 		expect(await harness.emit("context", { messages: [] })).toBeUndefined();
 	});
 
-	test("maps only OMP search tools and never propagates hook failures", async () => {
+	test("maps OMP search and semctx tools without propagating hook failures", async () => {
 		const invoker = new FakeInvoker(() => {
 			throw new Error("hook unavailable");
 		});
@@ -180,6 +180,18 @@ describe("semctx OMP extension", () => {
 			).toBeUndefined();
 			expect(invoker.calls.at(-1)?.input.tool_name).toBe(expected);
 		}
+		const semctxTool = "mcp__semctx_semctx_search_codebase";
+		await harness.emit("tool_call", {
+			toolCallId: "semctx",
+			toolName: semctxTool,
+			input: { query: "authentication" },
+		});
+		expect(invoker.calls.at(-1)?.input).toMatchObject({
+			hook_event_name: "PreToolUse",
+			tool_name: semctxTool,
+			tool_input: { query: "authentication" },
+		});
+
 		const callsBeforeRead = invoker.calls.length;
 		await harness.emit("tool_call", {
 			toolCallId: "read",

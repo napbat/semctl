@@ -158,14 +158,30 @@ in-process but delegates retrieval, authentication, and nudge state to the
 `SEMCTX_HOOK_DISABLE=1` to disable all hook behavior or
 `SEMCTX_NUDGE_DISABLE=1` to disable only shell-search reminders.
 
+Observed semctx use cools further reminders for the active prompt. A new prompt
+or context reset re-arms guidance immediately; within one prompt, three
+consecutive broad built-in searches re-arm it by default. Tune that streak with
+`SEMCTX_NUDGE_REARM_BROAD`, and tune the existing escalation ladder with
+`SEMCTX_NUDGE_GRACE`, `SEMCTX_NUDGE_COOLDOWN`, and `SEMCTX_NUDGE_MAX` (default
+cap: four successful nudges per clear/compact segment).
+
 ## Development
 
+Run `prek install` once to install the repository's pre-commit hook. The complete
+local/CI-equivalent gate is:
+
 ```sh
-cargo build
-cargo test --workspace
+prek run --all-files
+```
+
+The configured hooks run:
+
+```sh
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items
+cargo test --workspace
+bun test plugins/semctx/adapters/omp/index.test.ts
 ```
 
 `plugins/semctx/` is the shared plugin root for every supported coding agent.
