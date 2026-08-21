@@ -1,0 +1,10 @@
+# Pinned for the same reason global.json pins the .NET SDK: a floating
+# toolchain makes a compiler difference indistinguishable from a code
+# difference. `stable` moved under CI and two new clippy lints turned into
+# two build failures on a morning nobody had touched the code they were in.
+#
+# Raising this is a deliberate change with a diff, which is what an upgrade
+# that can break the build should be.
+[toolchain]
+channel = "1.98.0"
+components = ["clippy", "rustfmt"]

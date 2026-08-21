@@ -1864,22 +1864,26 @@ impl ServerHandler for McpServer {
     // versions (it checks `has_method`), so the Markdown descriptions
     // reach the host. `call_tool` is still generated — it ignores
     // descriptions, so the default delegation is correct.
-    async fn list_tools(
+    // Not `async`: there is nothing to await, and the trait accepts any
+    // `Future`. Written as async it is a future that never yields, which newer
+    // clippy calls out rather than letting it read as if it might.
+    fn list_tools(
         &self,
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ListToolsResult, ErrorData> {
+    ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> {
         let tools = self
             .tool_router
             .list_all()
             .into_iter()
             .map(Self::with_doc)
             .collect();
-        Ok(ListToolsResult {
+
+        std::future::ready(Ok(ListToolsResult {
             tools,
             meta: None,
             next_cursor: None,
-        })
+        }))
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
