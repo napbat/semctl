@@ -1,7 +1,7 @@
 //! The nudge copy. Static and local. Tool names are fully qualified so they
 //! stay unambiguous against the built-in search tools; the exact prefix is a
-//! host contract because OMP namespaces marketplace MCP servers differently
-//! from Claude Code and Codex.
+//! host contract because Claude Code and OMP namespace plugin MCP servers
+//! differently from Codex.
 //!
 //! The message never claims the built-in Grep/Glob "miss unopened files" (they
 //! search the working tree). It argues semctl's real edge: the symbol graph,
@@ -20,9 +20,12 @@ pub enum SearchKind {
 /// How the host exposes tools from the `semctx` MCP server.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ToolNameStyle {
-    /// Claude Code and Codex use `mcp__semctx__<tool>`.
+    /// Codex exposes the plugin's server as `mcp__semctx__<tool>`.
     #[default]
-    ClaudeCompatible,
+    CodexPlugin,
+    /// Claude Code qualifies plugin MCP servers with both the plugin and server
+    /// names: `mcp__plugin_semctx_semctx__<tool>`.
+    ClaudePlugin,
     /// OMP namespaces a marketplace server as `semctx:semctx`, which its tool
     /// bridge sanitizes to `mcp__semctx_semctx_<tool>`.
     OmpMarketplace,
@@ -31,7 +34,8 @@ pub enum ToolNameStyle {
 impl ToolNameStyle {
     const fn prefix(self) -> &'static str {
         match self {
-            Self::ClaudeCompatible => "mcp__semctx__",
+            Self::CodexPlugin => "mcp__semctx__",
+            Self::ClaudePlugin => "mcp__plugin_semctx_semctx__",
             Self::OmpMarketplace => "mcp__semctx_semctx_",
         }
     }
@@ -149,7 +153,7 @@ mod tests {
     #[test]
     fn tier2_symbol_names_the_graph_tools_and_the_symbol() {
         let m = tier2(
-            ToolNameStyle::ClaudeCompatible,
+            ToolNameStyle::CodexPlugin,
             SearchKind::Content,
             5,
             Some("parse_config"),
@@ -162,7 +166,7 @@ mod tests {
     #[test]
     fn tier2_concept_names_search_codebase() {
         let m = tier2(
-            ToolNameStyle::ClaudeCompatible,
+            ToolNameStyle::CodexPlugin,
             SearchKind::Content,
             8,
             Some("how does retry work"),
@@ -172,12 +176,7 @@ mod tests {
 
     #[test]
     fn tier2_filename_routes_to_file_tools_not_grep() {
-        let m = tier2(
-            ToolNameStyle::ClaudeCompatible,
-            SearchKind::Filename,
-            5,
-            None,
-        );
+        let m = tier2(ToolNameStyle::CodexPlugin, SearchKind::Filename, 5, None);
         assert!(m.contains("mcp__semctx__list_files"));
         assert!(m.contains("mcp__semctx__file_tree"));
         // A filename nudge must never tell the agent to grep.
@@ -189,23 +188,18 @@ mod tests {
         // The lead ends "segment. " so each tail must start capitalized.
         for m in [
             tier2(
-                ToolNameStyle::ClaudeCompatible,
+                ToolNameStyle::CodexPlugin,
                 SearchKind::Content,
                 5,
                 Some("how does retry work"),
             ), // Concept tail
             tier2(
-                ToolNameStyle::ClaudeCompatible,
+                ToolNameStyle::CodexPlugin,
                 SearchKind::Content,
                 5,
                 Some(r"foo\("),
             ), // Literal tail
-            tier2(
-                ToolNameStyle::ClaudeCompatible,
-                SearchKind::Filename,
-                5,
-                None,
-            ),
+            tier2(ToolNameStyle::CodexPlugin, SearchKind::Filename, 5, None),
         ] {
             let after = m.split("segment. ").nth(1).unwrap();
             let first = after.chars().next().unwrap();
@@ -220,19 +214,14 @@ mod tests {
     fn messages_do_not_repeat_the_false_grep_claim() {
         let all = format!(
             "{} {} {}",
-            tier1(ToolNameStyle::ClaudeCompatible),
+            tier1(ToolNameStyle::CodexPlugin),
             tier2(
-                ToolNameStyle::ClaudeCompatible,
+                ToolNameStyle::CodexPlugin,
                 SearchKind::Content,
                 5,
                 Some("x"),
             ),
-            tier2(
-                ToolNameStyle::ClaudeCompatible,
-                SearchKind::Filename,
-                5,
-                None,
-            )
+            tier2(ToolNameStyle::CodexPlugin, SearchKind::Filename, 5, None,)
         );
         let lc = all.to_lowercase();
         assert!(!lc.contains("unopened"));
@@ -243,19 +232,14 @@ mod tests {
     #[test]
     fn messages_keep_context_and_local_tools_first_class() {
         let messages = [
-            tier1(ToolNameStyle::ClaudeCompatible),
+            tier1(ToolNameStyle::CodexPlugin),
             tier2(
-                ToolNameStyle::ClaudeCompatible,
+                ToolNameStyle::CodexPlugin,
                 SearchKind::Content,
                 5,
                 Some("x"),
             ),
-            tier2(
-                ToolNameStyle::ClaudeCompatible,
-                SearchKind::Filename,
-                5,
-                None,
-            ),
+            tier2(ToolNameStyle::CodexPlugin, SearchKind::Filename, 5, None),
         ];
         let all = messages.join(" ");
         assert!(all.contains("existing context") || all.contains("already available"));
@@ -276,7 +260,8 @@ mod tests {
     #[test]
     fn messages_name_only_real_tools() {
         for names in [
-            ToolNameStyle::ClaudeCompatible,
+            ToolNameStyle::CodexPlugin,
+            ToolNameStyle::ClaudePlugin,
             ToolNameStyle::OmpMarketplace,
         ] {
             let all = format!(
@@ -307,5 +292,12 @@ mod tests {
         let message = tier1(ToolNameStyle::OmpMarketplace);
         assert!(message.contains("`mcp__semctx_semctx_search_codebase`"));
         assert!(!message.contains("mcp__semctx__"));
+    }
+
+    #[test]
+    fn claude_plugin_uses_plugin_and_server_names_in_prefix() {
+        let message = tier1(ToolNameStyle::ClaudePlugin);
+        assert!(message.contains("`mcp__plugin_semctx_semctx__search_codebase`"));
+        assert!(!message.contains("`mcp__semctx__search_codebase`"));
     }
 }

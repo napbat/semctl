@@ -147,13 +147,17 @@ fn phantom_tools(text: &str, tools: &[String]) -> Vec<String> {
         "stale",
     ];
     // A tool reference is valid either bare (`grep`) or fully-qualified as a
-    // supported host sees it. Claude/Codex use `mcp__semctx__grep`; OMP
-    // namespaces the marketplace server and uses `mcp__semctx_semctx_grep`.
+    // supported host sees it. Codex uses `mcp__semctx__grep`, Claude qualifies
+    // both plugin and server, and OMP sanitizes its marketplace namespace.
     let is_registered_tool = |t: &str| -> bool {
-        let bare = ["mcp__semctx__", "mcp__semctx_semctx_"]
-            .iter()
-            .find_map(|prefix| t.strip_prefix(prefix))
-            .unwrap_or(t);
+        let bare = [
+            "mcp__semctx__",
+            "mcp__plugin_semctx_semctx__",
+            "mcp__semctx_semctx_",
+        ]
+        .iter()
+        .find_map(|prefix| t.strip_prefix(prefix))
+        .unwrap_or(t);
         tools.iter().any(|n| n == bare)
     };
     let mut out: Vec<String> = backticked_idents(text)
@@ -366,7 +370,11 @@ fn phantom_detection_actually_fires() {
 fn phantom_guard_understands_host_mcp_prefixes() {
     let tools = registered_tools();
     // Fully-qualified names map to their bare registered tool.
-    for name in ["mcp__semctx__grep", "mcp__semctx_semctx_grep"] {
+    for name in [
+        "mcp__semctx__grep",
+        "mcp__plugin_semctx_semctx__grep",
+        "mcp__semctx_semctx_grep",
+    ] {
         assert_eq!(
             phantom_tools(&format!("use `{name}`"), &tools),
             Vec::<String>::new()
@@ -383,10 +391,11 @@ fn phantom_guard_understands_host_mcp_prefixes() {
 fn nudge_copy_names_no_phantom_tools() {
     use crate::commands::hook::message::{self, SearchKind, ToolNameStyle};
     let tools = registered_tools();
-    // Exercise EVERY message branch for both host naming styles — tier1 plus
+    // Exercise EVERY message branch for all host naming styles — tier1 plus
     // all four tier2 tails (symbol, concept, literal, filename).
     for names in [
-        ToolNameStyle::ClaudeCompatible,
+        ToolNameStyle::CodexPlugin,
+        ToolNameStyle::ClaudePlugin,
         ToolNameStyle::OmpMarketplace,
     ] {
         let copy = format!(

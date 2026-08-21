@@ -106,14 +106,16 @@ impl HookInput {
     }
 
     fn is_codex(&self) -> bool {
-        !self.turn_id.is_empty()
+        self.prompt_id.is_empty() && !self.turn_id.is_empty()
     }
 
     fn tool_name_style(&self) -> message::ToolNameStyle {
         if self.host.eq_ignore_ascii_case("omp") {
             message::ToolNameStyle::OmpMarketplace
+        } else if self.is_codex() {
+            message::ToolNameStyle::CodexPlugin
         } else {
-            message::ToolNameStyle::ClaudeCompatible
+            message::ToolNameStyle::ClaudePlugin
         }
     }
 }
@@ -685,11 +687,13 @@ async fn pretooluse_nudge(cli: &Cli, input: &HookInput) -> Option<String> {
     message
 }
 
-const SEMCTX_CLAUDE_TOOL_PREFIX: &str = "mcp__semctx__";
+const SEMCTX_CODEX_TOOL_PREFIX: &str = "mcp__semctx__";
+const SEMCTX_CLAUDE_PLUGIN_TOOL_PREFIX: &str = "mcp__plugin_semctx_semctx__";
 const SEMCTX_OMP_TOOL_PREFIX: &str = "mcp__semctx_semctx_";
 
 fn is_semctx_tool_name(tool_name: &str) -> bool {
-    tool_name.starts_with(SEMCTX_CLAUDE_TOOL_PREFIX)
+    tool_name.starts_with(SEMCTX_CODEX_TOOL_PREFIX)
+        || tool_name.starts_with(SEMCTX_CLAUDE_PLUGIN_TOOL_PREFIX)
         || tool_name.starts_with(SEMCTX_OMP_TOOL_PREFIX)
 }
 
@@ -1133,8 +1137,22 @@ mod tests {
     }
 
     #[test]
+    fn claude_prompt_id_selects_plugin_scoped_tool_names() {
+        let raw = r#"{"hook_event_name":"PreToolUse","session_id":"s","prompt_id":"p1","cwd":"/repo","tool_name":"Bash","tool_input":{"command":"rg needle ."}}"#;
+        let input: HookInput = serde_json::from_str(raw).expect("Claude payload parses");
+        assert_eq!(input.turn_key(), "p1");
+        assert_eq!(
+            input.tool_name_style(),
+            message::ToolNameStyle::ClaudePlugin
+        );
+    }
+
+    #[test]
     fn recognizes_each_hosts_semctx_tool_namespace() {
         assert!(is_semctx_tool_name("mcp__semctx__search_codebase"));
+        assert!(is_semctx_tool_name(
+            "mcp__plugin_semctx_semctx__search_codebase"
+        ));
         assert!(is_semctx_tool_name("mcp__semctx_semctx_find_definition"));
         assert!(!is_semctx_tool_name("Grep"));
         assert!(!is_semctx_tool_name("mcp__other__search_codebase"));
@@ -1157,6 +1175,7 @@ mod tests {
             "turn_id drives the dedup key when prompt_id is absent"
         );
         assert_eq!(input.tool_name, "Bash");
+        assert_eq!(input.tool_name_style(), message::ToolNameStyle::CodexPlugin);
         assert!(
             sniffer::eligible_search(&input.tool_name, &input.tool_input).is_some(),
             "codex Bash `rg` is an eligible search"
@@ -1175,6 +1194,14 @@ mod tests {
             input.turn_key(),
             "p",
             "prompt_id wins when both are present"
+        );
+        assert!(
+            !input.is_codex(),
+            "prompt_id precedence also controls host-specific output"
+        );
+        assert_eq!(
+            input.tool_name_style(),
+            message::ToolNameStyle::ClaudePlugin
         );
     }
 
@@ -1398,7 +1425,7 @@ mod tests {
         let (msg, out) = finalize(
             st,
             escalation::Tier::Two,
-            message::ToolNameStyle::ClaudeCompatible,
+            message::ToolNameStyle::CodexPlugin,
             message::SearchKind::Content,
             Some("x"),
             "p1",
@@ -1426,7 +1453,7 @@ mod tests {
         let (msg, out) = finalize(
             st,
             escalation::Tier::Two,
-            message::ToolNameStyle::ClaudeCompatible,
+            message::ToolNameStyle::CodexPlugin,
             message::SearchKind::Content,
             Some("parse_config"),
             "p1",
@@ -1451,7 +1478,7 @@ mod tests {
         let (msg, _) = finalize(
             st,
             escalation::Tier::Two,
-            message::ToolNameStyle::ClaudeCompatible,
+            message::ToolNameStyle::CodexPlugin,
             message::SearchKind::Filename,
             None,
             "p1",
@@ -1749,7 +1776,10 @@ mod tests {
         );
 
         let compliance_entry = &pre[1];
-        assert_eq!(compliance_entry["matcher"], "mcp__semctx__.*");
+        assert_eq!(
+            compliance_entry["matcher"],
+            "mcp__semctx__.*|mcp__plugin_semctx_semctx__.*"
+        );
         assert_eq!(compliance_entry["hooks"][0]["command"], "semctl hook");
         assert_eq!(compliance_entry["hooks"][0]["timeout"], 2);
         assert!(
