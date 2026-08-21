@@ -196,7 +196,7 @@ test commands. To record fresh Codex, Claude, and OMP tool-event traces for the
 model-level golden prompts:
 
 ```sh
-python scripts/run_skill_evals.py --host all
+python3 scripts/run_skill_evals.py --host all
 ```
 
 CI (`.github/workflows/ci.yml`) runs the same checks — clippy is `pedantic`, and

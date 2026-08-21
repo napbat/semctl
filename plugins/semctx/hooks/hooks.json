@@ -39,7 +39,7 @@
         ]
       },
       {
-        "matcher": "mcp__semctx__.*",
+        "matcher": "mcp__semctx__.*|mcp__plugin_semctx_semctx__.*",
         "hooks": [
           {
             "type": "command",

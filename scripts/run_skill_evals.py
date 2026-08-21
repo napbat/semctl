@@ -75,6 +75,7 @@ def claude_command(query: str) -> list[str]:
     return [
         "claude",
         "--print",
+        "--verbose",
         "--output-format",
         "stream-json",
         "--include-hook-events",
@@ -203,6 +204,7 @@ def main() -> int:
         "hosts": hosts,
         "cases": [],
     }
+    failed = False
 
     for host in hosts:
         for case in selected:
@@ -233,6 +235,7 @@ def main() -> int:
                 record["duration_seconds"] = round(time.monotonic() - started, 3)
                 record["stderr"] = completed.stderr
                 output_path.write_text(completed.stdout, encoding="utf-8")
+                failed = failed or completed.returncode != 0
             except subprocess.TimeoutExpired as error:
                 record["exit_code"] = None
                 record["duration_seconds"] = round(time.monotonic() - started, 3)
@@ -241,6 +244,7 @@ def main() -> int:
                 if isinstance(timed_out_output, bytes):
                     timed_out_output = timed_out_output.decode("utf-8", errors="replace")
                 output_path.write_text(timed_out_output, encoding="utf-8")
+                failed = True
             record["events"] = display_path(output_path)
             manifest["cases"].append(record)
             print(f"{host} {case['id']}: {record['exit_code']}")
@@ -252,7 +256,7 @@ def main() -> int:
             encoding="utf-8",
         )
         print(f"results: {run_dir}")
-    return 0
+    return int(failed)
 
 
 if __name__ == "__main__":
