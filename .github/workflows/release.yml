@@ -105,7 +105,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends build-essential clang
 
       - name: Build
-        run: cargo build --release --bin semctl
+        run: cargo build --release --bin semctl --locked
 
       - name: Stage binary
         shell: bash

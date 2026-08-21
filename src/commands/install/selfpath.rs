@@ -349,9 +349,7 @@ pub fn remove_installed_binary() -> Result<BinaryRemoval> {
     if !target.exists() {
         return Ok(BinaryRemoval::NotFound);
     }
-    let running_is_target = std::env::current_exe()
-        .ok()
-        .is_some_and(|c| same_file(&c, &target));
+    let running_is_target = std::env::current_exe().is_ok_and(|c| same_file(&c, &target));
     if running_is_target {
         self_replace::self_delete().context("remove the running semctl binary")?;
         Ok(BinaryRemoval::RemovedRunning { target })
