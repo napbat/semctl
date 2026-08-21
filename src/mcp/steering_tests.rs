@@ -205,6 +205,37 @@ fn skill_covers_every_tool() {
 }
 
 #[test]
+fn retrieval_guidance_bounds_expansion_and_routes_local_reads() {
+    let skill = skill_md();
+    let server = server_instructions();
+    let search = McpServer::tool_doc("search_codebase").expect("search docs");
+    let read_source = McpServer::tool_doc("read_source").expect("read_source docs");
+
+    for (name, text) in [
+        ("skill", skill.as_str()),
+        ("server", server),
+        ("search", search),
+    ] {
+        assert!(
+            text.contains("server") && text.contains("result-content budget"),
+            "{name} must expose the server result-content budget"
+        );
+        assert!(
+            text.contains("5–8") && text.contains("expand"),
+            "{name} must steer initial search toward focused snippets"
+        );
+    }
+    assert!(
+        skill.contains("host `Read`") && read_source.contains("host Read"),
+        "known local current bytes belong to the host reader"
+    );
+    assert!(
+        skill.contains("retrieval supplies evidence only"),
+        "cross-repository retrieval must not silently authorize edits"
+    );
+}
+
+#[test]
 fn every_tool_has_explicit_safety_annotations() {
     for tool in McpServer::tool_router()
         .list_all()

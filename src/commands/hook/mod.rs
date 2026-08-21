@@ -9,18 +9,18 @@
 //! `prompt_id`. The parser also accepts `PostCompact` for compatibility, while
 //! the packaged hooks use `SessionStart(source=compact)` as the shared boundary.
 //!
-//! - **`SessionStart`** — a one-line orientation: which codebase this repo maps
-//!   to, how to route missing evidence between semctx and local context, and
-//!   (only when needed) a cached, once-per-session instruction to tell the user
-//!   about a newer CLI.
+//! - **`SessionStart`** — a one-line orientation: semctx is available, how to
+//!   route missing evidence between semctx and local context, accepted selectors
+//!   for another checkout, and (only when needed) a cached, once-per-session
+//!   instruction to tell the user about a newer CLI.
 //! - **`UserPromptSubmit`** — gated, summary-style retrieval for fuzzy discovery
 //!   prompts: search the repo's codebase and inject a compact candidate list
 //!   (path + line range + symbol + score), not full chunk bodies. Exact graph or
 //!   tool-shaped prompts are left for the model to route directly.
-//! - **`PreToolUse`** — when the agent repeatedly reaches for broad built-in
-//!   `Grep`/`Glob` or Bash/PowerShell search, and this repo is indexed, emit
-//!   balanced guidance about semctx's discovery strengths and valid local-tool
-//!   cases. Narrow single-file searches do not count toward escalation.
+//! - **`PreToolUse`** — broad built-in search can emit balanced guidance about
+//!   semctx's discovery strengths and valid local-tool cases. Semctx MCP calls
+//!   silently record compliance; immediate reminders cool, then a new prompt,
+//!   context reset, or bounded consecutive broad-search streak re-arms them.
 //!
 //! Contract: **never break a session.** An unindexed repo produces an opt-in
 //! notice; every actual failure path — not logged in, server down, parse error —
@@ -399,30 +399,24 @@ async fn session_start_context(
     combine_context(orientation, update)
 }
 
-/// One-shot orientation: name an indexed codebase and describe the evidence-based
-/// routing boundary, or tell the agent that an unindexed repo requires opt-in.
+/// One-shot orientation: advertise semctx's discovery domain and the accepted
+/// current/alternate checkout selectors, or require opt-in for an unindexed repo.
 async fn session_orientation_context(cli: &Cli, input: &HookInput) -> Option<String> {
-    let (client, codebase) = match resolve_connection(cli, &input.cwd).await? {
-        HookConnection::Indexed(client, codebase) => (client, codebase),
-        HookConnection::Unindexed(dir) => {
-            return Some(unindexed_notice(&dir));
-        }
-    };
-    // Best-effort: the codebase's slug for a friendlier label.
-    let name = client
-        .get::<api::CodebaseSummary>(&format!("/v1/codebases/{codebase}"))
-        .await
-        .ok()
-        .map_or_else(|| codebase.clone(), |c| c.slug);
-    Some(format!(
-        "This repository is indexed by semctl as \"{name}\". Begin with relevant, \
-         fresh evidence already available in the conversation. Use the semctl MCP \
-         tools (`search_codebase`, `find_definition`, `find_references`, `who_calls`, \
-         `imports`) for repository discovery, unknown locations, cross-file \
-         relationships, symbol graphs, and broad indexed searches. Use local file \
-         tools for current bytes at a known path or range and for narrow, file-scoped \
-         checks — see the codebase-retrieval skill.",
-    ))
+    match resolve_connection(cli, &input.cwd).await? {
+        HookConnection::Indexed(_, _) => Some(indexed_orientation().to_string()),
+        HookConnection::Unindexed(dir) => Some(unindexed_notice(&dir)),
+    }
+}
+
+fn indexed_orientation() -> &'static str {
+    "This repository is indexed by semctl. Begin with relevant, fresh evidence \
+     already available in the conversation. Use the semctl MCP tools \
+     (`search_codebase`, `find_definition`, `find_references`, `who_calls`, `imports`) \
+     for repository discovery, unknown locations, cross-file relationships, symbol \
+     graphs, and broad indexed searches. Use local file tools for current bytes at a \
+     known path or range and for narrow, file-scoped checks. Omit `codebase` for this \
+     checkout; for another indexed checkout, pass its immutable codebase ID or local \
+     directory path — see the codebase-retrieval skill."
 }
 
 fn unindexed_notice(dir: &std::path::Path) -> String {
@@ -591,10 +585,10 @@ async fn connect(cli: &Cli, cwd: &str) -> Option<(Client, String)> {
     }
 }
 
-/// `PreToolUse`: when the agent repeatedly reaches for broad built-in search in
-/// an indexed repo, emit balanced routing guidance. Single-file and outside-repo
-/// searches stay silent; eligible broad searches escalate within a segment,
-/// deduped per turn and strictly gated on availability.
+/// `PreToolUse`: record semctx compliance silently, or emit balanced routing
+/// guidance when broad built-in searching resumes. Single-file and outside-repo
+/// searches stay silent; compliance cools immediate reminders and a bounded
+/// broad-search streak re-arms them. Emissions remain deduped and availability-gated.
 async fn pretooluse_nudge(cli: &Cli, input: &HookInput) -> Option<String> {
     if std::env::var_os("SEMCTX_NUDGE_DISABLE").is_some() {
         return None;
@@ -612,6 +606,13 @@ async fn pretooluse_nudge(cli: &Cli, input: &HookInput) -> Option<String> {
             !input.session_id.is_empty(),
             !turn.is_empty()
         ));
+        return None;
+    }
+
+    // The compliance matcher has a state-only fast path: no availability probe,
+    // message, or recursive nudge. A later broad-search streak re-arms guidance.
+    if is_semctx_tool_name(&input.tool_name) {
+        record_semctx_compliance(&input.session_id, turn);
         return None;
     }
 
@@ -650,6 +651,10 @@ async fn pretooluse_nudge(cli: &Cli, input: &HookInput) -> Option<String> {
         debug(format_args!("nudge: session lock contended — skip"));
         return None;
     };
+
+    if compliance_suppresses(&store, &input.session_id, turn, load_compliance_rearm()) {
+        return None;
+    }
     // advance() logs its own specific silence reason (dedup / grace / cooldown / cap).
     let (mut st, tier) = advance(&store, &input.session_id, turn, &load_thresholds())?;
     debug(format_args!(
@@ -678,6 +683,58 @@ async fn pretooluse_nudge(cli: &Cli, input: &HookInput) -> Option<String> {
         )),
     }
     message
+}
+
+const SEMCTX_CLAUDE_TOOL_PREFIX: &str = "mcp__semctx__";
+const SEMCTX_OMP_TOOL_PREFIX: &str = "mcp__semctx_semctx_";
+
+fn is_semctx_tool_name(tool_name: &str) -> bool {
+    tool_name.starts_with(SEMCTX_CLAUDE_TOOL_PREFIX)
+        || tool_name.starts_with(SEMCTX_OMP_TOOL_PREFIX)
+}
+
+fn record_semctx_compliance(session_id: &str, prompt_id: &str) {
+    let store = state::Store::default_store();
+    let Some(_lock) = store.try_lock(session_id) else {
+        debug(format_args!("compliance: session lock contended — skip"));
+        return;
+    };
+    let mut st = store.load(session_id);
+    if st.record_semctx_use(prompt_id) {
+        store.save(session_id, &st);
+        debug(format_args!("compliance: recorded semctx use"));
+    } else {
+        debug(format_args!("compliance: already current"));
+    }
+}
+
+fn compliance_suppresses(
+    store: &state::Store,
+    session_id: &str,
+    prompt_id: &str,
+    rearm_after: u32,
+) -> bool {
+    let mut st = store.load(session_id);
+    match st.compliance_decision(prompt_id, rearm_after) {
+        state::ComplianceDecision::Inactive => false,
+        state::ComplianceDecision::Suppress => {
+            store.save(session_id, &st);
+            debug(format_args!(
+                "nudge: semctx used this prompt; cooling broad search {}",
+                st.broad_searches_after_semctx
+            ));
+            true
+        }
+        state::ComplianceDecision::Rearmed => {
+            store.save(session_id, &st);
+            debug(format_args!("nudge: compliance cooling re-armed"));
+            false
+        }
+    }
+}
+
+fn load_compliance_rearm() -> u32 {
+    env_parse("SEMCTX_NUDGE_REARM_BROAD").unwrap_or(3)
 }
 
 /// Finalize a fired decision against the availability verdict. Pure and
@@ -1043,6 +1100,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn indexed_orientation_keeps_discovery_signal_without_slugs() {
+        let message = indexed_orientation();
+        assert!(message.starts_with("This repository is indexed by semctl."));
+        assert!(message.contains("`search_codebase`"));
+        assert!(message.contains("repository discovery"));
+        assert!(message.contains("Omit `codebase` for this checkout"));
+        assert!(message.contains("immutable codebase ID or local directory path"));
+        assert!(!message.contains("indexed by semctl as"));
+        assert!(!message.contains("slug"));
+    }
+
     // Belt-and-suspenders: a camelCase payload (older/other hosts) still binds.
     #[test]
     fn still_accepts_camel_case_event_name() {
@@ -1061,6 +1130,14 @@ mod tests {
             input.tool_name_style(),
             message::ToolNameStyle::OmpMarketplace
         );
+    }
+
+    #[test]
+    fn recognizes_each_hosts_semctx_tool_namespace() {
+        assert!(is_semctx_tool_name("mcp__semctx__search_codebase"));
+        assert!(is_semctx_tool_name("mcp__semctx_semctx_find_definition"));
+        assert!(!is_semctx_tool_name("Grep"));
+        assert!(!is_semctx_tool_name("mcp__other__search_codebase"));
     }
 
     // Codex sends the same snake_case shape as Claude but names the per-turn id
@@ -1276,6 +1353,39 @@ mod tests {
             4,
             "dedup does not increment"
         );
+    }
+
+    #[test]
+    fn compliance_cools_immediate_searches_then_rearms() {
+        let t = temp_store();
+        let mut st = state::NudgeState::default();
+        st.remember_prompt("p1");
+        st.record_semctx_use("p1");
+        t.store.save("s1", &st);
+
+        assert!(compliance_suppresses(&t.store, "s1", "p1", 3));
+        assert!(compliance_suppresses(&t.store, "s1", "p1", 3));
+        assert!(!compliance_suppresses(&t.store, "s1", "p1", 3));
+
+        assert!(
+            advance(&t.store, "s1", "p1", &T).is_none(),
+            "normal grace applies after the compliance streak"
+        );
+        let (st, tier) = advance(&t.store, "s1", "p1", &T).expect("fourth later search re-nudges");
+        assert_eq!(tier, escalation::Tier::One);
+        assert_eq!(st.eligible_count, 2);
+    }
+
+    #[test]
+    fn new_prompt_rearms_compliance_with_normal_grace() {
+        let t = temp_store();
+        let mut st = state::NudgeState::default();
+        st.record_semctx_use("p1");
+        t.store.save("s1", &st);
+
+        assert!(!compliance_suppresses(&t.store, "s1", "p2", 3));
+        assert!(advance(&t.store, "s1", "p2", &T).is_none());
+        assert_eq!(t.store.load("s1").eligible_count, 1);
     }
 
     #[test]
@@ -1619,20 +1729,32 @@ mod tests {
         let pre = v["hooks"]["PreToolUse"]
             .as_array()
             .expect("PreToolUse block present");
-        let entry = pre.first().expect("a PreToolUse entry");
+        assert_eq!(pre.len(), 2, "search routing + silent semctx compliance");
+        let search_entry = &pre[0];
         assert_eq!(
-            entry["hooks"][0]["command"], "semctl hook",
-            "PreToolUse → semctl hook"
+            search_entry["hooks"][0]["command"], "semctl hook",
+            "PreToolUse search → semctl hook"
         );
 
-        let matcher = entry["matcher"].as_str().expect("matcher is a string");
+        let matcher = search_entry["matcher"]
+            .as_str()
+            .expect("search matcher is a string");
         let mut got: Vec<&str> = matcher.split('|').collect();
         got.sort_unstable();
         let mut want: Vec<&str> = sniffer::HANDLED_TOOLS.to_vec();
         want.sort_unstable();
         assert_eq!(
             got, want,
-            "hooks.json PreToolUse matcher drifted from sniffer::HANDLED_TOOLS"
+            "hooks.json search matcher drifted from sniffer::HANDLED_TOOLS"
+        );
+
+        let compliance_entry = &pre[1];
+        assert_eq!(compliance_entry["matcher"], "mcp__semctx__.*");
+        assert_eq!(compliance_entry["hooks"][0]["command"], "semctl hook");
+        assert_eq!(compliance_entry["hooks"][0]["timeout"], 2);
+        assert!(
+            compliance_entry["hooks"][0].get("statusMessage").is_none(),
+            "compliance recording stays invisible"
         );
 
         for event in ["SessionStart", "UserPromptSubmit", "PreToolUse"] {

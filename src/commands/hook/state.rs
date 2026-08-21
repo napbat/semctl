@@ -1,6 +1,6 @@
-//! Per-session nudge state: the running counts that drive escalation, the
-//! availability TTL cache, and per-`prompt_id` dedup. Lives in a throwaway file
-//! under the OS temp dir, keyed by session id.
+//! Per-session nudge state: escalation counts, time-bounded cooling after
+//! observed semctx use, the availability TTL cache, and per-`prompt_id` dedup.
+//! Lives in a throwaway file under the OS temp dir, keyed by session id.
 //!
 //! Concurrency (Codex MAJOR): Claude can fire parallel `PreToolUse` calls, so the
 //! read-modify-write is guarded by a per-session try-lock. If the lock can't be
@@ -33,6 +33,13 @@ pub struct NudgeState {
     pub last_nudge_at_count: u32,
     #[serde(default)]
     pub nudged_prompt_ids: Vec<String>,
+    /// Prompt/turn that most recently used a semctx MCP tool. While this matches
+    /// the active prompt, broad built-in searches are temporarily cooled.
+    #[serde(default)]
+    pub semctx_prompt_id: String,
+    /// Consecutive broad built-in searches observed after that semctx use.
+    #[serde(default)]
+    pub broad_searches_after_semctx: u32,
     #[serde(default)]
     pub avail_checked_at: u64,
     #[serde(default)]
@@ -53,6 +60,13 @@ pub struct NudgeState {
     pub update_notice_emitted: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComplianceDecision {
+    Inactive,
+    Suppress,
+    Rearmed,
+}
+
 impl NudgeState {
     /// Record that `prompt_id` has been nudged (bounded ring).
     pub fn remember_prompt(&mut self, prompt_id: &str) {
@@ -68,6 +82,50 @@ impl NudgeState {
 
     pub fn already_nudged(&self, prompt_id: &str) -> bool {
         !prompt_id.is_empty() && self.nudged_prompt_ids.iter().any(|p| p == prompt_id)
+    }
+
+    /// Record demonstrated semctx use. Search pressure restarts from zero, while
+    /// the per-segment fired cap and availability/update state remain intact.
+    /// Returns whether persisted state changed, avoiding duplicate writes for
+    /// consecutive semctx calls in the same prompt.
+    pub fn record_semctx_use(&mut self, prompt_id: &str) -> bool {
+        if prompt_id.is_empty() {
+            return false;
+        }
+        let changed = self.eligible_count != 0
+            || self.last_nudge_at_count != 0
+            || self.semctx_prompt_id != prompt_id
+            || self.broad_searches_after_semctx != 0;
+        self.eligible_count = 0;
+        self.last_nudge_at_count = 0;
+        self.semctx_prompt_id = prompt_id.to_string();
+        self.broad_searches_after_semctx = 0;
+        changed
+    }
+
+    /// Cool immediate broad-search reminders after semctx use, then re-arm on a
+    /// new prompt or after `rearm_after` consecutive broad searches. Re-arming
+    /// forgets this prompt's prior nudge so a later sequential reminder is
+    /// possible; parallel calls remain protected until the streak is reached.
+    pub fn compliance_decision(&mut self, prompt_id: &str, rearm_after: u32) -> ComplianceDecision {
+        if self.semctx_prompt_id.is_empty() {
+            return ComplianceDecision::Inactive;
+        }
+        if self.semctx_prompt_id != prompt_id {
+            self.semctx_prompt_id.clear();
+            self.broad_searches_after_semctx = 0;
+            return ComplianceDecision::Rearmed;
+        }
+
+        self.broad_searches_after_semctx = self.broad_searches_after_semctx.saturating_add(1);
+        if rearm_after != 0 && self.broad_searches_after_semctx < rearm_after {
+            return ComplianceDecision::Suppress;
+        }
+
+        self.semctx_prompt_id.clear();
+        self.broad_searches_after_semctx = 0;
+        self.nudged_prompt_ids.retain(|id| id != prompt_id);
+        ComplianceDecision::Rearmed
     }
 }
 
@@ -346,6 +404,8 @@ mod tests {
             &NudgeState {
                 eligible_count: 9,
                 nudges_fired: 3,
+                semctx_prompt_id: "p1".into(),
+                broad_searches_after_semctx: 2,
                 update_checked_at: 123,
                 update_latest_version: "0.2.0".into(),
                 update_notice_emitted: true,
@@ -357,6 +417,8 @@ mod tests {
         assert_eq!(st.eligible_count, 0);
         assert_eq!(st.nudges_fired, 0);
         assert!(st.nudged_prompt_ids.is_empty());
+        assert!(st.semctx_prompt_id.is_empty());
+        assert_eq!(st.broad_searches_after_semctx, 0);
         assert_eq!(st.update_checked_at, 123);
         assert_eq!(st.update_latest_version, "0.2.0");
         assert!(st.update_notice_emitted);
@@ -414,6 +476,63 @@ mod tests {
         }
         assert!(st.nudged_prompt_ids.len() <= MAX_PROMPT_IDS);
         assert!(!st.already_nudged("p1"), "oldest evicted");
+    }
+
+    #[test]
+    fn semctx_compliance_cools_then_rearms_a_prompt() {
+        let mut st = NudgeState {
+            eligible_count: 8,
+            nudges_fired: 2,
+            last_nudge_at_count: 5,
+            ..Default::default()
+        };
+        st.remember_prompt("p1");
+        assert!(st.record_semctx_use("p1"));
+        assert_eq!(st.eligible_count, 0);
+        assert_eq!(st.last_nudge_at_count, 0);
+        assert_eq!(st.nudges_fired, 2, "the segment cap survives compliance");
+        assert_eq!(st.semctx_prompt_id, "p1");
+        assert!(
+            !st.record_semctx_use("p1"),
+            "consecutive semctx calls avoid duplicate state writes"
+        );
+
+        assert_eq!(
+            st.compliance_decision("p1", 3),
+            ComplianceDecision::Suppress
+        );
+        assert_eq!(
+            st.compliance_decision("p1", 3),
+            ComplianceDecision::Suppress
+        );
+        assert_eq!(st.compliance_decision("p1", 3), ComplianceDecision::Rearmed);
+        assert!(st.semctx_prompt_id.is_empty());
+        assert_eq!(st.broad_searches_after_semctx, 0);
+        assert!(
+            !st.already_nudged("p1"),
+            "sequential re-arm permits a later nudge"
+        );
+        assert_eq!(
+            st.compliance_decision("p1", 3),
+            ComplianceDecision::Inactive
+        );
+    }
+
+    #[test]
+    fn new_prompt_and_zero_streak_rearm_immediately() {
+        let mut next_prompt = NudgeState::default();
+        next_prompt.record_semctx_use("p1");
+        assert_eq!(
+            next_prompt.compliance_decision("p2", 3),
+            ComplianceDecision::Rearmed
+        );
+
+        let mut no_cooling = NudgeState::default();
+        no_cooling.record_semctx_use("p1");
+        assert_eq!(
+            no_cooling.compliance_decision("p1", 0),
+            ComplianceDecision::Rearmed
+        );
     }
 
     #[test]

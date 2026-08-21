@@ -158,6 +158,13 @@ in-process but delegates retrieval, authentication, and nudge state to the
 `SEMCTX_HOOK_DISABLE=1` to disable all hook behavior or
 `SEMCTX_NUDGE_DISABLE=1` to disable only shell-search reminders.
 
+Observed semctx use cools further reminders for the active prompt. A new prompt
+or context reset re-arms guidance immediately; within one prompt, three
+consecutive broad built-in searches re-arm it by default. Tune that streak with
+`SEMCTX_NUDGE_REARM_BROAD`, and tune the existing escalation ladder with
+`SEMCTX_NUDGE_GRACE`, `SEMCTX_NUDGE_COOLDOWN`, and `SEMCTX_NUDGE_MAX` (default
+cap: four successful nudges per clear/compact segment).
+
 ## Development
 
 ```sh

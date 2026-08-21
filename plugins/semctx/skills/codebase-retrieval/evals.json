@@ -82,6 +82,32 @@
         "Uses host Read or Grep scoped to the known file because current local bytes and one literal are requested",
         "Does not issue a broad semctx search or graph lookup"
       ]
+    },
+    {
+      "skills": ["codebase-retrieval"],
+      "query": "I don't know where production readiness is implemented. Find the likely code and explain the relevant path without flooding the context.",
+      "expected_behavior": [
+        "Starts with one focused search_codebase call using snippets rather than expand and a small top_k around 5-8",
+        "Refines or expands only the most relevant hit instead of issuing overlapping semantic searches",
+        "Uses an expanded body directly rather than immediately rereading the same file"
+      ]
+    },
+    {
+      "skills": ["codebase-retrieval"],
+      "query": "Compare authentication behavior with the already indexed sibling repository, but make any requested edits only in this repository.",
+      "expected_behavior": [
+        "Scopes retrieval to the sibling by immutable codebase id or indexed local path without requesting new indexing consent",
+        "Treats sibling results as evidence and does not modify or open a PR in that checkout"
+      ]
+    },
+    {
+      "skills": ["codebase-retrieval"],
+      "query": "How should I set the codebase argument for this checkout and for a different indexed checkout?",
+      "expected_behavior": [
+        "Omits codebase for the current checkout",
+        "Uses an immutable codebase id or indexed local directory path for another checkout",
+        "Does not present or reuse a friendly slug as a selector"
+      ]
     }
   ],
   "triggering": {

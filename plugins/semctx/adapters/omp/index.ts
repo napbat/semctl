@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
 const HOST = "omp";
+const OMP_SEMCTX_TOOL_PREFIX = "mcp__semctx_semctx_";
 const MAX_HOOK_OUTPUT_BYTES = 64 * 1024;
 const SESSION_TIMEOUT_MS = 8_000;
 const PROMPT_TIMEOUT_MS = 12_000;
@@ -33,7 +34,7 @@ export interface SemctlHookInput {
 	prompt_id?: string;
 	prompt?: string;
 	source?: SessionSource;
-	tool_name?: "Grep" | "Glob" | "Bash";
+	tool_name?: string;
 	tool_input?: Record<string, unknown>;
 }
 
@@ -144,6 +145,7 @@ function hiddenMessage(customType: string, content: string) {
 }
 
 function hookToolName(toolName: string): SemctlHookInput["tool_name"] {
+	if (toolName.startsWith(OMP_SEMCTX_TOOL_PREFIX)) return toolName;
 	switch (toolName) {
 		case "grep":
 			return "Grep";

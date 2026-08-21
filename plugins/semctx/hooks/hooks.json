@@ -37,6 +37,16 @@
             "statusMessage": "Checking semctx retrieval guidance"
           }
         ]
+      },
+      {
+        "matcher": "mcp__semctx__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "semctl hook",
+            "timeout": 2
+          }
+        ]
       }
     ]
   }
