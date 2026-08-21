@@ -634,6 +634,15 @@ pub struct CheckoutVcsInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revision: Option<String>,
     pub dirty: bool,
+    /// The remote this working copy tracks right now.
+    ///
+    /// Sent every sync rather than only at registration, because it moves: a
+    /// repository is renamed or transferred, and a remote is re-pointed. The
+    /// project a codebase belongs to is derived from this server-side, so a
+    /// server told once and never again holds an identity that has drifted away
+    /// from what the checkout actually tracks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_url: Option<String>,
 }
 
 /// The diff the server computed — paths whose content must be uploaded, and
@@ -641,6 +650,17 @@ pub struct CheckoutVcsInfo {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncPlan {
+    /// The codebase the plan is actually against.
+    ///
+    /// Usually the one that was posted to. When it is not, this checkout has
+    /// been moved: its remote no longer names the project it was filed under,
+    /// so the server put it where it belongs and said so. Following that is not
+    /// optional — carrying on with the old id starts a second copy in a project
+    /// this checkout has left.
+    ///
+    /// `None` from a server too old to move anything, where the id posted to is
+    /// by definition the right one.
+    pub codebase_id: Option<String>,
     pub job_id: String,
     pub need_content: Vec<String>,
     pub to_delete: Vec<String>,

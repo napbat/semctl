@@ -28,9 +28,16 @@ use git::{git_capture, git_is_dirty, git_remote};
 
 pub(crate) use identity::source_id as checkout_source_id;
 
-/// Where the checkout at `dir` is standing: its branch, its revision, and
-/// whether the tree is clean. `None` when the folder is not a git checkout,
-/// which is a thing to say nothing about rather than a thing to guess at.
+/// Where the checkout at `dir` is standing: its branch, its revision, the
+/// remote it tracks, and whether the tree is clean. `None` when the folder is
+/// not a git checkout, which is a thing to say nothing about rather than a
+/// thing to guess at.
+///
+/// The remote is reported on every sync, not just at registration. It moves —
+/// a repository is renamed or transferred, a remote is re-pointed, and a plain
+/// folder becomes a checkout — and the server derives the project identity from
+/// it, so saying it once would leave that identity describing a repository this
+/// copy no longer tracks.
 pub(crate) async fn checkout_state(dir: &Path) -> Option<api::CheckoutVcsInfo> {
     let ref_name = git_capture(dir, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
     let revision = git_capture(dir, &["rev-parse", "HEAD"]).await;
@@ -42,6 +49,7 @@ pub(crate) async fn checkout_state(dir: &Path) -> Option<api::CheckoutVcsInfo> {
         ref_name,
         revision,
         dirty: git_is_dirty(dir).await,
+        remote_url: git_remote(dir).await,
     })
 }
 

@@ -313,6 +313,19 @@ where
         .await
         .context("sync plan")?;
 
+    // A checkout whose remote was re-pointed belongs to a different project
+    // than the one it was filed under, and the server moves it rather than
+    // letting it go on writing into a codebase it has left. Everything after
+    // this — the uploads, the cache, what gets reported — is about where the
+    // checkout actually is now.
+    let codebase_id = match plan.codebase_id.as_deref() {
+        Some(moved) if moved != codebase_id => {
+            let _ = crate::config::cache_codebase(&dir, moved);
+            moved.to_string()
+        }
+        _ => codebase_id,
+    };
+
     let uploaded = upload_needed(
         client,
         &codebase_id,
