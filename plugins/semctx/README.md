@@ -18,9 +18,36 @@ Each coding agent keeps only the adapter material that cannot be shared:
 To add another coding agent, point its marketplace at this plugin root and its
 adapter at `skills/` and the shared hooks wherever its plugin format allows. OMP
 instead loads `adapters/omp/index.ts`: its native events invoke `semctl hook` and
-inject the returned context without duplicating retrieval policy in TypeScript.
-Do not manually copy shared skills; when a host requires a projected format,
-generate it from the canonical skill and verify parity in CI.
+inject the returned context. When an enabled semctx MCP tool is exposed either
+top-level or through OMP's `xd://` catalog, the adapter also appends a short
+host-specific routing block after OMP's base prompt. That block resolves OMP's
+generic LSP-first rule; the complete retrieval policy remains in the canonical
+skill. Do not manually copy shared skills; when a host requires a projected
+format, generate it from the canonical skill and verify parity in CI.
+
+The OMP adapter intentionally composes with, rather than replaces, OMP's native
+LSP and memory systems. Indexed repository discovery and graph/flow questions
+route to semctx first; diagnostics, hover, code actions, formatting, and live
+edit validation stay with LSP. The adapter does not forward native LSP actions
+to the shell hook; its per-turn routing block resolves the host-level precedence
+conflict before tool selection. The non-blocking drift nudge watches only broad
+built-in search. Every semctx MCP call is forwarded as silent compliance so the
+shared policy can cool immediate reminders and re-arm after a bounded broad-search
+streak; a newer semctx call also invalidates any older in-flight nudge. Ordinary
+rename remains LSP-first; semctx symbolic edits are appropriate when guarded
+transactions, safe-delete analysis, or undo are specifically useful.
+Orientation and prompt hits use custom messages (excluded from OMP's
+retained user/assistant memory transcript), and nudges use a one-provider-call
+`context` injection. Do not save indexed snippets through `ctx.memory`: the
+server index is the freshness boundary, while OMP memory is for durable
+conversation knowledge.
+
+OMP's general-purpose `task` subagent inherits the parent MCP manager, skills,
+and extension paths, so it receives this integration. Some bundled specialist
+agents (`scout`, `reviewer`, `librarian`, and `security-reviewer`) declare a
+fixed built-in tool allowlist that omits MCP tools; use `task` for delegated
+semctx-backed discovery unless that upstream agent definition is explicitly
+extended with semctx tool names.
 
 Then add the host in three registries:
 

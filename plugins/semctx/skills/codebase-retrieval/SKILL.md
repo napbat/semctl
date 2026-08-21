@@ -105,7 +105,10 @@ the last complete index.
   from that evidence without another retrieval call.
 - A known local file or range needs current working-tree bytes.
 - A narrow literal or filename check targets one known file.
-- Semctx tools are unavailable (plugin not installed, disabled, or degraded).
+- Semctx tools are unavailable or not attached at all (plugin not installed,
+  disabled, or degraded).
+- You need a file's exact current bytes to edit it — hits are indexed
+  snapshots, and stale ones are flagged.
 - The target is excluded from the index: gitignored, `.semctxignore` matches,
   lockfiles, build output, generated/minified files, test fixtures, or files over
   1 MB. Markdown docs ARE indexed — search them with `prefer: "docs"`.

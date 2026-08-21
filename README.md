@@ -156,7 +156,17 @@ hook` for a bounded, best-effort candidate search. The OMP extension runs
 in-process but delegates retrieval, authentication, and nudge state to the
 `semctl` subprocess; it does not make network requests itself. Set
 `SEMCTX_HOOK_DISABLE=1` to disable all hook behavior or
-`SEMCTX_NUDGE_DISABLE=1` to disable only shell-search reminders.
+`SEMCTX_NUDGE_DISABLE=1` to disable only built-in retrieval/navigation reminders.
+
+When semctx MCP tools are actually exposed, a per-turn OMP system-prompt block
+makes indexed repository retrieval and graph/flow analysis semctx-first despite
+OMP's generic LSP navigation rule. Native `lsp` calls are not intercepted or
+forwarded to `semctl`: diagnostics, hover, code actions, formatting, live edit
+validation, and ordinary rename remain LSP-native. Semctx orientation and prompt
+hits are OMP custom messages, which OMP excludes from retained user/assistant
+memory; the one-shot built-in-search nudge is injected only into the next provider
+context. This keeps current indexed code evidence out of long-term memory while
+allowing both systems to contribute to a turn.
 
 Observed semctx use cools further reminders for the active prompt. A new prompt
 or context reset re-arms guidance immediately; within one prompt, three
@@ -167,8 +177,15 @@ cap: four successful nudges per clear/compact segment).
 
 ## Development
 
-Run `prek install` once to install the repository's pre-commit hook. The complete
-local/CI-equivalent gate is:
+Install the OMP adapter's pinned development dependencies after checkout or a
+lockfile change, then install the repository's pre-commit hook:
+
+```sh
+bun install --cwd plugins/semctx/adapters/omp --frozen-lockfile
+prek install
+```
+
+The complete local/CI-equivalent gate is:
 
 ```sh
 prek run --all-files
@@ -178,10 +195,11 @@ The configured hooks run:
 
 ```sh
 cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items
-cargo test --workspace
-bun test plugins/semctx/adapters/omp/index.test.ts
+cargo clippy --workspace --all-targets --locked -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items --locked
+cargo test --workspace --locked
+bun run --cwd plugins/semctx/adapters/omp check
+bun run --cwd plugins/semctx/adapters/omp test
 ```
 
 `plugins/semctx/` is the shared plugin root for every supported coding agent.
@@ -198,6 +216,12 @@ model-level golden prompts:
 ```sh
 python3 scripts/run_skill_evals.py --host all
 ```
+
+The OMP eval lane deliberately leaves its normal tool set enabled: native LSP
+and semctx MCP tools must compete in the same session. `--no-lsp` is suitable
+only for a separate ablation because it also removes OMP formatting and
+diagnostics; a built-ins-only `--tools` allowlist would silently exclude the
+plugin's MCP tools.
 
 CI (`.github/workflows/ci.yml`) runs the same checks — clippy is `pedantic`, and
 warnings (including broken doc links) fail the build.

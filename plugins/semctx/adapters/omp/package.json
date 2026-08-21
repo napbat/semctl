@@ -1,0 +1,14 @@
+{
+  "name": "@semctx/omp-adapter-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "tsgo --noEmit -p tsconfig.json",
+    "test": "bun test index.test.ts"
+  },
+  "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "17.4.0",
+    "@types/bun": "1.3.14",
+    "@typescript/native-preview": "7.0.0-dev.20260707.2"
+  }
+}
