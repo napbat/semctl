@@ -11,15 +11,35 @@ const ORIENTATION_MESSAGE = "ca.napbat.semctx.orientation";
 const PROMPT_CONTEXT_MESSAGE = "ca.napbat.semctx.prompt-context";
 const NUDGE_MESSAGE = "ca.napbat.semctx.nudge";
 
+// OMP's base prompt treats every LSP navigation action as mandatory whenever
+// the LSP tool is present. Semctx is more specific for indexed, repository-wide
+// retrieval, so append this narrow exception after OMP's base blocks. Keep the
+// full routing table and degraded-state policy in the shared skill; this block
+// only resolves the host-level precedence conflict and preserves LSP's live
+// editor/edit-validation responsibilities.
+export const SEMCTX_ROUTING_SYSTEM_PROMPT = `<semctx-tool-routing>
+The connected semctx MCP tools and OMP's LSP are complementary. This is the specific exception to the generic LSP-first navigation policy above:
+- For indexed repository discovery, use semctx first for semantic search, definitions, references, callers, implementations, type hierarchy, call paths/graphs, data flow, dependency structure, and cross-codebase queries.
+- Keep LSP for diagnostics, hover, code actions, formatting/import fixes, live edit validation, unsupported semctx languages, and fallback when semctx reports unavailable, stale, or incomplete coverage.
+- Before changing an exported symbol, use semctx for repository blast radius, then still run LSP references against the live workspace before editing.
+- Use Read for exact current bytes and edit sites; a stale semctx hit must be re-read locally.
+- Prefer LSP for ordinary rename/refactor actions. Use semctx symbolic edits when their guarded transaction, safe-delete analysis, or undo support is specifically useful, then validate with LSP diagnostics.
+- For delegated semctx discovery, use OMP's general-purpose task agent, which inherits MCP. Fixed-tool specialist agents omit MCP; give them semctx findings as context rather than delegating the initial lookup to them.
+- Never index an unindexed repository without explicit user opt-in.
+- When applicable, read skill://codebase-retrieval for the detailed tool routing and degraded-state rules.
+</semctx-tool-routing>`;
+
 type SessionSource = "startup" | "resume" | "clear" | "compact";
 type HookEventName = "SessionStart" | "UserPromptSubmit" | "PreToolUse";
-type HookContext = Pick<ExtensionContext, "cwd" | "sessionManager" | "setTimeout" | "clearTimer">;
+export type HookContext = Pick<ExtensionContext, "cwd" | "setTimeout" | "clearTimer"> & {
+	sessionManager: Pick<ExtensionContext["sessionManager"], "getSessionId">;
+};
 type HookTimer = Parameters<HookContext["clearTimer"]>[0];
 
 interface HookChild {
 	stdin: {
-		write(data: string): number;
-		end(): number;
+		write(data: string): number | Promise<number>;
+		end(): number | Promise<number>;
 	};
 	stdout: ReadableStream<Uint8Array>;
 	exited: Promise<number>;
@@ -93,16 +113,15 @@ function createSemctlHookInvoker(): HookInvoker {
 			let child: HookChild | undefined;
 			let timer: HookTimer | undefined;
 			try {
-				child = Bun.spawn(["semctl", "hook"], {
+				const spawned: HookChild = Bun.spawn(["semctl", "hook"], {
 					cwd: ctx.cwd,
 					env: process.env,
 					stdin: "pipe",
 					stdout: "pipe",
 					stderr: "ignore",
 				});
-				children.add(child);
-				child.stdin.write(JSON.stringify(input));
-				child.stdin.end();
+				child = spawned;
+				children.add(spawned);
 				timer = ctx.setTimeout(() => {
 					try {
 						child?.kill();
@@ -110,12 +129,19 @@ function createSemctlHookInvoker(): HookInvoker {
 						// A concurrent clean exit is already the desired state.
 					}
 				}, timeoutMs);
+				await spawned.stdin.write(JSON.stringify(input));
+				await spawned.stdin.end();
 
-				const stdout = await readBounded(child.stdout);
-				if (stdout === undefined) child.kill();
-				const exitCode = await child.exited;
+				const stdout = await readBounded(spawned.stdout);
+				if (stdout === undefined) spawned.kill();
+				const exitCode = await spawned.exited;
 				return exitCode === 0 && stdout !== undefined ? extractAdditionalContext(stdout) : undefined;
 			} catch {
+				try {
+					child?.kill();
+				} catch {
+					// The child may already have exited or been killed by the deadline.
+				}
 				return undefined;
 			} finally {
 				if (timer !== undefined) ctx.clearTimer(timer);
@@ -136,6 +162,10 @@ function createSemctlHookInvoker(): HookInvoker {
 }
 
 function hiddenMessage(customType: string, content: string) {
+	// OMP persists these as custom-message entries. Its memory backends retain
+	// only primary user/assistant conversation turns, so indexed source snippets
+	// do not leak into long-term memory as durable facts. Tool nudges below are
+	// even shorter lived: the `context` event injects them for one provider call.
 	return {
 		customType,
 		content,
@@ -145,7 +175,7 @@ function hiddenMessage(customType: string, content: string) {
 }
 
 function hookToolName(toolName: string): SemctlHookInput["tool_name"] {
-	if (toolName.startsWith(OMP_SEMCTX_TOOL_PREFIX)) return toolName;
+	if (isSemctxMcpToolName(toolName)) return toolName;
 	switch (toolName) {
 		case "grep":
 			return "Grep";
@@ -158,12 +188,37 @@ function hookToolName(toolName: string): SemctlHookInput["tool_name"] {
 	}
 }
 
+function isSemctxMcpToolName(toolName: string): boolean {
+	return toolName.startsWith(OMP_SEMCTX_TOOL_PREFIX);
+}
+
+function semctxToolsAreExposed(pi: ExtensionAPI, systemPrompt: readonly string[]): boolean {
+	// Discoverable MCP tools normally live under xd:// rather than in
+	// getActiveTools(). Conversely, getAllTools() also includes tools excluded by
+	// an explicit --tools allowlist. Requiring either a top-level activation or a
+	// prompt-catalog mention distinguishes both presentation modes from an
+	// installed-but-disabled semctx server.
+	try {
+		const active = new Set(pi.getActiveTools());
+		const renderedPrompt = systemPrompt.join("\n");
+		return pi.getAllTools().some(tool => {
+			const isSemctxMcp = tool.sourceInfo.source === "mcp" && isSemctxMcpToolName(tool.name);
+			return isSemctxMcp && (active.has(tool.name) || renderedPrompt.includes(tool.name));
+		});
+	} catch {
+		// Tool discovery must never make an OMP turn fail.
+		return false;
+	}
+}
+
 export function createSemctxExtension(invoker: HookInvoker = createSemctlHookInvoker()) {
 	return function semctxExtension(pi: ExtensionAPI): void {
 		const instanceId = `${process.pid}-${Date.now().toString(36)}`;
+		let lifecycleGeneration = 0;
 		let promptGeneration = 0;
 		let activePromptId = "";
 		let pendingNudge: string | undefined;
+		let semctxUseGeneration = 0;
 
 		pi.setLabel("semctx");
 
@@ -181,21 +236,29 @@ export function createSemctxExtension(invoker: HookInvoker = createSemctlHookInv
 		const resetTurnState = () => {
 			activePromptId = "";
 			pendingNudge = undefined;
+			semctxUseGeneration = 0;
 		};
 		const sendOrientation = async (source: SessionSource, ctx: HookContext) => {
+			lifecycleGeneration += 1;
+			const generation = lifecycleGeneration;
+			const sessionId = ctx.sessionManager.getSessionId();
 			resetTurnState();
 			const context = await safeInvoke(
 				{
 					host: HOST,
 					hook_event_name: "SessionStart",
 					cwd: ctx.cwd,
-					session_id: ctx.sessionManager.getSessionId(),
+					session_id: sessionId,
 					source,
 				},
 				ctx,
 				SESSION_TIMEOUT_MS,
 			);
-			if (context !== undefined) {
+			if (
+				context !== undefined &&
+				generation === lifecycleGeneration &&
+				ctx.sessionManager.getSessionId() === sessionId
+			) {
 				pi.sendMessage(hiddenMessage(ORIENTATION_MESSAGE, context), {
 					deliverAs: "nextTurn",
 				});
@@ -212,42 +275,84 @@ export function createSemctxExtension(invoker: HookInvoker = createSemctlHookInv
 
 		pi.on("before_agent_start", async (event, ctx) => {
 			pendingNudge = undefined;
-			activePromptId = allocatePromptId(ctx);
+			semctxUseGeneration = 0;
+			const generation = lifecycleGeneration;
+			const sessionId = ctx.sessionManager.getSessionId();
+			const promptId = allocatePromptId(ctx);
+			activePromptId = promptId;
 			const context = await safeInvoke(
 				{
 					host: HOST,
 					hook_event_name: "UserPromptSubmit",
 					cwd: ctx.cwd,
-					session_id: ctx.sessionManager.getSessionId(),
-					prompt_id: activePromptId,
+					session_id: sessionId,
+					prompt_id: promptId,
 					prompt: event.prompt,
 				},
 				ctx,
 				PROMPT_TIMEOUT_MS,
 			);
-			return context === undefined
-				? undefined
-				: { message: hiddenMessage(PROMPT_CONTEXT_MESSAGE, context) };
+			const current =
+				generation === lifecycleGeneration &&
+				activePromptId === promptId &&
+				ctx.sessionManager.getSessionId() === sessionId;
+			if (!current) return undefined;
+
+			const routingEnabled =
+				process.env.SEMCTX_HOOK_DISABLE === undefined &&
+				semctxToolsAreExposed(pi, event.systemPrompt) &&
+				!event.systemPrompt.includes(SEMCTX_ROUTING_SYSTEM_PROMPT);
+			if (context === undefined && !routingEnabled) return undefined;
+
+			return {
+				...(context === undefined
+					? {}
+					: { message: hiddenMessage(PROMPT_CONTEXT_MESSAGE, context) }),
+				...(routingEnabled
+					? { systemPrompt: [...event.systemPrompt, SEMCTX_ROUTING_SYSTEM_PROMPT] }
+					: {}),
+			};
 		});
 
 		pi.on("tool_call", async (event, ctx) => {
+			const isSemctxTool = isSemctxMcpToolName(event.toolName);
+			if (isSemctxTool) {
+				// Forward compliance so semctl owns cooling/rearm policy. The local
+				// generation only invalidates a built-in nudge that was already in
+				// flight when newer semctx evidence arrived.
+				semctxUseGeneration += 1;
+				pendingNudge = undefined;
+			}
 			const toolName = hookToolName(event.toolName);
 			if (toolName === undefined) return undefined;
 			activePromptId ||= allocatePromptId(ctx);
+			const generation = lifecycleGeneration;
+			const complianceGeneration = semctxUseGeneration;
+			const sessionId = ctx.sessionManager.getSessionId();
+			const promptId = activePromptId;
 			const context = await safeInvoke(
 				{
 					host: HOST,
 					hook_event_name: "PreToolUse",
 					cwd: ctx.cwd,
-					session_id: ctx.sessionManager.getSessionId(),
-					prompt_id: activePromptId,
+					session_id: sessionId,
+					prompt_id: promptId,
 					tool_name: toolName,
-					tool_input: event.input,
+					tool_input: { ...event.input },
 				},
 				ctx,
 				TOOL_TIMEOUT_MS,
 			);
-			if (context !== undefined) pendingNudge = context;
+			if (
+				!isSemctxTool &&
+				complianceGeneration === semctxUseGeneration &&
+				context !== undefined &&
+				generation === lifecycleGeneration &&
+				activePromptId === promptId &&
+				ctx.sessionManager.getSessionId() === sessionId
+			) {
+				pendingNudge = context;
+			}
 			return undefined;
 		});
 
@@ -271,6 +376,7 @@ export function createSemctxExtension(invoker: HookInvoker = createSemctlHookInv
 			pendingNudge = undefined;
 		});
 		pi.on("session_shutdown", () => {
+			lifecycleGeneration += 1;
 			resetTurnState();
 			invoker.shutdown();
 		});

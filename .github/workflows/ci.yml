@@ -38,5 +38,12 @@ jobs:
           RUSTDOCFLAGS: "-D warnings"
       - name: test
         run: cargo test --workspace --locked
+      - name: Install OMP extension test dependencies
+        working-directory: plugins/semctx/adapters/omp
+        run: bun install --frozen-lockfile
+      - name: OMP extension type check
+        working-directory: plugins/semctx/adapters/omp
+        run: bun run check
       - name: OMP extension test
-        run: bun test plugins/semctx/adapters/omp/index.test.ts
+        working-directory: plugins/semctx/adapters/omp
+        run: bun run test

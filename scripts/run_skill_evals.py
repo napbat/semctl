@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replay the retrieval-skill golden prompts in fresh Codex or Claude sessions.
+"""Replay retrieval-skill golden prompts in fresh Codex, Claude, or OMP sessions.
 
 This runner records raw JSONL events and a manifest for review. It deliberately
 does not ask a model to grade itself; CI or a human reviewer can compare tool
@@ -88,6 +88,11 @@ def claude_command(query: str) -> list[str]:
     ]
 
 def omp_command(query: str) -> list[str]:
+    # Keep OMP's production tool mix for the primary integration lane. `--tools`
+    # is a post-discovery allowlist, so a built-ins-only value silently removes
+    # every semctx MCP tool. `--no-lsp` would also disable OMP formatting and
+    # diagnostics; that is useful only as a separate ablation, not as the
+    # coexistence test this runner records.
     return [
         "omp",
         "--mode",
@@ -96,8 +101,6 @@ def omp_command(query: str) -> list[str]:
         "--no-session",
         "--approval-mode",
         "yolo",
-        "--tools",
-        "read,grep,glob,lsp",
         "--plugin-dir",
         str(PLUGIN_ROOT),
         query,
