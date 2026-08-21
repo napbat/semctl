@@ -416,8 +416,8 @@ mod tests {
         let st = t.store.load("s1");
         assert_eq!(st.eligible_count, 0);
         assert_eq!(st.nudges_fired, 0);
-        assert!(st.nudged_prompt_ids.is_empty());
-        assert!(st.semctx_prompt_id.is_empty());
+        assert_eq!(st.nudged_prompt_ids, Vec::<String>::new());
+        assert_eq!(st.semctx_prompt_id, "");
         assert_eq!(st.broad_searches_after_semctx, 0);
         assert_eq!(st.update_checked_at, 123);
         assert_eq!(st.update_latest_version, "0.2.0");
@@ -506,7 +506,7 @@ mod tests {
             ComplianceDecision::Suppress
         );
         assert_eq!(st.compliance_decision("p1", 3), ComplianceDecision::Rearmed);
-        assert!(st.semctx_prompt_id.is_empty());
+        assert_eq!(st.semctx_prompt_id, "");
         assert_eq!(st.broad_searches_after_semctx, 0);
         assert!(
             !st.already_nudged("p1"),

@@ -1,0 +1,47 @@
+default_stages = ["pre-commit"]
+
+[[repos]]
+repo = "local"
+hooks = [
+  {
+    id = "cargo-fmt",
+    name = "cargo fmt --check",
+    language = "system",
+    entry = "cargo fmt --check",
+    pass_filenames = false,
+    always_run = true,
+  },
+  {
+    id = "cargo-clippy",
+    name = "cargo clippy --workspace --all-targets -- -D warnings",
+    language = "system",
+    entry = "cargo clippy --workspace --all-targets -- -D warnings",
+    pass_filenames = false,
+    always_run = true,
+  },
+  {
+    id = "cargo-doc",
+    name = "cargo doc --workspace --no-deps --document-private-items",
+    language = "system",
+    entry = "cargo doc --workspace --no-deps --document-private-items",
+    env = { RUSTDOCFLAGS = "-D warnings" },
+    pass_filenames = false,
+    always_run = true,
+  },
+  {
+    id = "cargo-test",
+    name = "cargo test --workspace",
+    language = "system",
+    entry = "cargo test --workspace",
+    pass_filenames = false,
+    always_run = true,
+  },
+  {
+    id = "omp-extension-test",
+    name = "bun test OMP extension",
+    language = "system",
+    entry = "bun test plugins/semctx/adapters/omp/index.test.ts",
+    pass_filenames = false,
+    always_run = true,
+  },
+]

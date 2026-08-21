@@ -367,7 +367,10 @@ fn phantom_guard_understands_host_mcp_prefixes() {
     let tools = registered_tools();
     // Fully-qualified names map to their bare registered tool.
     for name in ["mcp__semctx__grep", "mcp__semctx_semctx_grep"] {
-        assert!(phantom_tools(&format!("use `{name}`"), &tools).is_empty());
+        assert_eq!(
+            phantom_tools(&format!("use `{name}`"), &tools),
+            Vec::<String>::new()
+        );
     }
     // A bogus qualified name is still caught.
     assert_eq!(

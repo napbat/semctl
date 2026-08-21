@@ -167,12 +167,21 @@ cap: four successful nudges per clear/compact segment).
 
 ## Development
 
+Run `prek install` once to install the repository's pre-commit hook. The complete
+local/CI-equivalent gate is:
+
 ```sh
-cargo build
-cargo test --workspace
+prek run --all-files
+```
+
+The configured hooks run:
+
+```sh
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items
+cargo test --workspace
+bun test plugins/semctx/adapters/omp/index.test.ts
 ```
 
 `plugins/semctx/` is the shared plugin root for every supported coding agent.
