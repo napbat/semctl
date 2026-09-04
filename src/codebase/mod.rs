@@ -1,9 +1,10 @@
 //! Resolve which server codebase a local checkout maps to.
 //!
-//! Local path identity is explicit: only the canonical directory cache written
-//! by `semctl index` may bind a checkout (plus an explicitly configured umbrella
-//! ancestor for read-time resolution), and the server is asked which project
-//! holds THIS checkout's copy before anything is registered.
+//! Local path identity is explicit: the canonical working-copy cache written by
+//! `semctl index` binds a checkout (plus an explicitly configured umbrella
+//! ancestor for read-time resolution). If that cache is missing or stale, a
+//! version-aware server may recover the same checkout by its opaque source id;
+//! Git remotes and folder names are never used as identity.
 //!
 //! A git remote does now decide which project a checkout belongs under. It did
 //! not use to: two clones carry different complete manifests, and one codebase
@@ -74,25 +75,45 @@ pub async fn working_copy_root(dir: &Path) -> PathBuf {
     std::fs::canonicalize(&root).unwrap_or(root)
 }
 
-/// Resolve the codebase for `dir` from the on-disk path cache. An explicitly
-/// configured umbrella ancestor may satisfy a child lookup. `Ok(None)` means
-/// this path has never been indexed locally; callers must not guess by Git
-/// remote or folder name.
+/// Resolve the codebase for `dir`. Git paths are first lifted to their working
+/// copy root, matching the directory [`sync`](crate::sync) records and walks.
+/// The on-disk path cache is preferred; an explicitly configured umbrella
+/// ancestor may satisfy a child lookup. When the cache is absent or points to a
+/// codebase the server no longer has, a version-aware server is asked for the
+/// codebase holding this exact checkout's opaque source id and the repaired
+/// mapping is cached locally.
+///
+/// `Ok(None)` means neither local nor server-side evidence says this checkout
+/// was indexed before; callers must not guess by Git remote or folder name.
 pub async fn resolve(client: &Client, dir: &Path) -> Result<Option<Resolved>> {
-    let cached = crate::config::load()
-        .ok()
-        .and_then(|config| config.cached_codebase_for(dir));
-    validate_cached(client, cached).await
+    let dir = working_copy_root(dir).await;
+    resolve_root(client, &dir, false).await
 }
 
 /// Registration's stricter lookup: an explicit `semctl index PATH` reuses only
 /// PATH's own cache entry, never an umbrella ancestor.
 pub(crate) async fn resolve_exact(client: &Client, dir: &Path) -> Result<Option<Resolved>> {
-    let cached = crate::config::load()
-        .ok()
-        .and_then(|config| config.cached_codebase_exact(dir))
-        .map(|id| (id, "cache"));
-    validate_cached(client, cached).await
+    let dir = working_copy_root(dir).await;
+    resolve_root(client, &dir, true).await
+}
+
+/// Resolve an already-normalized working-copy root. `exact` disables umbrella
+/// inheritance for registration while keeping exact source-id recovery: a
+/// server copy with this installation+path identity is prior indexing, not a
+/// guess or a new registration.
+async fn resolve_root(client: &Client, dir: &Path, exact: bool) -> Result<Option<Resolved>> {
+    let cached = crate::config::load().ok().and_then(|config| {
+        if exact {
+            config.cached_codebase_exact(dir).map(|id| (id, "cache"))
+        } else {
+            config.cached_codebase_for(dir)
+        }
+    });
+    if let Some(resolved) = validate_cached(client, cached).await? {
+        return Ok(Some(resolved));
+    }
+
+    recover_by_source(client, dir).await
 }
 
 async fn validate_cached(
@@ -117,15 +138,36 @@ async fn validate_cached(
     }
 }
 
+/// Recover a checkout whose local path cache was lost or whose cached codebase
+/// id became stale after a server-side project merge. The source id hashes this
+/// installation plus the canonical checkout path, so a match is proof that this
+/// exact working copy was indexed before. Older single-manifest servers cannot
+/// safely filter by source id and are deliberately left on cache-only lookup.
+async fn recover_by_source(client: &Client, dir: &Path) -> Result<Option<Resolved>> {
+    if !client.supports(CAPABILITY_CODEBASE_VERSIONS).await {
+        return Ok(None);
+    }
+    let source_id = identity::source_id(dir)?;
+    let Some(existing) = find_by_source(client, &source_id).await? else {
+        return Ok(None);
+    };
+    let _ = crate::config::cache_codebase(dir, &existing.id);
+    Ok(Some(Resolved {
+        id: existing.id,
+        how: "server source id",
+    }))
+}
+
 /// The codebase id for `dir`, creating a **Local** codebase (the working-copy
 /// kind) if none exists yet. Used by `semctl index` so a fresh folder gets
 /// registered before its first sync. The id is cached for later resolution.
 pub async fn ensure(client: &Client, dir: &Path) -> Result<String> {
-    if let Some(resolved) = resolve_exact(client, dir).await? {
+    let dir = working_copy_root(dir).await;
+    if let Some(resolved) = resolve_root(client, &dir, true).await? {
         return Ok(resolved.id);
     }
-    let id = create_local(client, dir).await?;
-    let _ = crate::config::cache_codebase(dir, &id);
+    let id = create_local(client, &dir).await?;
+    let _ = crate::config::cache_codebase(&dir, &id);
     Ok(id)
 }
 

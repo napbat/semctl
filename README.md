@@ -167,8 +167,9 @@ cap: four successful nudges per clear/compact segment).
 
 ## Development
 
-Run `prek install` once to install the repository's pre-commit hook. The complete
-local/CI-equivalent gate is:
+Run `mise install` to install the repository's Rust and Bun toolchains. Run
+`prek install` once to install the pre-commit hook. The complete local and CI
+gate is:
 
 ```sh
 prek run --all-files
@@ -178,10 +179,10 @@ The configured hooks run:
 
 ```sh
 cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items
-cargo test --workspace
-bun test plugins/semctx/adapters/omp/index.test.ts
+cargo clippy --workspace --all-targets --locked -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items --locked
+cargo test --workspace --locked
+mise exec -c "bun test plugins/semctx/adapters/omp/index.test.ts"
 ```
 
 `plugins/semctx/` is the shared plugin root for every supported coding agent.

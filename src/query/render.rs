@@ -9,7 +9,7 @@ use std::path::Path;
 
 use crate::client::api;
 
-use super::GRAPH_LIST_CAP;
+use super::inspection::GRAPH_LIST_CAP;
 
 /// Absolutize a codebase-relative path against the local checkout `root`,
 /// so the host can open it directly. With no known root (canonical /
