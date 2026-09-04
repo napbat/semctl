@@ -301,26 +301,17 @@ where
         cached_files,
     });
 
-    debug!("reading checkout metadata");
-    let vcs = crate::codebase::checkout_state(&dir).await;
-    debug!("requesting sync plan");
     let plan: api::SyncPlan = client
         .post(
             &format!("/v1/codebases/{codebase_id}/sync"),
             &api::SyncManifestRequest {
                 files: manifest,
                 source_id: source_id.clone(),
-                vcs,
+                vcs: crate::codebase::checkout_state(&dir).await,
             },
         )
         .await
         .context("sync plan")?;
-    debug!(
-        need_content = plan.need_content.len(),
-        to_delete = plan.to_delete.len(),
-        job = %plan.job_id,
-        "received sync plan"
-    );
 
     // A checkout whose remote was re-pointed belongs to a different project
     // than the one it was filed under, and the server moves it rather than
