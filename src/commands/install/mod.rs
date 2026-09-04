@@ -126,6 +126,7 @@ pub trait Host {
     fn remove_legacy(&self) {}
 }
 
+#[derive(Clone)]
 pub enum HostStatus {
     Installed,
     NotInstalled,
@@ -138,6 +139,44 @@ fn hosts() -> Vec<Box<dyn Host>> {
     vec![Box::new(ClaudeCode), Box::new(Codex), Box::new(Omp)]
 }
 
+/// Refresh every integration that is already installed.
+///
+/// This function does not install a missing integration or remove an existing
+/// integration. It uses the same reconcile path as [`run`], so each host keeps
+/// one update implementation for plugin, hook, and MCP configuration changes.
+pub(crate) fn refresh_installed() -> Result<usize> {
+    let hosts = hosts();
+    refresh_installed_hosts(&hosts)
+}
+
+fn refresh_installed_hosts(hosts: &[Box<dyn Host>]) -> Result<usize> {
+    let snap = snapshot_hosts(hosts);
+    let desired = snap
+        .iter()
+        .filter(|(_, status)| matches!(status, HostStatus::Installed))
+        .map(|(host, _)| host.id().to_string())
+        .collect();
+
+    reconcile(
+        &snap,
+        &desired,
+        "No installed agent integrations to update.",
+    )
+}
+
+/// Snapshot every host once. A failed probe must not block another host.
+fn snapshot_hosts(hosts: &[Box<dyn Host>]) -> Vec<(&dyn Host, HostStatus)> {
+    hosts
+        .iter()
+        .map(|host| {
+            let status = host.status().unwrap_or_else(|error| {
+                HostStatus::Unavailable(format!("status check failed — {error:#}"))
+            });
+            (host.as_ref(), status)
+        })
+        .collect()
+}
+
 pub fn run(args: &InstallArgs) -> Result<()> {
     let hosts = hosts();
 
@@ -145,16 +184,7 @@ pub fn run(args: &InstallArgs) -> Result<()> {
     // the post-migration state and reconcile re-adds from semctl's source.
     migrate_legacy(&hosts);
 
-    // Snapshot every host's state once, up front. A probe failure degrades to
-    // `Unavailable` rather than aborting, so one host's broken CLI can't block
-    // reconciling the others (matching reconcile's own per-host tolerance).
-    let mut snap: Vec<(&dyn Host, HostStatus)> = Vec::with_capacity(hosts.len());
-    for h in &hosts {
-        let st = h
-            .status()
-            .unwrap_or_else(|e| HostStatus::Unavailable(format!("status check failed — {e:#}")));
-        snap.push((h.as_ref(), st));
-    }
+    let snap = snapshot_hosts(&hosts);
 
     // Reject unknown host names before doing anything.
     if !args.hosts.is_empty() {
@@ -179,7 +209,8 @@ pub fn run(args: &InstallArgs) -> Result<()> {
         ensure_semctl_on_path();
     }
 
-    reconcile(&snap, &desired)
+    reconcile(&snap, &desired, "Nothing to do — no tools selected.")?;
+    Ok(())
 }
 
 /// One-time retirement of a previous `semctx` install (the CLI's old name) so
@@ -428,7 +459,11 @@ fn resolve_desired(
 
 /// Drive each host toward the desired state, printing what happens. Tolerant per
 /// host: one failure is reported and counted but doesn't abort the others.
-fn reconcile(snap: &[(&dyn Host, HostStatus)], desired: &HashSet<String>) -> Result<()> {
+fn reconcile(
+    snap: &[(&dyn Host, HostStatus)],
+    desired: &HashSet<String>,
+    idle_message: &str,
+) -> Result<usize> {
     let mut acted = 0usize;
     let mut failed = 0usize;
 
@@ -485,9 +520,9 @@ fn reconcile(snap: &[(&dyn Host, HostStatus)], desired: &HashSet<String>) -> Res
         bail!("{failed} host(s) could not be configured");
     }
     if acted == 0 {
-        println!("Nothing to do — no tools selected.");
+        println!("{idle_message}");
     }
-    Ok(())
+    Ok(acted)
 }
 
 /// Print a note + manual steps for every host we can't manage on this machine.
@@ -512,5 +547,117 @@ struct Choice {
 impl std::fmt::Display for Choice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.label)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct Calls {
+        install: Rc<Cell<usize>>,
+        update: Rc<Cell<usize>>,
+        uninstall: Rc<Cell<usize>>,
+    }
+
+    struct FakeHost {
+        id: &'static str,
+        status: HostStatus,
+        calls: Calls,
+        update_fails: bool,
+    }
+
+    impl Host for FakeHost {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+
+        fn label(&self) -> &'static str {
+            self.id
+        }
+
+        fn status(&self) -> Result<HostStatus> {
+            Ok(self.status.clone())
+        }
+
+        fn install(&self) -> Result<()> {
+            self.calls.install.set(self.calls.install.get() + 1);
+            Ok(())
+        }
+
+        fn update(&self) -> Result<()> {
+            self.calls.update.set(self.calls.update.get() + 1);
+            if self.update_fails {
+                bail!("simulated update failure");
+            }
+            Ok(())
+        }
+
+        fn uninstall(&self) -> Result<()> {
+            self.calls.uninstall.set(self.calls.uninstall.get() + 1);
+            Ok(())
+        }
+    }
+
+    fn fake_host(
+        id: &'static str,
+        status: HostStatus,
+        update_fails: bool,
+    ) -> (Box<dyn Host>, Calls) {
+        let calls = Calls::default();
+        (
+            Box::new(FakeHost {
+                id,
+                status,
+                calls: calls.clone(),
+                update_fails,
+            }),
+            calls,
+        )
+    }
+
+    #[test]
+    fn refresh_updates_only_installed_integrations() {
+        let (installed, installed_calls) = fake_host("installed", HostStatus::Installed, false);
+        let (missing, missing_calls) = fake_host("missing", HostStatus::NotInstalled, false);
+        let (unavailable, unavailable_calls) = fake_host(
+            "unavailable",
+            HostStatus::Unavailable("host CLI is absent".to_owned()),
+            false,
+        );
+        let hosts = vec![installed, missing, unavailable];
+
+        let refreshed = refresh_installed_hosts(&hosts).expect("refresh should succeed");
+
+        assert_eq!(refreshed, 1);
+        assert_eq!(installed_calls.update.get(), 1);
+        assert_eq!(installed_calls.install.get(), 0);
+        assert_eq!(installed_calls.uninstall.get(), 0);
+        for calls in [missing_calls, unavailable_calls] {
+            assert_eq!(calls.update.get(), 0);
+            assert_eq!(calls.install.get(), 0);
+            assert_eq!(calls.uninstall.get(), 0);
+        }
+    }
+
+    #[test]
+    fn refresh_attempts_every_installed_integration_after_a_failure() {
+        let (failing, failing_calls) = fake_host("failing", HostStatus::Installed, true);
+        let (working, working_calls) = fake_host("working", HostStatus::Installed, false);
+        let hosts = vec![failing, working];
+
+        let error = refresh_installed_hosts(&hosts).expect_err("one refresh should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("1 host(s) could not be configured")
+        );
+        assert_eq!(failing_calls.update.get(), 1);
+        assert_eq!(working_calls.update.get(), 1);
     }
 }
