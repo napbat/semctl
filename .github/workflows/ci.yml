@@ -17,9 +17,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
+      - uses: jdx/mise-action@v4
         with:
-          bun-version: 1.3.14
+          install_args: bun
       # Deliberately floating. A new stable can turn a fresh lint into a build
       # failure on a morning nobody touched the code — the trade is that those
       # arrive one at a time and get fixed, instead of accumulating behind a pin
@@ -39,4 +39,4 @@ jobs:
       - name: test
         run: cargo test --workspace --locked
       - name: OMP extension test
-        run: bun test plugins/semctx/adapters/omp/index.test.ts
+        run: mise exec -c "bun test plugins/semctx/adapters/omp/index.test.ts"

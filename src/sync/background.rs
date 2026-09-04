@@ -51,7 +51,10 @@ fn spawn(
         // Mutex inside also serializes them so only one runs at a time.
         let cache = Arc::new(Mutex::new(SyncCache::default()));
 
-        spawn_initial_index(
+        // Startup sync intentionally races watcher registration so edits made
+        // during a long initial walk are still observed. Git metadata capture
+        // is safe alongside MCP/watch I/O on Windows (see `codebase::git`).
+        spawn_startup_reconcile(
             client.clone(),
             dir.clone(),
             cache.clone(),
@@ -87,10 +90,10 @@ fn spawn(
     });
 }
 
-/// Spawn the startup auto-index: walk `dir`, diff against the server, upload the
-/// changed files. Detached so it runs alongside `serve`; logs to stderr to keep
-/// stdout JSON-RPC-clean.
-fn spawn_initial_index(
+/// Schedule the startup trigger for the shared [`sync`] reconcile engine.
+/// Detached so it runs alongside `serve`; the optional result channel exists
+/// only for first-index readiness, not as a separate indexing implementation.
+fn spawn_startup_reconcile(
     client: Client,
     dir: PathBuf,
     cache: Arc<Mutex<SyncCache>>,

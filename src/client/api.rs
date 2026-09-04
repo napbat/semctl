@@ -765,7 +765,7 @@ pub struct TenantDto {
 }
 
 #[cfg(test)]
-mod envelope_tests {
+mod tests {
     use super::*;
 
     /// A row shape shared by both cases below, so the assertions differ only in

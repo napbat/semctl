@@ -1,4 +1,4 @@
-//! Drift guards for the prose surfaces that steer agents to the MCP tools.
+//! Unit and drift guards for the MCP server.
 //!
 //! Three surfaces describe the tool inventory: the per-tool docs
 //! (`docs/tools/*.md`, compiled in via `tool_doc`), the server-level
@@ -9,13 +9,91 @@
 //! router: adding, renaming, or removing a tool without updating them fails
 //! `cargo test`.
 
-use super::{
-    AnalysisPageArgs, BatchArgs, CallGraphArgs, CallPathArgs, DIRECT_EDIT_TOOLS, ExpandArgs,
-    FlowBetweenArgs, FlowFromArgs, FlowToArgs, GrepArgs, InsertSymbolArgs, ListFilesArgs,
-    McpServer, NoArgs, OutlineArgs, ReadSourceArgs, ReferenceArgs, RenameSymbolArgs,
-    ReplaceBodyArgs, SafeDeleteSymbolArgs, SearchArgs, SymbolArgs, SymbolAtPositionArgs,
-    SymbolSearchArgs, TraceArgs, TypeHierarchyArgs, UndoEditArgs,
+use std::time::Duration;
+
+use super::tool_types::{
+    AnalysisPageArgs, BatchArgs, CallGraphArgs, CallPathArgs, ExpandArgs, FlowBetweenArgs,
+    FlowFromArgs, FlowToArgs, GrepArgs, InsertSymbolArgs, ListFilesArgs, NoArgs, OutlineArgs,
+    ReadSourceArgs, ReferenceArgs, RenameSymbolArgs, ReplaceBodyArgs, SafeDeleteSymbolArgs,
+    SearchArgs, SymbolArgs, SymbolAtPositionArgs, SymbolSearchArgs, TraceArgs, TypeHierarchyArgs,
+    UndoEditArgs, render_edit_action_outcome,
 };
+use super::{DIRECT_EDIT_TOOLS, InitialIndexGate, McpServer, client, initial_job_result};
+
+fn job(completed: bool, failed: i64, error: Option<&str>) -> client::api::JobStatus {
+    client::api::JobStatus {
+        files_to_embed: 3,
+        files_to_delete: 0,
+        files_embedded: if completed { 3 - failed } else { 1 },
+        files_deleted: 0,
+        files_failed: failed,
+        chunk_count: completed.then_some(12),
+        error: error.map(str::to_string),
+        started_at: Some("2026-07-31T00:00:00Z".into()),
+        completed_at: completed.then(|| "2026-07-31T00:00:01Z".into()),
+    }
+}
+
+#[tokio::test]
+async fn first_index_gate_blocks_until_embedding_is_ready() {
+    let gate = InitialIndexGate::pending();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(5), gate.wait())
+            .await
+            .is_err(),
+        "a pending first index must block retrieval"
+    );
+
+    gate.finish(Ok(())).await;
+    assert_eq!(gate.wait().await, Ok(()));
+}
+
+#[tokio::test]
+async fn first_index_gate_propagates_failure() {
+    let gate = InitialIndexGate::pending();
+    gate.finish(Err("embedding failed".into())).await;
+    assert_eq!(gate.wait().await, Err("embedding failed".into()));
+}
+
+#[test]
+fn first_index_requires_terminal_success() {
+    assert!(initial_job_result("j", &job(false, 0, None)).is_none());
+    assert_eq!(initial_job_result("j", &job(true, 0, None)), Some(Ok(())));
+    assert!(
+        initial_job_result("j", &job(true, 1, None))
+            .unwrap()
+            .unwrap_err()
+            .contains("1 failed file")
+    );
+    assert!(
+        initial_job_result("j", &job(true, 0, Some("worker died")))
+            .unwrap()
+            .unwrap_err()
+            .contains("worker died")
+    );
+}
+
+#[test]
+fn action_result_exposes_an_edit_id_without_transporting_the_plan() {
+    let outcome = crate::editing::ApplyOutcome {
+        plan_id: "a".repeat(64),
+        operation: "rename_symbol".into(),
+        changed_files: vec![crate::editing::AppliedFile {
+            path: "src/lib.rs".into(),
+            content_hash: "b".repeat(64),
+        }],
+        already_applied: false,
+        already_undone: false,
+        watcher_active: true,
+        sync_state: "watcher will enqueue sync".into(),
+    };
+
+    let rendered = render_edit_action_outcome(&outcome).expect("render action result");
+    let value: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+    assert_eq!(value["editId"], outcome.plan_id);
+    assert!(value.get("planId").is_none());
+    assert!(value.get("plan").is_none());
+}
 
 #[test]
 fn every_codebase_scoped_argument_schema_has_the_selector() {
@@ -61,7 +139,7 @@ fn every_codebase_scoped_argument_schema_has_the_selector() {
 
 /// Registered tool names, straight from the router the MCP host sees.
 fn registered_tools() -> Vec<String> {
-    McpServer::tool_router()
+    super::tools::router()
         .list_all()
         .into_iter()
         .map(|t| t.name.to_string())
@@ -241,7 +319,7 @@ fn retrieval_guidance_bounds_expansion_and_routes_local_reads() {
 
 #[test]
 fn every_tool_has_explicit_safety_annotations() {
-    for tool in McpServer::tool_router()
+    for tool in super::tools::router()
         .list_all()
         .into_iter()
         .map(McpServer::with_doc)

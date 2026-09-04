@@ -371,9 +371,9 @@ impl Client {
     }
 
     /// GET a flat paginated endpoint, returning the page. Distinct from
-    /// [`Self::get`], which unwraps the `data` envelope: paginated list endpoints
-    /// inline the page (`items`/`total`/`page`/`pageSize`) beside `success` with
-    /// no `data` wrapper (see [`unwrap_page`]).
+    /// [`Self::get`], which unwraps `data` as the entire response payload:
+    /// paginated list endpoints put their rows (`data`, or legacy `items`) and
+    /// page metadata beside `success` (see [`unwrap_page`]).
     pub async fn get_page<T: DeserializeOwned>(&self, path: &str) -> Result<api::Page<T>> {
         let (resp, url) = self.send(reqwest::Method::GET, path, None).await?;
         unwrap_page(resp, "GET", &url).await
@@ -544,9 +544,10 @@ fn summarize_errors(errors: &[serde_json::Value]) -> String {
 }
 
 /// Unwrap a flat paginated envelope (`PaginatedApiResponse<T>` —
-/// `{ success, errors, items, total, page, pageSize }`, no `data`) into its
-/// [`api::Page`]. The list endpoints inline the page beside `success`; the
-/// standard [`unwrap_envelope`] (which extracts `.data`) doesn't apply.
+/// `{ success, errors, data, total, page, pageSize }`) into its [`api::Page`].
+/// The list endpoints inline the rows and page metadata beside `success`; the
+/// standard [`unwrap_envelope`] (which extracts `.data` as one value) doesn't
+/// apply.
 async fn unwrap_page<T: DeserializeOwned>(
     resp: reqwest::Response,
     method: &str,
@@ -566,30 +567,20 @@ async fn unwrap_page<T: DeserializeOwned>(
             summarize_errors(env.errors.as_deref().unwrap_or_default())
         );
     }
-    Ok(api::Page {
-        items: env.items,
-        total: env.total,
-        number: env.page,
-        size: env.page_size,
-    })
+    Ok(env.page)
 }
 
-/// The flat `PaginatedApiResponse<T>` envelope — the page fields sit beside
-/// `success`/`errors` (no `data` wrapper).
+/// The flat `PaginatedApiResponse<T>` envelope — the rows and page fields sit
+/// beside `success`/`errors`. Current servers call the rows `data`; older ones
+/// called them `items`; [`api::Page`] owns that compatibility in one place.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PageEnvelope<T> {
     success: bool,
     #[serde(default)]
     errors: Option<Vec<serde_json::Value>>,
-    #[serde(default = "Vec::new")]
-    items: Vec<T>,
-    #[serde(default)]
-    total: u32,
-    #[serde(default)]
-    page: u32,
-    #[serde(default)]
-    page_size: u32,
+    #[serde(flatten)]
+    page: api::Page<T>,
 }
 
 /// Whether a codebase's `source_kind` is `Local` — the caller's own working
@@ -653,10 +644,45 @@ pub async fn for_cwd(cli: &crate::cli::Cli) -> Result<Client> {
 }
 
 #[cfg(test)]
-mod gateway_error_tests {
+mod tests {
     use std::time::Duration;
 
-    use super::{gateway_error, loading_retry_delay, tenant_binding_denied, tenant_selection};
+    use serde::Deserialize;
+
+    use super::{
+        Client, PageEnvelope, gateway_error, loading_retry_delay, tenant_binding_denied,
+        tenant_selection,
+    };
+
+    #[derive(Debug, Deserialize, PartialEq, Eq)]
+    struct Row {
+        id: u32,
+    }
+
+    #[test]
+    fn http_page_decoder_reads_standard_data_rows() {
+        let page: PageEnvelope<Row> = serde_json::from_str(
+            r#"{"success":true,"errors":null,"data":[{"id":1}],
+                "page":0,"pageSize":25,"count":1,"total":1}"#,
+        )
+        .expect("the live server's standard page shape must parse");
+
+        assert_eq!(page.page.items, vec![Row { id: 1 }]);
+        assert_eq!(page.page.total, 1);
+        assert_eq!(page.page.number, 0);
+        assert_eq!(page.page.size, 25);
+    }
+
+    #[test]
+    fn http_page_decoder_still_reads_legacy_item_rows() {
+        let page: PageEnvelope<Row> = serde_json::from_str(
+            r#"{"success":true,"errors":null,"items":[{"id":1}],
+                "page":0,"pageSize":25,"total":1}"#,
+        )
+        .expect("the legacy page shape must keep parsing");
+
+        assert_eq!(page.page.items, vec![Row { id: 1 }]);
+    }
 
     /// A gateway's HTML error page must be reported as the gateway failure it is,
     /// not as a JSON parse error.
@@ -742,12 +768,6 @@ mod gateway_error_tests {
             "malformed retry instructions are surfaced normally"
         );
     }
-}
-
-#[cfg(test)]
-mod checkout_scope_tests {
-    use super::Client;
-
     /// A checkout answers about itself; asking for canonical drops the claim
     /// that the caller is standing anywhere, which is how the server hears
     /// "tell me what the project publishes".

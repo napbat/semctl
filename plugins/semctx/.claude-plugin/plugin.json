@@ -1,7 +1,7 @@
 {
   "name": "semctx",
   "description": "Indexed code retrieval and symbol navigation through semctx. Retrieval requests and indexed repository content are sent to the configured semctx service.",
-  "version": "0.1.16",
+  "version": "0.1.17",
   "author": {
     "name": "Jon-Luke Biddle"
   },
