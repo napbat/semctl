@@ -1,4 +1,4 @@
-//! `semctl upgrade` — replace the running `semctl` binary with the latest build.
+//! `semctl upgrade` — update semctl and refresh its installed integrations.
 //!
 //! Always server-mediated: **ask the server for a download link → download it →
 //! swap the running binary.** There is no CLI-supplied URL; semctl is private, so
@@ -15,6 +15,10 @@
 //! - **Swap ([`self_replace`]).** Cross-platform: rename-the-live-image on
 //!   Windows, replace-by-inode on Unix.
 //!
+//! After the binary phase succeeds, the command refreshes each installed host
+//! integration through the install command's reconcile path. This step also runs
+//! when the binary is current or cargo-managed. It does not add or remove a host.
+//!
 //! Publishing is wired end-to-end: `.github/workflows/release.yml` runs on every
 //! push to `main` but builds + publishes a GitHub Release only when Cargo.toml's
 //! `version` is bumped to a not-yet-released value (tagged `v<version>`). The
@@ -30,11 +34,33 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::cli::Cli;
-use crate::commands::install::{InstallKind, install_kind};
+use crate::commands::install::{self, InstallKind, install_kind};
 use crate::config;
 use crate::term::{ok, say};
 
 pub async fn run(cli: &Cli) -> Result<()> {
+    let binary_updated = update_binary(cli).await?;
+    let integrations_updated = tokio::task::spawn_blocking(install::refresh_installed)
+        .await
+        .context("wait for installed agent integrations to refresh")?
+        .with_context(|| {
+            if binary_updated {
+                "semctl was updated, but its installed agent integrations could not be refreshed"
+            } else {
+                "refresh installed agent integrations"
+            }
+        })?;
+
+    if binary_updated || integrations_updated > 0 {
+        println!(
+            "      Restart running agent sessions so they reload semctl and its integration assets."
+        );
+    }
+    Ok(())
+}
+
+/// Update the running binary when semctl owns it. Return whether it changed.
+async fn update_binary(cli: &Cli) -> Result<bool> {
     // A cargo-installed binary is managed by cargo; self-replacing it in place
     // would leave cargo's own metadata pointing at a binary it no longer built.
     // Defer to cargo instead of downloading over it.
@@ -43,7 +69,7 @@ pub async fn run(cli: &Cli) -> Result<()> {
         println!(
             "    cargo install --git https://github.com/napbat/semctl --locked --force semctl"
         );
-        return Ok(());
+        return Ok(false);
     }
 
     let current = std::env::current_exe().context("locate the running semctl binary")?;
@@ -63,14 +89,14 @@ pub async fn run(cli: &Cli) -> Result<()> {
         ok(&format!(
             "semctl is already at the latest version (v{running})."
         ));
-        return Ok(());
+        return Ok(false);
     }
     if cmp == VersionCmp::Older {
         ok(&format!(
             "semctl (v{running}) is newer than the latest published release (v{}); nothing to do.",
             dl.version
         ));
-        return Ok(());
+        return Ok(false);
     }
 
     // 2. Download it, verifying the checksum. Stage next to the current binary so
@@ -95,8 +121,7 @@ pub async fn run(cli: &Cli) -> Result<()> {
         dl.version,
         current.display()
     ));
-    println!("      Restart any running `semctl mcp` / Claude Code session to pick it up.");
-    Ok(())
+    Ok(true)
 }
 
 /// Where to fetch the latest binary, as told by the server (the `data` payload

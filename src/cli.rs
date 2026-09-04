@@ -83,9 +83,9 @@ pub enum Command {
     #[command(alias = "setup")]
     Install(commands::install::InstallArgs),
 
-    /// Update the `semctl` binary itself, in place, to the latest release.
-    /// Cross-platform (Windows / macOS / Linux). Distinct from `semctl install`,
-    /// which manages the editor/agent integrations rather than this binary.
+    /// Update the `semctl` binary and refresh each installed agent integration.
+    /// Cross-platform (Windows / macOS / Linux). This does not add or remove an
+    /// integration; use `semctl install` to change the selected tools.
     #[command(alias = "self-update")]
     Upgrade,
 

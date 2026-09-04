@@ -56,7 +56,7 @@ semctl index        # register + sync the current repo for indexing
 | `semctl mcp`                                          | Run as an MCP stdio server (launched by the host, not by hand).                                                       |
 | `semctl install`                                      | Add/remove the editor/agent integrations.                                                                             |
 | `semctl uninstall`                                    | Reverse `install`: unwire the tools, remove from PATH, delete the binary (`--purge` also drops config + credentials). |
-| `semctl upgrade`                                      | Update the `semctl` binary in place.                                                                                  |
+| `semctl upgrade`                                      | Update the binary and refresh each installed editor/agent integration.                                                |
 | `semctl auth login` / `logout` / `whoami` / `tenants` | Account & session.                                                                                                    |
 
 ## Grammar-native editing
@@ -112,7 +112,11 @@ semctl upgrade
 For a binary installed the standard way (the install script), `upgrade` downloads
 the latest release and self-replaces in place. If `semctl` was installed with
 `cargo install`, it's cargo-managed — `upgrade` detects that and tells you to
-re-run `cargo install … --force` instead of clobbering it.
+re-run `cargo install … --force` instead of clobbering it. In both cases,
+`upgrade` refreshes each installed integration through the same update path as
+`semctl install`. This refresh can update hooks, skills, and MCP configuration.
+The refresh also runs when the binary is already current. It does not install or
+remove an integration.
 
 ## Configuration
 
