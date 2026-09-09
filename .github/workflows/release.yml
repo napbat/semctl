@@ -4,6 +4,7 @@ name: release
 # but a release is built and published ONLY when the `version` in Cargo.toml names
 # a version that hasn't been released yet. To cut a release, bump `version` in
 # Cargo.toml (e.g. 0.1.0 -> 0.1.1) and push; every other push is a ~15s no-op.
+# A manual run can rebuild an existing release to restore missing assets.
 #
 # Cargo.toml is the single source of truth: the tag (`v<version>`), the release
 # name, and the binary's CARGO_PKG_VERSION all come straight from it — no
@@ -16,10 +17,16 @@ name: release
 on:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      rebuild:
+        description: Rebuild binaries for an existing release
+        type: boolean
+        default: false
 
 concurrency:
   # Serialize so two near-simultaneous pushes can't both build the same new
-  # version; the second sees the first's release and skips.
+  # version. Automatic runs skip existing releases; manual rebuilds run in order.
   group: release
   cancel-in-progress: false
 
@@ -45,6 +52,7 @@ jobs:
       - id: v
         env:
           GH_TOKEN: ${{ github.token }}
+          REBUILD: ${{ inputs.rebuild == true }}
         shell: bash
         run: |
           set -euo pipefail
@@ -54,12 +62,12 @@ jobs:
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          if gh release view "v$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          if [ "$REBUILD" != "true" ] && gh release view "v$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "release=false" >> "$GITHUB_OUTPUT"
             echo "v$version is already released — nothing to do"
           else
             echo "release=true" >> "$GITHUB_OUTPUT"
-            echo "v$version is new — building a release"
+            echo "Building semctl v$version"
           fi
 
   build:

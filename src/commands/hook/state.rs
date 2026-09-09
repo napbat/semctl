@@ -58,6 +58,9 @@ pub struct NudgeState {
     /// Whether this session already received the update instruction.
     #[serde(default)]
     pub update_notice_emitted: bool,
+    /// Whether the current context segment already received the server manual.
+    #[serde(default)]
+    pub server_instructions_emitted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +71,16 @@ pub enum ComplianceDecision {
 }
 
 impl NudgeState {
+    /// Clear context-local guidance state while retaining the session update cache.
+    pub fn reset_segment(&mut self) {
+        *self = Self {
+            update_checked_at: self.update_checked_at,
+            update_latest_version: std::mem::take(&mut self.update_latest_version),
+            update_notice_emitted: self.update_notice_emitted,
+            ..Self::default()
+        };
+    }
+
     /// Record that `prompt_id` has been nudged (bounded ring).
     pub fn remember_prompt(&mut self, prompt_id: &str) {
         if prompt_id.is_empty() {
@@ -161,42 +174,22 @@ impl Store {
 
     /// Best-effort atomic write (unique temp + rename).
     pub fn save(&self, session_id: &str, state: &NudgeState) {
-        let _ = fs::create_dir_all(&self.dir);
+        // This state controls advisory reminders. Failure must not block tools.
+        let _ = self.try_save(session_id, state);
+    }
+
+    /// Persist state before emitting guidance that must not repeat on each prompt.
+    pub fn try_save(&self, session_id: &str, state: &NudgeState) -> io::Result<()> {
+        fs::create_dir_all(&self.dir)?;
         let path = self.state_path(session_id);
         let tmp = self.dir.join(format!(
             "{}.{}.tmp",
             file_key(session_id),
             std::process::id()
         ));
-        if let Ok(json) = serde_json::to_string(state)
-            && fs::write(&tmp, json).is_ok()
-        {
-            let _ = fs::rename(&tmp, &path);
-        }
-    }
-
-    /// Start a fresh nudge segment: zero search/nudge state while preserving the
-    /// session-wide update cache and one-shot notice flag. Called on
-    /// `SessionStart` `clear`/`compact`; those shrink the context but do not start
-    /// a new agent session, so an update reminder must not repeat afterward.
-    ///
-    /// Deliberately does NOT remove the lock file: a concurrent `PreToolUse` may
-    /// hold it, and deleting a live lock would let a second `PreToolUse` into the
-    /// critical section. A lock left by a crash is reclaimed by stale-steal.
-    pub fn reset(&self, session_id: &str) {
-        if session_id.is_empty() {
-            return;
-        }
-        let previous = self.load(session_id);
-        self.save(
-            session_id,
-            &NudgeState {
-                update_checked_at: previous.update_checked_at,
-                update_latest_version: previous.update_latest_version,
-                update_notice_emitted: previous.update_notice_emitted,
-                ..NudgeState::default()
-            },
-        );
+        let json = serde_json::to_vec(state).map_err(io::Error::other)?;
+        fs::write(&tmp, json)?;
+        fs::rename(&tmp, &path)
     }
 
     /// Try to take the per-session lock. `None` if another process holds a
@@ -351,6 +344,17 @@ mod tests {
     }
 
     #[test]
+    fn legacy_state_starts_with_server_instructions_pending() {
+        let state: NudgeState = serde_json::from_str(
+            r#"{"eligible_count":2,"nudges_fired":1,"last_nudge_at_count":2}"#,
+        )
+        .unwrap();
+        assert_eq!(state.eligible_count, 2);
+        assert_eq!(state.nudges_fired, 1);
+        assert!(!state.server_instructions_emitted);
+    }
+
+    #[test]
     fn save_load_roundtrip() {
         let t = temp_store();
         let st = NudgeState {
@@ -397,23 +401,19 @@ mod tests {
     }
 
     #[test]
-    fn reset_zeroes_nudges_but_preserves_session_update_state() {
-        let t = temp_store();
-        t.store.save(
-            "s1",
-            &NudgeState {
-                eligible_count: 9,
-                nudges_fired: 3,
-                semctx_prompt_id: "p1".into(),
-                broad_searches_after_semctx: 2,
-                update_checked_at: 123,
-                update_latest_version: "0.2.0".into(),
-                update_notice_emitted: true,
-                ..Default::default()
-            },
-        );
-        t.store.reset("s1");
-        let st = t.store.load("s1");
+    fn reset_rearms_guidance_and_preserves_session_update_state() {
+        let mut st = NudgeState {
+            eligible_count: 9,
+            nudges_fired: 3,
+            semctx_prompt_id: "p1".into(),
+            broad_searches_after_semctx: 2,
+            update_checked_at: 123,
+            update_latest_version: "0.2.0".into(),
+            update_notice_emitted: true,
+            server_instructions_emitted: true,
+            ..Default::default()
+        };
+        st.reset_segment();
         assert_eq!(st.eligible_count, 0);
         assert_eq!(st.nudges_fired, 0);
         assert_eq!(st.nudged_prompt_ids, Vec::<String>::new());
@@ -422,6 +422,7 @@ mod tests {
         assert_eq!(st.update_checked_at, 123);
         assert_eq!(st.update_latest_version, "0.2.0");
         assert!(st.update_notice_emitted);
+        assert!(!st.server_instructions_emitted);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! `semctl hook` — the binary side of the Claude Code and Codex CLI plugin hooks.
-//! Reads a hook event as JSON on stdin and, when the current repo maps to an
-//! indexed codebase, emits `additionalContext` for the agent to fold into the turn.
+//! Reads a hook event as JSON on stdin and emits shared instructions plus
+//! available repository context through `additionalContext`.
 //!
 //! Both hosts send the same `snake_case` payload and accept
 //! `hookSpecificOutput.additionalContext`; Codex additionally documents
@@ -9,7 +9,8 @@
 //! `prompt_id`. The parser also accepts `PostCompact` for compatibility, while
 //! the packaged hooks use `SessionStart(source=compact)` as the shared boundary.
 //!
-//! - **`SessionStart`** — a one-line orientation: semctx is available, how to
+//! - **`SessionStart`** — the server manual once per context segment, plus an
+//!   orientation: semctx is available, how to
 //!   route missing evidence between semctx and local context, accepted selectors
 //!   for another checkout, and (only when needed) a cached, once-per-session
 //!   instruction to tell the user about a newer CLI.
@@ -17,14 +18,16 @@
 //!   prompts: search the repo's codebase and inject a compact candidate list
 //!   (path + line range + symbol + score), not full chunk bodies. Exact graph or
 //!   tool-shaped prompts are left for the model to route directly.
+//!   This event also restores the manual if startup was missed or a compatible
+//!   `PostCompact` event cleared its delivery state.
 //! - **`PreToolUse`** — broad built-in search can emit balanced guidance about
 //!   semctx's discovery strengths and valid local-tool cases. Semctx MCP calls
 //!   silently record compliance; immediate reminders cool, then a new prompt,
 //!   context reset, or bounded consecutive broad-search streak re-arms them.
 //!
 //! Contract: **never break a session.** An unindexed repo produces an opt-in
-//! notice; every actual failure path — not logged in, server down, parse error —
-//! produces no output and exits 0.
+//! notice. Network failures suppress repository context. Shared instructions
+//! do not require a connection. Invalid input produces no output and exits 0.
 //! The only thing written to stdout is a well-formed hook-output JSON object.
 
 use std::fmt::Write;
@@ -41,6 +44,7 @@ use crate::client::{self, Client, api};
 
 mod availability;
 mod escalation;
+mod instructions;
 // Reachable from the mcp steering-tests drift guard, which pins the nudge copy
 // to the live tool registry.
 pub(crate) mod message;
@@ -149,30 +153,17 @@ pub async fn run(_args: HookArgs, cli: &Cli) -> Result<()> {
     };
     let context = match input.hook_event_name.as_str() {
         "UserPromptSubmit" => user_prompt_context(cli, &input).await,
-        "SessionStart" | "PostCompact" => {
-            // A shrunk-context boundary. Reset the per-session nudge segment (so
-            // stale drift pressure never survives it) BEFORE any context work and
-            // regardless of availability; opportunistic cleanup too. Hosts use
-            // SessionStart(source=clear|compact), and some configurations may also
-            // send PostCompact — `resets_segment` accepts both.
+        "SessionStart" => {
             let store = state::Store::default_store();
-            if resets_segment(&input.hook_event_name, &input.source) {
-                store.reset(&input.session_id);
-            }
-            store.cleanup();
-            // Orientation injects on SessionStart (both hosts). A bare PostCompact
-            // emits nothing: Codex's PostCompact schema doesn't accept
-            // additionalContext, and orientation re-establishes on the next prompt.
-            if input.hook_event_name == "SessionStart" {
-                session_start_context(cli, &input, &store).await
-            } else {
-                None
-            }
+            session_start_context(cli, &input, &store).await
         }
         "PreToolUse" => pretooluse_nudge(cli, &input).await,
         _ => None,
     };
-    if let Some(text) = context {
+    // Claim delivery after network work. Tool events cannot claim the manual.
+    // PostCompact only resets state because its output schema rejects context.
+    let shared = instructions::context(&input).await;
+    if let Some(text) = combine_context(shared, context) {
         emit(&input, &text);
     }
     Ok(())

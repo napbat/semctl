@@ -743,7 +743,8 @@ impl ServerHandler for McpServer {
         // the fields we care about.
         let mut info = ServerInfo::default();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
-        info.instructions = Some(include_str!("docs/instructions/server.md").to_string());
+        // Hosts can prepend server instructions to every tool description.
+        // The session hook delivers server.md once per context segment instead.
         info
     }
 }
