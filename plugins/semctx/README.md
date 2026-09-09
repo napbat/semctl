@@ -36,9 +36,23 @@ are implemented and its eval session passes. MCP-only agents should launch
 canonical skill directly. Host-native rules or instruction files are generated
 projections, not new sources of truth.
 
+The session hook loads `src/mcp/docs/instructions/server.md` once per context
+segment. Repeated startup, resume, prompt, and tool events do not reload it.
+Clear and compaction events reset delivery. A prompt hook restores the manual
+when startup was missed or a `PostCompact` event could not return context.
+Delivery requires a session id and writable session state. The manual is local
+and does not require a server connection.
+
+The MCP server leaves `ServerInfo.instructions` unset because hosts can prepend
+that field to every tool description. Each tool retains its own documentation,
+schema, and annotations. MCP-only clients do not receive the session manual
+automatically. Keep selection advice and required caveats in each tool's
+documentation so those clients can still use the tools. The retrieval skill
+remains available to hosts that support Agent Skills.
+
 The MCP server exposes symbolic edits as immediate, approved checkout actions.
 Each action consumes the server-generated plan internally at semctl's verified
 local mutation boundary; raw plans are not MCP tools. Rename, delete, body
 replacement, insertion, and `undo_edit` all carry write/destructive annotations.
-Keep those annotations and the canonical skill/server tool lists in sync—the
-steering tests reject missing docs, phantom tools, and safety drift.
+Keep those annotations, tool documentation, the server manual, and the skill in sync.
+The steering tests reject missing docs, phantom tools, and safety drift.

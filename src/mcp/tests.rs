@@ -1,13 +1,10 @@
 //! Unit and drift guards for the MCP server.
 //!
-//! Three surfaces describe the tool inventory: the per-tool docs
-//! (`docs/tools/*.md`, compiled in via `tool_doc`), the server-level
-//! instructions (`docs/instructions/server.md`), and the shared coding-agent
-//! skill (`plugins/semctx/skills/codebase-retrieval/SKILL.md`). The last
-//! two are hand-written and drift silently — the skill sat at 8 of 23 tools
-//! for a month while the registry grew. These tests pin both files to the
-//! router: adding, renaming, or removing a tool without updating them fails
-//! `cargo test`.
+//! Per-tool docs (`docs/tools/*.md`) describe each tool. Session hooks deliver
+//! the server manual (`docs/instructions/server.md`). The shared retrieval
+//! skill lives at `plugins/semctx/skills/codebase-retrieval/SKILL.md`.
+//! These tests check all three against the router to detect missing
+//! documentation and references to tools that were renamed or removed.
 
 use std::time::Duration;
 
