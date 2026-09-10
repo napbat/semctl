@@ -95,7 +95,7 @@ pub(super) fn render_compact(
             hit_symbol(h),
             write_marker(h)
         )
-        .unwrap();
+        .expect("writing to a String cannot fail");
     }
     out
 }
@@ -118,7 +118,7 @@ pub(super) fn render_boundaries(boundaries: &[String], empty_msg: &str) -> Strin
         boundaries.len(),
         if boundaries.len() == 1 { "y" } else { "ies" }
     )
-    .unwrap();
+    .expect("writing to a String cannot fail");
     out
 }
 
@@ -127,7 +127,8 @@ pub(super) fn render_boundaries(boundaries: &[String], empty_msg: &str) -> Strin
 pub(super) fn render_files(files: &[api::CodebaseFile], root: Option<&Path>) -> String {
     let mut out = String::new();
     for f in files {
-        writeln!(out, "{}  ({} bytes)", local_path(root, &f.path), f.size).unwrap();
+        writeln!(out, "{}  ({} bytes)", local_path(root, &f.path), f.size)
+            .expect("writing to a String cannot fail");
     }
     out
 }
@@ -152,7 +153,7 @@ pub(super) fn render_job(job_id: &str, j: &api::JobStatus) -> String {
         j.files_embedded, j.files_deleted, j.files_failed,
     );
     if let Some(e) = &j.error {
-        write!(out, "\n  error: {e}").unwrap();
+        write!(out, "\n  error: {e}").expect("writing to a String cannot fail");
     }
     if phase == "done" && total == 0 {
         out.push_str("\n  (up to date — nothing to sync)");
@@ -176,7 +177,7 @@ pub fn render_projects(graph: &api::ProjectGraph) -> String {
             g.root,
             g.children.len()
         )
-        .unwrap();
+        .expect("writing to a String cannot fail");
     }
     for p in &graph.projects {
         writeln!(
@@ -184,9 +185,9 @@ pub fn render_projects(graph: &api::ProjectGraph) -> String {
             "{}  ({}, {})  {} file(s)",
             p.name, p.kind, p.root, p.file_count
         )
-        .unwrap();
+        .expect("writing to a String cannot fail");
         if let Some(cfg) = &p.config_file {
-            writeln!(out, "    {cfg}").unwrap();
+            writeln!(out, "    {cfg}").expect("writing to a String cannot fail");
         }
     }
     out
@@ -199,7 +200,7 @@ pub(super) fn truncation_note(out: &mut String, shown: usize, total: u32) {
             out,
             "\n(showing {shown} of {total} — capped at {GRAPH_LIST_CAP}; narrow the codebase to see the rest)\n"
         )
-        .unwrap();
+        .expect("writing to a String cannot fail");
     }
 }
 
@@ -209,12 +210,12 @@ pub(super) fn render_tree(nodes: &[api::FileTreeNode], depth: usize, out: &mut S
     for n in nodes {
         let pad = "  ".repeat(depth);
         if n.is_directory {
-            writeln!(out, "{pad}{}/", n.name).unwrap();
+            writeln!(out, "{pad}{}/", n.name).expect("writing to a String cannot fail");
             if let Some(children) = &n.children {
                 render_tree(children, depth + 1, out);
             }
         } else {
-            writeln!(out, "{pad}{}", n.name).unwrap();
+            writeln!(out, "{pad}{}", n.name).expect("writing to a String cannot fail");
         }
     }
 }
@@ -280,7 +281,7 @@ pub(super) fn render_hits_inner(
                 "{:.0}% of top score) ---\n\n",
                 WEAK_HIT_FRACTION * 100.0
             )
-            .unwrap();
+            .expect("writing to a String cannot fail");
             separated = true;
         }
         let lang = h
@@ -321,7 +322,7 @@ pub(super) fn render_hits_inner(
             hit_location(h, root),
             write_marker(h)
         )
-        .unwrap();
+        .expect("writing to a String cannot fail");
         // Skip leading blank lines so the declaration/signature leads the snippet
         // rather than whitespace. `--expand` shows the whole body; otherwise the
         // first few lines, enough to judge relevance without flooding context.

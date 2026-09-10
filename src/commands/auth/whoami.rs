@@ -10,7 +10,7 @@ use crate::session::SessionContext;
 /// check that the server accepts our token by pinging `/v1/domains`.
 pub async fn run(cli: &Cli) -> Result<()> {
     let context = SessionContext::from_process(cli)?;
-    let transport = HttpTransport::new();
+    let transport = HttpTransport::new()?;
     // One command, one request at a time: no remote bound to share.
     let client = client::from_context(&context, &transport, None)?;
     let token =

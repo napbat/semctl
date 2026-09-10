@@ -79,7 +79,7 @@ impl Client {
     #[cfg(test)]
     pub(crate) fn for_test(codebase: &str, local_root: Option<PathBuf>) -> Self {
         let mut client = Self::new(
-            &HttpTransport::new(),
+            &HttpTransport::new().expect("build the test transport"),
             CredentialSource::Stored,
             "http://127.0.0.1:1",
             None,
@@ -731,7 +731,7 @@ pub fn from_cli(cli: &crate::cli::Cli) -> Result<Client> {
     let context = SessionContext::from_process(cli)?;
     // A one-shot command sends one interactive request at a time, so it needs
     // no remote bound. Its uploads are bounded by the sync limits it builds.
-    from_context(&context, &HttpTransport::new(), None)
+    from_context(&context, &HttpTransport::new()?, None)
 }
 
 /// Like [`from_cli`], but ensures a codebase is set — resolving the session's
@@ -739,7 +739,7 @@ pub fn from_cli(cli: &crate::cli::Cli) -> Result<Client> {
 /// codebase-scoped commands (`projects`, `graph …`) run inside a repo.
 pub async fn for_cwd(cli: &crate::cli::Cli) -> Result<Client> {
     let context = SessionContext::from_process(cli)?;
-    let client = from_context(&context, &HttpTransport::new(), None)?;
+    let client = from_context(&context, &HttpTransport::new()?, None)?;
     let dir = context.cwd;
     if client.codebase_raw().is_some() {
         return Ok(client.with_cached_local_root(Some(&dir)));
@@ -770,7 +770,7 @@ mod tests {
     /// A client with no codebase and no checkout, for the pure selection tests.
     fn test_client() -> Client {
         Client::new(
-            &HttpTransport::new(),
+            &HttpTransport::new().expect("build the test transport"),
             CredentialSource::Stored,
             "https://example.invalid",
             None,

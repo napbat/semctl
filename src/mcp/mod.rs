@@ -62,9 +62,7 @@ const DIRECT_EDIT_TOOLS: &[&str] = &[
 #[derive(Clone)]
 pub struct McpServer {
     shared: Arc<Shared>,
-    // Read by the `#[tool_handler]`-generated `call_tool` / `list_tools`
-    // impls; the dead-code analyzer can't see through the macro.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // The `tool_handler` macro reads this field.
     tool_router: ToolRouter<Self>,
 }
 
@@ -769,7 +767,7 @@ pub async fn run(cli: &Cli) -> Result<()> {
     let context = SessionContext::from_process(cli)?;
     // One engine per process. In standalone mode it serves exactly one session;
     // the type and the ownership are the same either way.
-    let engine = Engine::new(EngineSettings::from_environment());
+    let engine = Engine::new(EngineSettings::from_environment())?;
     let server = McpServer::new(context, engine).await?;
 
     // Detached, best-effort check for a newer published CLI.

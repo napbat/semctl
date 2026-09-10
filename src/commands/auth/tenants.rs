@@ -23,7 +23,7 @@ pub async fn run(args: TenantsArgs, cli: &Cli) -> Result<()> {
     let cfg = config::load()?;
     let server_url = cfg.server_url(context.server.as_deref());
 
-    let transport = HttpTransport::new();
+    let transport = HttpTransport::new()?;
     let http = transport.http();
     let session = auth::authenticated_session(http, &server_url, &context.credentials).await?;
     let items = auth::fetch_tenants(http, &session.authority_url, &session.access_token).await?;

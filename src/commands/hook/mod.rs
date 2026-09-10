@@ -263,7 +263,8 @@ async fn user_prompt_context(cli: &Cli, input: &HookInput) -> Option<String> {
             .as_deref()
             .map(|l| format!("  ·  {l}"))
             .unwrap_or_default();
-        writeln!(out, "- {path}{loc}{sym}{lang}  ({:.3}){freshness}", h.score).unwrap();
+        writeln!(out, "- {path}{loc}{sym}{lang}  ({:.3}){freshness}", h.score)
+            .expect("writing to a String cannot fail");
     }
     Some(out)
 }

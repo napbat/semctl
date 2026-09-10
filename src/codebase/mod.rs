@@ -6,14 +6,10 @@
 //! version-aware server may recover the same checkout by its opaque source id;
 //! Git remotes and folder names are never used as identity.
 //!
-//! A git remote does now decide which project a checkout belongs under. It did
-//! not use to: two clones carry different complete manifests, and one codebase
-//! could only hold one of them, so sharing a remote meant deleting each other's
-//! files. The server keeps a copy per checkout now, so clones of one repository
-//! belong in one catalog entry — the thing a tenant holding ten of them for one
-//! repository was missing. A folder with NO remote still gets a slug of its
-//! own: a bare folder name is not a project identity, and two unrelated `src`
-//! directories must not be fused on that guess.
+//! A Git remote identifies a project only when the server supports separate
+//! checkout copies. Each checkout still owns an independent manifest. A folder
+//! without a remote keeps a checkout-specific slug because its name does not
+//! establish project identity.
 
 mod git;
 mod identity;
@@ -31,8 +27,7 @@ pub(crate) use identity::{path_from_key, path_key, source_id as checkout_source_
 
 /// Where the checkout at `dir` is standing: its branch, its revision, the
 /// remote it tracks, and whether the tree is clean. `None` when the folder is
-/// not a git checkout, which is a thing to say nothing about rather than a
-/// thing to guess at.
+/// not a Git checkout.
 ///
 /// The remote is reported on every sync, not just at registration. It moves —
 /// a repository is renamed or transferred, a remote is re-pointed, and a plain
@@ -122,9 +117,10 @@ async fn validate_cached(
     let Some((id, how)) = cached else {
         return Ok(None);
     };
-    // The cache is not server-scoped and a codebase can be deleted. A
-    // definitive miss purges the stale mapping; a transient error keeps it
-    // rather than turning a network wobble into duplicate registration.
+    // The cache is not server-scoped and a codebase can be deleted. Cleanup after
+    // a definitive miss is best effort because the next lookup validates a
+    // retained entry. A transient server failure keeps the entry to prevent
+    // duplicate registration.
     match client
         .get_opt::<api::CodebaseSummary>(&format!("/v1/codebases/{id}"))
         .await
@@ -150,6 +146,7 @@ async fn recover_by_source(client: &Client, dir: &Path) -> Result<Option<Resolve
     let Some(existing) = find_by_source(client, &source_id).await? else {
         return Ok(None);
     };
+    // Cache failure does not invalidate the authoritative server match.
     let _ = crate::config::cache_codebase(dir, &existing.id).await;
     Ok(Some(Resolved {
         id: existing.id,
@@ -166,16 +163,11 @@ pub async fn ensure(client: &Client, dir: &Path) -> Result<String> {
         return Ok(resolved.id);
     }
     let id = create_local(client, &dir).await?;
+    // Source-id recovery can rebuild this best-effort cache entry.
     let _ = crate::config::cache_codebase(&dir, &id).await;
     Ok(id)
 }
 
-/// The codebase already holding this checkout's copy, asked of the server
-/// rather than remembered.
-///
-/// The source id is recomputed on every run and never stored, so this survives
-/// what a cached id does not: a project merged into another keeps the copy, and
-/// the answer here is simply the codebase that now holds it.
 async fn find_by_source(client: &Client, source_id: &str) -> Result<Option<api::CodebaseSummary>> {
     let page = client
         .get_page::<api::CodebaseSummary>(&format!(
@@ -185,10 +177,6 @@ async fn find_by_source(client: &Client, source_id: &str) -> Result<Option<api::
     Ok(page.items.into_iter().next())
 }
 
-/// Register or recover the deterministic Local codebase for `dir`. The friendly
-/// name comes from the folder; its slug includes the opaque checkout identity,
-/// so another same-named clone is a separate catalog row. VCS metadata is still
-/// attached for display and source navigation, never matching.
 async fn create_local(client: &Client, dir: &Path) -> Result<String> {
     let name = dir
         .file_name()
@@ -207,23 +195,14 @@ async fn create_local(client: &Client, dir: &Path) -> Result<String> {
     };
     let source_id = identity::source_id(dir)?;
 
-    // A server that keeps one manifest per codebase cannot hold two checkouts,
-    // so against one of those this stays what it always was: a codebase per
-    // checkout, slugged with its own digest. Putting them together there would
-    // have them delete each other's files on every sync.
+    // Legacy servers need one codebase per checkout because each codebase holds
+    // one manifest.
     let versioned = client.supports(CAPABILITY_CODEBASE_VERSIONS).await;
 
-    // Already known? Then this checkout has synced before, under a project it
-    // may since have been merged into.
     if versioned && let Some(existing) = find_by_source(client, &source_id).await? {
         return Ok(existing.id);
     }
 
-    // A server that derives the project itself needs nothing guessed on its
-    // behalf: it reads the remote out of the request below, finds or creates
-    // the codebase that owns it, and answers with the id. The slug is only a
-    // label there, so this asks for a readable one and accepts whatever comes
-    // back — including a different one, when the project already existed.
     let derives_projects = client.supports(CAPABILITY_PROJECT_KEYS).await;
 
     // Only a project-key server can establish that two remotes identify the
@@ -249,14 +228,8 @@ async fn create_local(client: &Client, dir: &Path) -> Result<String> {
     {
         Ok(created) => Ok(created.id),
         Err(create_error) => {
-            // Two processes may index the same new path concurrently. Its
-            // digest-backed slug identifies the same checkout in both calls.
-            //
-            // Not against a server that derives projects: there the race is
-            // settled by a unique key in its database and both callers are
-            // answered with the winner, so a create that still failed failed for
-            // a real reason and must be reported rather than papered over with
-            // whatever shares the slug.
+            // Only legacy creation can lose the digest-slug race. A project-key
+            // error has another cause and must be returned.
             if !derives_projects && let Ok(Some(existing)) = find_by_slug(client, &slug).await {
                 return Ok(existing.id);
             }

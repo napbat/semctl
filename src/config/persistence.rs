@@ -105,6 +105,21 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn new_private_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("installation-id");
+        drop(create_private_new(&path).unwrap());
+
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
     #[test]
     fn failed_publication_preserves_existing_target() {
         let directory = tempfile::tempdir().unwrap();

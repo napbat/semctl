@@ -116,7 +116,7 @@ pub(crate) async fn serve() -> Result<()> {
 
     let idle_after = idle_after(std::env::var(IDLE_SECS_VAR).ok().as_deref());
     let daemon = Arc::new(Daemon {
-        engine: Engine::new(EngineSettings::from_environment()),
+        engine: Engine::new(EngineSettings::from_environment()).context("build the engine")?,
         sessions: Arc::new(Sessions::new()),
         stop: Notify::new(),
         started: Instant::now(),

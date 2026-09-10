@@ -196,6 +196,7 @@ fn commit_apply(
             // Keep the history when conflicts retain recovery data. A retry
             // must not treat a partially recovered transaction as a fresh plan.
             if !transaction::recovery_required(&error) {
+                // A failed cleanup leaves only the private diagnostic history.
                 let _ = fs::remove_file(&path);
             }
             return Err(error);
@@ -605,6 +606,7 @@ fn create_history(path: &Path, history: &EditHistory) -> Result<()> {
     let mut file = crate::config::create_private_new(path)?;
     if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
         drop(file);
+        // A failed cleanup leaves only the private, incomplete history file.
         let _ = fs::remove_file(path);
         return Err(error).with_context(|| format!("write {}", path.display()));
     }

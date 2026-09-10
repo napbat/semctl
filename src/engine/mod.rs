@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use anyhow::Result;
 use tokio::sync::Mutex;
 use tokio::time::MissedTickBehavior;
 use tracing::info;
@@ -75,7 +76,7 @@ impl Engine {
     ///
     /// Call this inside a runtime: it starts the registry's idle sweeper. The
     /// sweeper holds a weak handle, so it ends when the engine does.
-    pub(crate) fn new(settings: EngineSettings) -> Arc<Self> {
+    pub(crate) fn new(settings: EngineSettings) -> Result<Arc<Self>> {
         let scheduler = Arc::new(Scheduler::new(settings.scheduler));
         let registry = Arc::new(CheckoutRegistry::new(
             Arc::new(WatchHub::new()),
@@ -83,13 +84,13 @@ impl Engine {
             settings.idle_grace,
         ));
         spawn_idle_sweeper(Arc::downgrade(&registry));
-        Arc::new(Self {
+        Ok(Arc::new(Self {
             registry,
             scheduler,
-            transport: HttpTransport::new(),
+            transport: HttpTransport::new()?,
             update_note: Arc::new(Mutex::new(None)),
             update_check_started: AtomicBool::new(false),
-        })
+        }))
     }
 
     /// An engine whose reconciles are counted instead of performed.
@@ -99,7 +100,7 @@ impl Engine {
         Arc::new(Self {
             registry: Arc::new(CheckoutRegistry::for_test(reconciler, DEFAULT_IDLE_GRACE)),
             scheduler,
-            transport: HttpTransport::new(),
+            transport: HttpTransport::new().expect("build the test transport"),
             update_note: Arc::new(Mutex::new(None)),
             update_check_started: AtomicBool::new(false),
         })

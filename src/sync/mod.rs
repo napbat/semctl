@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::client::{Client, api};
 use scan::ScanResult;
@@ -170,7 +170,10 @@ where
     // checkout actually is now.
     let codebase_id = match plan.codebase_id.as_deref() {
         Some(moved) if moved != codebase_id => {
-            let _ = crate::config::cache_codebase(&dir, moved).await;
+            if let Err(error) = crate::config::cache_codebase(&dir, moved).await {
+                // Continue because the server move is authoritative and recoverable.
+                warn!(%error, "could not cache the moved codebase");
+            }
             moved.to_string()
         }
         _ => codebase_id,
