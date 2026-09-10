@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 use crate::cli::Cli;
@@ -31,8 +31,11 @@ use crate::client::{self, Client};
 use crate::query;
 use crate::sync::{self, JobRegistry};
 
+mod readiness;
 mod tool_types;
 mod tools;
+
+use readiness::{InitialIndexGate, InitialIndexes, initial_gate_for_path, ready_for_codebases};
 
 use tool_types::{InsertSymbolArgs, render_edit_action_outcome};
 
@@ -51,9 +54,7 @@ const DIRECT_EDIT_TOOLS: &[&str] = &[
 #[derive(Clone)]
 pub struct McpServer {
     shared: Arc<Shared>,
-    // Read by the `#[tool_handler]`-generated `call_tool` / `list_tools`
-    // impls; the dead-code analyzer can't see through the macro.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // The `tool_handler` macro reads this field.
     tool_router: ToolRouter<Self>,
 }
 
@@ -62,54 +63,6 @@ pub struct McpServer {
 /// behind a `Mutex` so concurrent searches reuse one poll. See
 /// [`McpServer::index_freshness`].
 type FreshnessCache = Arc<Mutex<Option<(String, Option<String>)>>>;
-
-#[derive(Default)]
-struct InitialIndexes {
-    by_path: HashMap<PathBuf, Arc<InitialIndexGate>>,
-    by_codebase: HashMap<String, Arc<InitialIndexGate>>,
-}
-
-struct InitialIndexGate {
-    state: Mutex<InitialIndexState>,
-    changed: Notify,
-}
-
-#[derive(Clone)]
-enum InitialIndexState {
-    Pending,
-    Ready,
-    Failed(String),
-}
-
-impl InitialIndexGate {
-    fn pending() -> Self {
-        Self {
-            state: Mutex::new(InitialIndexState::Pending),
-            changed: Notify::new(),
-        }
-    }
-
-    async fn wait(&self) -> std::result::Result<(), String> {
-        loop {
-            // Register before checking state so a completion between the check and
-            // await cannot be missed.
-            let changed = self.changed.notified();
-            match self.state.lock().await.clone() {
-                InitialIndexState::Pending => changed.await,
-                InitialIndexState::Ready => return Ok(()),
-                InitialIndexState::Failed(reason) => return Err(reason),
-            }
-        }
-    }
-
-    async fn finish(&self, result: std::result::Result<(), String>) {
-        *self.state.lock().await = match result {
-            Ok(()) => InitialIndexState::Ready,
-            Err(reason) => InitialIndexState::Failed(reason),
-        };
-        self.changed.notify_waiters();
-    }
-}
 
 /// State shared across handler clones. The codebase binding is resolved lazily
 /// and cached here, so a server that started unauthenticated (or before its
@@ -137,7 +90,7 @@ struct Shared {
     /// First-ever indexes currently building (or completed/failed in this
     /// process). Retrieval tools await these gates; `sync_status` deliberately
     /// bypasses them so progress remains observable.
-    initial_indexes: Mutex<InitialIndexes>,
+    initial_indexes: RwLock<InitialIndexes>,
     /// Cached search freshness footer, keyed by the job id it describes; filled
     /// only once that job is terminal so repeated searches don't re-poll. See
     /// [`McpServer::index_freshness`].
@@ -159,7 +112,7 @@ impl McpServer {
                 bound: Mutex::new(None),
                 jobs: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 watched: Mutex::new(HashMap::new()),
-                initial_indexes: Mutex::new(InitialIndexes::default()),
+                initial_indexes: RwLock::new(InitialIndexes::default()),
                 freshness: Arc::new(Mutex::new(None)),
                 update_note: Arc::new(Mutex::new(None)),
             }),
@@ -174,6 +127,7 @@ impl McpServer {
     /// claim for a codebase indexed earlier (that caveat lives in `sync_status`).
     /// Cached once the job is terminal, keyed by job id so a later sync recomputes.
     async fn index_freshness(&self, client: &Client) -> Option<String> {
+        client.local_root()?;
         let codebase_id = client.codebase_raw()?;
         let job = self.shared.jobs.lock().await.get(codebase_id).cloned()?;
         if let Some((id, footer)) = self.shared.freshness.lock().await.as_ref()
@@ -220,9 +174,7 @@ impl McpServer {
             self.await_initial_path(dir).await?;
         }
         let client = self.bound_unchecked().await?;
-        if let Some(id) = client.codebase_raw() {
-            self.await_initial_codebase(id).await?;
-        }
+        self.await_initial_client(&client).await?;
         Ok(client)
     }
 
@@ -239,11 +191,9 @@ impl McpServer {
         // recorded by an explicit index.
         if self.shared.pinned {
             let c = attach_local_root(self.shared.base.clone());
-            let root = c.local_root().map(Path::to_path_buf);
             *guard = Some(c.clone());
-            if let Some(root) = root {
-                self.watch_once(c.clone(), root).await;
-            }
+            drop(guard);
+            self.watch_checkout_once(&c).await;
             return Ok(c);
         }
 
@@ -293,10 +243,13 @@ impl McpServer {
 
         let client = attach_local_root(self.shared.base.clone().with_codebase(id));
         *guard = Some(client.clone());
-        // Keep this directory indexed for the rest of the session. Started here
-        // (not unconditionally at startup) so it only runs once the codebase is
-        // actually bound — including the self-heal path after a late login.
-        self.watch_once(client.clone(), dir).await;
+        // Watcher ownership takes the index registry lock. Do not retain the
+        // binding lock while another index may need it to finish registration.
+        drop(guard);
+        // An umbrella root can differ from the launch directory. Start watching
+        // the bound checkout only after resolution succeeds, including after a
+        // login performed while this MCP server was already running.
+        self.watch_checkout_once(&client).await;
         Ok(client)
     }
 
@@ -316,15 +269,17 @@ impl McpServer {
             || raw == ".."
             || raw.contains('/')
             || raw.contains('\\');
-        if path_like {
+        let client = if path_like {
             let dir = canonical_directory(&candidate)?;
             let dir = crate::codebase::working_copy_root(&dir).await;
             self.await_initial_path(&dir).await?;
             let selector = dir.to_string_lossy().into_owned();
-            return self.client_for_unchecked(Some(&selector)).await;
-        }
-        self.await_initial_codebase(raw).await?;
-        self.client_for_unchecked(Some(raw)).await
+            self.client_for_unchecked(Some(&selector)).await?
+        } else {
+            self.client_for_unchecked(Some(raw)).await?
+        };
+        self.await_initial_client(&client).await?;
+        Ok(client)
     }
 
     /// [`Self::client_for`], answering about the copy `copy` names.
@@ -399,9 +354,7 @@ impl McpServer {
             Ok(Some(_)) => {
                 let client =
                     attach_local_root(self.shared.base.clone().with_codebase(raw.to_string()));
-                if let Some(root) = client.local_root().map(Path::to_path_buf) {
-                    self.watch_once(client.clone(), root).await;
-                }
+                self.watch_checkout_once(&client).await;
                 Ok(client)
             }
             Ok(None) => Err(format!(
@@ -411,16 +364,21 @@ impl McpServer {
         }
     }
 
+    /// Different checkouts can share a codebase id. A bound checkout waits for
+    /// its own gate; a rootless request waits for all matching checkouts.
+    async fn await_initial_client(&self, client: &Client) -> std::result::Result<(), String> {
+        if let Some(root) = client.local_root() {
+            self.await_initial_path(root).await
+        } else if let Some(id) = client.codebase_raw() {
+            self.await_initial_codebase(id).await
+        } else {
+            Ok(())
+        }
+    }
+
     async fn await_initial_path(&self, dir: &Path) -> std::result::Result<(), String> {
         let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-        let gate = self
-            .shared
-            .initial_indexes
-            .lock()
-            .await
-            .by_path
-            .get(&dir)
-            .cloned();
+        let gate = initial_gate_for_path(&self.shared.initial_indexes, &dir).await;
         match gate {
             Some(gate) => gate
                 .wait()
@@ -431,20 +389,15 @@ impl McpServer {
     }
 
     async fn await_initial_codebase(&self, id: &str) -> std::result::Result<(), String> {
-        let gate = self
-            .shared
-            .initial_indexes
-            .lock()
+        ready_for_codebases(&self.shared.initial_indexes, &[id.to_string()])
             .await
-            .by_codebase
-            .get(id)
-            .cloned();
-        match gate {
-            Some(gate) => gate
-                .wait()
-                .await
-                .map_err(|e| format!("initial index failed — {e}")),
-            None => Ok(()),
+            .map(|_| ())
+    }
+
+    /// Watch the checkout whose source identity the client sends with requests.
+    async fn watch_checkout_once(&self, client: &Client) {
+        if let Some(root) = client.local_root() {
+            self.watch_once(client.clone(), root.to_path_buf()).await;
         }
     }
 
@@ -454,12 +407,27 @@ impl McpServer {
         let Some(codebase_id) = client.codebase_raw().map(str::to_string) else {
             return;
         };
-        let mut watched = self.shared.watched.lock().await;
-        if !watched.contains_key(&dir) {
-            watched.insert(dir.clone(), codebase_id);
-            drop(watched);
+        if self.claim_untracked_watch(&dir, &codebase_id).await {
             sync::spawn_indexing(client, dir, self.shared.jobs.clone());
         }
+    }
+
+    /// A first-index gate owns watcher startup even before registration returns.
+    /// Status calls must not replace that startup with an untracked watcher.
+    async fn claim_untracked_watch(&self, dir: &Path, codebase_id: &str) -> bool {
+        // Always lock the index registry before the watcher registry. Keep the
+        // first lock until the claim completes so a gate cannot appear between
+        // the ownership check and the watcher claim.
+        let indexes = self.shared.initial_indexes.read().await;
+        if indexes.by_path.contains_key(dir) {
+            return false;
+        }
+        let mut watched = self.shared.watched.lock().await;
+        if watched.contains_key(dir) {
+            return false;
+        }
+        watched.insert(dir.to_path_buf(), codebase_id.to_string());
+        true
     }
 
     /// Claim a new local root and start the exact same watcher lifecycle as
@@ -756,14 +724,9 @@ fn spawn_update_check(note: Arc<Mutex<Option<String>>>, server_override: Option<
 /// and the host can open them directly. A miss (canonical / server-pulled
 /// codebase, or one never indexed locally) leaves paths codebase-relative.
 fn attach_local_root(client: Client) -> Client {
-    let Some(id) = client.codebase_raw() else {
-        return client;
-    };
-    let root = crate::config::load()
-        .ok()
-        .and_then(|cfg| cfg.codebase_root(id, std::env::current_dir().ok().as_deref()));
-    if let Some(r) = &root {
+    let client = client.with_cached_local_root(std::env::current_dir().ok().as_deref());
+    if let Some(r) = client.local_root() {
         debug!(root = %r.display(), "hit paths absolutized against local checkout");
     }
-    client.with_local_root(root)
+    client
 }

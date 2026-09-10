@@ -18,7 +18,6 @@ $ErrorActionPreference = 'Stop'
 $ReleaseBase = if ($env:SEMCTL_RELEASE_BASE) { $env:SEMCTL_RELEASE_BASE } else { 'https://github.com/napbat/semctl/releases/latest/download' }
 
 function Say($m)  { Write-Host "==> $m" -ForegroundColor Cyan }
-function Warn($m) { Write-Host "  ! $m" -ForegroundColor Yellow }
 function Ok($m)   { Write-Host "  + $m" -ForegroundColor Green }
 
 if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64') {
@@ -32,23 +31,24 @@ try {
     Say "Downloading $asset from the latest release..."
     Invoke-WebRequest -Uri "$ReleaseBase/$asset" -OutFile $bin -UseBasicParsing
 
-    # Verify SHA-256 against the release manifest (a missing manifest only warns;
-    # a MISMATCH aborts).
+    # Require one valid entry before the downloaded binary can execute.
     $sums = Join-Path $tmp 'checksums.txt'
-    $haveChecksums = $true
-    try { Invoke-WebRequest -Uri "$ReleaseBase/checksums-sha256.txt" -OutFile $sums -UseBasicParsing }
-    catch { $haveChecksums = $false; Warn 'could not fetch checksums - skipping verification' }
-    if ($haveChecksums) {
-        $line = Select-String -Path $sums -Pattern ([regex]::Escape($asset) + '$') | Select-Object -First 1
-        if ($line) {
-            $want = (($line.Line -split '\s+') | Where-Object { $_ })[0]
-            $got  = (Get-FileHash -Algorithm SHA256 -Path $bin).Hash.ToLower()
-            if ($got -ne $want.ToLower()) { throw "sha256 mismatch: expected $want, got $got" }
-            Ok 'sha256 verified'
-        } else {
-            Warn "no checksum entry for $asset - skipping verification"
-        }
+    Invoke-WebRequest -Uri "$ReleaseBase/checksums-sha256.txt" -OutFile $sums -UseBasicParsing
+    $entries = @(Get-Content -LiteralPath $sums | Where-Object {
+        $fields = @($_.Trim() -split '\s+')
+        $fields.Count -ge 2 -and ($fields[1] -ceq $asset -or $fields[1] -ceq "*$asset")
+    })
+    if ($entries.Count -ne 1) {
+        throw "checksum manifest must contain one SHA-256 entry for $asset"
     }
+    $entry = @($entries[0].Trim() -split '\s+')
+    if ($entry.Count -ne 2 -or $entry[0] -cnotmatch '^[0-9a-fA-F]{64}$') {
+        throw "invalid SHA-256 entry for $asset"
+    }
+    $want = $entry[0].ToLowerInvariant()
+    $got = (Get-FileHash -Algorithm SHA256 -LiteralPath $bin).Hash.ToLowerInvariant()
+    if ($got -ne $want) { throw "SHA-256 mismatch: expected $want, got $got" }
+    Ok 'SHA-256 verified'
 
     # Hand off to the CLI: `install` copies the binary to a stable PATH location
     # and wires up the AI tools it finds (Claude Code, Codex).

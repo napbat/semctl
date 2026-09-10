@@ -15,7 +15,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::auth;
 
@@ -62,17 +62,26 @@ pub struct Client {
 }
 
 impl Client {
+    /// Build isolated client state for tests that do not send HTTP requests.
+    #[cfg(test)]
+    pub(crate) fn for_test(codebase: &str, local_root: Option<PathBuf>) -> Self {
+        let mut client = Self::new("http://127.0.0.1:1", None, Some(codebase.into()), false)
+            .expect("the default test HTTP client must build");
+        client.local_root = local_root;
+        client
+    }
+
     fn new(
         base_url: &str,
         tenant: Option<String>,
         codebase: Option<String>,
         repair_configured_tenant: bool,
-    ) -> Self {
+    ) -> Result<Self> {
         let http = reqwest::Client::builder()
             .user_agent(concat!("semctx-cli/", env!("CARGO_PKG_VERSION")))
             .build()
-            .expect("reqwest client build is infallible with default config");
-        Self {
+            .context("build HTTP client")?;
+        Ok(Self {
             http,
             base_url: base_url.trim_end_matches('/').to_string(),
             tenant: Arc::new(RwLock::new(tenant)),
@@ -82,7 +91,7 @@ impl Client {
             local_root: None,
             checkout_source_id: None,
             capabilities: Arc::new(tokio::sync::OnceCell::new()),
-        }
+        })
     }
 
     /// The resolved codebase id, or an error naming how to set it. Code /
@@ -111,17 +120,29 @@ impl Client {
         self
     }
 
-    /// Return a copy with the codebase's local checkout root set — used by
-    /// `semctl mcp` so hit paths can be absolutized for the host.
+    /// Attach a checkout only when its source identity can be derived. A failed
+    /// identity leaves both the request selector and local rendering unbound.
     pub fn with_local_root(mut self, root: Option<PathBuf>) -> Self {
+        let root = root.filter(|dir| dir.is_dir());
         // Derived here, once, rather than per request: it hashes the
         // installation id with the path, and every read would otherwise pay
         // for a file read it does not need.
         self.checkout_source_id = root
             .as_deref()
             .and_then(|dir| crate::codebase::checkout_source_id(dir).ok());
-        self.local_root = root;
+        self.local_root = root.filter(|_| self.checkout_source_id.is_some());
         self
+    }
+
+    /// Attach only a checkout recorded for this codebase. A missing cache leaves
+    /// the client unbound, so edit operations cannot select an unrelated directory.
+    pub fn with_cached_local_root(self, prefer: Option<&Path>) -> Self {
+        let root = self.codebase_raw().and_then(|id| {
+            crate::config::load()
+                .ok()
+                .and_then(|config| config.codebase_root(id, prefer))
+        });
+        self.with_local_root(root)
     }
 
     /// The same client, asking about the project rather than about the
@@ -134,6 +155,7 @@ impl Client {
     pub fn for_canonical(&self) -> Self {
         let mut client = self.clone();
         client.checkout_source_id = None;
+        client.local_root = None;
         client
     }
 
@@ -163,7 +185,7 @@ impl Client {
         method: reqwest::Method,
         path: &str,
     ) -> Result<(reqwest::RequestBuilder, String, Option<String>)> {
-        let token = auth::get_valid_access_token(&self.http).await?;
+        let token = auth::get_valid_access_token(&self.http, &self.base_url).await?;
         let url = self.url(path);
         let mut req = self.http.request(method, &url).bearer_auth(&token);
         let tenant = self.tenant.read().await.clone();
@@ -256,60 +278,49 @@ impl Client {
             return current.is_some();
         }
 
-        let mut cfg = match crate::config::load() {
-            Ok(cfg) => cfg,
+        let session = match auth::authenticated_session(&self.http, &self.base_url).await {
+            Ok(session) => session,
             Err(error) => {
-                warn!(%error, "couldn't load config while repairing stale tenant");
+                warn!(%error, "could not read the current login while repairing tenant selection");
                 return false;
             }
         };
-
-        // Honour a validated switch performed by another process while this MCP
-        // server was running before making another identity round-trip.
-        if let Some(configured) = cfg.active_tenant.clone()
+        if let Some(configured) = &session.active_tenant
             && configured != rejected
         {
             *self.tenant.write().await = Some(configured.clone());
-            info!(tenant = %configured, "adopted updated active tenant");
             return true;
         }
-
-        let token = match auth::get_valid_access_token(&self.http).await {
-            Ok(token) => token,
-            Err(error) => {
-                warn!(%error, "couldn't get token while repairing stale tenant");
-                return false;
-            }
-        };
-        let identity_url = match auth::discover_authority(&self.http, &self.base_url).await {
-            Ok(url) => url,
-            Err(error) => {
-                warn!(%error, "couldn't discover identity while repairing stale tenant");
-                return false;
-            }
-        };
-        let memberships = match auth::fetch_tenants(&self.http, &identity_url, &token).await {
-            Ok(memberships) => memberships,
-            Err(error) => {
-                warn!(%error, "couldn't list memberships while repairing stale tenant");
-                return false;
-            }
-        };
+        let memberships =
+            match auth::fetch_tenants(&self.http, &session.authority_url, &session.access_token)
+                .await
+            {
+                Ok(memberships) => memberships,
+                Err(error) => {
+                    warn!(%error, "could not list memberships while repairing tenant selection");
+                    return false;
+                }
+            };
         let [only] = memberships.as_slice() else {
             return false;
         };
-
-        cfg.active_tenant = Some(only.slug.clone());
-        if let Err(error) = crate::config::save(&cfg) {
-            warn!(%error, tenant = %only.slug, "repaired tenant for this session but couldn't save it");
+        match auth::set_active_tenant(
+            &session.stamp,
+            Some(rejected.to_string()),
+            Some(only.slug.clone()),
+        )
+        .await
+        {
+            Ok(true) => {
+                *self.tenant.write().await = Some(only.slug.clone());
+                true
+            }
+            Ok(false) => false,
+            Err(error) => {
+                warn!(%error, "could not persist repaired tenant selection");
+                false
+            }
         }
-        *self.tenant.write().await = Some(only.slug.clone());
-        info!(
-            rejected_tenant = %rejected,
-            tenant = %only.slug,
-            "repaired stale active tenant; retrying request"
-        );
-        true
     }
 
     /// Whether the server reports `capability`.
@@ -610,16 +621,14 @@ fn tenant_selection(configured: Option<String>, explicit: Option<&str>) -> (Opti
 /// Build an authenticated `Client` from the loaded config + the global CLI flags.
 pub fn from_cli(cli: &crate::cli::Cli) -> Result<Client> {
     let cfg = crate::config::load()?;
-    let server = cfg.server_url(cli.server.as_deref());
+    let server = auth::normalize_server_url(&cfg.server_url(cli.server.as_deref()))?;
+    let configured_tenant = (auth::normalize_server_url(&cfg.persisted_server_url())? == server)
+        .then(|| cfg.active_tenant.clone())
+        .flatten();
     let (tenant, repair_configured_tenant) =
-        tenant_selection(cfg.active_tenant.clone(), cli.tenant.as_deref());
+        tenant_selection(configured_tenant, cli.tenant.as_deref());
     let codebase = cfg.active_codebase(cli.codebase.as_deref());
-    Ok(Client::new(
-        &server,
-        tenant,
-        codebase,
-        repair_configured_tenant,
-    ))
+    Client::new(&server, tenant, codebase, repair_configured_tenant)
 }
 
 /// Like [`from_cli`], but ensures a codebase is set — resolving the working
@@ -627,10 +636,10 @@ pub fn from_cli(cli: &crate::cli::Cli) -> Result<Client> {
 /// codebase-scoped commands (`projects`, `graph …`) run inside a repo.
 pub async fn for_cwd(cli: &crate::cli::Cli) -> Result<Client> {
     let client = from_cli(cli)?;
-    if client.codebase_raw().is_some() {
-        return Ok(client);
-    }
     let dir = std::env::current_dir().context("read working directory")?;
+    if client.codebase_raw().is_some() {
+        return Ok(client.with_cached_local_root(Some(&dir)));
+    }
     let id = crate::codebase::resolve(&client, &dir)
         .await?
         .map(|r| r.id)
@@ -640,7 +649,7 @@ pub async fn for_cwd(cli: &crate::cli::Cli) -> Result<Client> {
                 dir.display()
             )
         })?;
-    Ok(client.with_codebase(id))
+    Ok(client.with_codebase(id).with_cached_local_root(Some(&dir)))
 }
 
 #[cfg(test)]
@@ -773,23 +782,36 @@ mod tests {
     /// "tell me what the project publishes".
     #[test]
     fn asking_for_canonical_stops_claiming_a_checkout() {
-        let mut client = Client::new("https://example.invalid", None, None, false);
+        let mut client = Client::new("https://example.invalid", None, None, false).unwrap();
         client.checkout_source_id = Some("digest".into());
+        client.local_root = Some(std::path::PathBuf::from("checkout"));
 
         assert_eq!(client.for_canonical().checkout_source_id, None);
+        assert_eq!(client.for_canonical().local_root(), None);
 
         // A view, not a move: the checkout client stays usable, so one
         // canonical lookup cannot silently redirect the rest of a session to
         // the trunk.
         assert_eq!(client.checkout_source_id.as_deref(), Some("digest"));
+        assert_eq!(client.local_root(), Some(std::path::Path::new("checkout")));
     }
 
     /// Outside a checkout there is nothing to drop, and canonical is already
     /// what every read resolves to.
     #[test]
     fn canonical_is_a_no_op_when_no_checkout_is_claimed() {
-        let client = Client::new("https://example.invalid", None, None, false);
+        let client = Client::new("https://example.invalid", None, None, false).unwrap();
 
         assert_eq!(client.for_canonical().checkout_source_id, None);
+    }
+
+    #[test]
+    fn failed_checkout_identity_clears_local_binding() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut client = Client::for_test("codebase", Some(directory.path().to_path_buf()));
+        client.checkout_source_id = Some("old-checkout".into());
+        let client = client.with_local_root(Some(directory.path().join("missing")));
+        assert_eq!(client.checkout_source_id, None);
+        assert_eq!(client.local_root(), None);
     }
 }

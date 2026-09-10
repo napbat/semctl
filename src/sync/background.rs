@@ -47,7 +47,7 @@ fn spawn(
         // a nested directory. The sync manifest is complete desired state, not
         // a subtree patch.
         let dir = crate::codebase::working_copy_root(&dir).await;
-        // One stamp cache shared across startup / periodic / watch syncs; the
+        // One content-decision cache shared across startup / periodic / watch syncs; the
         // Mutex inside also serializes them so only one runs at a time.
         let cache = Arc::new(Mutex::new(SyncCache::default()));
 
@@ -101,6 +101,7 @@ fn spawn_startup_reconcile(
     initial_result: Option<oneshot::Sender<Result<SyncOutcome, String>>>,
 ) {
     tokio::spawn(async move {
+        // The readiness receiver may be dropped while this detached task runs.
         match sync(&client, &dir, &cache).await {
             Ok(o) => {
                 info!(

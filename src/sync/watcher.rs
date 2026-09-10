@@ -13,22 +13,27 @@
 //! under the VCS dir or matched by the root gitignore are filtered out too, so a
 //! `cargo build` / `git` operation doesn't spin the sync.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify::event::{AccessKind, AccessMode};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebouncedEvent, Debouncer, RecommendedCache, new_debouncer};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use super::SyncCache;
+use super::{
+    SyncCache,
+    blocking::Cancellation,
+    policy::{SourcePolicy, event_may_affect_policy},
+};
 use crate::client::Client;
 
 /// Debounce window: collapse a burst of saves into a single re-sync.
 const DEBOUNCE_MS: u64 = 750;
+
+type WatchControl = std::sync::Mutex<Debouncer<RecommendedWatcher, RecommendedCache>>;
 
 /// Begin watching `dir`. Returns the watcher guard — dropping it stops the
 /// watch, so the caller keeps it alive for the server's lifetime. `None` when
@@ -39,19 +44,49 @@ pub(super) fn spawn(
     dir: PathBuf,
     cache: Arc<Mutex<SyncCache>>,
     jobs: Arc<super::JobRegistry>,
-) -> Option<Debouncer<RecommendedWatcher, RecommendedCache>> {
+) -> Option<Arc<WatchControl>> {
     // Wake-only channel: the re-sync re-walks the whole tree, so we forward
     // "something interesting changed", not which paths.
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
 
-    let gi = build_ignore(&dir);
+    let initial_policy = load_initial_policy(&dir);
+    let mut observed: std::collections::HashSet<_> = initial_policy
+        .as_ref()
+        .into_iter()
+        .flat_map(SourcePolicy::observed_sources)
+        .collect();
+
+    let ignore_root = dir.clone();
     let mut debouncer = match new_debouncer(
         Duration::from_millis(DEBOUNCE_MS),
         None,
         move |result: Result<Vec<DebouncedEvent>, Vec<notify::Error>>| match result {
             Ok(events) => {
-                if events.iter().any(|e| is_interesting(&e.event, &gi)) {
-                    let _ = tx.send(());
+                if !events.iter().any(|event| {
+                    can_change_tree(&event.event)
+                        && event
+                            .paths
+                            .iter()
+                            .any(|path| event_may_affect_policy(&ignore_root, path, &observed))
+                }) {
+                    return;
+                }
+                // Notifications and manifests share the checked policy engine.
+                // A load error still wakes the scanner, which reports the error
+                // and refuses upload instead of treating unreadable rules as empty.
+                let interesting = match SourcePolicy::load(&ignore_root, &Cancellation::default()) {
+                    Ok(mut policy) => {
+                        let interesting = events
+                            .iter()
+                            .any(|event| is_interesting(&event.event, &mut policy));
+                        observed.extend(policy.observed_sources());
+                        interesting
+                    }
+                    Err(_) => true,
+                };
+                if interesting {
+                    // A full channel has a wake-up; a closed channel has no consumer.
+                    let _ = tx.try_send(());
                 }
             }
             Err(errs) => {
@@ -72,6 +107,12 @@ pub(super) fn spawn(
         warn!(error = %e, "fs watch registration failed; relying on periodic re-sync");
         return None;
     }
+    let mut registered = std::collections::HashSet::new();
+    if let Some(policy) = initial_policy {
+        register_external_watches(&mut debouncer, &policy, &mut registered);
+    }
+    let debouncer = Arc::new(std::sync::Mutex::new(debouncer));
+    let control = Arc::downgrade(&debouncer);
     info!(dir = %dir.display(), debounce_ms = DEBOUNCE_MS, "fs watcher active");
 
     // Single-flight consumer: await each re-sync before taking the next wake,
@@ -92,47 +133,99 @@ pub(super) fn spawn(
                 Ok(_) => debug!("watch re-sync: no changes"),
                 Err(e) => warn!(error = %format!("{e:#}"), "watch re-sync failed"),
             }
+            // A config change can select a rule in a different directory. Add
+            // that directory after reconciliation so later rule edits wake us.
+            let Some(control) = control.upgrade() else {
+                break;
+            };
+            let root = dir.clone();
+            let mut previous = registered.clone();
+            match super::blocking::run(move |cancellation| {
+                let policy = SourcePolicy::load(&root, &cancellation)?;
+                let mut watcher = control
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("watch control lock is poisoned"))?;
+                register_external_watches(&mut watcher, &policy, &mut previous);
+                Ok(previous)
+            })
+            .await
+            {
+                Ok(current) => registered = current,
+                Err(error) => {
+                    warn!(%error, "source policy watch refresh failed; periodic sync covers changes");
+                }
+            }
         }
     });
 
     Some(debouncer)
 }
 
-/// Root gitignore matcher (root `.gitignore` + `.semctlignore`). Best-effort: a
-/// missing/unreadable file just yields a matcher that ignores nothing.
-fn build_ignore(root: &Path) -> Gitignore {
-    let mut b = GitignoreBuilder::new(root);
-    let _ = b.add(root.join(".gitignore"));
-    let _ = b.add(root.join(".semctlignore"));
-    b.build().unwrap_or_else(|_| Gitignore::empty())
+fn load_initial_policy(dir: &std::path::Path) -> Option<SourcePolicy> {
+    match SourcePolicy::load(dir, &Cancellation::default()) {
+        Ok(policy) => Some(policy),
+        Err(error) => {
+            warn!(%error, "source policy unavailable at watcher startup; relying on periodic re-sync");
+            None
+        }
+    }
 }
 
-/// Whether a debounced event can have changed a path worth re-syncing.
-///
-/// A close-after-write is the sole access event that can signal new bytes. All
-/// other access events are observations, including the directory/file opens made
-/// by the manifest walk itself, and must not feed back into another sync.
-fn is_interesting(event: &Event, gi: &Gitignore) -> bool {
-    let can_change_tree = !matches!(event.kind, EventKind::Access(_))
+/// Watch rule parents so creation and atomic replacement are visible. For a
+/// parent that does not exist yet, watch its closest existing ancestor first.
+fn register_external_watches(
+    watcher: &mut Debouncer<RecommendedWatcher, RecommendedCache>,
+    policy: &SourcePolicy,
+    registered: &mut std::collections::HashSet<PathBuf>,
+) {
+    for path in policy.external_sources() {
+        let parent = path
+            .parent()
+            .and_then(|parent| parent.ancestors().find(|ancestor| ancestor.is_dir()));
+        let Some(parent) = parent else { continue };
+        if registered.contains(parent) {
+            continue;
+        }
+        match watcher.watch(parent, RecursiveMode::NonRecursive) {
+            Ok(()) => {
+                registered.insert(parent.to_path_buf());
+            }
+            Err(error) => {
+                warn!(%error, "external source policy watch unavailable; periodic sync covers changes");
+            }
+        }
+    }
+}
+
+/// Filesystem errors wake the authoritative scanner, which fails closed.
+fn is_interesting(event: &Event, policy: &mut SourcePolicy) -> bool {
+    can_change_tree(event)
+        && event.paths.iter().any(|path| {
+            policy
+                .event_is_relevant(path, path.is_dir(), &Cancellation::default())
+                .unwrap_or(true)
+        })
+}
+
+fn can_change_tree(event: &Event) -> bool {
+    !matches!(event.kind, EventKind::Access(_))
         || matches!(
             event.kind,
             EventKind::Access(AccessKind::Close(AccessMode::Write))
-        );
-    can_change_tree
-        && event.paths.iter().any(|p| {
-            if p.components().any(|c| c.as_os_str() == ".git") {
-                return false;
-            }
-            let is_dir = p.is_dir();
-            !gi.matched_path_or_any_parents(p, is_dir).is_ignore()
-        })
+        )
 }
 
 #[cfg(test)]
 mod tests {
     use notify::event::{CreateKind, ModifyKind, RemoveKind};
+    use std::path::Path;
 
     use super::*;
+    use crate::sync::walker::IGNORE_FILES;
+
+    fn test_policy(root: &Path) -> SourcePolicy {
+        SourcePolicy::load(root, &Cancellation::default()).unwrap()
+    }
 
     fn event(kind: EventKind) -> Event {
         Event::new(kind).add_path(PathBuf::from("src/lib.rs"))
@@ -140,7 +233,8 @@ mod tests {
 
     #[test]
     fn scan_access_does_not_schedule_another_sync() {
-        let gi = Gitignore::empty();
+        let temp = tempfile::tempdir().unwrap();
+        let mut policy = test_policy(temp.path());
 
         for kind in [
             EventKind::Access(AccessKind::Read),
@@ -148,13 +242,17 @@ mod tests {
             EventKind::Access(AccessKind::Open(AccessMode::Write)),
             EventKind::Access(AccessKind::Close(AccessMode::Read)),
         ] {
-            assert!(!is_interesting(&event(kind), &gi), "accepted {kind:?}");
+            assert!(
+                !is_interesting(&event(kind), &mut policy),
+                "accepted {kind:?}"
+            );
         }
     }
 
     #[test]
     fn mutations_still_schedule_a_sync() {
-        let gi = Gitignore::empty();
+        let temp = tempfile::tempdir().unwrap();
+        let mut policy = test_policy(temp.path());
 
         for kind in [
             EventKind::Access(AccessKind::Close(AccessMode::Write)),
@@ -162,16 +260,48 @@ mod tests {
             EventKind::Modify(ModifyKind::Any),
             EventKind::Remove(RemoveKind::File),
         ] {
-            assert!(is_interesting(&event(kind), &gi), "rejected {kind:?}");
+            assert!(
+                is_interesting(&event(kind), &mut policy),
+                "rejected {kind:?}"
+            );
         }
     }
 
     #[test]
     fn vcs_events_remain_ignored() {
-        let gi = Gitignore::empty();
+        let temp = tempfile::tempdir().unwrap();
+        let mut policy = test_policy(temp.path());
         let event =
             Event::new(EventKind::Modify(ModifyKind::Any)).add_path(PathBuf::from(".git/index"));
 
-        assert!(!is_interesting(&event, &gi));
+        assert!(!is_interesting(&event, &mut policy));
+    }
+
+    #[test]
+    fn both_project_ignore_files_filter_watcher_events() {
+        for ignore_name in IGNORE_FILES {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::write(temp.path().join(ignore_name), "private.txt\n").unwrap();
+            let mut policy = test_policy(temp.path());
+            let event = Event::new(EventKind::Modify(ModifyKind::Any))
+                .add_path(temp.path().join("private.txt"));
+            assert!(!is_interesting(&event, &mut policy));
+        }
+    }
+
+    #[test]
+    fn ignore_file_changes_always_schedule_a_scan() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join(".gitignore"),
+            ".semctxignore\n.semctlignore\n",
+        )
+        .unwrap();
+        let mut policy = test_policy(temp.path());
+        for name in IGNORE_FILES {
+            let event =
+                Event::new(EventKind::Modify(ModifyKind::Any)).add_path(temp.path().join(name));
+            assert!(is_interesting(&event, &mut policy));
+        }
     }
 }

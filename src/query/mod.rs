@@ -30,7 +30,8 @@ pub use advanced::*;
 
 pub use render::render_projects;
 use render::{
-    hit_location, local_path, render_boundaries, render_compact, render_hits, render_hits_inner,
+    HitContext, hit_location, local_path, render_boundaries, render_compact, render_hits,
+    render_hits_inner,
 };
 
 /// Turn the MCP renderer's inline failure convention into a real CLI error.
@@ -85,6 +86,23 @@ pub struct SearchOpts {
     pub codebase_ids: Vec<String>,
 }
 
+impl SearchOpts {
+    pub(crate) fn normalized_scope(&self) -> Result<Option<&'static str>, &'static str> {
+        let scope = self
+            .scope
+            .as_deref()
+            .map(|scope| {
+                normalize_scope(scope)
+                    .ok_or("search failed: scope must be local, personal, organization, or global")
+            })
+            .transpose()?;
+        if scope.is_some() && !self.codebase_ids.is_empty() {
+            return Err("search failed: scope and codebase_ids are mutually exclusive");
+        }
+        Ok(scope)
+    }
+}
+
 /// Cross-domain search, scoped to the launched codebase when one is set. The
 /// server applies the kind filter, ranking bias, and symbol granularity; the
 /// client sends the options, annotates local staleness, and renders.
@@ -95,6 +113,10 @@ pub async fn search(
     domains: &[String],
     opts: &SearchOpts,
 ) -> String {
+    let scope = match opts.normalized_scope() {
+        Ok(scope) => scope,
+        Err(error) => return error.to_string(),
+    };
     let body = api::SearchRequestBody {
         query,
         top_k,
@@ -102,11 +124,7 @@ pub async fn search(
             .then(|| client.codebase().ok())
             .flatten(),
         codebase_ids: (!opts.codebase_ids.is_empty()).then(|| opts.codebase_ids.clone()),
-        scope: opts
-            .scope
-            .as_deref()
-            .and_then(normalize_scope)
-            .map(str::to_string),
+        scope: scope.map(str::to_string),
         domains: if domains.is_empty() {
             None
         } else {
@@ -133,15 +151,13 @@ pub async fn search(
     }
 
     // Staleness is the one shaping the client owns — only it has the local bytes.
-    let stale = stale_paths(client, &hits).await;
-    render_hits_inner(
-        &hits,
-        "no results",
+    let context = HitContext::search(
         client.local_root(),
-        true,
-        &stale,
-        opts.expand,
-    )
+        client.codebase_raw(),
+        opts.scope.is_none() && opts.codebase_ids.is_empty() && client.codebase_raw().is_some(),
+    );
+    let stale = stale_paths_in_context(client, &hits, context).await;
+    render_hits_inner(&hits, "no results", context, true, &stale, opts.expand)
 }
 
 fn normalize_scope(scope: &str) -> Option<&'static str> {
@@ -161,30 +177,54 @@ fn normalize_scope(scope: &str) -> Option<&'static str> {
 /// a genuine hash mismatch (or a file that's gone). Only the hits' own paths
 /// are hashed, not the whole tree.
 pub(crate) async fn stale_paths(client: &Client, hits: &[api::SearchHit]) -> HashSet<String> {
-    let mut stale = HashSet::new();
+    let context = HitContext::search(client.local_root(), client.codebase_raw(), true);
+    stale_paths_in_context(client, hits, context).await
+}
+
+async fn stale_paths_in_context(
+    client: &Client,
+    hits: &[api::SearchHit],
+    context: HitContext<'_>,
+) -> HashSet<String> {
     let Some(root) = client.local_root() else {
         // Server-pulled codebase with no local bytes — staleness is a
         // local-edit concern, so there's nothing to compare.
-        return stale;
+        return HashSet::new();
     };
-    let paths: HashSet<&str> = hits.iter().filter_map(|h| h.path.as_deref()).collect();
+    let paths: HashSet<String> = hits
+        .iter()
+        .filter(|hit| context.root_for(hit).is_some())
+        .filter_map(|hit| hit.path.clone())
+        .collect();
     if paths.is_empty() {
-        return stale;
+        return HashSet::new();
     }
     let Ok(catalog) = catalog_hashes(client).await else {
-        return stale;
+        return HashSet::new();
     };
-    for rel in paths {
-        // Only decide when the catalog has a recorded hash for this path; an
-        // unknown path (not yet catalogued) isn't flagged, to avoid noise.
-        let Some(Some(indexed)) = catalog.get(rel) else {
-            continue;
-        };
-        if is_stale(indexed, local_blake3(&root.join(rel)).as_deref()) {
-            stale.insert(rel.to_string());
+    let root = root.to_path_buf();
+    // Hashing local content can block on storage. A failed freshness check only
+    // omits annotations; it never authorizes an edit or changes indexed state.
+    tokio::task::spawn_blocking(move || {
+        let mut stale = HashSet::new();
+        for rel in paths {
+            // Only decide when the catalog has a recorded hash for this path; an
+            // unknown path (not yet catalogued) isn't flagged, to avoid noise.
+            let Some(Some(indexed)) = catalog.get(&rel) else {
+                continue;
+            };
+            let local = std::fs::canonicalize(root.join(&rel))
+                .ok()
+                .filter(|path| path.starts_with(&root))
+                .and_then(|path| local_blake3(&path));
+            if is_stale(indexed, local.as_deref()) {
+                stale.insert(rel);
+            }
         }
-    }
-    stale
+        stale
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// Whether a hit is stale: its `local` hash differs from the `indexed` one, or
@@ -255,9 +295,9 @@ pub async fn trace(client: &Client, symbol: &str, depth: u32) -> String {
     let mut out = format!("definition of `{symbol}`:\n");
     out.push_str(&render_hits(&t.definition, "", root, false));
 
-    write!(out, "\ncallers ({}):\n", t.callers.len()).unwrap();
+    write!(out, "\ncallers ({}):\n", t.callers.len()).expect("writing to a String cannot fail");
     out.push_str(&render_compact(&t.callers, "  (none)", root));
-    write!(out, "\ncallees ({}):\n", t.callees.len()).unwrap();
+    write!(out, "\ncallees ({}):\n", t.callees.len()).expect("writing to a String cannot fail");
     out.push_str(&render_compact(&t.callees, "  (none)", root));
     out
 }
@@ -290,7 +330,8 @@ pub async fn find_references(client: &Client, symbol: &str, namespace: Option<&s
         urlencode(symbol)
     );
     if let Some(namespace) = namespace.filter(|value| !value.is_empty()) {
-        write!(path, "&referenceNamespace={}", urlencode(namespace)).unwrap();
+        write!(path, "&referenceNamespace={}", urlencode(namespace))
+            .expect("writing to a String cannot fail");
     }
     match client.get::<Vec<api::SearchHit>>(&path).await {
         Ok(hits) if hits.is_empty() => near_miss(client, symbol, "references").await,
@@ -443,7 +484,7 @@ pub async fn grep(
         urlencode(pattern)
     );
     if let Some(p) = path.filter(|p| !p.is_empty()) {
-        write!(url, "&path={}", urlencode(p)).unwrap();
+        write!(url, "&path={}", urlencode(p)).expect("writing to a String cannot fail");
     }
     match client.get::<Vec<api::GrepMatch>>(&url).await {
         Ok(matches) if matches.is_empty() => format!("no matches for `{pattern}`"),
@@ -458,7 +499,7 @@ pub async fn grep(
                     m.line_number,
                     m.line.trim_end()
                 )
-                .unwrap();
+                .expect("writing to a String cannot fail");
             }
             writeln!(
                 out,
@@ -466,7 +507,7 @@ pub async fn grep(
                 matches.len(),
                 if matches.len() == 1 { "" } else { "es" }
             )
-            .unwrap();
+            .expect("writing to a String cannot fail");
             out
         }
         Err(e) => format!("grep failed: {e}"),
@@ -491,10 +532,10 @@ pub async fn file_outline(
         urlencode(path)
     );
     if let Some(depth) = max_depth {
-        write!(url, "&maxDepth={depth}").unwrap();
+        write!(url, "&maxDepth={depth}").expect("writing to a String cannot fail");
     }
     for kind in kinds {
-        write!(url, "&kinds={}", urlencode(kind)).unwrap();
+        write!(url, "&kinds={}", urlencode(kind)).expect("writing to a String cannot fail");
     }
     match client.get::<api::FileOutline>(&url).await {
         Ok(outline) if outline.entries.is_empty() => {
@@ -518,10 +559,10 @@ pub async fn file_outline(
                     e.line_end,
                     symbol_kind
                 )
-                .unwrap();
+                .expect("writing to a String cannot fail");
                 if let Some(body) = &e.body {
                     for line in body.lines() {
-                        writeln!(out, "      {line}").unwrap();
+                        writeln!(out, "      {line}").expect("writing to a String cannot fail");
                     }
                 }
             }
@@ -594,7 +635,8 @@ async fn near_miss(client: &Client, symbol: &str, what: &str) -> String {
             && (lower.contains(&needle) || needle.contains(&lower))
             && seen.insert(sym.to_string())
         {
-            writeln!(out, "  `{sym}`  {}", hit_location(h, root)).unwrap();
+            writeln!(out, "  `{sym}`  {}", hit_location(h, root))
+                .expect("writing to a String cannot fail");
         }
         if seen.len() == 5 {
             break;
@@ -616,7 +658,7 @@ fn urlencode(s: &str) -> String {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 out.push(b as char);
             }
-            _ => write!(out, "%{b:02X}").unwrap(),
+            _ => write!(out, "%{b:02X}").expect("writing to a String cannot fail"),
         }
     }
     out

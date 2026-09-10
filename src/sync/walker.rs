@@ -1,11 +1,11 @@
 //! Filesystem walker for `semctl index` and the `semctl mcp` auto-index.
 //!
-//! Produces the candidate file list both sync paths share — a **stat-only**
-//! traversal (no content read) so the caller can decide, via its hash cache,
-//! which files actually need reading. Conventions:
+//! Produces the candidate file list both sync paths share. The policy engine
+//! reads and validates all effective rules. The scanner then reads and hashes
+//! every accepted source file. Conventions:
 //!   - `.gitignore` honored even outside a git checkout (`require_git(false)`),
 //!     including nested ignore files in non-repository workspaces;
-//!   - a project-local `.semctlignore`;
+//!   - project-local `.semctxignore` and `.semctlignore` files;
 //!   - a built-in file-glob backstop ([`DEFAULT_EXCLUDE_FILE_GLOBS`]) for junk
 //!     that often isn't gitignored — lockfiles, minified/map assets, and
 //!     generated protobuf code;
@@ -14,20 +14,24 @@
 //! Content-level hygiene (empty / generated / minified) is [`is_indexable`],
 //! which the caller applies once it has actually read a new or changed file.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use ignore::{WalkBuilder, overrides::OverrideBuilder};
+use anyhow::{Context, Result, ensure};
+use ignore::overrides::OverrideBuilder;
 
-/// A file the walker accepted, with the stamp needed to tell whether it changed
-/// since the last sync. No content is read here — that's the caller's job, only
-/// on a cache miss.
+use super::blocking::Cancellation;
+use super::policy::SourcePolicy;
+
+pub(super) const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Both names remain supported at the indexing boundary.
+pub(super) const IGNORE_FILES: &[&str] = &[".semctxignore", ".semctlignore"];
+
+/// A file accepted by the source policy. The scanner verifies its content.
+#[derive(Debug)]
 pub struct Candidate {
     /// Forward-slashed path relative to the walk root (the server's key).
     pub rel: String,
-    /// Absolute path, for the caller to read on a cache miss.
-    pub path: PathBuf,
-    pub mtime_ns: u128,
-    pub size: u64,
 }
 
 /// Tunables for [`walk`]. [`Default`] matches what the server can embed.
@@ -45,7 +49,7 @@ pub struct WalkOptions {
 impl Default for WalkOptions {
     fn default() -> Self {
         Self {
-            max_file_bytes: 16 * 1024 * 1024,
+            max_file_bytes: MAX_FILE_BYTES,
             excludes: DEFAULT_EXCLUDE_FILE_GLOBS,
         }
     }
@@ -54,40 +58,68 @@ impl Default for WalkOptions {
 /// Walk `root`, returning the candidate files sorted by path for a stable
 /// manifest. Directories, oversized files, gitignored paths, and the built-in
 /// exclude globs are filtered out. No file contents are read.
-pub fn walk(root: &Path, opts: &WalkOptions) -> Vec<Candidate> {
-    let mut builder = WalkBuilder::new(root);
-    builder
-        .standard_filters(true)
-        .hidden(true)
-        .require_git(false)
-        .add_custom_ignore_filename(".semctlignore")
-        .overrides(exclude_overrides(root, opts.excludes));
+pub(super) struct WalkResult {
+    pub(super) candidates: Vec<Candidate>,
+    pub(super) policy: SourcePolicy,
+}
 
+pub(super) fn walk(
+    root: &Path,
+    opts: &WalkOptions,
+    cancellation: &Cancellation,
+) -> Result<WalkResult> {
+    cancellation.check()?;
+    let metadata = std::fs::metadata(root)
+        .with_context(|| format!("read checkout root {}", root.display()))?;
+    ensure!(
+        metadata.is_dir(),
+        "checkout root is not a directory: {}",
+        root.display()
+    );
+    let mut policy = SourcePolicy::load(root, cancellation)?;
+    let excludes = exclude_overrides(root, opts.excludes);
+    let mut pending = vec![root.to_path_buf()];
     let mut out = Vec::new();
-    for entry in builder.build() {
-        let Ok(entry) = entry else { continue };
-        if !entry.file_type().is_some_and(|t| t.is_file()) {
-            continue;
+    while let Some(directory) = pending.pop() {
+        cancellation.check()?;
+        policy.load_directory(&directory, cancellation)?;
+        for entry in std::fs::read_dir(&directory)
+            .with_context(|| format!("walk {}", directory.display()))?
+        {
+            cancellation.check()?;
+            let entry = entry.with_context(|| format!("walk {}", directory.display()))?;
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .with_context(|| format!("read file type for {}", path.display()))?;
+            if !file_type.is_dir() && !file_type.is_file() {
+                continue;
+            }
+            if excludes.matched(&path, file_type.is_dir()).is_ignore()
+                || !policy.includes(&path, file_type.is_dir())
+            {
+                continue;
+            }
+            if file_type.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            let metadata = entry
+                .metadata()
+                .with_context(|| format!("read metadata for {}", path.display()))?;
+            if metadata.len() <= opts.max_file_bytes {
+                out.push(Candidate {
+                    rel: rel_path(root, &path)?,
+                });
+            }
         }
-        let Ok(meta) = entry.metadata() else {
-            continue;
-        };
-        if meta.len() > opts.max_file_bytes {
-            continue;
-        }
-        let path = entry.into_path();
-        let Some(rel) = rel_path(root, &path) else {
-            continue;
-        };
-        out.push(Candidate {
-            rel,
-            path,
-            mtime_ns: mtime_ns(&meta),
-            size: meta.len(),
-        });
     }
+    policy.verify(cancellation)?;
     out.sort_unstable_by(|a, b| a.rel.cmp(&b.rel));
-    out
+    Ok(WalkResult {
+        candidates: out,
+        policy,
+    })
 }
 
 /// Whether a file's *content* is worth indexing: non-blank, not machine-
@@ -137,25 +169,25 @@ fn exclude_overrides(root: &Path, patterns: &[&str]) -> ignore::overrides::Overr
         .expect("built-in exclude matcher must compile")
 }
 
-fn mtime_ns(meta: &std::fs::Metadata) -> u128 {
-    meta.modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_nanos())
-}
-
 /// Forward-slashed path of `file` relative to `root` — the form the server keys
 /// on. `None` if `file` isn't under `root`.
-fn rel_path(root: &Path, file: &Path) -> Option<String> {
-    let rel = file.strip_prefix(root).ok()?;
+fn rel_path(root: &Path, file: &Path) -> Result<String> {
+    let rel = file
+        .strip_prefix(root)
+        .context("file is outside the checkout root")?;
     let mut normalized = String::new();
     for component in rel.components() {
         if !normalized.is_empty() {
             normalized.push('/');
         }
-        normalized.push_str(&component.as_os_str().to_string_lossy());
+        normalized.push_str(
+            component
+                .as_os_str()
+                .to_str()
+                .context("file path is not UTF-8")?,
+        );
     }
-    Some(normalized)
+    Ok(normalized)
 }
 
 /// Conservative generated-file detection: scan the first few lines for the
@@ -189,6 +221,14 @@ mod tests {
     use super::*;
     use std::fs;
 
+    fn walk(
+        root: &Path,
+        opts: &WalkOptions,
+        cancellation: &Cancellation,
+    ) -> Result<Vec<Candidate>> {
+        super::walk(root, opts, cancellation).map(|walk| walk.candidates)
+    }
+
     fn rels(files: &[Candidate]) -> Vec<&str> {
         files.iter().map(|c| c.rel.as_str()).collect()
     }
@@ -203,7 +243,7 @@ mod tests {
         fs::write(root.join("svc/bin/artifact.json"), "{\"built\": true}\n").unwrap();
         fs::write(root.join("svc/main.rs"), "fn main() {}\n").unwrap();
 
-        let files = walk(root, &WalkOptions::default());
+        let files = walk(root, &WalkOptions::default(), &Cancellation::default()).unwrap();
         let names = rels(&files);
         assert!(names.contains(&"svc/main.rs"), "got {names:?}");
         assert!(
@@ -226,7 +266,7 @@ mod tests {
         fs::write(root.join("Cargo.lock"), "[[package]]\n").unwrap();
         fs::write(root.join("app.min.js"), "a\n").unwrap();
 
-        let files = walk(root, &WalkOptions::default());
+        let files = walk(root, &WalkOptions::default(), &Cancellation::default()).unwrap();
         assert_eq!(
             rels(&files),
             vec![
@@ -249,7 +289,7 @@ mod tests {
             max_file_bytes: 10,
             ..WalkOptions::default()
         };
-        let files = walk(root, &opts);
+        let files = walk(root, &opts, &Cancellation::default()).unwrap();
         assert_eq!(rels(&files), vec!["small.txt"]);
     }
 
@@ -266,5 +306,70 @@ mod tests {
             !is_indexable(&format!("var x={};", "1".repeat(3000))),
             "minified"
         );
+    }
+
+    #[test]
+    fn a_missing_or_non_directory_root_cannot_be_an_empty_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let cancellation = Cancellation::default();
+        assert!(
+            walk(
+                &temp.path().join("missing"),
+                &WalkOptions::default(),
+                &cancellation
+            )
+            .is_err()
+        );
+        let file = temp.path().join("file.txt");
+        fs::write(&file, "text").unwrap();
+        assert!(walk(&file, &WalkOptions::default(), &cancellation).is_err());
+    }
+
+    #[test]
+    fn malformed_ignore_rules_abort_the_walk() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join(".semctxignore"), "{unterminated\n").unwrap();
+        fs::write(temp.path().join("main.rs"), "fn main() {}\n").unwrap();
+        assert!(
+            walk(
+                temp.path(),
+                &WalkOptions::default(),
+                &Cancellation::default()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn an_unreadable_ignore_path_aborts_the_walk() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join(".semctxignore")).unwrap();
+        fs::write(temp.path().join("main.rs"), "fn main() {}\n").unwrap();
+        let error = walk(
+            temp.path(),
+            &WalkOptions::default(),
+            &Cancellation::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("policy path is a directory"));
+    }
+
+    #[test]
+    fn both_project_ignore_names_apply_in_nested_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        for (index, name) in IGNORE_FILES.iter().enumerate() {
+            let directory = temp.path().join(format!("part{index}"));
+            fs::create_dir(&directory).unwrap();
+            fs::write(directory.join(name), "private.txt\n").unwrap();
+            fs::write(directory.join("private.txt"), "TEST DATA\n").unwrap();
+            fs::write(directory.join("main.rs"), "fn main() {}\n").unwrap();
+        }
+        let files = walk(
+            temp.path(),
+            &WalkOptions::default(),
+            &Cancellation::default(),
+        )
+        .unwrap();
+        assert_eq!(rels(&files), vec!["part0/main.rs", "part1/main.rs"]);
     }
 }
