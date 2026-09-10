@@ -15,7 +15,10 @@ use super::tool_types::{
     SearchArgs, SymbolArgs, SymbolAtPositionArgs, SymbolSearchArgs, TraceArgs, TypeHierarchyArgs,
     UndoEditArgs, render_edit_action_outcome,
 };
-use super::{DIRECT_EDIT_TOOLS, InitialIndexGate, McpServer, client, initial_job_result};
+use super::{
+    DIRECT_EDIT_TOOLS, InitialIndexGate, InitialIndexes, McpServer, client, initial_gate_for_path,
+    initial_job_result, ready_for_codebases,
+};
 
 fn job(completed: bool, failed: i64, error: Option<&str>) -> client::api::JobStatus {
     client::api::JobStatus {
@@ -43,6 +46,254 @@ async fn first_index_gate_blocks_until_embedding_is_ready() {
 
     gate.finish(Ok(())).await;
     assert_eq!(gate.wait().await, Ok(()));
+}
+
+#[tokio::test]
+async fn first_index_completion_releases_active_waiters() {
+    let gate = InitialIndexGate::pending();
+    let (first, second, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::join!(biased; gate.wait(), gate.wait(), gate.finish(Ok(())))
+    })
+    .await
+    .expect("completion must acquire the mutex while retrieval waits");
+    assert_eq!(first, Ok(()));
+    assert_eq!(second, Ok(()));
+}
+
+#[tokio::test]
+async fn first_index_failure_releases_an_active_waiter() {
+    let gate = InitialIndexGate::pending();
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::join!(biased; gate.wait(), gate.finish(Err("embedding failed".into())))
+    })
+    .await
+    .expect("failure must acquire the mutex while retrieval waits");
+    assert_eq!(result, Err("embedding failed".into()));
+}
+
+#[tokio::test]
+async fn scoped_readiness_allows_registration_and_holds_new_indexes_out() {
+    let indexes = tokio::sync::RwLock::new(InitialIndexes::default());
+    let gate = std::sync::Arc::new(InitialIndexGate::pending());
+    indexes
+        .write()
+        .await
+        .by_path
+        .insert("checkout".into(), gate.clone());
+    let searching = async {
+        let guard = ready_for_codebases(&indexes, &["A".into()]).await.unwrap();
+        assert!(
+            indexes.try_write().is_err(),
+            "registration must wait for the query"
+        );
+        drop(guard);
+    };
+    let registering = async {
+        assert!(
+            indexes.try_write().is_ok(),
+            "registration must remain available while embedding runs"
+        );
+        gate.register_codebase("A".into()).await;
+        gate.finish(Ok(())).await;
+    };
+    tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::join!(biased; searching, registering);
+    })
+    .await
+    .expect("registration and completion must not require the registry write lock");
+    assert!(indexes.try_write().is_ok());
+}
+
+#[tokio::test]
+async fn explicit_ids_ignore_unrelated_pending_and_failed_indexes_after_registration() {
+    let mut indexes = InitialIndexes::default();
+    let gate = std::sync::Arc::new(InitialIndexGate::pending());
+    indexes.by_path.insert("checkout".into(), gate.clone());
+    let waiting = async { indexes.wait_for_codebases(&["B".into()]).await };
+    let registering = async { gate.register_codebase("A".into()).await };
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::join!(biased; waiting, registering)
+    })
+    .await
+    .expect("the unrelated index need not finish");
+    assert_eq!(result, Ok(()));
+    gate.finish(Err("embedding failed".into())).await;
+    assert_eq!(indexes.wait_for_codebases(&["B".into()]).await, Ok(()));
+    assert!(indexes.wait_for_codebases(&["A".into()]).await.is_err());
+    assert!(indexes.wait_for_codebases(&[]).await.is_err());
+}
+
+#[tokio::test]
+async fn scoped_readiness_rechecks_indexes_registered_while_it_waits() {
+    let indexes = tokio::sync::RwLock::new(InitialIndexes::default());
+    let first = std::sync::Arc::new(InitialIndexGate::pending());
+    first.register_codebase("A".into()).await;
+    indexes
+        .write()
+        .await
+        .by_path
+        .insert("first".into(), first.clone());
+    let search = ready_for_codebases(&indexes, &[]);
+    tokio::pin!(search);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(5), &mut search)
+            .await
+            .is_err()
+    );
+    let second = std::sync::Arc::new(InitialIndexGate::pending());
+    second.register_codebase("B".into()).await;
+    indexes
+        .write()
+        .await
+        .by_path
+        .insert("second".into(), second.clone());
+    first.finish(Ok(())).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(5), &mut search)
+            .await
+            .is_err()
+    );
+    second.finish(Ok(())).await;
+    let guard = tokio::time::timeout(Duration::from_secs(1), &mut search)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(guard.by_path.len(), 2);
+    assert!(indexes.try_write().is_err());
+}
+
+#[tokio::test]
+async fn repeated_index_waiting_allows_registration_to_finish() {
+    let indexes = tokio::sync::RwLock::new(InitialIndexes::default());
+    let gate = std::sync::Arc::new(InitialIndexGate::pending());
+    let path = std::path::Path::new("checkout");
+    indexes
+        .write()
+        .await
+        .by_path
+        .insert(path.to_path_buf(), gate.clone());
+    let waiting = async {
+        if let Some(gate) = initial_gate_for_path(&indexes, path).await {
+            gate.wait().await.unwrap();
+        }
+    };
+    let registering = async {
+        gate.register_codebase("codebase".into()).await;
+        gate.finish(Ok(())).await;
+    };
+    tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::join!(biased; waiting, registering);
+    })
+    .await
+    .expect("an active index request must release the registry lock");
+}
+
+#[tokio::test]
+async fn first_index_gate_reserves_watcher_startup_before_registration() {
+    let base = client::Client::for_test("codebase", None);
+    let server = McpServer::new(base, None, false);
+    let root = std::path::Path::new("first-checkout");
+    let gate = std::sync::Arc::new(InitialIndexGate::pending());
+    server
+        .shared
+        .initial_indexes
+        .write()
+        .await
+        .by_path
+        .insert(root.to_path_buf(), gate.clone());
+
+    assert!(!server.claim_untracked_watch(root, "codebase").await);
+    assert!(server.shared.watched.lock().await.is_empty());
+
+    gate.finish(Ok(())).await;
+    assert!(!server.claim_untracked_watch(root, "codebase").await);
+    gate.finish(Err("upload failed".into())).await;
+    assert!(!server.claim_untracked_watch(root, "codebase").await);
+
+    let other = std::path::Path::new("other-checkout");
+    assert!(server.claim_untracked_watch(other, "other-codebase").await);
+    assert!(!server.claim_untracked_watch(other, "other-codebase").await);
+}
+
+#[tokio::test]
+async fn canonical_search_omits_cached_checkout_freshness() {
+    let base = client::Client::for_test("codebase", Some("checkout".into()));
+    let server = McpServer::new(base.clone(), None, true);
+    server.shared.jobs.lock().await.insert(
+        "codebase".into(),
+        crate::sync::LastJob {
+            job_id: "job".into(),
+        },
+    );
+    *server.shared.freshness.lock().await =
+        Some(("job".into(), Some("checkout sync failed".into())));
+
+    assert_eq!(
+        server.index_freshness(&base).await,
+        Some("checkout sync failed".into())
+    );
+    assert_eq!(server.index_freshness(&base.for_canonical()).await, None);
+}
+
+#[tokio::test]
+async fn checkout_readiness_does_not_use_another_checkouts_codebase_gate() {
+    let first_root = std::path::PathBuf::from("first-checkout");
+    let first = client::Client::for_test("shared-codebase", Some(first_root.clone()));
+    let server = McpServer::new(first.clone(), None, false);
+    let first_gate = std::sync::Arc::new(InitialIndexGate::pending());
+    let second_gate = std::sync::Arc::new(InitialIndexGate::pending());
+    first_gate.register_codebase("shared-codebase".into()).await;
+    second_gate
+        .register_codebase("shared-codebase".into())
+        .await;
+    second_gate.finish(Ok(())).await;
+    {
+        let mut indexes = server.shared.initial_indexes.write().await;
+        indexes.by_path.insert(first_root, first_gate.clone());
+        indexes
+            .by_path
+            .insert("second-checkout".into(), second_gate.clone());
+    }
+
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(5),
+            server.await_initial_client(&first)
+        )
+        .await
+        .is_err()
+    );
+    first_gate.finish(Ok(())).await;
+    second_gate
+        .finish(Err("another checkout failed".into()))
+        .await;
+    assert_eq!(server.await_initial_client(&first).await, Ok(()));
+    let rootless = client::Client::for_test("shared-codebase", None);
+    assert!(
+        server
+            .await_initial_client(&rootless)
+            .await
+            .unwrap_err()
+            .contains("another checkout failed")
+    );
+}
+
+#[tokio::test]
+async fn automatic_watching_uses_the_bound_umbrella_root() {
+    let umbrella = std::path::PathBuf::from("umbrella");
+    let base = client::Client::for_test("codebase", Some(umbrella.clone()));
+    let server = McpServer::new(base.clone(), Some(umbrella.join("child")), false);
+    let gate = std::sync::Arc::new(InitialIndexGate::pending());
+    server
+        .shared
+        .initial_indexes
+        .write()
+        .await
+        .by_path
+        .insert(umbrella, gate);
+
+    server.watch_checkout_once(&base).await;
+    assert!(server.shared.watched.lock().await.is_empty());
 }
 
 #[tokio::test]

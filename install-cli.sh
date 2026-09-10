@@ -21,7 +21,6 @@ set -eu
 RELEASE_BASE="${SEMCTL_RELEASE_BASE:-https://github.com/napbat/semctl/releases/latest/download}"
 
 say()  { printf '\033[1;36m==>\033[0m %s\n' "$1"; }
-warn() { printf '\033[1;33m  ! \033[0m %s\n' "$1"; }
 ok()   { printf '\033[1;32m  ✓ \033[0m %s\n' "$1"; }
 die()  { printf '\033[1;31merror:\033[0m %s\n' "$1" >&2; exit 1; }
 
@@ -52,29 +51,32 @@ trap 'rm -rf "$tmp"' EXIT
 say "Downloading $asset from the latest release…"
 dl "$RELEASE_BASE/$asset" "$tmp/semctl" || die "download failed: $RELEASE_BASE/$asset"
 
-# Verify the SHA-256 against the release manifest (a missing manifest only warns;
-# a MISMATCH always aborts).
-if dl "$RELEASE_BASE/checksums-sha256.txt" "$tmp/checksums.txt" 2>/dev/null; then
-	want="$(grep " $asset\$" "$tmp/checksums.txt" 2>/dev/null | awk '{print $1}')"
-	if [ -n "$want" ]; then
-		if command -v sha256sum >/dev/null 2>&1; then
-			got="$(sha256sum "$tmp/semctl" | awk '{print $1}')"
-		elif command -v shasum >/dev/null 2>&1; then
-			got="$(shasum -a 256 "$tmp/semctl" | awk '{print $1}')"
-		else
-			got=""
-			warn "no sha256sum/shasum — skipping checksum verification"
-		fi
-		if [ -n "$got" ]; then
-			[ "$got" = "$want" ] || die "sha256 mismatch: expected $want, got $got"
-			ok "sha256 verified"
-		fi
-	else
-		warn "no checksum entry for $asset — skipping verification"
-	fi
+# Require one valid entry before the downloaded binary can execute.
+dl "$RELEASE_BASE/checksums-sha256.txt" "$tmp/checksums.txt" \
+	|| die "cannot download checksum manifest"
+want="$(awk -v asset="$asset" '
+	$2 == asset || $2 == "*" asset {
+		matches++
+		if (NF != 2 || length($1) != 64 || $1 ~ /[^0-9a-fA-F]/) invalid = 1
+		hash = tolower($1)
+	}
+	END {
+		if (matches != 1 || invalid) exit 1
+		print hash
+	}
+' "$tmp/checksums.txt")" || die "checksum manifest must contain one valid SHA-256 entry for $asset"
+
+# Capture the command status before parsing output. A pipeline can hide failure.
+if command -v sha256sum >/dev/null 2>&1; then
+	checksum="$(sha256sum "$tmp/semctl")" || die "sha256sum failed"
+elif command -v shasum >/dev/null 2>&1; then
+	checksum="$(shasum -a 256 "$tmp/semctl")" || die "shasum failed"
 else
-	warn "couldn't fetch checksums — skipping verification"
+	die "need sha256sum or shasum to verify the binary"
 fi
+got="${checksum%% *}"
+[ "$got" = "$want" ] || die "SHA-256 mismatch: expected $want, got $got"
+ok "SHA-256 verified"
 
 chmod +x "$tmp/semctl"
 

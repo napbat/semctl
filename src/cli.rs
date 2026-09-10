@@ -3,7 +3,7 @@
 //! every subcommand; [`Cli::run`] dispatches each command to the matching module
 //! under [`crate::commands`].
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use crate::commands;
@@ -121,10 +121,16 @@ impl Cli {
             Command::Edit(cmd) => commands::edit::run(cmd, &self).await,
             Command::Files(cmd) => commands::files::run(cmd, &self).await,
             Command::Inspect(cmd) => commands::inspect::run(cmd, &self).await,
-            Command::Install(args) => commands::install::run(&args),
+            Command::Install(args) => {
+                tokio::task::spawn_blocking(move || commands::install::run(&args))
+                    .await
+                    .context("installation task failed")?
+            }
             Command::Upgrade => commands::upgrade::run(&self).await,
             Command::Uninstall(args) => {
-                commands::install::run_uninstall(&args);
+                tokio::task::spawn_blocking(move || commands::install::run_uninstall(&args))
+                    .await
+                    .context("uninstallation task failed")?;
                 Ok(())
             }
             Command::Mcp => crate::mcp::run(&self).await,

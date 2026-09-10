@@ -21,7 +21,8 @@ use super::tool_types::{
     render_edit_action_outcome,
 };
 use super::{
-    InitialIndexGate, McpServer, canonical_directory, client, query, wait_for_initial_job,
+    InitialIndexGate, McpServer, canonical_directory, client, initial_gate_for_path, query,
+    ready_for_codebases, wait_for_initial_job,
 };
 
 // Tool descriptions come entirely from `docs/tools/<name>.md`: the `#[tool]`
@@ -32,19 +33,58 @@ use super::{
 impl McpServer {
     #[tool]
     async fn search_codebase(&self, Parameters(args): Parameters<SearchArgs>) -> String {
-        let client = match self
-            .client_for_copy(args.codebase.as_deref(), args.copy.as_deref())
-            .await
-        {
-            Ok(client) => client,
-            Err(e) => return format!("search_codebase unavailable — {e}"),
-        };
         let opts = query::SearchOpts {
             prefer: args.prefer,
             kinds: args.kinds.unwrap_or_default(),
             expand: args.expand.unwrap_or(false),
             scope: args.scope,
             codebase_ids: args.codebase_ids.unwrap_or_default(),
+        };
+        let independent = args
+            .codebase
+            .as_deref()
+            .is_none_or(|selector| selector.trim().is_empty())
+            && (opts.scope.is_some() || !opts.codebase_ids.is_empty());
+        let client = if independent {
+            // An explicit search scope does not require the launch directory to
+            // be indexed. A known binding can still identify its own local hits.
+            let client = self
+                .shared
+                .bound
+                .lock()
+                .await
+                .clone()
+                .unwrap_or_else(|| self.shared.base.clone());
+            if args
+                .copy
+                .as_deref()
+                .is_some_and(|copy| copy.trim().eq_ignore_ascii_case("canonical"))
+            {
+                client.for_canonical()
+            } else {
+                client
+            }
+        } else {
+            match self
+                .client_for_copy(args.codebase.as_deref(), args.copy.as_deref())
+                .await
+            {
+                Ok(client) => client,
+                Err(error) => return format!("search_codebase unavailable — {error}"),
+            }
+        };
+        if let Err(error) = opts.normalized_scope() {
+            return error.to_string();
+        }
+        // Reserve checked registry membership only for the query. A new
+        // codebase cannot appear between readiness and scope evaluation.
+        let indexes = if opts.scope.is_some() || !opts.codebase_ids.is_empty() {
+            match ready_for_codebases(&self.shared.initial_indexes, &opts.codebase_ids).await {
+                Ok(indexes) => Some(indexes),
+                Err(error) => return format!("search_codebase unavailable — {error}"),
+            }
+        } else {
+            None
         };
         let mut out = query::search(
             &client,
@@ -54,8 +94,12 @@ impl McpServer {
             &opts,
         )
         .await;
-        // Tell the reader how current the index is, so stale hits can be re-read.
-        if let Some(footer) = self.index_freshness(&client).await {
+        drop(indexes);
+        // The launch checkout's watcher does not describe a broader search.
+        if opts.scope.is_none()
+            && opts.codebase_ids.is_empty()
+            && let Some(footer) = self.index_freshness(&client).await
+        {
             out.push_str("\n\n");
             out.push_str(&footer);
         }
@@ -565,15 +609,7 @@ impl McpServer {
         // A concurrent/recent first-index call owns the gate. Await it rather
         // than queueing another full upload. Failure stays closed for this MCP
         // process, so retrieval can never fall through to a partial first index.
-        if let Some(gate) = self
-            .shared
-            .initial_indexes
-            .lock()
-            .await
-            .by_path
-            .get(&dir)
-            .cloned()
-        {
+        if let Some(gate) = initial_gate_for_path(&self.shared.initial_indexes, &dir).await {
             return match gate.wait().await {
                 Ok(()) => format!(
                     "initial indexing complete\npath {}\nretrieval tools are now available",
@@ -612,7 +648,7 @@ impl McpServer {
         // server codebase, concurrent current/path-scoped retrieval calls already
         // have something to wait on.
         let (gate, starts_work) = {
-            let mut indexes = self.shared.initial_indexes.lock().await;
+            let mut indexes = self.shared.initial_indexes.write().await;
             if let Some(gate) = indexes.by_path.get(&dir) {
                 (gate.clone(), false)
             } else {
@@ -639,12 +675,7 @@ impl McpServer {
                 return format!("index_codebase failed for {}: {reason}", dir.display());
             }
         };
-        self.shared
-            .initial_indexes
-            .lock()
-            .await
-            .by_codebase
-            .insert(id.clone(), gate.clone());
+        gate.register_codebase(id.clone()).await;
         let client = self
             .shared
             .base

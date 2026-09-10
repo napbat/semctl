@@ -7,10 +7,10 @@
 //! in semctl's private config directory for hash-guarded undo.
 
 use std::collections::HashSet;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File};
 use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -18,11 +18,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::client::{Client, api};
 
+mod formatter;
+mod paths;
+mod transaction;
+
 const PLAN_SCHEMA_VERSION: u32 = 1;
 const MAX_FILES: usize = 256;
 const MAX_EDITS: usize = 4096;
 const MAX_REPLACEMENT_BYTES: usize = 4 * 1024 * 1024;
-const FORMATTER_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -66,12 +69,26 @@ struct HistoryFile {
 
 struct PreparedFile {
     path: String,
+    // This path is a label for formatters and diagnostics. Mutations use the
+    // directory capability in `location`.
     target: PathBuf,
+    location: paths::Target,
     preimage: Vec<u8>,
     postimage: Vec<u8>,
     postimage_hash: String,
     temporary: PathBuf,
     backup: PathBuf,
+}
+
+impl PreparedFile {
+    fn recovery_path(&self) -> PathBuf {
+        self.backup.with_extension("edit")
+    }
+
+    fn verify_requested_path(&self) -> Result<()> {
+        self.location
+            .verify_requested_path(&self.path, &self.target)
+    }
 }
 
 /// Apply one plan to the client's bound checkout. A formatter step is executed
@@ -84,104 +101,152 @@ pub async fn apply(
 ) -> Result<ApplyOutcome> {
     validate_plan_contract(plan, run_formatter)?;
     let root = checkout_root(client)?;
+    let checkout = paths::Checkout::open(&root)?;
     validate_server_context(client, &root, plan).await?;
 
-    let history_path = history_path(&plan.plan_id)?;
-    if history_path.exists() {
-        let history = read_history(&history_path)?;
-        if history.undone {
-            bail!(
-                "plan {} was already undone; request a fresh plan",
-                plan.plan_id
-            );
-        }
-        if history_matches(&root, &history, false)? {
-            return Ok(outcome_from_history(&history, true, false, watcher_active));
-        }
-        bail!(
+    let prepare_plan = plan.clone();
+    let preparation = tokio::task::spawn_blocking(move || {
+        prepare_apply(&checkout, &prepare_plan, watcher_active)
+    })
+    .await
+    .context("prepare edit task failed")??;
+    let mut prepared = match preparation {
+        ApplyPreparation::Complete(outcome) => return Ok(outcome),
+        ApplyPreparation::Pending(files) => files,
+    };
+    if let Some(step) = &plan.formatter {
+        formatter::format(&root, step, &mut prepared).await?;
+        validate_server_context(client, &root, plan).await?;
+    }
+    let plan = plan.clone();
+    // Once commit starts, the blocking task owns the complete transaction. A
+    // cancelled MCP request cannot interrupt it between filesystem replacements.
+    tokio::task::spawn_blocking(move || commit_apply(&root, &plan, &mut prepared, watcher_active))
+        .await
+        .context("commit edit task failed")?
+}
+
+enum ApplyPreparation {
+    Complete(ApplyOutcome),
+    Pending(Vec<PreparedFile>),
+}
+
+fn prepare_apply(
+    checkout: &Arc<paths::Checkout>,
+    plan: &api::WorkspaceEditPlan,
+    watcher_active: bool,
+) -> Result<ApplyPreparation> {
+    let path = history_path(&plan.plan_id)?;
+    let directory = path.parent().context("edit history path has no parent")?;
+    let _lock = lock_checkout(directory, &plan.source_identity)?;
+    if let Some(outcome) = existing_apply(&checkout.path, plan, &path, watcher_active)? {
+        return Ok(ApplyPreparation::Complete(outcome));
+    }
+    Ok(ApplyPreparation::Pending(prepare_plan(checkout, plan)?))
+}
+
+fn existing_apply(
+    root: &Path,
+    plan: &api::WorkspaceEditPlan,
+    path: &Path,
+    watcher_active: bool,
+) -> Result<Option<ApplyOutcome>> {
+    if path.exists() {
+        let history = read_history(path)?;
+        ensure!(
+            !history.undone,
+            "plan {} was already undone; request a fresh plan",
+            plan.plan_id
+        );
+        ensure_no_retained_recovery(root, &history)?;
+        ensure!(
+            history_matches(root, &history, false)?,
             "edit history for plan {} exists but the checkout no longer matches its postimages",
             plan.plan_id
         );
+        return Ok(Some(outcome_from_history(
+            &history,
+            true,
+            false,
+            watcher_active,
+        )));
     }
+    Ok(None)
+}
 
-    let mut prepared = prepare_plan(&root, plan)?;
-    let mut history = history_from(plan, &prepared);
-    create_history(&history_path, &history)?;
-
-    if let Err(error) = stage_and_commit(&mut prepared) {
-        let _ = fs::remove_file(&history_path);
-        return Err(error);
+fn commit_apply(
+    root: &Path,
+    plan: &api::WorkspaceEditPlan,
+    prepared: &mut [PreparedFile],
+    watcher_active: bool,
+) -> Result<ApplyOutcome> {
+    let path = history_path(&plan.plan_id)?;
+    let directory = path.parent().context("edit history path has no parent")?;
+    let _lock = lock_checkout(directory, &plan.source_identity)?;
+    // Another request can complete the same plan while formatting or waiting
+    // for the checkout lock. Replay must still return the recorded outcome.
+    if let Some(outcome) = existing_apply(root, plan, &path, watcher_active)? {
+        return Ok(outcome);
     }
-
-    if let Some(formatter) = &plan.formatter
-        && let Err(error) = run_formatter_step(&root, formatter, &prepared).await
-    {
-        rollback(&prepared);
-        let _ = fs::remove_file(&history_path);
-        return Err(error);
-    }
-
-    // A formatter may intentionally change the planned postimages. Record the
-    // exact bytes now on disk; undo verifies these hashes before restoring.
-    for (state, record) in prepared.iter_mut().zip(&mut history.files) {
-        let bytes = match fs::read(&state.target)
-            .with_context(|| format!("read formatted postimage {}", state.target.display()))
-        {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                rollback(&prepared);
-                let _ = fs::remove_file(&history_path);
-                return Err(error);
+    let history = history_from(plan, prepared);
+    create_history(&path, &history)?;
+    let transaction = match transaction::Transaction::commit(prepared) {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            // Keep the history when conflicts retain recovery data. A retry
+            // must not treat a partially recovered transaction as a fresh plan.
+            if !transaction::recovery_required(&error) {
+                let _ = fs::remove_file(&path);
             }
-        };
-        state.postimage_hash = hash(&bytes);
-        record.postimage_hash.clone_from(&state.postimage_hash);
-    }
-    if let Err(error) = write_history(&history_path, &history) {
-        rollback(&prepared);
-        let _ = fs::remove_file(&history_path);
-        return Err(error);
-    }
-
-    cleanup_sidecars(&prepared);
+            return Err(error);
+        }
+    };
+    transaction.finish()?;
     Ok(outcome_from_history(&history, false, false, watcher_active))
 }
 
 /// Restore retained preimages while every current file still matches the
-/// postimage recorded by [`apply`].
-// Undo restores backups on THIS disk. It no longer asks the server anything —
-// the checkout owns its own files — but stays async: it is half of the
-// apply/undo pair the command and MCP surfaces both await, and a signature that
-// disagrees with its twin is a papercut for every caller.
-#[allow(
-    clippy::unused_async,
-    reason = "pairs with apply on the command surface"
-)]
+/// postimage recorded by [`apply`]. The filesystem transaction completes even
+/// when the awaiting request is cancelled.
 pub async fn undo(client: &Client, plan_id: &str, watcher_active: bool) -> Result<ApplyOutcome> {
     validate_plan_id(plan_id)?;
     let root = checkout_root(client)?;
+    let client = client.clone();
+    let plan_id = plan_id.to_string();
+    tokio::task::spawn_blocking(move || undo_local(&client, &root, &plan_id, watcher_active))
+        .await
+        .context("undo edit task failed")?
+}
+
+fn undo_local(
+    client: &Client,
+    root: &Path,
+    plan_id: &str,
+    watcher_active: bool,
+) -> Result<ApplyOutcome> {
+    let directory = crate::config::edit_history_dir()?;
+    let source = crate::codebase::checkout_source_id(root)?;
+    let _lock = lock_checkout(&directory, &source)?;
     let path = history_path(plan_id)?;
     let mut history = read_history(&path)
         .with_context(|| format!("no retained edit history for plan {plan_id}"))?;
-    validate_history_context(client, &root, &history)?;
-
+    validate_history_context(client, root, &history)?;
+    ensure_no_retained_recovery(root, &history)?;
     if history.undone {
         ensure!(
-            history_matches(&root, &history, true)?,
+            history_matches(root, &history, true)?,
             "plan {plan_id} is marked undone but its files no longer match the retained preimages"
         );
         return Ok(outcome_from_history(&history, false, true, watcher_active));
     }
-
-    let mut prepared = prepare_undo(&root, &history)?;
-    stage_and_commit(&mut prepared)?;
+    let checkout = paths::Checkout::open(root)?;
+    let prepared = prepare_undo(&checkout, &history)?;
+    let transaction = transaction::Transaction::commit(&prepared)?;
     history.undone = true;
     if let Err(error) = write_history(&path, &history) {
-        rollback(&prepared);
-        history.undone = false;
-        return Err(error);
+        return Err(transaction.rollback_error(error));
     }
-    cleanup_sidecars(&prepared);
+    transaction.finish()?;
     Ok(outcome_from_history(&history, false, false, watcher_active))
 }
 
@@ -269,16 +334,21 @@ fn checkout_root(client: &Client) -> Result<PathBuf> {
     fs::canonicalize(raw).with_context(|| format!("canonicalize checkout {}", raw.display()))
 }
 
-fn prepare_plan(root: &Path, plan: &api::WorkspaceEditPlan) -> Result<Vec<PreparedFile>> {
+fn prepare_plan(
+    checkout: &Arc<paths::Checkout>,
+    plan: &api::WorkspaceEditPlan,
+) -> Result<Vec<PreparedFile>> {
     let mut seen = HashSet::new();
     plan.files
         .iter()
         .enumerate()
         .map(|(index, file)| {
-            let (path, target) = resolve_target(root, &file.path)?;
+            let (path, target) = resolve_target(&checkout.path, &file.path)?;
             ensure!(seen.insert(target.clone()), "duplicate edit file {path}");
-            let preimage =
-                fs::read(&target).with_context(|| format!("read preimage {}", target.display()))?;
+            let location = paths::Target::bind(checkout, &target)?;
+            let preimage = location
+                .read()
+                .with_context(|| format!("read preimage {path}"))?;
             ensure!(
                 hash(&preimage).eq_ignore_ascii_case(&file.preimage_hash),
                 "stale preimage for {path}"
@@ -297,6 +367,7 @@ fn prepare_plan(root: &Path, plan: &api::WorkspaceEditPlan) -> Result<Vec<Prepar
             Ok(PreparedFile {
                 path,
                 target,
+                location,
                 preimage,
                 postimage,
                 postimage_hash,
@@ -307,15 +378,20 @@ fn prepare_plan(root: &Path, plan: &api::WorkspaceEditPlan) -> Result<Vec<Prepar
         .collect()
 }
 
-fn prepare_undo(root: &Path, history: &EditHistory) -> Result<Vec<PreparedFile>> {
+fn prepare_undo(
+    checkout: &Arc<paths::Checkout>,
+    history: &EditHistory,
+) -> Result<Vec<PreparedFile>> {
     history
         .files
         .iter()
         .enumerate()
         .map(|(index, file)| {
-            let (path, target) = resolve_target(root, &file.path)?;
-            let current = fs::read(&target)
-                .with_context(|| format!("read current postimage {}", target.display()))?;
+            let (path, target) = resolve_target(&checkout.path, &file.path)?;
+            let location = paths::Target::bind(checkout, &target)?;
+            let current = location
+                .read()
+                .with_context(|| format!("read current postimage {path}"))?;
             ensure!(
                 hash(&current).eq_ignore_ascii_case(&file.postimage_hash),
                 "cannot undo {path}: current file does not match the recorded postimage"
@@ -335,6 +411,7 @@ fn prepare_undo(root: &Path, history: &EditHistory) -> Result<Vec<PreparedFile>>
             Ok(PreparedFile {
                 path,
                 target,
+                location,
                 preimage: current,
                 postimage: preimage,
                 postimage_hash: file.preimage_hash.clone(),
@@ -393,154 +470,12 @@ fn resolve_target(root: &Path, relative: &str) -> Result<(String, PathBuf)> {
         target.is_file(),
         "edit target is not a regular file: {relative}"
     );
-    Ok((normalized.to_string_lossy().replace('\\', "/"), target))
-}
-
-fn stage_and_commit(files: &mut [PreparedFile]) -> Result<()> {
-    stage_postimages(files)?;
-    install_staged(files, None)
-}
-
-fn stage_postimages(files: &[PreparedFile]) -> Result<()> {
-    for file in files {
-        let result = (|| -> Result<()> {
-            let mut staged = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&file.temporary)
-                .with_context(|| format!("create staged postimage {}", file.temporary.display()))?;
-            staged
-                .write_all(&file.postimage)
-                .and_then(|()| staged.sync_all())
-                .with_context(|| format!("write staged postimage {}", file.temporary.display()))?;
-            let permissions = fs::metadata(&file.target)?.permissions();
-            fs::set_permissions(&file.temporary, permissions)?;
-            Ok(())
-        })();
-        if let Err(error) = result {
-            cleanup_sidecars(files);
-            return Err(error);
-        }
-    }
-    Ok(())
-}
-
-fn install_staged(files: &[PreparedFile], fail_before: Option<usize>) -> Result<()> {
-    for (index, file) in files.iter().enumerate() {
-        if fail_before == Some(index) {
-            rollback(&files[..index]);
-            cleanup_sidecars(files);
-            bail!("injected atomic-install failure before {}", file.path);
-        }
-        if let Err(error) = fs::rename(&file.target, &file.backup)
-            .and_then(|()| fs::rename(&file.temporary, &file.target))
-        {
-            rollback(&files[..index.saturating_add(1)]);
-            cleanup_sidecars(files);
-            return Err(error).with_context(|| format!("atomically replace {}", file.path));
-        }
-    }
-    Ok(())
-}
-
-fn rollback(files: &[PreparedFile]) {
-    for file in files.iter().rev() {
-        if !file.backup.exists() {
-            continue;
-        }
-        if file.target.exists() {
-            let _ = fs::rename(&file.target, &file.temporary);
-        }
-        let _ = fs::rename(&file.backup, &file.target);
-        let _ = fs::remove_file(&file.temporary);
-    }
-}
-
-fn cleanup_sidecars(files: &[PreparedFile]) {
-    for file in files {
-        let _ = fs::remove_file(&file.temporary);
-        let _ = fs::remove_file(&file.backup);
-    }
-}
-
-async fn run_formatter_step(
-    root: &Path,
-    step: &api::FormatterStep,
-    planned: &[PreparedFile],
-) -> Result<()> {
-    let program = Path::new(&step.program);
-    ensure!(
-        program.components().count() == 1,
-        "formatter program must be a bare executable name"
-    );
-    let program_name = program
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    ensure!(
-        matches!(program_name.as_str(), "rustfmt" | "gofmt" | "prettier"),
-        "formatter program '{}' is not in semctl's bounded allowlist",
-        step.program
-    );
-    validate_formatter_arguments(&program_name, &step.arguments)?;
-    ensure!(
-        !step.paths.is_empty() && step.paths.len() <= MAX_FILES,
-        "formatter must name between 1 and {MAX_FILES} planned paths"
-    );
-    let planned_targets: HashSet<&Path> =
-        planned.iter().map(|file| file.target.as_path()).collect();
-    let mut formatter_targets = HashSet::new();
-    let mut normalized_paths = Vec::with_capacity(step.paths.len());
-    for path in &step.paths {
-        let (normalized, target) = resolve_target(root, path)?;
-        ensure!(
-            planned_targets.contains(target.as_path()),
-            "formatter path {normalized} is not part of the edit plan"
-        );
-        ensure!(
-            formatter_targets.insert(target),
-            "duplicate formatter path {normalized}"
-        );
-        normalized_paths.push(normalized);
-    }
-    let mut command = tokio::process::Command::new(&step.program);
-    command
-        .current_dir(root)
-        .kill_on_drop(true)
-        .args(&step.arguments)
-        .args(normalized_paths);
-    let status = tokio::time::timeout(FORMATTER_TIMEOUT, command.status())
-        .await
-        .context("formatter timed out after 30 seconds")??;
-    ensure!(status.success(), "formatter exited with {status}");
-    Ok(())
-}
-
-fn validate_formatter_arguments(program: &str, arguments: &[String]) -> Result<()> {
-    let valid = match program {
-        "rustfmt" => match arguments {
-            [] => true,
-            [flag, edition]
-                if flag == "--edition"
-                    && matches!(edition.as_str(), "2015" | "2018" | "2021" | "2024") =>
-            {
-                true
-            }
-            _ => false,
-        },
-        "gofmt" => matches!(arguments, [write] if write == "-w"),
-        "prettier" => {
-            matches!(arguments, [write] if write == "--write")
-                || matches!(arguments, [write, unknown] if write == "--write" && unknown == "--ignore-unknown")
-        }
-        _ => false,
-    };
-    ensure!(
-        valid,
-        "formatter arguments are outside semctl's bounded allowlist"
-    );
-    Ok(())
+    let normalized = normalized.to_str().context("edit path is not UTF-8")?;
+    #[cfg(windows)]
+    let normalized = normalized.replace('\\', "/");
+    #[cfg(not(windows))]
+    let normalized = normalized.to_owned();
+    Ok((normalized, target))
 }
 
 fn history_from(plan: &api::WorkspaceEditPlan, prepared: &[PreparedFile]) -> EditHistory {
@@ -577,6 +512,37 @@ fn history_matches(root: &Path, history: &EditHistory, preimages: bool) -> Resul
         }
     }
     Ok(true)
+}
+
+fn retained_recovery_paths(root: &Path, history: &EditHistory) -> Result<Vec<PathBuf>> {
+    let mut retained = Vec::new();
+    for (index, file) in history.files.iter().enumerate() {
+        let (_, target) = resolve_target(root, &file.path)?;
+        let (temporary, backup) = sidecars(&target, &history.plan_id, index);
+        for path in [backup.with_extension("edit"), temporary, backup] {
+            match fs::symlink_metadata(&path) {
+                Ok(_) => retained.push(path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("check retained edit recovery files"),
+            }
+        }
+    }
+    Ok(retained)
+}
+
+fn ensure_no_retained_recovery(root: &Path, history: &EditHistory) -> Result<()> {
+    let paths = retained_recovery_paths(root, history)?;
+    ensure!(
+        paths.is_empty(),
+        "plan {} has retained edit recovery files; inspect them before retrying: {}",
+        history.plan_id,
+        paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Ok(())
 }
 
 fn outcome_from_history(
@@ -636,51 +602,18 @@ fn create_history(path: &Path, history: &EditHistory) -> Result<()> {
     let parent = path.parent().context("edit history path has no parent")?;
     fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     let bytes = serde_json::to_vec(history).context("serialize edit history")?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .with_context(|| format!("create {}", path.display()))?;
+    let mut file = crate::config::create_private_new(path)?;
     if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
         drop(file);
         let _ = fs::remove_file(path);
         return Err(error).with_context(|| format!("write {}", path.display()));
     }
-    restrict_history_permissions(path);
     Ok(())
 }
 
 fn write_history(path: &Path, history: &EditHistory) -> Result<()> {
     let bytes = serde_json::to_vec(history).context("serialize edit history")?;
-    let temporary = path.with_extension("json.new");
-    let backup = path.with_extension("json.old");
-    ensure!(
-        !temporary.exists() && !backup.exists(),
-        "edit-history update sidecar already exists"
-    );
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .with_context(|| format!("create {}", temporary.display()))?;
-    if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
-        drop(file);
-        let _ = fs::remove_file(&temporary);
-        return Err(error).with_context(|| format!("write {}", temporary.display()));
-    }
-    drop(file);
-    if let Err(error) = fs::rename(path, &backup) {
-        let _ = fs::remove_file(&temporary);
-        return Err(error).with_context(|| format!("backup {}", path.display()));
-    }
-    if let Err(error) = fs::rename(&temporary, path) {
-        let _ = fs::rename(&backup, path);
-        let _ = fs::remove_file(&temporary);
-        return Err(error).with_context(|| format!("replace {}", path.display()));
-    }
-    let _ = fs::remove_file(&backup);
-    restrict_history_permissions(path);
-    Ok(())
+    crate::config::atomic_write_private(path, &bytes)
 }
 
 fn read_history(path: &Path) -> Result<EditHistory> {
@@ -694,14 +627,15 @@ fn read_history(path: &Path) -> Result<EditHistory> {
     Ok(history)
 }
 
-#[cfg(unix)]
-fn restrict_history_permissions(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+/// Apply and undo share this lock across processes. Hash the opaque source
+/// identity so no plan field can introduce a path component into the lock name.
+fn lock_checkout(directory: &Path, source_identity: &str) -> Result<File> {
+    let path = directory.join(format!(
+        "checkout-{}.lock",
+        hash(source_identity.as_bytes())
+    ));
+    crate::config::lock_file(&path)
 }
-
-#[cfg(not(unix))]
-fn restrict_history_permissions(_path: &Path) {}
 
 fn sidecars(target: &Path, plan_id: &str, index: usize) -> (PathBuf, PathBuf) {
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
@@ -717,156 +651,4 @@ fn hash(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::fs;
-
-    use super::{
-        EditHistory, HistoryFile, PLAN_SCHEMA_VERSION, PreparedFile, apply_byte_edits,
-        cleanup_sidecars, hash, history_matches, install_staged, outcome_from_history,
-        resolve_target, rollback, sidecars, stage_postimages, validate_formatter_arguments,
-    };
-    use crate::client::api::ByteEdit;
-
-    #[test]
-    fn byte_edits_apply_in_reverse_without_offset_drift() {
-        let edits = vec![
-            ByteEdit {
-                start: 0,
-                end: 1,
-                replacement: "AA".into(),
-            },
-            ByteEdit {
-                start: 4,
-                end: 6,
-                replacement: "Z".into(),
-            },
-        ];
-        assert_eq!(apply_byte_edits(b"abcdef", &edits, "x").unwrap(), b"AAbcdZ");
-    }
-
-    #[test]
-    fn overlapping_edits_are_rejected() {
-        let edits = vec![
-            ByteEdit {
-                start: 1,
-                end: 4,
-                replacement: String::new(),
-            },
-            ByteEdit {
-                start: 3,
-                end: 5,
-                replacement: String::new(),
-            },
-        ];
-        assert!(apply_byte_edits(b"abcdef", &edits, "x").is_err());
-    }
-
-    #[test]
-    fn out_of_checkout_paths_are_rejected() {
-        let temp = tempfile::tempdir().unwrap();
-        assert!(resolve_target(temp.path(), "../escape.rs").is_err());
-        assert!(resolve_target(temp.path(), "/escape.rs").is_err());
-    }
-
-    #[test]
-    fn formatter_arguments_cannot_select_an_arbitrary_subcommand_or_plugin() {
-        assert!(validate_formatter_arguments("rustfmt", &[]).is_ok());
-        assert!(validate_formatter_arguments("gofmt", &["-w".to_string()]).is_ok());
-        assert!(validate_formatter_arguments("prettier", &["--write".to_string()]).is_ok());
-        assert!(validate_formatter_arguments("cargo", &["run".to_string()]).is_err());
-        assert!(
-            validate_formatter_arguments(
-                "prettier",
-                &["--plugin".to_string(), "untrusted.js".to_string()]
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn staged_multi_file_failure_rolls_back_every_installed_file() {
-        let temp = tempfile::tempdir().unwrap();
-        let first = temp.path().join("first.rs");
-        let second = temp.path().join("second.rs");
-        fs::write(&first, b"first-before").unwrap();
-        fs::write(&second, b"second-before").unwrap();
-        let files = vec![
-            prepared(&first, "first-after", 0),
-            prepared(&second, "second-after", 1),
-        ];
-
-        stage_postimages(&files).unwrap();
-        assert!(install_staged(&files, Some(1)).is_err());
-
-        assert_eq!(fs::read(&first).unwrap(), b"first-before");
-        assert_eq!(fs::read(&second).unwrap(), b"second-before");
-        assert!(
-            files
-                .iter()
-                .all(|file| !file.temporary.exists() && !file.backup.exists())
-        );
-    }
-
-    #[test]
-    fn retained_backups_restore_verified_preimages() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(temp.path()).unwrap();
-        let target = root.join("source.rs");
-        fs::write(&target, b"before").unwrap();
-        let files = vec![prepared(&target, "after", 0)];
-
-        stage_postimages(&files).unwrap();
-        install_staged(&files, None).unwrap();
-        assert_eq!(fs::read(&target).unwrap(), b"after");
-
-        rollback(&files);
-        cleanup_sidecars(&files);
-        assert_eq!(fs::read(&target).unwrap(), b"before");
-    }
-
-    #[test]
-    fn retained_hashes_recognize_duplicate_apply_and_undo_delivery() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(temp.path()).unwrap();
-        let target = root.join("source.rs");
-        fs::write(&target, b"after").unwrap();
-        let mut history = EditHistory {
-            schema_version: PLAN_SCHEMA_VERSION,
-            plan_id: "a".repeat(64),
-            operation: "rename_symbol".into(),
-            codebase_id: "cb".into(),
-            source_identity: "checkout".into(),
-            files: vec![HistoryFile {
-                path: "source.rs".into(),
-                preimage_hash: hash(b"before"),
-                preimage_base64: String::new(),
-                postimage_hash: hash(b"after"),
-            }],
-            undone: false,
-        };
-
-        assert!(history_matches(&root, &history, false).unwrap());
-        let applied = outcome_from_history(&history, true, false, true);
-        assert!(applied.already_applied);
-
-        fs::write(&target, b"before").unwrap();
-        history.undone = true;
-        assert!(history_matches(&root, &history, true).unwrap());
-        let undone = outcome_from_history(&history, false, true, true);
-        assert!(undone.already_undone);
-    }
-
-    fn prepared(target: &std::path::Path, postimage: &str, index: usize) -> PreparedFile {
-        let preimage = fs::read(target).unwrap();
-        let (temporary, backup) = sidecars(target, &"a".repeat(64), index);
-        PreparedFile {
-            path: target.file_name().unwrap().to_string_lossy().into_owned(),
-            target: target.to_path_buf(),
-            preimage,
-            postimage: postimage.as_bytes().to_vec(),
-            postimage_hash: hash(postimage.as_bytes()),
-            temporary,
-            backup,
-        }
-    }
-}
+mod tests;

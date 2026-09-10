@@ -11,6 +11,44 @@ use crate::client::api;
 
 use super::inspection::GRAPH_LIST_CAP;
 
+/// Local paths are valid only for hits from the selected checkout.
+#[derive(Clone, Copy)]
+pub(super) struct HitContext<'a> {
+    root: Option<&'a Path>,
+    codebase_id: Option<&'a str>,
+    allow_unidentified: bool,
+}
+
+impl<'a> HitContext<'a> {
+    fn local(root: Option<&'a Path>) -> Self {
+        Self {
+            root,
+            codebase_id: None,
+            allow_unidentified: true,
+        }
+    }
+
+    pub(super) fn search(
+        root: Option<&'a Path>,
+        codebase_id: Option<&'a str>,
+        scoped: bool,
+    ) -> Self {
+        Self {
+            root,
+            codebase_id,
+            allow_unidentified: scoped,
+        }
+    }
+
+    pub(super) fn root_for(self, hit: &api::SearchHit) -> Option<&'a Path> {
+        match (hit.codebase_id.as_deref(), self.codebase_id) {
+            (Some(hit_id), Some(selected)) if hit_id == selected => self.root,
+            (None, _) | (Some(_), None) if self.allow_unidentified => self.root,
+            _ => None,
+        }
+    }
+}
+
 /// Absolutize a codebase-relative path against the local checkout `root`,
 /// so the host can open it directly. With no known root (canonical /
 /// server-pulled codebase) the path is left relative — absolutizing it
@@ -195,7 +233,14 @@ pub(super) fn render_hits(
     root: Option<&Path>,
     show_score: bool,
 ) -> String {
-    render_hits_inner(hits, empty_msg, root, show_score, &HashSet::new(), false)
+    render_hits_inner(
+        hits,
+        empty_msg,
+        HitContext::local(root),
+        show_score,
+        &HashSet::new(),
+        false,
+    )
 }
 
 /// As [`render_hits`], but annotates any hit whose codebase-relative path is in
@@ -206,7 +251,7 @@ pub(super) fn render_hits(
 pub(super) fn render_hits_inner(
     hits: &[api::SearchHit],
     empty_msg: &str,
-    root: Option<&Path>,
+    context: HitContext<'_>,
     show_score: bool,
     stale: &HashSet<String>,
     full_body: bool,
@@ -224,6 +269,7 @@ pub(super) fn render_hits_inner(
     let mut out = String::new();
     let mut separated = false;
     for h in hits {
+        let root = context.root_for(h);
         if let Some(floor) = weak_below
             && !separated
             && h.score < floor
@@ -255,14 +301,22 @@ pub(super) fn render_hits_inner(
         } else {
             format!(" ({})", h.kind)
         };
-        let stale_mark = if h.path.as_deref().is_some_and(|p| stale.contains(p)) {
+        let stale_mark = if root.is_some() && h.path.as_deref().is_some_and(|p| stale.contains(p)) {
             "  ⚠ stale (edited since indexed)"
         } else {
             ""
         };
+        let codebase = if show_score {
+            h.codebase_id
+                .as_deref()
+                .map(|id| format!(" [codebase {id}]"))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         writeln!(
             out,
-            "[{}{lang}] {}  {sym}{kind}{}{score}{stale_mark}",
+            "[{}{lang}]{codebase} {}  {sym}{kind}{}{score}{stale_mark}",
             h.domain_id,
             hit_location(h, root),
             write_marker(h)
@@ -348,7 +402,7 @@ pub(super) fn hit_location(h: &api::SearchHit, root: Option<&Path>) -> String {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{api, render_hits_inner, render_job, strip_verbatim_prefix};
+    use super::{HitContext, api, render_hits_inner, render_job, strip_verbatim_prefix};
 
     /// A `SearchHit` with a chosen chunk id + path — for the render test that
     /// keys on those.
@@ -387,12 +441,61 @@ mod tests {
         let hits = [node("a", "dirty.rs"), node("b", "clean.rs")];
         let stale: HashSet<String> = ["dirty.rs".to_string()].into_iter().collect();
 
-        let out = render_hits_inner(&hits, "none", None, true, &stale, false);
+        let out = render_hits_inner(
+            &hits,
+            "none",
+            HitContext::local(Some(std::path::Path::new("/repo"))),
+            true,
+            &stale,
+            false,
+        );
         let dirty = out.lines().find(|l| l.contains("dirty.rs")).unwrap();
         let clean = out.lines().find(|l| l.contains("clean.rs")).unwrap();
 
         assert!(dirty.contains("⚠ stale"), "edited file flagged");
         assert!(!clean.contains("⚠ stale"), "untouched file not flagged");
+    }
+
+    #[test]
+    fn search_locations_keep_codebases_with_the_same_path_separate() {
+        let root = std::path::Path::new("checkout-a");
+        let mut local = node("local", "src/lib.rs");
+        local.codebase_id = Some("a".into());
+        let mut remote = node("remote", "src/lib.rs");
+        remote.codebase_id = Some("b".into());
+        let unidentified = node("unidentified", "src/lib.rs");
+        let context = HitContext::search(Some(root), Some("a"), false);
+        let stale = HashSet::from(["src/lib.rs".to_string()]);
+        let output = render_hits_inner(
+            &[local, remote, unidentified],
+            "none",
+            context,
+            true,
+            &stale,
+            false,
+        );
+        let lines: Vec<_> = output
+            .lines()
+            .filter(|line| line.starts_with('['))
+            .collect();
+        assert!(lines[0].contains("[codebase a]"));
+        assert!(lines[0].contains(&root.join("src/lib.rs").display().to_string()));
+        assert!(lines[0].contains("stale"));
+        assert!(lines[1].contains("[codebase b] src/lib.rs"));
+        assert!(!lines[1].contains("checkout-a"));
+        assert!(!lines[1].contains("stale"));
+        assert!(!lines[2].contains("checkout-a"));
+        assert!(!lines[2].contains("stale"));
+    }
+
+    #[test]
+    fn legacy_search_hits_use_local_paths_only_for_a_scoped_request() {
+        let root = std::path::Path::new("checkout");
+        let hit = node("legacy", "source.rs");
+        let scoped = HitContext::search(Some(root), Some("a"), true);
+        let broad = HitContext::search(Some(root), Some("a"), false);
+        assert_eq!(scoped.root_for(&hit), Some(root));
+        assert_eq!(broad.root_for(&hit), None);
     }
 
     #[test]
@@ -404,7 +507,14 @@ mod tests {
         write.enclosing_symbol = Some("reset".into());
         write.is_write = Some(true);
 
-        let out = render_hits_inner(&[read, write], "none", None, false, &HashSet::new(), false);
+        let out = render_hits_inner(
+            &[read, write],
+            "none",
+            HitContext::local(None),
+            false,
+            &HashSet::new(),
+            false,
+        );
         let lines: Vec<&str> = out.lines().filter(|l| l.contains("run.rs")).collect();
 
         assert!(lines[0].contains("dispatch in run_until"), "{out}");

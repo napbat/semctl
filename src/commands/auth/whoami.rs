@@ -2,14 +2,14 @@ use anyhow::Result;
 
 use crate::auth;
 use crate::cli::Cli;
-use crate::config;
 
 /// The server doesn't expose `/v1/me` yet — until it does, we decode
 /// the JWT's `sub` / `email` claims locally and print those, plus
 /// check that the server accepts our token by pinging `/v1/domains`.
 pub async fn run(cli: &Cli) -> Result<()> {
     let http = reqwest::Client::new();
-    let token = auth::get_valid_access_token(&http).await?;
+    let client = crate::client::from_cli(cli)?;
+    let token = auth::get_valid_access_token(&http, client.server_url()).await?;
 
     let claims = decode_jwt_payload(&token)?;
     let sub = claims
@@ -49,8 +49,7 @@ pub async fn run(cli: &Cli) -> Result<()> {
         println!("exp:    {exp} ({state}, {}s from now)", exp - now);
     }
 
-    let cfg = config::load()?;
-    if let Some(tenant) = cfg.active_tenant(cli.tenant.as_deref()) {
+    if let Some(tenant) = client.tenant().await {
         println!("tenant: {tenant} (active)");
     } else {
         println!("tenant: (none — set with `semctl auth tenants --switch <slug>`)");
@@ -58,7 +57,6 @@ pub async fn run(cli: &Cli) -> Result<()> {
 
     // Liveness probe — proves the access token actually works against
     // the configured server.
-    let client = crate::client::from_cli(cli)?;
     match client
         .get::<Vec<crate::client::api::DomainDescriptor>>("/v1/domains")
         .await

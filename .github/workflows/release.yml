@@ -4,7 +4,7 @@ name: release
 # but a release is built and published ONLY when the `version` in Cargo.toml names
 # a version that hasn't been released yet. To cut a release, bump `version` in
 # Cargo.toml (e.g. 0.1.0 -> 0.1.1) and push; every other push is a ~15s no-op.
-# A manual run can rebuild an existing release to restore missing assets.
+# A manual run from the release tag can rebuild its assets from the same commit.
 #
 # Cargo.toml is the single source of truth: the tag (`v<version>`), the release
 # name, and the binary's CARGO_PKG_VERSION all come straight from it — no
@@ -20,7 +20,7 @@ on:
   workflow_dispatch:
     inputs:
       rebuild:
-        description: Rebuild binaries for an existing release
+        description: Rebuild an existing release (select its tag as the run ref)
         type: boolean
         default: false
 
@@ -49,6 +49,8 @@ jobs:
       release: ${{ steps.v.outputs.release }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - id: v
         env:
           GH_TOKEN: ${{ github.token }}
@@ -62,13 +64,26 @@ jobs:
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          if [ "$REBUILD" != "true" ] && gh release view "v$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          # An API failure must not be treated as an absent release.
+          releases=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" --jq '.[].tag_name')
+          if [ "$REBUILD" != "true" ] && grep -Fxq "v$version" <<< "$releases"; then
             echo "release=false" >> "$GITHUB_OUTPUT"
             echo "v$version is already released — nothing to do"
           else
+            tag_args=()
+            if [ "$REBUILD" = "true" ]; then
+              tag_args+=(--require-tag)
+            fi
+            python3 .github/scripts/verify_release_source.py \
+              --tag "v$version" --commit "$GITHUB_SHA" "${tag_args[@]}"
             echo "release=true" >> "$GITHUB_OUTPUT"
             echo "Building semctl v$version"
           fi
+
+  verify:
+    needs: check
+    if: needs.check.outputs.release == 'true'
+    uses: ./.github/workflows/ci.yml
 
   build:
     needs: check
@@ -98,6 +113,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -129,11 +146,14 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: [check, build]
+    needs: [check, verify, build]
     if: needs.check.outputs.release == 'true'
     name: publish (GitHub release)
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - name: Download binaries
         uses: actions/download-artifact@v4
         with:
@@ -149,10 +169,24 @@ jobs:
           ( cd rel && sha256sum semctl-* > checksums-sha256.txt )
           echo "----- rel/ -----"; ls -l rel; echo; cat rel/checksums-sha256.txt
 
+      - name: Bind the release tag to the verified source
+        env:
+          RELEASE_VERSION: ${{ needs.check.outputs.version }}
+          REBUILD: ${{ inputs.rebuild == true }}
+        run: |
+          set -euo pipefail
+          tag_args=(--create-tag)
+          if [ "$REBUILD" = "true" ]; then
+            tag_args+=(--require-tag)
+          fi
+          python3 .github/scripts/verify_release_source.py \
+            --tag "v$RELEASE_VERSION" --commit "$GITHUB_SHA" "${tag_args[@]}"
+
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ needs.check.outputs.version }}
+          target_commitish: ${{ github.sha }}
           name: semctl v${{ needs.check.outputs.version }}
           generate_release_notes: true
           files: rel/*

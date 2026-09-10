@@ -25,9 +25,9 @@ use anyhow::Result;
 use crate::client::{
     Client, api, api::CAPABILITY_CODEBASE_VERSIONS, api::CAPABILITY_PROJECT_KEYS, is_local_source,
 };
-use git::{git_capture, git_is_dirty, git_remote};
+use git::{git_capture, git_is_dirty, git_remote, git_working_copy_root};
 
-pub(crate) use identity::source_id as checkout_source_id;
+pub(crate) use identity::{path_from_key, path_key, source_id as checkout_source_id};
 
 /// Where the checkout at `dir` is standing: its branch, its revision, the
 /// remote it tracks, and whether the tree is clean. `None` when the folder is
@@ -68,10 +68,9 @@ pub struct Resolved {
 /// remain independently indexable at the path the caller selected.
 pub async fn working_copy_root(dir: &Path) -> PathBuf {
     let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-    let Some(root) = git_capture(&canonical, &["rev-parse", "--show-toplevel"]).await else {
+    let Some(root) = git_working_copy_root(&canonical).await else {
         return canonical;
     };
-    let root = PathBuf::from(root);
     std::fs::canonicalize(&root).unwrap_or(root)
 }
 
@@ -131,7 +130,7 @@ async fn validate_cached(
         .await
     {
         Ok(None) => {
-            let _ = crate::config::uncache_codebase_id(&id);
+            let _ = crate::config::uncache_codebase_id(&id).await;
             Ok(None)
         }
         Ok(Some(_)) | Err(_) => Ok(Some(Resolved { id, how })),
@@ -151,7 +150,7 @@ async fn recover_by_source(client: &Client, dir: &Path) -> Result<Option<Resolve
     let Some(existing) = find_by_source(client, &source_id).await? else {
         return Ok(None);
     };
-    let _ = crate::config::cache_codebase(dir, &existing.id);
+    let _ = crate::config::cache_codebase(dir, &existing.id).await;
     Ok(Some(Resolved {
         id: existing.id,
         how: "server source id",
@@ -167,7 +166,7 @@ pub async fn ensure(client: &Client, dir: &Path) -> Result<String> {
         return Ok(resolved.id);
     }
     let id = create_local(client, &dir).await?;
-    let _ = crate::config::cache_codebase(&dir, &id);
+    let _ = crate::config::cache_codebase(&dir, &id).await;
     Ok(id)
 }
 
@@ -227,27 +226,15 @@ async fn create_local(client: &Client, dir: &Path) -> Result<String> {
     // back — including a different one, when the project already existed.
     let derives_projects = client.supports(CAPABILITY_PROJECT_KEYS).await;
 
-    // The project this checkout belongs under, or — with no remote to say what
-    // that project is — a codebase of its own.
-    //
-    // Only ever consulted against an older server. The slug is the remote's
-    // LAST path component, and two unrelated repositories can share one, so
-    // matching on it adopts somebody else's codebase — napbat/semctx#8. There
-    // is no fixing that here: the client cannot tell those two apart from what
-    // a listing shows it. What it can do is not guess when it does not have to.
-    let project = (versioned && !derives_projects)
-        .then(|| identity::project_slug(remote.as_deref()))
-        .flatten();
-    let slug = match &project {
-        Some(slug) => slug.clone(),
-        // A label where the server keeps identity elsewhere, and a
-        // collision-proof slug where the slug still has to be unique.
-        None if derives_projects => identity::label(&name),
-        None => identity::slug(&name, &source_id),
+    // Only a project-key server can establish that two remotes identify the
+    // same project. Older servers use the checkout identity, even when they
+    // support separate copies. A basename never proves project ownership.
+    let slug = if derives_projects {
+        identity::label(&name)
+    } else {
+        identity::slug(&name, &source_id)
     };
-    if !derives_projects
-        && let Some(existing) = find_by_slug(client, &slug, project.is_none()).await?
-    {
+    if !derives_projects && let Some(existing) = find_by_slug(client, &slug).await? {
         return Ok(existing.id);
     }
     let body = api::CreateCodebaseRequest {
@@ -262,19 +249,15 @@ async fn create_local(client: &Client, dir: &Path) -> Result<String> {
     {
         Ok(created) => Ok(created.id),
         Err(create_error) => {
-            // Two processes may index the same new path concurrently, and two
-            // clones of one repository race for its project slug. Either way the
-            // slug is deterministic, so the loser adopts the winner instead of
-            // inventing a second codebase.
+            // Two processes may index the same new path concurrently. Its
+            // digest-backed slug identifies the same checkout in both calls.
             //
             // Not against a server that derives projects: there the race is
             // settled by a unique key in its database and both callers are
             // answered with the winner, so a create that still failed failed for
             // a real reason and must be reported rather than papered over with
             // whatever shares the slug.
-            if !derives_projects
-                && let Ok(Some(existing)) = find_by_slug(client, &slug, project.is_none()).await
-            {
+            if !derives_projects && let Ok(Some(existing)) = find_by_slug(client, &slug).await {
                 return Ok(existing.id);
             }
             Err(create_error)
@@ -284,17 +267,9 @@ async fn create_local(client: &Client, dir: &Path) -> Result<String> {
 
 /// The codebase with this slug, if any.
 ///
-/// `local_only` is the no-remote case: that slug carries a checkout digest and
-/// means one specific working copy, so adopting a server-pulled codebase that
-/// happened to take the name would point a full manifest at a corpus the server
-/// maintains. A project slug has no such worry — attaching a working copy to the
-/// project's pulled codebase is the intent, and the server keeps the two apart
-/// as separate copies.
-async fn find_by_slug(
-    client: &Client,
-    slug: &str,
-    local_only: bool,
-) -> Result<Option<api::CodebaseSummary>> {
+/// This slug contains the checkout digest. Only a Local codebase can satisfy
+/// the lookup; a server-pulled corpus must not receive this desired manifest.
+async fn find_by_slug(client: &Client, slug: &str) -> Result<Option<api::CodebaseSummary>> {
     let mut page_number = 0_u32;
     loop {
         let page = client
@@ -302,9 +277,11 @@ async fn find_by_slug(
                 "/v1/codebases?page={page_number}&pageSize=500"
             ))
             .await?;
-        if let Some(found) = page.items.into_iter().find(|codebase| {
-            codebase.slug == slug && (!local_only || is_local_source(&codebase.source_kind))
-        }) {
+        if let Some(found) = page
+            .items
+            .into_iter()
+            .find(|codebase| codebase.slug == slug && is_local_source(&codebase.source_kind))
+        {
             return Ok(Some(found));
         }
         let consumed = page.number.saturating_add(1).saturating_mul(page.size);
@@ -344,5 +321,30 @@ mod tests {
             working_copy_root(temp.path()).await,
             std::fs::canonicalize(temp.path()).unwrap()
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_root_preserves_native_bytes_and_trailing_whitespace() {
+        use std::os::unix::ffi::OsStringExt;
+        let temp = tempfile::tempdir().unwrap();
+        for name in [b"repo \n".to_vec(), b"repo-\xff".to_vec()] {
+            let root = temp.path().join(std::ffi::OsString::from_vec(name));
+            std::fs::create_dir(&root).unwrap();
+            assert!(
+                std::process::Command::new("git")
+                    .args(["init", "--quiet"])
+                    .current_dir(&root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let child = root.join("src");
+            std::fs::create_dir(&child).unwrap();
+            assert_eq!(
+                working_copy_root(&child).await,
+                std::fs::canonicalize(&root).unwrap()
+            );
+        }
     }
 }

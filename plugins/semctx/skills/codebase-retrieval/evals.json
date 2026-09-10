@@ -42,9 +42,9 @@
     },
     {
       "skills": ["codebase-retrieval"],
-      "query": "Any semctx tool call returns 'not logged in — run `semctx login`'.",
+      "query": "Any semctx tool call returns 'not logged in — run `semctl auth login`'.",
       "expected_behavior": [
-        "Tells the user about the auth state and the `semctx login` remedy instead of silently falling back",
+        "Tells the user about the auth state and the `semctl auth login` remedy instead of silently falling back",
         "Still answers the immediate question with host tools",
         "Does not tell the host to reconnect the MCP server (tools recover on retry after login)"
       ]
