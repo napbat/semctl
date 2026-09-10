@@ -54,9 +54,7 @@ const DIRECT_EDIT_TOOLS: &[&str] = &[
 #[derive(Clone)]
 pub struct McpServer {
     shared: Arc<Shared>,
-    // Read by the `#[tool_handler]`-generated `call_tool` / `list_tools`
-    // impls; the dead-code analyzer can't see through the macro.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // The `tool_handler` macro reads this field.
     tool_router: ToolRouter<Self>,
 }
 

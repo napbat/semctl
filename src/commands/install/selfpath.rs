@@ -110,6 +110,7 @@ fn install_binary(current: &Path, target: &Path) -> Result<bool> {
     let tmp = target.with_file_name(format!(".semctl-install.{}.tmp", std::process::id()));
     std::fs::copy(current, &tmp).with_context(|| format!("copy semctl to {}", tmp.display()))?;
     if let Err(e) = std::fs::rename(&tmp, target) {
+        // A failed cleanup leaves a complete temporary copy next to the target.
         let _ = std::fs::remove_file(&tmp);
         return Err(e).with_context(|| format!("install semctl to {}", target.display()));
     }
@@ -522,6 +523,7 @@ pub fn remove_legacy_binary() -> Result<Option<PathBuf>> {
     if cfg!(windows)
         && let Some(dir) = legacy_bin_dir()
     {
+        // Keep a non-empty directory because it may contain user data.
         let _ = std::fs::remove_dir(&dir);
     }
     Ok(Some(p))

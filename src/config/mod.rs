@@ -6,7 +6,7 @@
 //! Config dir is `~/.config/semctl/` on every platform (XDG-style, overridable
 //! with `XDG_CONFIG_HOME`).
 
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -220,20 +220,19 @@ pub(crate) fn installation_id() -> Result<String> {
     );
     let id = blake3::hash(seed.as_bytes()).to_hex().to_string();
 
-    match OpenOptions::new().write(true).create_new(true).open(&path) {
+    match create_private_new(&path) {
         Ok(mut file) => {
             file.write_all(id.as_bytes())
                 .and_then(|()| file.write_all(b"\n"))
                 .and_then(|()| file.flush())
                 .with_context(|| format!("write {}", path.display()))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
-            }
             Ok(id)
         }
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == ErrorKind::AlreadyExists) =>
+        {
             // Another semctl process won first-run creation. It may still be
             // finishing its tiny write, so give it a bounded moment to publish.
             for _ in 0..20 {
@@ -245,7 +244,7 @@ pub(crate) fn installation_id() -> Result<String> {
             read_installation_id(&path)
                 .with_context(|| format!("read concurrently-created {}", path.display()))
         }
-        Err(error) => Err(error).with_context(|| format!("create {}", path.display())),
+        Err(error) => Err(error),
     }
 }
 

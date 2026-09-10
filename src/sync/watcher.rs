@@ -49,7 +49,7 @@ pub(super) fn spawn(
     // "something interesting changed", not which paths.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
 
-    let initial_policy = SourcePolicy::load(&dir, &Cancellation::default()).ok();
+    let initial_policy = load_initial_policy(&dir);
     let mut observed: std::collections::HashSet<_> = initial_policy
         .as_ref()
         .into_iter()
@@ -85,6 +85,7 @@ pub(super) fn spawn(
                     Err(_) => true,
                 };
                 if interesting {
+                    // A full channel has a wake-up; a closed channel has no consumer.
                     let _ = tx.try_send(());
                 }
             }
@@ -158,6 +159,16 @@ pub(super) fn spawn(
     });
 
     Some(debouncer)
+}
+
+fn load_initial_policy(dir: &std::path::Path) -> Option<SourcePolicy> {
+    match SourcePolicy::load(dir, &Cancellation::default()) {
+        Ok(policy) => Some(policy),
+        Err(error) => {
+            warn!(%error, "source policy unavailable at watcher startup; relying on periodic re-sync");
+            None
+        }
+    }
 }
 
 /// Watch rule parents so creation and atomic replacement are visible. For a

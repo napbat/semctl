@@ -65,7 +65,8 @@ impl Client {
     /// Build isolated client state for tests that do not send HTTP requests.
     #[cfg(test)]
     pub(crate) fn for_test(codebase: &str, local_root: Option<PathBuf>) -> Self {
-        let mut client = Self::new("http://127.0.0.1:1", None, Some(codebase.into()), false);
+        let mut client = Self::new("http://127.0.0.1:1", None, Some(codebase.into()), false)
+            .expect("the default test HTTP client must build");
         client.local_root = local_root;
         client
     }
@@ -75,12 +76,12 @@ impl Client {
         tenant: Option<String>,
         codebase: Option<String>,
         repair_configured_tenant: bool,
-    ) -> Self {
+    ) -> Result<Self> {
         let http = reqwest::Client::builder()
             .user_agent(concat!("semctx-cli/", env!("CARGO_PKG_VERSION")))
             .build()
-            .expect("reqwest client build is infallible with default config");
-        Self {
+            .context("build HTTP client")?;
+        Ok(Self {
             http,
             base_url: base_url.trim_end_matches('/').to_string(),
             tenant: Arc::new(RwLock::new(tenant)),
@@ -90,7 +91,7 @@ impl Client {
             local_root: None,
             checkout_source_id: None,
             capabilities: Arc::new(tokio::sync::OnceCell::new()),
-        }
+        })
     }
 
     /// The resolved codebase id, or an error naming how to set it. Code /
@@ -627,12 +628,7 @@ pub fn from_cli(cli: &crate::cli::Cli) -> Result<Client> {
     let (tenant, repair_configured_tenant) =
         tenant_selection(configured_tenant, cli.tenant.as_deref());
     let codebase = cfg.active_codebase(cli.codebase.as_deref());
-    Ok(Client::new(
-        &server,
-        tenant,
-        codebase,
-        repair_configured_tenant,
-    ))
+    Client::new(&server, tenant, codebase, repair_configured_tenant)
 }
 
 /// Like [`from_cli`], but ensures a codebase is set — resolving the working
@@ -786,7 +782,7 @@ mod tests {
     /// "tell me what the project publishes".
     #[test]
     fn asking_for_canonical_stops_claiming_a_checkout() {
-        let mut client = Client::new("https://example.invalid", None, None, false);
+        let mut client = Client::new("https://example.invalid", None, None, false).unwrap();
         client.checkout_source_id = Some("digest".into());
         client.local_root = Some(std::path::PathBuf::from("checkout"));
 
@@ -804,7 +800,7 @@ mod tests {
     /// what every read resolves to.
     #[test]
     fn canonical_is_a_no_op_when_no_checkout_is_claimed() {
-        let client = Client::new("https://example.invalid", None, None, false);
+        let client = Client::new("https://example.invalid", None, None, false).unwrap();
 
         assert_eq!(client.for_canonical().checkout_source_id, None);
     }

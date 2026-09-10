@@ -295,9 +295,9 @@ pub async fn trace(client: &Client, symbol: &str, depth: u32) -> String {
     let mut out = format!("definition of `{symbol}`:\n");
     out.push_str(&render_hits(&t.definition, "", root, false));
 
-    write!(out, "\ncallers ({}):\n", t.callers.len()).unwrap();
+    write!(out, "\ncallers ({}):\n", t.callers.len()).expect("writing to a String cannot fail");
     out.push_str(&render_compact(&t.callers, "  (none)", root));
-    write!(out, "\ncallees ({}):\n", t.callees.len()).unwrap();
+    write!(out, "\ncallees ({}):\n", t.callees.len()).expect("writing to a String cannot fail");
     out.push_str(&render_compact(&t.callees, "  (none)", root));
     out
 }
@@ -330,7 +330,8 @@ pub async fn find_references(client: &Client, symbol: &str, namespace: Option<&s
         urlencode(symbol)
     );
     if let Some(namespace) = namespace.filter(|value| !value.is_empty()) {
-        write!(path, "&referenceNamespace={}", urlencode(namespace)).unwrap();
+        write!(path, "&referenceNamespace={}", urlencode(namespace))
+            .expect("writing to a String cannot fail");
     }
     match client.get::<Vec<api::SearchHit>>(&path).await {
         Ok(hits) if hits.is_empty() => near_miss(client, symbol, "references").await,
@@ -483,7 +484,7 @@ pub async fn grep(
         urlencode(pattern)
     );
     if let Some(p) = path.filter(|p| !p.is_empty()) {
-        write!(url, "&path={}", urlencode(p)).unwrap();
+        write!(url, "&path={}", urlencode(p)).expect("writing to a String cannot fail");
     }
     match client.get::<Vec<api::GrepMatch>>(&url).await {
         Ok(matches) if matches.is_empty() => format!("no matches for `{pattern}`"),
@@ -498,7 +499,7 @@ pub async fn grep(
                     m.line_number,
                     m.line.trim_end()
                 )
-                .unwrap();
+                .expect("writing to a String cannot fail");
             }
             writeln!(
                 out,
@@ -506,7 +507,7 @@ pub async fn grep(
                 matches.len(),
                 if matches.len() == 1 { "" } else { "es" }
             )
-            .unwrap();
+            .expect("writing to a String cannot fail");
             out
         }
         Err(e) => format!("grep failed: {e}"),
@@ -531,10 +532,10 @@ pub async fn file_outline(
         urlencode(path)
     );
     if let Some(depth) = max_depth {
-        write!(url, "&maxDepth={depth}").unwrap();
+        write!(url, "&maxDepth={depth}").expect("writing to a String cannot fail");
     }
     for kind in kinds {
-        write!(url, "&kinds={}", urlencode(kind)).unwrap();
+        write!(url, "&kinds={}", urlencode(kind)).expect("writing to a String cannot fail");
     }
     match client.get::<api::FileOutline>(&url).await {
         Ok(outline) if outline.entries.is_empty() => {
@@ -558,10 +559,10 @@ pub async fn file_outline(
                     e.line_end,
                     symbol_kind
                 )
-                .unwrap();
+                .expect("writing to a String cannot fail");
                 if let Some(body) = &e.body {
                     for line in body.lines() {
-                        writeln!(out, "      {line}").unwrap();
+                        writeln!(out, "      {line}").expect("writing to a String cannot fail");
                     }
                 }
             }
@@ -634,7 +635,8 @@ async fn near_miss(client: &Client, symbol: &str, what: &str) -> String {
             && (lower.contains(&needle) || needle.contains(&lower))
             && seen.insert(sym.to_string())
         {
-            writeln!(out, "  `{sym}`  {}", hit_location(h, root)).unwrap();
+            writeln!(out, "  `{sym}`  {}", hit_location(h, root))
+                .expect("writing to a String cannot fail");
         }
         if seen.len() == 5 {
             break;
@@ -656,7 +658,7 @@ fn urlencode(s: &str) -> String {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 out.push(b as char);
             }
-            _ => write!(out, "%{b:02X}").unwrap(),
+            _ => write!(out, "%{b:02X}").expect("writing to a String cannot fail"),
         }
     }
     out

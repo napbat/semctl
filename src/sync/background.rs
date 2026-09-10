@@ -101,6 +101,7 @@ fn spawn_startup_reconcile(
     initial_result: Option<oneshot::Sender<Result<SyncOutcome, String>>>,
 ) {
     tokio::spawn(async move {
+        // The readiness receiver may be dropped while this detached task runs.
         match sync(&client, &dir, &cache).await {
             Ok(o) => {
                 info!(

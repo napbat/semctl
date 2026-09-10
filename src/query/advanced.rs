@@ -80,7 +80,7 @@ pub async fn list_codebases(client: &Client) -> String {
                     codebase.graph_fresh,
                     this_checkout,
                 )
-                .unwrap();
+                .expect("writing to a String cannot fail");
             }
             out
         }
@@ -130,13 +130,14 @@ pub async fn current_context(
                     summary.graph_fresh,
                     describe_copies(client, &codebase, &source).await
                 )
-                .unwrap();
+                .expect("writing to a String cannot fail");
             }
-            Err(error) => write!(out, "\ngraph/index state unavailable: {error}").unwrap(),
+            Err(error) => write!(out, "\ngraph/index state unavailable: {error}")
+                .expect("writing to a String cannot fail"),
         }
     }
     if let Some(job) = last_job_id {
-        write!(out, "\nlast session sync job {job}").unwrap();
+        write!(out, "\nlast session sync job {job}").expect("writing to a String cannot fail");
     }
     out
 }
@@ -154,13 +155,13 @@ pub async fn read_source(
     };
     let mut url = format!("/v1/codebases/{cb}/files/content?path={}", urlencode(path));
     if let Some(revision) = revision {
-        write!(url, "&revision={}", urlencode(revision)).unwrap();
+        write!(url, "&revision={}", urlencode(revision)).expect("writing to a String cannot fail");
     }
     if let Some((start, end)) = byte_range {
-        write!(url, "&byteStart={start}&byteEnd={end}").unwrap();
+        write!(url, "&byteStart={start}&byteEnd={end}").expect("writing to a String cannot fail");
     }
     if let Some((start, end)) = line_range {
-        write!(url, "&lineStart={start}&lineEnd={end}").unwrap();
+        write!(url, "&lineStart={start}&lineEnd={end}").expect("writing to a String cannot fail");
     }
     let content = match client.get::<api::FileContent>(&url).await {
         Ok(content) => content,
@@ -215,7 +216,7 @@ pub async fn search_symbols(client: &Client, options: &SymbolSearchOptions<'_>) 
         options.limit.clamp(1, 500)
     );
     for kind in options.kinds {
-        write!(url, "&kinds={}", urlencode(kind)).unwrap();
+        write!(url, "&kinds={}", urlencode(kind)).expect("writing to a String cannot fail");
     }
     for (name, value) in [
         ("pathPrefix", options.path_prefix),
@@ -223,7 +224,7 @@ pub async fn search_symbols(client: &Client, options: &SymbolSearchOptions<'_>) 
         ("language", options.language),
     ] {
         if let Some(value) = value.filter(|value| !value.is_empty()) {
-            write!(url, "&{name}={}", urlencode(value)).unwrap();
+            write!(url, "&{name}={}", urlencode(value)).expect("writing to a String cannot fail");
         }
     }
     match client.get::<Vec<api::SymbolSearchHit>>(&url).await {
@@ -243,7 +244,7 @@ pub async fn search_symbols(client: &Client, options: &SymbolSearchOptions<'_>) 
                     hit.project.as_deref().unwrap_or("-"),
                     hit.score
                 )
-                .unwrap();
+                .expect("writing to a String cannot fail");
             }
             out
         }
@@ -284,9 +285,11 @@ pub async fn call_graph(client: &Client, symbol: &str, depth: u32, direction: &s
         Ok(graph) => {
             let mut out = format!("nodes ({})\n", graph.nodes.len());
             out.push_str(&render_hits(&graph.nodes, "", client.local_root(), false));
-            writeln!(out, "edges ({})", graph.edges.len()).unwrap();
+            writeln!(out, "edges ({})", graph.edges.len())
+                .expect("writing to a String cannot fail");
             for edge in &graph.edges {
-                writeln!(out, "  {} -> {}", edge.from, edge.to).unwrap();
+                writeln!(out, "  {} -> {}", edge.from, edge.to)
+                    .expect("writing to a String cannot fail");
             }
             out
         }
@@ -323,9 +326,9 @@ pub async fn unused(client: &Client, page: u32, page_size: u32) -> String {
                     item.reason,
                     item.completeness_caveat
                 )
-                .unwrap();
+                .expect("writing to a String cannot fail");
                 if let Some(identity) = item.definition.qualified_symbol.as_deref() {
-                    writeln!(out, "  symbol: {identity}").unwrap();
+                    writeln!(out, "  symbol: {identity}").expect("writing to a String cannot fail");
                 }
             }
             writeln!(
@@ -335,7 +338,7 @@ pub async fn unused(client: &Client, page: u32, page_size: u32) -> String {
                 result.items.len(),
                 result.total
             )
-            .unwrap();
+            .expect("writing to a String cannot fail");
             out
         }
         Err(error) => format!("unused failed: {error}"),
@@ -455,7 +458,7 @@ fn render_type_hierarchy(client: &Client, hierarchy: &api::TypeHierarchy) -> Str
             .map(|caveat| format!(" ({caveat})"))
             .unwrap_or_default()
     );
-    writeln!(out, "nodes ({})", hierarchy.nodes.len()).unwrap();
+    writeln!(out, "nodes ({})", hierarchy.nodes.len()).expect("writing to a String cannot fail");
     for node in &hierarchy.nodes {
         let location = node.path.as_deref().map_or_else(
             || "external".into(),
@@ -468,16 +471,17 @@ fn render_type_hierarchy(client: &Client, hierarchy: &api::TypeHierarchy) -> Str
                 )
             },
         );
-        writeln!(out, "  {}  {}  {}", node.identity, node.kind, location).unwrap();
+        writeln!(out, "  {}  {}  {}", node.identity, node.kind, location)
+            .expect("writing to a String cannot fail");
     }
-    writeln!(out, "edges ({})", hierarchy.edges.len()).unwrap();
+    writeln!(out, "edges ({})", hierarchy.edges.len()).expect("writing to a String cannot fail");
     for edge in &hierarchy.edges {
         writeln!(
             out,
             "  {} -> {}  {} {} depth={}",
             edge.subtype, edge.supertype, edge.relation, edge.origin, edge.depth
         )
-        .unwrap();
+        .expect("writing to a String cannot fail");
     }
     out
 }
@@ -504,7 +508,7 @@ async fn graph_clusters(client: &Client, endpoint: &str, label: &str) -> String 
                         .map(|hash| format!(" hash={hash}"))
                         .unwrap_or_default()
                 )
-                .unwrap();
+                .expect("writing to a String cannot fail");
                 for hit in &group.chunks {
                     writeln!(
                         out,
@@ -515,7 +519,7 @@ async fn graph_clusters(client: &Client, endpoint: &str, label: &str) -> String 
                             .or(hit.symbol.as_deref())
                             .unwrap_or("-")
                     )
-                    .unwrap();
+                    .expect("writing to a String cannot fail");
                 }
             }
             out
