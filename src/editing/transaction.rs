@@ -192,10 +192,7 @@ impl<'a> Transaction<'a> {
         // Permission changes made after staging belong to the displaced
         // version too. Preserve them instead of restoring stale permissions.
         let permissions = recovery.directory.metadata(PREIMAGE)?.permissions();
-        recovery
-            .directory
-            .open(POSTIMAGE)?
-            .set_permissions(permissions)?;
+        recovery.directory.set_permissions(POSTIMAGE, permissions)?;
         recovery.publish(POSTIMAGE, &file.location)?;
         staged.state = State::Installed;
         hook(Boundary::AfterInstall, index)?;
