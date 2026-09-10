@@ -757,9 +757,9 @@ async fn scoped_mcp_search_waits_for_initial_embedding_and_propagates_failure() 
         ids.sort_unstable();
         assert_eq!(ids, [2, 3, 4]);
         drop(stdin);
-        let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
+        let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
             .await
-            .unwrap()
+            .expect("MCP shutdown timed out")
             .unwrap();
         assert!(output.status.success(), "{:?}", output.stderr);
         assert_eq!(

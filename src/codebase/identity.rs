@@ -194,7 +194,9 @@ fn slugify(name: &str) -> String {
 mod tests {
     use std::path::Path;
 
-    use super::{MAX_SLUG_LEN, label, path_from_key, path_key, slug, source_id_for};
+    #[cfg(unix)]
+    use super::path_key;
+    use super::{MAX_SLUG_LEN, label, path_from_key, slug, source_id_for};
 
     #[test]
     fn source_identity_is_stable_for_the_same_checkout() {
