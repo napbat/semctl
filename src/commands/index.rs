@@ -33,11 +33,13 @@ pub struct IndexArgs {
 /// How long to wait for the embed job before giving up the poll (the job keeps
 /// running server-side regardless).
 const JOB_WAIT: std::time::Duration = std::time::Duration::from_mins(10);
-// Tight enough that a fast single-file sync isn't masked by poll granularity —
-// the job usually finishes in a few seconds.
-const POLL_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
+// Fast jobs finish during this window. Poll them closely so status latency does
+// not mask indexing latency. Long jobs back off to bound steady database load.
+const RESPONSIVE_POLL_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+const RESPONSIVE_POLL_EVERY: std::time::Duration = std::time::Duration::from_millis(100);
+const STEADY_POLL_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
 /// Emit a heartbeat often enough that a large repository never looks hung,
-/// without turning the 500 ms status poll into terminal spam.
+/// without turning the status poll into terminal spam.
 const PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug, PartialEq, Eq)]
@@ -128,6 +130,14 @@ fn sync_progress_message(progress: &SyncProgress) -> String {
     }
 }
 
+fn poll_interval(elapsed: std::time::Duration) -> std::time::Duration {
+    if elapsed < RESPONSIVE_POLL_WINDOW {
+        RESPONSIVE_POLL_EVERY
+    } else {
+        STEADY_POLL_EVERY
+    }
+}
+
 /// Poll the index job until the worker finishes embedding, reporting the
 /// outcome. The job runs server-side regardless of whether we keep waiting, so
 /// a timeout here isn't a failure — just stop watching.
@@ -178,7 +188,7 @@ async fn wait_for_job(client: &Client, job_id: &str) -> Result<()> {
             next_progress = now + PROGRESS_EVERY;
         }
         debug!(%job_id, "embedding…");
-        tokio::time::sleep(POLL_EVERY).await;
+        tokio::time::sleep(poll_interval(start.elapsed())).await;
     }
 }
 
@@ -186,7 +196,25 @@ async fn wait_for_job(client: &Client, job_id: &str) -> Result<()> {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{JobProgress, SyncProgress, api, sync_progress_message, terminal_result};
+    use super::{
+        JobProgress, SyncProgress, api, poll_interval, sync_progress_message, terminal_result,
+    };
+
+    #[test]
+    fn polling_is_responsive_for_fast_jobs_then_backs_off() {
+        assert_eq!(
+            poll_interval(std::time::Duration::ZERO),
+            std::time::Duration::from_millis(100)
+        );
+        assert_eq!(
+            poll_interval(std::time::Duration::from_millis(4_999)),
+            std::time::Duration::from_millis(100)
+        );
+        assert_eq!(
+            poll_interval(std::time::Duration::from_secs(5)),
+            std::time::Duration::from_millis(500)
+        );
+    }
 
     fn job(completed: bool, failed: i64, error: Option<&str>) -> api::JobStatus {
         api::JobStatus {
