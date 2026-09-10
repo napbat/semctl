@@ -17,9 +17,10 @@ pub struct LoginArgs {
 }
 
 pub async fn run(args: LoginArgs, cli: &Cli) -> Result<()> {
-    let mut cfg = config::load()?;
+    let cfg = config::load()?;
     // The server we're logging into (--server / SEMCTX_SERVER > config > default).
-    let server_url = cfg.server_url(cli.server.as_deref());
+    let server_url = auth::normalize_server_url(&cfg.server_url(cli.server.as_deref()))?;
+    let attempt = auth::begin_login(&server_url)?;
 
     let http = reqwest::Client::new();
 
@@ -29,6 +30,7 @@ pub async fn run(args: LoginArgs, cli: &Cli) -> Result<()> {
     let identity_url = auth::discover_authority(&http, &server_url)
         .await
         .with_context(|| format!("{server_url} didn't tell us where to authenticate"))?;
+    let identity_url = auth::normalize_server_url(&identity_url)?;
     println!("{server_url} authenticates via {identity_url}");
 
     println!("Requesting device code from {identity_url} …");
@@ -55,12 +57,7 @@ pub async fn run(args: LoginArgs, cli: &Cli) -> Result<()> {
     );
 
     let tokens = auth::poll_for_token(&http, &identity_url, &init).await?;
-    auth::save_tokens(&tokens)?;
-
-    // Remember which server we logged into; identity is never cached — it's
-    // re-discovered from the server on every login / refresh.
-    cfg.server_url = Some(server_url.clone());
-    config::save(&cfg)?;
+    let session = auth::finish_login(attempt, &identity_url, tokens).await?;
 
     println!();
     println!("Logged in to {server_url}. Tokens stored in ~/.config/semctl/credentials.json.");
@@ -68,7 +65,7 @@ pub async fn run(args: LoginArgs, cli: &Cli) -> Result<()> {
     // Resolve an active tenant so the user is ready to `index` / `search`
     // without a separate `semctl auth tenants --switch`. Best-effort — never fail
     // the login over this.
-    select_tenant(&http, &identity_url, &tokens.access_token, &mut cfg).await;
+    select_tenant(&http, &session).await;
 
     Ok(())
 }
@@ -80,26 +77,22 @@ pub async fn run(args: LoginArgs, cli: &Cli) -> Result<()> {
 /// - exactly one membership → auto-select;
 /// - several, interactive shell → prompt;
 /// - several, non-interactive → list them and point at `tenants --switch`.
-async fn select_tenant(
-    http: &reqwest::Client,
-    identity_url: &str,
-    token: &str,
-    cfg: &mut config::Config,
-) {
-    let tenants = match auth::fetch_tenants(http, identity_url, token).await {
-        Ok(t) => t,
-        Err(e) => {
-            // Don't derail a successful login or discard a tenant we couldn't
-            // validate because identity was temporarily unavailable.
-            eprintln!(
-                "note: couldn't validate tenant memberships ({e}); \
+async fn select_tenant(http: &reqwest::Client, session: &auth::AuthenticatedSession) {
+    let tenants =
+        match auth::fetch_tenants(http, &session.authority_url, &session.access_token).await {
+            Ok(t) => t,
+            Err(e) => {
+                // Don't derail a successful login or discard a tenant we couldn't
+                // validate because identity was temporarily unavailable.
+                eprintln!(
+                    "note: couldn't validate tenant memberships ({e}); \
                  check with `semctl auth tenants`."
-            );
-            return;
-        }
-    };
+                );
+                return;
+            }
+        };
 
-    if let Some(active) = cfg.active_tenant(None) {
+    if let Some(active) = session.active_tenant.clone() {
         if membership_named(&tenants, &active).is_some() {
             println!(
                 "Active tenant: {active} (change with `semctl auth tenants --switch <slug>`)."
@@ -111,7 +104,7 @@ async fn select_tenant(
 
     let chosen = match tenants.as_slice() {
         [] => {
-            clear_active_tenant(cfg);
+            clear_active_tenant(session).await;
             println!("No tenant memberships yet.");
             return;
         }
@@ -120,7 +113,7 @@ async fn select_tenant(
             if let Some(i) = prompt_tenant(many) {
                 &many[i]
             } else {
-                clear_active_tenant(cfg);
+                clear_active_tenant(session).await;
                 println!(
                     "No tenant set. Choose one later with `semctl auth tenants --switch <slug>`."
                 );
@@ -128,7 +121,7 @@ async fn select_tenant(
             }
         }
         _ => {
-            clear_active_tenant(cfg);
+            clear_active_tenant(session).await;
             println!(
                 "You belong to multiple tenants — pick one with `semctl auth tenants --switch <slug>`."
             );
@@ -136,12 +129,19 @@ async fn select_tenant(
         }
     };
 
-    cfg.active_tenant = Some(chosen.slug.clone());
-    if let Err(e) = config::save(cfg) {
-        eprintln!("note: logged in but couldn't save active tenant ({e}).");
-        return;
+    match auth::set_active_tenant(
+        &session.stamp,
+        session.active_tenant.clone(),
+        Some(chosen.slug.clone()),
+    )
+    .await
+    {
+        Ok(true) => println!("Active tenant -> {} ({}).", chosen.slug, chosen.name),
+        Ok(false) => {
+            eprintln!("note: login or tenant changed; the earlier tenant selection was ignored.");
+        }
+        Err(error) => eprintln!("note: logged in but could not save active tenant ({error})."),
     }
-    println!("Active tenant -> {} ({}).", chosen.slug, chosen.name);
 }
 
 fn membership_named<'a>(tenants: &'a [api::TenantDto], active: &str) -> Option<&'a api::TenantDto> {
@@ -150,11 +150,11 @@ fn membership_named<'a>(tenants: &'a [api::TenantDto], active: &str) -> Option<&
     })
 }
 
-fn clear_active_tenant(cfg: &mut config::Config) {
-    if cfg.active_tenant.take().is_some()
-        && let Err(e) = config::save(cfg)
+async fn clear_active_tenant(session: &auth::AuthenticatedSession) {
+    if let Err(error) =
+        auth::set_active_tenant(&session.stamp, session.active_tenant.clone(), None).await
     {
-        eprintln!("note: couldn't clear the stale active tenant ({e}).");
+        eprintln!("note: could not clear the stale active tenant ({error}).");
     }
 }
 

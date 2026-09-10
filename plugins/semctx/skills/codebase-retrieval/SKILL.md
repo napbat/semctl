@@ -90,9 +90,9 @@ the last complete index.
   `semctx index` while a known local checkout is active. If only a codebase id
   is known, pass its indexed local path as the codebase selector to activate
   watching.
-- A tool answers "not logged in — run `semctx login`" → answer the immediate
+- A tool reports that semctl is not logged in → answer the immediate
   question with host tools, and end your reply with one line telling the user
-  semctx is logged out and `semctx login` restores it (tools recover on
+  semctl is logged out and `semctl auth login` restores it (tools recover on
   retry, no reconnect needed).
 - `find_definition` / `find_references` misses return "Did you mean"
   candidates — retry with one before falling back.
@@ -106,6 +106,7 @@ the last complete index.
 - A known local file or range needs current working-tree bytes.
 - A narrow literal or filename check targets one known file.
 - Semctx tools are unavailable (plugin not installed, disabled, or degraded).
-- The target is excluded from the index: gitignored, `.semctxignore` matches,
-  lockfiles, build output, generated/minified files, test fixtures, or files over
-  1 MB. Markdown docs ARE indexed — search them with `prefer: "docs"`.
+- The target is excluded from the index: gitignored, `.semctlignore` or legacy
+  `.semctxignore` matches, lockfiles, build output, generated/minified files,
+  test fixtures, or files over 1 MB. Markdown docs ARE indexed — search them with
+  `prefer: "docs"`.

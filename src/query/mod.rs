@@ -30,7 +30,8 @@ pub use advanced::*;
 
 pub use render::render_projects;
 use render::{
-    hit_location, local_path, render_boundaries, render_compact, render_hits, render_hits_inner,
+    HitContext, hit_location, local_path, render_boundaries, render_compact, render_hits,
+    render_hits_inner,
 };
 
 /// Turn the MCP renderer's inline failure convention into a real CLI error.
@@ -85,6 +86,23 @@ pub struct SearchOpts {
     pub codebase_ids: Vec<String>,
 }
 
+impl SearchOpts {
+    pub(crate) fn normalized_scope(&self) -> Result<Option<&'static str>, &'static str> {
+        let scope = self
+            .scope
+            .as_deref()
+            .map(|scope| {
+                normalize_scope(scope)
+                    .ok_or("search failed: scope must be local, personal, organization, or global")
+            })
+            .transpose()?;
+        if scope.is_some() && !self.codebase_ids.is_empty() {
+            return Err("search failed: scope and codebase_ids are mutually exclusive");
+        }
+        Ok(scope)
+    }
+}
+
 /// Cross-domain search, scoped to the launched codebase when one is set. The
 /// server applies the kind filter, ranking bias, and symbol granularity; the
 /// client sends the options, annotates local staleness, and renders.
@@ -95,6 +113,10 @@ pub async fn search(
     domains: &[String],
     opts: &SearchOpts,
 ) -> String {
+    let scope = match opts.normalized_scope() {
+        Ok(scope) => scope,
+        Err(error) => return error.to_string(),
+    };
     let body = api::SearchRequestBody {
         query,
         top_k,
@@ -102,11 +124,7 @@ pub async fn search(
             .then(|| client.codebase().ok())
             .flatten(),
         codebase_ids: (!opts.codebase_ids.is_empty()).then(|| opts.codebase_ids.clone()),
-        scope: opts
-            .scope
-            .as_deref()
-            .and_then(normalize_scope)
-            .map(str::to_string),
+        scope: scope.map(str::to_string),
         domains: if domains.is_empty() {
             None
         } else {
@@ -133,15 +151,13 @@ pub async fn search(
     }
 
     // Staleness is the one shaping the client owns — only it has the local bytes.
-    let stale = stale_paths(client, &hits).await;
-    render_hits_inner(
-        &hits,
-        "no results",
+    let context = HitContext::search(
         client.local_root(),
-        true,
-        &stale,
-        opts.expand,
-    )
+        client.codebase_raw(),
+        opts.scope.is_none() && opts.codebase_ids.is_empty() && client.codebase_raw().is_some(),
+    );
+    let stale = stale_paths_in_context(client, &hits, context).await;
+    render_hits_inner(&hits, "no results", context, true, &stale, opts.expand)
 }
 
 fn normalize_scope(scope: &str) -> Option<&'static str> {
@@ -161,30 +177,54 @@ fn normalize_scope(scope: &str) -> Option<&'static str> {
 /// a genuine hash mismatch (or a file that's gone). Only the hits' own paths
 /// are hashed, not the whole tree.
 pub(crate) async fn stale_paths(client: &Client, hits: &[api::SearchHit]) -> HashSet<String> {
-    let mut stale = HashSet::new();
+    let context = HitContext::search(client.local_root(), client.codebase_raw(), true);
+    stale_paths_in_context(client, hits, context).await
+}
+
+async fn stale_paths_in_context(
+    client: &Client,
+    hits: &[api::SearchHit],
+    context: HitContext<'_>,
+) -> HashSet<String> {
     let Some(root) = client.local_root() else {
         // Server-pulled codebase with no local bytes — staleness is a
         // local-edit concern, so there's nothing to compare.
-        return stale;
+        return HashSet::new();
     };
-    let paths: HashSet<&str> = hits.iter().filter_map(|h| h.path.as_deref()).collect();
+    let paths: HashSet<String> = hits
+        .iter()
+        .filter(|hit| context.root_for(hit).is_some())
+        .filter_map(|hit| hit.path.clone())
+        .collect();
     if paths.is_empty() {
-        return stale;
+        return HashSet::new();
     }
     let Ok(catalog) = catalog_hashes(client).await else {
-        return stale;
+        return HashSet::new();
     };
-    for rel in paths {
-        // Only decide when the catalog has a recorded hash for this path; an
-        // unknown path (not yet catalogued) isn't flagged, to avoid noise.
-        let Some(Some(indexed)) = catalog.get(rel) else {
-            continue;
-        };
-        if is_stale(indexed, local_blake3(&root.join(rel)).as_deref()) {
-            stale.insert(rel.to_string());
+    let root = root.to_path_buf();
+    // Hashing local content can block on storage. A failed freshness check only
+    // omits annotations; it never authorizes an edit or changes indexed state.
+    tokio::task::spawn_blocking(move || {
+        let mut stale = HashSet::new();
+        for rel in paths {
+            // Only decide when the catalog has a recorded hash for this path; an
+            // unknown path (not yet catalogued) isn't flagged, to avoid noise.
+            let Some(Some(indexed)) = catalog.get(&rel) else {
+                continue;
+            };
+            let local = std::fs::canonicalize(root.join(&rel))
+                .ok()
+                .filter(|path| path.starts_with(&root))
+                .and_then(|path| local_blake3(&path));
+            if is_stale(indexed, local.as_deref()) {
+                stale.insert(rel);
+            }
         }
-    }
-    stale
+        stale
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// Whether a hit is stale: its `local` hash differs from the `indexed` one, or

@@ -8,9 +8,9 @@
 //! with the installation id and use that opaque value both for sync arbitration
 //! and for a deterministic, tenant-unique local codebase slug.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result, ensure};
 
 const MAX_SLUG_LEN: usize = 120;
 
@@ -18,14 +18,13 @@ const MAX_SLUG_LEN: usize = 120;
 /// the same checkout intentionally produce the same value; another clone gets a
 /// different value even when it points at the same Git remote.
 pub(crate) fn source_id(dir: &Path) -> Result<String> {
+    let dir = std::fs::canonicalize(dir)
+        .with_context(|| format!("resolve checkout identity {}", dir.display()))?;
+    ensure!(dir.is_dir(), "checkout identity requires a directory");
     let installation_id = crate::config::installation_id()?;
-    Ok(source_id_for(&installation_id, dir))
+    Ok(source_id_for(&installation_id, &dir))
 }
 
-/// A deterministic slug for this checkout. `display_name` remains the friendly
-/// folder name; the slug carries the opaque checkout identity so two folders
-/// with that same name can coexist in one tenant. Using the full digest makes a
-/// collision a cryptographic event rather than a naming race.
 /// The label a codebase is shown under, from the checkout's folder name.
 ///
 /// Only for a server that derives projects itself. There the slug carries no
@@ -45,27 +44,10 @@ pub(super) fn label(display_name: &str) -> String {
     }
 }
 
-/// The slug for the PROJECT a checkout belongs to, when there is a remote to
-/// say what that project is.
-///
-/// A remote is a real project identity — every clone of it is the same
-/// project, which is exactly what a catalog should hold one entry for. The
-/// server gives each checkout a copy of its own inside that entry, so clones
-/// no longer have to be separate codebases to avoid deleting each other's
-/// files — which is what used to leave a tenant holding ten of them for one
-/// repository.
-///
-/// `None` when the folder has no remote: a bare folder name is not a project
-/// identity, and merging two unrelated `src` directories on that guess is the
-/// expensive mistake. Those keep a slug of their own.
-pub(super) fn project_slug(remote_url: Option<&str>) -> Option<String> {
-    let remote = remote_url?.trim().trim_end_matches('/');
-    let remote = remote.strip_suffix(".git").unwrap_or(remote);
-    let name = remote.rsplit(['/', ':']).next()?;
-    let slug = slugify(name);
-
-    (!slug.is_empty() && slug != "codebase").then_some(slug)
-}
+/// A deterministic slug for this checkout. `display_name` remains the friendly
+/// folder name; the slug carries the opaque checkout identity so two folders
+/// with that same name can coexist in one tenant. Using the full digest makes a
+/// collision a cryptographic event rather than a naming race.
 pub(super) fn slug(display_name: &str, source_id: &str) -> String {
     let suffix_len = source_id.len().min(MAX_SLUG_LEN.saturating_sub(2));
     let suffix = &source_id[..suffix_len];
@@ -78,17 +60,114 @@ pub(super) fn slug(display_name: &str, source_id: &str) -> String {
 }
 
 fn source_id_for(installation_id: &str, dir: &Path) -> String {
-    let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-    let mut path = canonical.to_string_lossy().replace('\\', "/");
-    if cfg!(windows) {
-        path.make_ascii_lowercase();
-    }
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"semctl-sync-source-v1\0");
-    hasher.update(installation_id.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(path.as_bytes());
+    if let Some(path) = legacy_identity_path(dir) {
+        // Preserve deployed identities only on the subset whose old encoding
+        // is lossless. Ambiguous paths must never claim an old shared identity.
+        hasher.update(b"semctl-sync-source-v1\0");
+        hasher.update(installation_id.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(path.as_bytes());
+    } else {
+        hasher.update(b"semctl-sync-source-v2\0");
+        hasher.update(installation_id.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(path_key(dir).as_bytes());
+    }
     hasher.finalize().to_hex().to_string()
+}
+
+fn legacy_identity_path(dir: &Path) -> Option<String> {
+    let path = dir.to_str()?;
+    if legacy_key_is_ambiguous(path) {
+        return None;
+    }
+    #[cfg(windows)]
+    {
+        Some(path.replace('\\', "/").to_ascii_lowercase())
+    }
+    #[cfg(not(windows))]
+    {
+        Some(path.to_string())
+    }
+}
+
+fn legacy_key_is_ambiguous(path: &str) -> bool {
+    // Lossy UTF-8 conversion can manufacture U+FFFD in a cache key for a
+    // different native path. Such keys cannot prove prior checkout ownership.
+    path.contains('\u{fffd}') || (cfg!(unix) && path.contains('\\'))
+}
+
+/// Reversible cache key. Unambiguous UTF-8 paths retain their existing wire shape.
+/// The reserved prefix cannot be an absolute local path on supported platforms.
+pub(crate) fn path_key(path: &Path) -> String {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    if let Some(path) = path.to_str()
+        && !legacy_key_is_ambiguous(path)
+    {
+        return path.to_string();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        format!(
+            "semctl-path:unix:{}",
+            URL_SAFE_NO_PAD.encode(path.as_os_str().as_bytes())
+        )
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let bytes: Vec<u8> = path
+            .as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        format!("semctl-path:windows:{}", URL_SAFE_NO_PAD.encode(bytes))
+    }
+}
+
+/// Decode a cache key without replacing invalid native path characters.
+pub(crate) fn path_from_key(key: &str) -> Option<PathBuf> {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    if !key.starts_with("semctl-path:") {
+        // A legacy Unix backslash key may name a shared single-manifest
+        // codebase created through the old source-id collision. It cannot
+        // authorize recovery into that codebase under the new identity.
+        if legacy_key_is_ambiguous(key) {
+            return None;
+        }
+        return Some(PathBuf::from(key));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let bytes = URL_SAFE_NO_PAD
+            .decode(key.strip_prefix("semctl-path:unix:")?)
+            .ok()?;
+        let path = PathBuf::from(std::ffi::OsString::from_vec(bytes));
+        path.is_absolute().then_some(path)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        let bytes = URL_SAFE_NO_PAD
+            .decode(key.strip_prefix("semctl-path:windows:")?)
+            .ok()?;
+        if !bytes.len().is_multiple_of(2) {
+            return None;
+        }
+        let units: Vec<u16> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        let path = PathBuf::from(std::ffi::OsString::from_wide(&units));
+        path.is_absolute().then_some(path)
+    }
 }
 
 fn slugify(name: &str) -> String {
@@ -115,7 +194,7 @@ fn slugify(name: &str) -> String {
 mod tests {
     use std::path::Path;
 
-    use super::{MAX_SLUG_LEN, label, project_slug, slug, source_id_for};
+    use super::{MAX_SLUG_LEN, label, path_from_key, path_key, slug, source_id_for};
 
     #[test]
     fn source_identity_is_stable_for_the_same_checkout() {
@@ -187,23 +266,71 @@ mod tests {
     }
 
     #[test]
-    fn every_clone_of_one_repository_resolves_to_one_project() {
-        let https = project_slug(Some("https://github.com/napbat/semctx.git"));
-        let ssh = project_slug(Some("git@github.com:napbat/semctx"));
-        let trailing = project_slug(Some("https://github.com/napbat/semctx/"));
-
-        assert_eq!(https.as_deref(), Some("semctx"));
-        assert_eq!(ssh, https);
-        assert_eq!(trailing, https);
+    fn ordinary_paths_keep_the_deployed_source_identity() {
+        let path = Path::new("/work/repo");
+        let legacy = format!("semctl-sync-source-v1\0install-a\0{}", path.display());
+        assert_eq!(
+            source_id_for("install-a", path),
+            blake3::hash(legacy.as_bytes()).to_hex().to_string()
+        );
     }
 
     #[test]
     fn a_folder_with_no_remote_keeps_a_slug_of_its_own() {
         // Nothing says two unrelated folders of this name are one project, so
         // nothing may fuse them: the checkout digest stays in the slug.
-        assert_eq!(project_slug(None), None);
-
         let source = source_id_for("install-a", Path::new("/work/src"));
         assert!(slug("src", &source).ends_with(&source));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_path_characters_cannot_alias_a_different_checkout() {
+        use std::os::unix::ffi::OsStringExt;
+
+        assert_ne!(
+            source_id_for("install", Path::new("/work/same\\checkout")),
+            source_id_for("install", Path::new("/work/same/checkout"))
+        );
+        let ambiguous = Path::new("/work/same\\checkout");
+        assert_eq!(path_from_key(ambiguous.to_str().unwrap()), None);
+        assert_eq!(
+            path_from_key(&path_key(ambiguous)).as_deref(),
+            Some(ambiguous)
+        );
+        let first = std::path::PathBuf::from(std::ffi::OsString::from_vec(b"/work/\xff".to_vec()));
+        let second = std::path::PathBuf::from(std::ffi::OsString::from_vec(b"/work/\xfe".to_vec()));
+        assert_eq!(first.to_string_lossy(), second.to_string_lossy());
+        assert_ne!(
+            source_id_for("install", &first),
+            source_id_for("install", &second)
+        );
+        let replacement = Path::new("/work/\u{fffd}");
+        assert_eq!(path_from_key(replacement.to_str().unwrap()), None);
+        assert_ne!(
+            source_id_for("install", replacement),
+            source_id_for("install", &first)
+        );
+        assert_eq!(
+            path_from_key(&path_key(replacement)).as_deref(),
+            Some(replacement)
+        );
+        assert_eq!(
+            path_from_key(&path_key(&first)).as_deref(),
+            Some(first.as_path())
+        );
+        assert_eq!(
+            path_from_key(&path_key(&second)).as_deref(),
+            Some(second.as_path())
+        );
+        assert_ne!(path_key(&first), path_key(&second));
+    }
+
+    #[test]
+    fn malformed_native_path_keys_fail_closed() {
+        assert_eq!(path_from_key("semctl-path:unknown:AA"), None);
+        assert_eq!(path_from_key("semctl-path:unix:!"), None);
+        assert_eq!(path_from_key("semctl-path:unix:"), None);
+        assert_eq!(path_from_key("semctl-path:unix:cmVsYXRpdmU"), None);
     }
 }

@@ -85,8 +85,8 @@ pub async fn run(args: IndexArgs, cli: &Cli) -> Result<()> {
     let dir = std::fs::canonicalize(&args.path)
         .with_context(|| format!("resolve path {}", args.path.display()))?;
 
-    // Persist stamps/hashes before upload so a restarted command only reads
-    // files that changed while it was away. Source contents are not cached.
+    // Persist hashes and filter decisions. Every scan verifies current bytes
+    // before reusing a decision. Source contents are not cached on disk.
     let cache = Mutex::new(crate::sync::SyncCache::persistent());
     let outcome =
         crate::sync::sync_with_progress(&client, &dir, &cache, report_sync_progress).await?;
@@ -119,7 +119,9 @@ fn sync_progress_message(progress: &SyncProgress) -> String {
         SyncProgress::Planning {
             files,
             cached_files,
-        } => format!("scanned {files} files ({cached_files} hashes reused) — checking for changes"),
+        } => format!(
+            "scanned {files} files ({cached_files} filter decisions reused) — checking for changes"
+        ),
         SyncProgress::Uploading {
             uploaded_files,
             total_files,
@@ -240,14 +242,14 @@ mod tests {
     }
 
     #[test]
-    fn scan_summary_reports_reused_hashes() {
+    fn scan_summary_reports_verified_filter_decisions() {
         let message = sync_progress_message(&SyncProgress::Planning {
             files: 80,
             cached_files: 73,
         });
         assert_eq!(
             message,
-            "scanned 80 files (73 hashes reused) — checking for changes"
+            "scanned 80 files (73 filter decisions reused) — checking for changes"
         );
     }
 

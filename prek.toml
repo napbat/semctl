@@ -44,4 +44,20 @@ hooks = [
     pass_filenames = false,
     always_run = true,
   },
+  {
+    id = "bootstrap-installer-test",
+    name = "Bootstrap installer verification tests",
+    language = "system",
+    entry = "python3 tests/bootstrap_installers.py",
+    pass_filenames = false,
+    always_run = true,
+  },
+  {
+    id = "release-source-test",
+    name = "Release source verification tests",
+    language = "system",
+    entry = "python3 tests/release_source.py",
+    pass_filenames = false,
+    always_run = true,
+  },
 ]

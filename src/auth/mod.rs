@@ -17,9 +17,17 @@ use crate::{
     config::{self, SCOPES},
 };
 
+mod session;
 mod store;
 
-pub use store::{TokenSet, clear_tokens, load_tokens, save_tokens};
+pub use session::{
+    AuthenticatedSession, authenticated_session, begin_login, clear_tokens, finish_login,
+    get_valid_access_token, normalize_server_url, set_active_tenant,
+};
+pub use store::{SessionStamp, TokenSet, load_tokens};
+
+/// Discovery and refresh can run while the login state lock is held.
+const AUTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// RFC 8628 device-authorization response from `/connect/device`.
 #[derive(Debug, Deserialize)]
@@ -62,10 +70,18 @@ struct ProtectedResourceMetadata {
 
 /// Ask the semctx server which authorization server to authenticate against —
 /// the "resource server tells the client the authority" leg of OAuth, served at
-/// `/.well-known/oauth-protected-resource` (RFC 9728). Best-effort — the caller
-/// falls back to the configured/default identity when this fails (an older
-/// server, or one that doesn't expose the document).
+/// `/.well-known/oauth-protected-resource` (RFC 9728). A missing or malformed
+/// document stops login instead of guessing where to send credentials.
 pub async fn discover_authority(http: &reqwest::Client, server_url: &str) -> Result<String> {
+    tokio::time::timeout(
+        AUTH_REQUEST_TIMEOUT,
+        discover_authority_request(http, server_url),
+    )
+    .await
+    .context("authentication discovery timed out")?
+}
+
+async fn discover_authority_request(http: &reqwest::Client, server_url: &str) -> Result<String> {
     let url = format!(
         "{}/.well-known/oauth-protected-resource",
         server_url.trim_end_matches('/')
@@ -217,6 +233,19 @@ pub async fn refresh(
     identity_url: &str,
     refresh_token: &str,
 ) -> Result<TokenSet> {
+    tokio::time::timeout(
+        AUTH_REQUEST_TIMEOUT,
+        refresh_request(http, identity_url, refresh_token),
+    )
+    .await
+    .context("credential refresh timed out")?
+}
+
+async fn refresh_request(
+    http: &reqwest::Client,
+    identity_url: &str,
+    refresh_token: &str,
+) -> Result<TokenSet> {
     let url = format!("{}/connect/token", identity_url.trim_end_matches('/'));
     let client_id = config::client_id();
     let resp = http
@@ -235,12 +264,17 @@ pub async fn refresh(
         let body = resp.text().await.unwrap_or_default();
         bail!("refresh {status}: {body}");
     }
-    let raw: TokenResponse = resp.json().await.context("parse refresh response")?;
+    let mut raw: TokenResponse = resp.json().await.context("parse refresh response")?;
+    // A successful refresh response may omit a replacement refresh token.
+    // Keep the existing token unless the authority explicitly rotates it.
+    if raw.refresh_token.is_none() {
+        raw.refresh_token = Some(refresh_token.to_string());
+    }
     Ok(materialize(raw))
 }
 
 fn materialize(raw: TokenResponse) -> TokenSet {
-    let expires_at_unix = store::now_unix() + raw.expires_in;
+    let expires_at_unix = store::now_unix().saturating_add(raw.expires_in);
     TokenSet {
         access_token: raw.access_token,
         refresh_token: raw.refresh_token,
@@ -248,24 +282,5 @@ fn materialize(raw: TokenResponse) -> TokenSet {
     }
 }
 
-/// Convenience: load the stored token, refresh if expired, save the
-/// refreshed token, return the access string ready for `Bearer`. Used
-/// by every authenticated subcommand before hitting the server.
-pub async fn get_valid_access_token(http: &reqwest::Client) -> Result<String> {
-    let cfg = config::load()?;
-    let mut tokens =
-        load_tokens()?.ok_or_else(|| anyhow!("not logged in — run `semctl auth login`"))?;
-
-    if tokens.is_expired() {
-        let refresh_tok = tokens.refresh_token.clone().ok_or_else(|| {
-            anyhow!("access token expired and no refresh token — re-run `semctl auth login`")
-        })?;
-        // Ask the server where to authenticate (RFC 9728) — the same authority
-        // login used. The CLI never caches identity, so a moved identity server
-        // is picked up on the next refresh instead of dead-ending.
-        let identity_url = discover_authority(http, &cfg.server_url(None)).await?;
-        tokens = refresh(http, &identity_url, &refresh_tok).await?;
-        save_tokens(&tokens)?;
-    }
-    Ok(tokens.access_token)
-}
+#[cfg(test)]
+mod tests;
