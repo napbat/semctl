@@ -132,11 +132,6 @@ impl CheckoutRegistry {
         }
     }
 
-    /// The coordinator for `key`, if this process has one.
-    pub(crate) fn coordinator(&self, key: &CheckoutKey) -> Option<Arc<CheckoutCoordinator>> {
-        lock(&self.coordinators).get(key).cloned()
-    }
-
     /// Keep `root` in sync for as long as the returned lease lives.
     ///
     /// An existing coordinator is reused, whichever session created it. A new
@@ -185,8 +180,8 @@ impl CheckoutRegistry {
         first_index: bool,
     ) -> Result<(CoordinatorLease, Option<Arc<InitialIndexGate>>), String> {
         let key = CheckoutKey::for_client(&client, root).await;
-        if let Some(coordinator) = self.coordinator(&key) {
-            return Ok((CoordinatorLease::take(coordinator), None));
+        if let Some(lease) = self.lease_existing(&key) {
+            return Ok((lease, None));
         }
 
         // Registering with the hub walks the tree to seed the watcher's file-id
@@ -219,7 +214,9 @@ impl CheckoutRegistry {
         let lease = CoordinatorLease::take(coordinator.clone());
 
         let published = match lock(&self.coordinators).entry(key) {
-            Entry::Occupied(entry) => Err(entry.get().clone()),
+            // The lease on the other session's coordinator is taken under the
+            // map lock, for the same reason as in `lease_existing`.
+            Entry::Occupied(entry) => Err(CoordinatorLease::take(entry.get().clone())),
             Entry::Vacant(entry) => {
                 entry.insert(coordinator.clone());
                 Ok(())
@@ -240,9 +237,23 @@ impl CheckoutRegistry {
                 drop(task);
                 coordinator.cancel();
                 drop(coordinator);
-                Ok((CoordinatorLease::take(existing), None))
+                Ok((existing, None))
             }
         }
+    }
+
+    /// A lease on the coordinator for `key`, if this process has one.
+    ///
+    /// The lease is taken while the map lock is held. The idle sweeper decides
+    /// under that same lock whether a coordinator has no lease, so a
+    /// coordinator handed out here can never be swept between the lookup and
+    /// the lease. Taking the lease is one atomic increment, so nothing waits
+    /// under the lock.
+    fn lease_existing(&self, key: &CheckoutKey) -> Option<CoordinatorLease> {
+        lock(&self.coordinators)
+            .get(key)
+            .cloned()
+            .map(CoordinatorLease::take)
     }
 
     /// Remove every coordinator no session has held for the idle grace.
