@@ -68,6 +68,10 @@ fn init_tracing(command: &Command) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default));
     fmt()
         .with_env_filter(filter)
+        // A daemon's stderr is its log file, not a terminal. Colour escapes
+        // would make that file hard to read, so they are written only when a
+        // terminal is there to interpret them.
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .with_writer(std::io::stderr)
         .with_target(false)
         .without_time()

@@ -54,6 +54,7 @@ semctl index        # register + sync the current repo for indexing
 | `semctl files …`                                      | File catalog (`tree` / filtered `list`) and revision-pinned line/byte source reads.                                    |
 | `semctl inspect …`                                    | Projects/domains plus visible codebases and the effective server/tenant/index/graph context.                          |
 | `semctl mcp`                                          | Run as an MCP stdio server (launched by the host, not by hand).                                                       |
+| `semctl daemon status` / `stop`                       | Report or end the shared local daemon that serves the MCP sessions.                                                   |
 | `semctl install`                                      | Add/remove the editor/agent integrations.                                                                             |
 | `semctl uninstall`                                    | Reverse `install`: unwire the tools, remove from PATH, delete the binary (`--purge` also drops config + credentials). |
 | `semctl upgrade`                                      | Update the binary and refresh each installed editor/agent integration.                                                |
@@ -116,6 +117,69 @@ migrates your config + credentials to `~/.config/semctl`, removes the old binary
 and its PATH entry, and re-points the Claude Code / Codex plugin at semctl's
 source (the plugin itself stays the same). A `cargo install`'d `semctx` is left
 for you to remove with `cargo uninstall semctx-cli`.
+
+## Shared local daemon
+
+`semctl mcp` can serve its session from one shared local process instead of
+serving it in the process the host started. One daemon serves every MCP session
+of one operating-system user and one configuration directory. It keeps one
+filesystem watcher, one reconcile queue, one scan cache, and one HTTP connection
+pool per checkout, however many sessions use that checkout. Nothing changes at
+the MCP tool boundary: the host still launches `semctl mcp`, and that process
+becomes a byte pump between the host and the daemon.
+
+`SEMCTX_MCP_DAEMON` selects the role of a `semctl mcp` invocation:
+
+| Value | What it does |
+| ------------------ | ----------------------------------------------------------------------------------------------------------- |
+| `auto` (default) | Attach to the daemon, start one when none is running, and serve the session in this process when that fails. |
+| `off` | Serve the session in this process, as every earlier version did. |
+| `require` | Attach to the daemon, start one when none is running, and exit with status 1 when that fails. |
+
+Two commands inspect and end a running daemon:
+
+```sh
+semctl daemon status        # version, pid, uptime, sessions, permits, checkouts
+semctl daemon status --json # the same facts as one JSON object
+semctl daemon stop          # finish the sessions and exit
+```
+
+Both exit with status 1 and report `no daemon is running for this
+configuration` when no daemon answers. A daemon also exits by itself after ten
+minutes with no session.
+
+| Env                            | What it sets                                                                                   |
+| ------------------------------ | ---------------------------------------------------------------------------------------------- |
+| `SEMCTX_DAEMON_IDLE_SECS`      | Seconds with no session before the daemon exits. Default 600; `0` exits with the last session.  |
+| `SEMCTX_DAEMON_SCAN_PERMITS`   | Concurrent checkout scans. Default: half the available CPUs, at least 2 and at most 8.          |
+| `SEMCTX_DAEMON_UPLOAD_PERMITS` | Concurrent upload requests across every checkout. Default 8.                                    |
+| `SEMCTX_DAEMON_REMOTE_PERMITS` | Concurrent remote requests from tool calls. Default 64.                                         |
+
+Each permit override is clamped to the range 1 to 1024.
+
+The endpoint and the daemon log live in the same place on each platform:
+
+| Platform | Endpoint                                                             | Log                                     |
+| -------- | -------------------------------------------------------------------- | --------------------------------------- |
+| Linux    | `$XDG_RUNTIME_DIR/semctl/<id>.sock`, else `/tmp/semctl-<uid>/<id>.sock` | `<same directory>/<id>.log`             |
+| macOS    | `$TMPDIR/semctl/<id>.sock`, else `/tmp/semctl-<uid>/<id>.sock`         | `<same directory>/<id>.log`             |
+| Windows  | `\\.\pipe\semctl-<id>`                                                 | `%LOCALAPPDATA%\semctl\daemon-<id>.log` |
+
+`<id>` is a hash of the configuration directory, the build version, and the
+user. A new version therefore starts its own daemon and never attaches to a
+daemon of another version.
+
+On Unix the runtime directory and the socket are owner-only, semctl refuses a
+runtime directory it does not own or one that carries group or other permission
+bits, and the daemon checks each peer's user id before it reads a handshake. On
+Windows the pipe carries a security descriptor that grants the current user's
+SID alone, the first instance of the pipe name is the election, and the client
+opens the pipe at identification level so the server cannot impersonate it.
+Secrets travel only inside the handshake body: no token appears in an endpoint
+name, a command argument, a log line, or status output.
+
+The daemon is exercised at runtime on Linux only. The Windows and macOS paths
+are compile-checked on every change and have no runtime measurements yet.
 
 ## Updating
 

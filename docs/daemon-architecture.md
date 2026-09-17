@@ -1,8 +1,11 @@
 # Shared local daemon architecture
 
-Status: design for the `v0.2` branch. Implementation follows the stages at the
-end of this document. The feasibility study that motivates this design is
+Status: built on the `v0.2` branch, in the stages at the end of this document.
+This document describes the design as it was built. It is not a change log.
+The feasibility study that motivates the design is
 [reports/shared-daemon-feasibility.md](../reports/shared-daemon-feasibility.md).
+The measurements that decide the default are
+[reports/shared-daemon-results.md](../reports/shared-daemon-results.md).
 
 ## Goals
 
@@ -21,7 +24,7 @@ end of this document. The feasibility study that motivates this design is
 ## Process model
 
 ```text
-host ──stdio──▶ semctl mcp (byte pump, no Tokio) ──local socket / named pipe──▶ semctl daemon
+host ──stdio──▶ semctl mcp (byte pump, one current-thread runtime) ──local socket / named pipe──▶ semctl daemon
                                                                                   ├── Session (one per connection): McpServer over the stream
                                                                                   ├── Engine (shared): CheckoutRegistry, WatchHub, Scheduler, HttpTransport
                                                                                   └── CheckoutCoordinator (one per checkout key): watcher lease, reconcile queue, cache, jobs, readiness
@@ -31,13 +34,22 @@ Three roles share one binary:
 
 | Role | Entry | Runtime | Responsibility |
 | --- | --- | --- | --- |
-| Client | `semctl mcp` with daemon mode enabled | No Tokio runtime. Two blocking threads. | Attach handshake, then copy bytes between stdio and the daemon connection. Start a daemon when none is running. |
+| Client | `semctl mcp` with daemon mode enabled | One current-thread Tokio runtime. No worker pool. | Attach handshake, then copy bytes between stdio and the daemon connection. Start a daemon when none is running. |
 | Daemon | `semctl daemon run` (hidden) | Multi-thread Tokio, bounded worker count | Accept connections, build one `Session` per connection, own the shared `Engine`, exit when idle. |
 | Standalone | `semctl mcp` with daemon mode off | Multi-thread Tokio, as today | Build one `Session` from the process environment and serve it over stdio with the same `Engine` type. |
 
 The client must decide its role before any Tokio runtime exists. `main` parses
-the command line first and enters `#[tokio::main]`-equivalent code only for the
-daemon and standalone roles.
+the command line first and builds no runtime itself. Each role then builds the
+runtime it needs.
+
+The client role builds one current-thread runtime rather than no runtime at
+all. A Windows named pipe must be opened for overlapped input and output,
+because Windows serializes the operations on one file object opened for
+synchronous input and output. Two blocking threads on one such pipe would
+deadlock: the read of the answer would hold back the write of the request.
+Tokio's named pipe types already open the pipe for overlapped operation, so the
+pump is asynchronous on both platforms and one thread drives it. The client
+still owns no engine, no watcher, and no worker pool.
 
 ## Module map
 
@@ -59,20 +71,24 @@ src/ipc/
   handshake.rs    Attach and control wire types, protocol version, size and time limits.
   unix.rs         Unix domain socket listener, lock-file election, stale socket cleanup, peer uid check.
   windows.rs      Named pipe server and client options, first-instance election, security descriptor, QoS.
-  pump.rs         Blocking byte pump used by the client role.
+  pump.rs         Asynchronous byte pump used by the client role.
 src/daemon/
-  mod.rs          `semctl daemon` command surface: run, status, stop.
+  mod.rs          Role selection: daemon, client, or standalone.
+  client.rs       The client role: daemon mode, attach, fallback policy.
+  control.rs      The `semctl daemon status` and `semctl daemon stop` client.
   serve.rs        Listener loop, session accept, idle timer, drain, signals.
   session.rs      Handshake -> SessionContext -> McpServer::serve over the stream.
   spawn.rs        Detached daemon launch from a client, election retry.
+  status.rs       The status shape both readers share.
 ```
 
 Existing modules change as follows:
 
 - `src/mcp/mod.rs`: `McpServer` takes `(SessionContext, Arc<Engine>)`. `Shared`
-  keeps only per-session state: base client, launch directory, pinned flag, bound
-  client, freshness cache, and the set of coordinator leases this session holds.
-  `jobs`, `watched`, and `initial_indexes` move to the engine.
+  keeps the session context, the base client, the launch directory, the pinned
+  flag, the bound client, the freshness cache, one handle to the shared engine,
+  and the coordinator leases this session holds. Everything else moves to the
+  engine: `jobs`, `watched`, and `initial_indexes`.
 - `src/sync/background.rs` and `src/sync/watcher.rs`: their lifecycle logic moves
   into `CheckoutCoordinator` and `WatchHub`. The sync engine in `src/sync/mod.rs`
   stays the single reconcile implementation.
@@ -156,18 +172,26 @@ coordinators. That duplicates a watcher, but never mixes authorization.
 ### CheckoutCoordinator
 
 - Owns `Mutex<SyncCache>`, `last_job: Option<LastJob>`, `gate: Option<Arc<InitialIndexGate>>`,
-  a `WatchRegistration` handle, the trigger channel, and the reconcile task handle.
-- Triggers: `Startup`, `Watch`, `Periodic`, `Explicit`, `AfterEdit`. All triggers
+  its watch state (a `WatchRegistration` or the reason it has none), the trigger
+  channel with its overflow flag, and the reconcile task handle.
+- Triggers: `Startup`, `Watch`, `Periodic`, and `Explicit`. There is no separate
+  edit trigger. An applied edit raises `Explicit`, because an edit and a tool
+  that asks for a sync want the same thing: one reconcile, now. All triggers
   go through one bounded channel into one task. The task drains the channel
   before each run, so a burst of triggers produces one reconcile. A trigger that
   arrives during a run schedules exactly one follow-up run.
 - Every reconcile acquires a scan permit from the `Scheduler` before calling
   `sync::sync`. Upload concurrency inside `sync` acquires upload permits.
-- Periodic backstop: the coordinator owns its own timer. Interval is
-  `resync_secs` when the watcher is unavailable and `5 * resync_secs` when the
-  watcher is active. The first tick is offset by a random fraction of the
-  interval so 1,000 coordinators do not tick together. `resync_secs = 0`
-  disables the timer.
+- Periodic backstop: the coordinator owns its own timer. `resync_secs` comes
+  from the session that created the coordinator and defaults to 60 seconds. The
+  interval is `resync_secs` when the watcher is unavailable and
+  `5 * resync_secs` when the watcher is active: an active watcher reports real
+  edits inside its debounce window, so the timer is only a backstop against
+  events the platform dropped, and running it five times less often is what
+  makes 1,000 watched checkouts affordable. The first tick is offset by a
+  fraction of the interval derived from the root path, so 1,000 coordinators do
+  not tick together. `resync_secs = 0` disables the timer and leaves the
+  startup run and explicit triggers.
 - Cancellation: dropping the coordinator aborts the task. A running scan observes
   cancellation through the existing `sync::blocking::Cancellation`.
 - The coordinator exposes `status() -> CoordinatorStatus` for `sync_status` and
@@ -179,9 +203,12 @@ coordinators. That duplicates a watcher, but never mixes authorization.
 - One `notify_debouncer_full` instance per process, created lazily. On Linux this
   means one inotify instance for all roots instead of one per root.
 - `register(root) -> Result<WatchRegistration>` adds the root recursively and
-  records the coordinator's sender. External policy sources such as the global
-  gitignore are registered with reference counts and routed to every coordinator
-  that observes them.
+  records the coordinator's sender. Root watches and external policy sources
+  such as the global gitignore are both reference counted, so two registrations
+  on one root share one platform watch and the hub releases it with the last of
+  them. Two registrations on one root are normal: two sessions can attach one
+  checkout at the same time, and two credential scopes need two coordinators
+  for it. Events are routed to every coordinator that observes them.
 - The debouncer callback does no filesystem I/O. It groups event paths by
   registered root (every registered root that contains the path receives the
   batch) and calls `try_send` on that coordinator's bounded channel. When the
@@ -212,9 +239,12 @@ clamped to `1..=1024`.
 
 - `InitialIndexGate` semantics are unchanged. Gates live in the registry keyed
   by canonical root.
-- A session waiting for an empty cross-codebase selector waits only for gates
-  of coordinators that session holds leases on. It never waits on another
-  session's first index.
+- Readiness is scoped by the session's leases. The lease set in `Shared` is the
+  session's readiness scope: a retrieval tool with an empty cross-codebase
+  selector waits for the first-index gates of the checkouts this session holds
+  leases on and of no others. It never waits on another session's first index.
+  `sync_status` bypasses the gates on purpose, so progress stays observable
+  while a first index runs.
 - `sync_status` reads the coordinator's `last_job` and watcher state. A pinned
   session without a local root reports the last job of any leased coordinator
   bound to that codebase id.
@@ -297,8 +327,11 @@ The client spawns `current_exe daemon run` detached:
 
 ### Handshake
 
-Line-delimited JSON, UTF-8, one line per message, at most 64 KiB per line, 5
-second timeout for the exchange.
+Line-delimited JSON, UTF-8, one line per message, 5 second timeout for the
+exchange. A line that arrives from a peer is at most 64 KiB, because that bound
+decides how much an untrusted connection can make the reader allocate. A
+control answer carries one entry per checkout, so it takes its own bound of
+8 MiB.
 
 Client to daemon:
 
@@ -330,11 +363,15 @@ and exits.
 
 ### Client byte pump
 
-- Thread A: stdin to connection. On stdin EOF: Unix shuts down the write half.
-  Windows closes the connection.
-- Thread B: connection to stdout. On EOF or error the process exits. Exit status
-  is 0 after a clean daemon close and 1 after a transport error.
-- The main thread joins B, then waits up to 2 seconds for A.
+Two tasks on the client's current-thread runtime, so neither direction can
+block the other:
+
+- Outbound task: stdin to connection. On stdin end of file, Unix shuts down the
+  write half and Windows closes the connection.
+- Inbound task: connection to stdout. On end of file or error the pump returns.
+  Exit status is 0 after a clean daemon close and 1 after a transport error.
+- The pump returns on the inbound report, then waits at most 2 seconds for the
+  outbound task, which is usually still waiting for standard input.
 - Writes to a closed stdout end the process with status 0.
 
 ### Daemon mode selection
@@ -343,15 +380,24 @@ and exits.
 
 | Value | Behavior |
 | --- | --- |
-| `off` (default in this stage) | Standalone role. |
-| `auto` | Attach, spawn when needed. On failure log one warning to stderr and fall back to standalone. |
+| `off` | Standalone role. |
+| `auto` (default) | Attach, spawn when needed. On failure log one warning to stderr and fall back to standalone. |
 | `require` | Attach, spawn when needed. On failure exit with status 1 and a clear error. |
 
-The default flips to `auto` in a later stage after the measurement gate passes.
+An absent, empty, or unknown value means the default. An unknown value also
+raises one warning. The default is `auto` because every line of the measurement
+gate passed; see the results report.
 
 ### Daemon lifecycle
 
-- Idle exit after `SEMCTX_DAEMON_IDLE_SECS` (default 600) with zero sessions.
+- Idle exit after `SEMCTX_DAEMON_IDLE_SECS` (default 600) with no session. The
+  rule is "no session for N seconds". The deadline is an absolute instant taken
+  when the last session ended, so a client that only connects cannot postpone
+  it: `semctl daemon status` in a loop must not keep an unused daemon alive. An
+  open connection defers the decision only at the instant the deadline passes,
+  so a client that is attaching right then is not cut off. A value of `0` means
+  "exit as soon as the last session ends", which is what a test that measures
+  the idle exit asks for.
 - `SIGTERM`, `SIGINT`, and Windows console control events start a drain: stop
   accepting, cancel sessions, release coordinators, exit.
 - Runtime: multi-thread Tokio with `worker_threads = clamp(available_parallelism, 2, 8)`
@@ -364,6 +410,7 @@ The default flips to `auto` in a later stage after the measurement gate passes.
 | Bound | Value | Enforced by |
 | --- | --- | --- |
 | Handshake line | 64 KiB | `ipc::handshake` |
+| Control answer | 8 MiB | `ipc::handshake` |
 | Sessions | No fixed cap. Each session costs one task set and one `Client`. | Listener |
 | Coordinator trigger channel | 64 batches | `CheckoutCoordinator` |
 | Scan concurrency | Scheduler `scan` permits | `Scheduler` |
@@ -376,8 +423,8 @@ The default flips to `auto` in a later stage after the measurement gate passes.
 
 | Key | Role | Meaning |
 | --- | --- | --- |
-| `SEMCTX_MCP_DAEMON` | client | `off`, `auto`, `require` |
-| `SEMCTX_DAEMON_IDLE_SECS` | daemon | Idle exit delay |
+| `SEMCTX_MCP_DAEMON` | client | `off`, `auto`, `require`. Default `auto`. |
+| `SEMCTX_DAEMON_IDLE_SECS` | daemon | Idle exit delay in seconds. Default 600. `0` exits as soon as the last session ends. |
 | `SEMCTX_DAEMON_SCAN_PERMITS` | daemon, standalone | Scheduler override |
 | `SEMCTX_DAEMON_UPLOAD_PERMITS` | daemon, standalone | Scheduler override |
 | `SEMCTX_DAEMON_REMOTE_PERMITS` | daemon, standalone | Scheduler override |
@@ -417,9 +464,10 @@ target's C toolchain. When the toolchain is missing, the stage summary says so.
 
 ## Measurement gate
 
-Extend `reports/measure_mcp_processes.py` with a `--daemon` flag that runs the
-same cases through the daemon and records the daemon process with its clients.
-The gate for flipping the default to `auto`:
+`reports/measure_mcp_processes.py` runs the same cases in both modes. Its
+`--mode daemon` records the daemon process beside its clients, and its
+`--checkouts` option spreads the clients over several checkouts. The gate for
+flipping the default to `auto`:
 
 - 100 clients on one checkout: one startup manifest and one manifest per settled
   edit burst.
@@ -427,15 +475,18 @@ The gate for flipping the default to `auto`:
 - Thread and file descriptor growth bounded by the client pump cost.
 - No tool latency regression beyond the budget set in the report.
 
+Each line is evaluated against measurements in
+[reports/shared-daemon-results.md](../reports/shared-daemon-results.md).
+
 ## Stages
 
-| Stage | Scope | Exit condition |
-| --- | --- | --- |
-| 1a | `SessionContext`, `CredentialSource`, `HttpTransport`; `Client` and `auth` take them; standalone `mcp::run` builds the context from the process. | All existing tests pass. No environment read remains inside `client`, `auth::session` token fetch, or `mcp` session paths. |
-| 1b | `ipc` module: endpoint identity, runtime directory, Unix and Windows listeners and connectors, handshake types, byte pump. Isolated worktree. | Unit tests pass. Linux build green. Windows and macOS `cargo check` when possible. |
-| 2 | `engine`: registry, coordinator, watch hub, scheduler. `McpServer` uses the engine. `background.rs` and `watcher.rs` responsibilities move. Readiness and jobs rescoped. | All existing tests pass. New unit tests pass. Standalone behavior unchanged at the tool boundary. |
-| 3 | `daemon` command, client role in `main`, spawn and election, status and stop. | Integration tests pass. |
-| 4 | Measurement harness `--daemon`, results recorded, docs updated, version bump to 0.2.0. | Measurement gate evaluated and recorded. |
+| Stage | Scope | Commits | Status |
+| --- | --- | --- | --- |
+| 1a | `SessionContext`, `CredentialSource`, `HttpTransport`; `Client` and `auth` take them; standalone `mcp::run` builds the context from the process. | `f527804`, `c39f2cb` | Complete |
+| 1b | `ipc` module: endpoint identity, runtime directory, Unix and Windows listeners and connectors, handshake types, byte pump. Built in a separate worktree on `v0.2-ipc`. | `f9e82e0`, `7d39760`, merged by `e1bf613` | Complete |
+| 2 | `engine`: registry, coordinator, watch hub, scheduler. `McpServer` uses the engine. `background.rs` and `watcher.rs` responsibilities move. Readiness and jobs rescoped. | `e761b8a`, `cd049e1`, `7c3968b`, `2533055`, `364a1d5` | Complete |
+| 3 | `daemon` command, client role in `main`, spawn and election, status and stop. | `ba8c5f7`, `58d5986`, `edb1d87` | Complete |
+| 4 | Daemon and multi-checkout cases in the measurement harness, results recorded, documents updated, default decided, version 0.2.0. | The commits of this stage | Complete |
 
 ## Non-goals in this iteration
 
