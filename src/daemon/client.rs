@@ -37,10 +37,14 @@ const SPAWNED_DEADLINE: Duration = Duration::from_secs(10);
 /// What a `semctl mcp` invocation does about the shared daemon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DaemonMode {
-    /// Serve this session in this process. The default in this stage.
+    /// Serve this session in this process, as every version before 0.2.0 did.
     Off,
     /// Attach to a daemon, start one when needed, and serve the session in
-    /// this process when that fails.
+    /// this process when that fails. The default.
+    ///
+    /// The measurements in `reports/shared-daemon-results.md` are why this is
+    /// the default: one daemon replaces one watcher, one reconcile queue, and
+    /// one runtime per session, and it falls back when it cannot serve.
     Auto,
     /// Attach to a daemon, start one when needed, and fail when that fails.
     Require,
@@ -54,12 +58,17 @@ impl DaemonMode {
 
     /// The pure mapping behind [`Self::from_environment`].
     ///
-    /// An unknown value means `off` with one warning: a typo must not silently
-    /// change which role serves a session, and it must not stop the session
-    /// from being served either.
+    /// An absent, empty, or unknown value means the default, which is the rule
+    /// every other environment key in this program follows. An unknown value
+    /// also raises one warning, because a typo must be visible. The default is
+    /// safe for a typo: `auto` serves the session in this process when no
+    /// daemon can serve it.
     fn parse(raw: Option<&str>) -> Self {
         let value = raw.map(str::trim).unwrap_or_default();
-        if value.is_empty() || value.eq_ignore_ascii_case("off") {
+        if value.is_empty() {
+            return Self::Auto;
+        }
+        if value.eq_ignore_ascii_case("off") {
             return Self::Off;
         }
         if value.eq_ignore_ascii_case("auto") {
@@ -70,9 +79,9 @@ impl DaemonMode {
         }
         warn!(
             variable = DAEMON_MODE_VAR,
-            value, "unknown daemon mode; serving this session in this process"
+            value, "unknown daemon mode; using the default"
         );
-        Self::Off
+        Self::Auto
     }
 }
 
@@ -153,9 +162,16 @@ mod tests {
     use super::DaemonMode;
 
     #[test]
-    fn an_unset_or_empty_daemon_mode_serves_the_session_in_this_process() {
-        for value in [None, Some(""), Some("  "), Some("off"), Some("OFF")] {
-            assert_eq!(DaemonMode::parse(value), DaemonMode::Off, "{value:?}");
+    fn an_unset_or_empty_daemon_mode_attaches_to_the_shared_daemon() {
+        for value in [None, Some(""), Some("  ")] {
+            assert_eq!(DaemonMode::parse(value), DaemonMode::Auto, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn only_an_explicit_off_serves_the_session_in_this_process() {
+        for value in ["off", "OFF", " Off "] {
+            assert_eq!(DaemonMode::parse(Some(value)), DaemonMode::Off, "{value}");
         }
     }
 
@@ -173,11 +189,12 @@ mod tests {
         }
     }
 
-    /// A typo must not stop a session from being served.
+    /// A typo must not stop a session from being served, and must not turn
+    /// the shared daemon off by accident either.
     #[test]
-    fn an_unknown_daemon_mode_falls_back_to_off() {
+    fn an_unknown_daemon_mode_falls_back_to_the_default() {
         for value in ["on", "true", "1", "requires"] {
-            assert_eq!(DaemonMode::parse(Some(value)), DaemonMode::Off, "{value}");
+            assert_eq!(DaemonMode::parse(Some(value)), DaemonMode::Auto, "{value}");
         }
     }
 }

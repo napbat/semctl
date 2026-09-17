@@ -171,6 +171,10 @@ impl Checkout {
             .current_dir(cwd)
             .env("XDG_CONFIG_HOME", &self.config)
             .env("SEMCTX_TOKEN", "offline-test-token")
+            // Every command here runs in this process, including `mcp`. Pin
+            // the role so the default of `SEMCTX_MCP_DAEMON` cannot move an
+            // MCP session into a shared daemon.
+            .env("SEMCTX_MCP_DAEMON", "off")
             .env("NO_PROXY", "127.0.0.1,localhost")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
