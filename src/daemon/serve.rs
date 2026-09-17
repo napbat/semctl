@@ -12,9 +12,9 @@
 //! - Every connection is one task in one [`JoinSet`]. The task owns its
 //!   [`Stream`], so ending the task closes that connection.
 //! - Every task holds a connection guard, and an attached session holds a
-//!   session guard as well. The guards are what the idle timer and the status
-//!   line count, and a dropped guard is also correct for a task that was
-//!   aborted.
+//!   session guard as well. The guards are what the status line reports and
+//!   what the idle exit decides on, and a dropped guard is also correct for a
+//!   task that was aborted.
 //! - The drain aborts every task, which closes every connection. A connected
 //!   client observes end of file, which is the same event as a daemon that
 //!   went away, and its host reconnects if it wants another session.
@@ -23,11 +23,13 @@ use std::io;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::{Mutex as StdMutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use super::{VERSION, session, status};
@@ -36,7 +38,7 @@ use crate::ipc::handshake::{self, HandshakeError, PROTOCOL, Request, Response};
 use crate::ipc::{Election, Endpoint, Listener, Stream};
 use crate::session::PER_SESSION_VARS;
 
-/// How long the daemon stays alive with no connection.
+/// How long the daemon stays alive after its last session.
 const IDLE_SECS_VAR: &str = "SEMCTX_DAEMON_IDLE_SECS";
 
 /// Idle delay when `SEMCTX_DAEMON_IDLE_SECS` is unset or unreadable.
@@ -140,8 +142,8 @@ fn warn_about_session_environment() {
 /// The idle delay. An absent or unreadable value keeps the default, which is
 /// the rule every other environment key in this program follows.
 ///
-/// `0` means "exit as soon as nothing is connected", which is what a test that
-/// measures the idle exit asks for.
+/// `0` means "exit as soon as the last session ends", which is what a test
+/// that measures the idle exit asks for.
 fn idle_after(raw: Option<&str>) -> Duration {
     raw.and_then(|value| value.trim().parse().ok())
         .map_or(DEFAULT_IDLE, Duration::from_secs)
@@ -152,7 +154,7 @@ pub(super) struct Daemon {
     /// The shared engine. Every session holds a clone, so a second session on
     /// one checkout adds a lease and nothing else.
     engine: Arc<Engine>,
-    /// What the idle timer and the status line count.
+    /// What the status line reports and what the idle exit decides on.
     sessions: Arc<Sessions>,
     /// Notified by a `stop` control request, after its answer is on the wire.
     stop: Notify,
@@ -188,7 +190,7 @@ enum DrainReason {
     Signal,
     /// A client sent a `stop` control request.
     Stop,
-    /// Nothing was connected for the idle delay.
+    /// No session was served for the idle delay.
     Idle,
     /// The endpoint stopped accepting connections.
     ListenerFailed,
@@ -421,20 +423,29 @@ async fn answer_stop(daemon: &Arc<Daemon>, stream: &mut Stream) {
     daemon.stop.notify_one();
 }
 
-/// What one daemon has open, and how a waiter learns that it changed.
+/// What one daemon has open, and when it last had no session.
 ///
-/// Two counters, because they answer two different questions. `sessions` is
-/// what a person asked for: how many MCP sessions this daemon serves.
-/// `connections` includes a connection that is still in its handshake and a
-/// control request that is still being answered, so the idle timer cannot cut
-/// off a client that is attaching right now.
+/// Three pieces of state, because the idle exit is three different questions.
+///
+/// - `attached` is what a person asked about: the MCP sessions this daemon
+///   serves. It is also what the idle clock follows.
+/// - `idle_since` is when the last session ended, or when the daemon started.
+///   The deadline is an absolute instant, so watching a daemon cannot keep it
+///   alive: `semctl daemon status` in a loop must not stop an unused daemon
+///   from exiting.
+/// - `in_flight` is every open connection, including one still in its
+///   handshake. It never moves the deadline. It only defers the decision at
+///   the instant the deadline passes, so a client that is attaching right then
+///   is not cut off.
 pub(super) struct Sessions {
     attached: AtomicUsize,
-    connections: AtomicUsize,
+    in_flight: AtomicUsize,
+    /// `Some` while no session is attached: the instant that became true.
+    idle_since: StdMutex<Option<Instant>>,
     /// Session ids issued so far. It only ever grows, so no two sessions of
     /// one daemon share an id.
     issued: AtomicU64,
-    /// Notified after every change to either counter.
+    /// Notified after every change to any of the above.
     changed: Notify,
 }
 
@@ -442,7 +453,9 @@ impl Sessions {
     fn new() -> Self {
         Self {
             attached: AtomicUsize::new(0),
-            connections: AtomicUsize::new(0),
+            in_flight: AtomicUsize::new(0),
+            // A daemon nothing ever uses exits after one idle delay.
+            idle_since: StdMutex::new(Some(Instant::now())),
             issued: AtomicU64::new(0),
             changed: Notify::new(),
         }
@@ -455,7 +468,7 @@ impl Sessions {
 
     /// Count one open connection until the guard drops.
     fn connect(sessions: Arc<Self>) -> ConnectionGuard {
-        sessions.connections.fetch_add(1, Ordering::AcqRel);
+        sessions.in_flight.fetch_add(1, Ordering::AcqRel);
         sessions.changed.notify_waiters();
         ConnectionGuard { sessions }
     }
@@ -467,6 +480,9 @@ impl Sessions {
     pub(super) fn attach(sessions: Arc<Self>, pid: u32) -> SessionGuard {
         let ordinal = sessions.issued.fetch_add(1, Ordering::AcqRel) + 1;
         sessions.attached.fetch_add(1, Ordering::AcqRel);
+        // The daemon is in use. The clock starts again when the last session
+        // ends, not when this one began.
+        *lock(&sessions.idle_since) = None;
         sessions.changed.notify_waiters();
         SessionGuard {
             id: format!("{pid}-{ordinal}"),
@@ -474,51 +490,69 @@ impl Sessions {
         }
     }
 
-    /// Resolve once nothing has been connected for `idle`.
+    /// Resolve once this daemon has served no session for `idle`.
     ///
-    /// The wait watches `connections`, so an attaching client keeps the daemon
-    /// alive before it is a session. `idle` of zero resolves as soon as
-    /// nothing is connected.
+    /// The caller re-creates this future on every turn of its accept loop.
+    /// That is safe because the deadline is absolute: only the end of the last
+    /// session moves it.
     ///
-    /// The caller polls this inside its accept loop, so every accepted
-    /// connection and every reaped task restarts the wait. That is the
-    /// intended reading of "idle": a daemon that is being used does not exit.
+    /// `idle` of zero resolves as soon as nothing is attached and nothing is
+    /// connected.
     async fn wait_idle_for(&self, idle: Duration) {
         loop {
             let changed = self.changed.notified();
             let mut changed = std::pin::pin!(changed);
-            // Register before the counter is read. A connection that arrives
+            // Register before the state is read. A session that arrives
             // between the read and the wait would otherwise be missed.
             changed.as_mut().enable();
-            if self.connections.load(Ordering::Acquire) == 0 {
-                tokio::select! {
-                    () = tokio::time::sleep(idle) => {
-                        if self.connections.load(Ordering::Acquire) == 0 {
-                            return;
-                        }
-                    }
-                    () = changed.as_mut() => {}
+            let idle_since = *lock(&self.idle_since);
+            match idle_since {
+                // Nothing to wait for on the clock: a session is attached, or
+                // a connection is being handled right now. The next change
+                // decides.
+                None => changed.as_mut().await,
+                Some(_) if self.in_flight.load(Ordering::Acquire) > 0 => {
+                    changed.as_mut().await;
                 }
-            } else {
-                changed.as_mut().await;
+                Some(since) => {
+                    tokio::select! {
+                        () = tokio::time::sleep_until(since + idle) => {
+                            // Re-read under the deadline: a client may have
+                            // connected while the timer ran.
+                            if self.in_flight.load(Ordering::Acquire) == 0
+                                && self.attached.load(Ordering::Acquire) == 0
+                            {
+                                return;
+                            }
+                        }
+                        () = changed.as_mut() => {}
+                    }
+                }
             }
         }
     }
 
-    /// Record that a counter changed, so the idle wait starts again.
+    /// Record that the state changed, so a waiter reads it again.
     fn changed(&self) {
         self.changed.notify_waiters();
     }
 }
 
-/// One open connection, counted for the idle timer.
+/// A poisoned idle lock means a previous holder panicked while it held one
+/// instant. Recovering keeps the idle exit working; refusing would make the
+/// daemon unable to decide that it is idle.
+fn lock<T>(value: &StdMutex<T>) -> MutexGuard<'_, T> {
+    value.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// One open connection, counted while the daemon decides that it is idle.
 pub(super) struct ConnectionGuard {
     sessions: Arc<Sessions>,
 }
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
-        self.sessions.connections.fetch_sub(1, Ordering::AcqRel);
+        self.sessions.in_flight.fetch_sub(1, Ordering::AcqRel);
         self.sessions.changed();
     }
 }
@@ -538,7 +572,10 @@ impl SessionGuard {
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        self.sessions.attached.fetch_sub(1, Ordering::AcqRel);
+        if self.sessions.attached.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // The last session ended. The idle clock starts here.
+            *lock(&self.sessions.idle_since) = Some(Instant::now());
+        }
         self.sessions.changed();
     }
 }
@@ -607,57 +644,90 @@ mod tests {
         assert_eq!(sessions.session_count(), 0);
     }
 
-    /// The idle wait must not fire while a connection is still open, and it
-    /// must fire once the last one is gone.
+    /// A daemon that is serving a session must not exit.
     #[tokio::test(start_paused = true)]
-    async fn the_idle_wait_ends_only_after_the_last_connection() {
+    async fn the_idle_wait_never_ends_while_a_session_is_attached() {
         let sessions = Arc::new(Sessions::new());
-        let connection = Sessions::connect(sessions.clone());
+        let _session = Sessions::attach(sessions.clone(), 1);
 
         assert!(
             tokio::time::timeout(
-                Duration::from_secs(60),
+                Duration::from_secs(600),
                 sessions.wait_idle_for(Duration::from_secs(5))
             )
             .await
             .is_err(),
-            "an open connection must keep the daemon alive"
-        );
-
-        drop(connection);
-        assert!(
-            tokio::time::timeout(
-                Duration::from_secs(60),
-                sessions.wait_idle_for(Duration::from_secs(5))
-            )
-            .await
-            .is_ok(),
-            "the idle wait must end after the last connection"
+            "an attached session must keep the daemon alive"
         );
     }
 
-    /// A connection that arrives during the idle delay restarts it.
+    /// The clock starts when the last session ends.
     #[tokio::test(start_paused = true)]
-    async fn a_new_connection_restarts_the_idle_delay() {
+    async fn the_idle_wait_ends_after_the_last_session_leaves() {
         let sessions = Arc::new(Sessions::new());
+        let session = Sessions::attach(sessions.clone(), 1);
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        drop(session);
+
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(600),
+            sessions.wait_idle_for(Duration::from_secs(5)),
+        )
+        .await
+        .expect("the idle wait must end after the last session");
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+    }
+
+    /// Watching a daemon must not keep it alive. A control connection —
+    /// `semctl daemon status` in a loop — is not a session, and it must not
+    /// move the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_control_connection_does_not_move_the_idle_deadline() {
+        let sessions = Arc::new(Sessions::new());
+        drop(Sessions::attach(sessions.clone(), 1));
+        let started = tokio::time::Instant::now();
+
         let waiting = tokio::spawn({
             let sessions = sessions.clone();
             async move { sessions.wait_idle_for(Duration::from_secs(5)).await }
         });
+        for _ in 0..8 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            drop(Sessions::connect(sessions.clone()));
+        }
 
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        let connection = Sessions::connect(sessions.clone());
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        waiting.await.expect("the idle wait task finished");
         assert!(
-            !waiting.is_finished(),
-            "the wait must restart when something connects"
+            started.elapsed() < Duration::from_secs(6),
+            "the deadline moved to {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A connection that is attaching right when the deadline passes must not
+    /// be cut off.
+    #[tokio::test(start_paused = true)]
+    async fn an_arriving_connection_defers_the_idle_exit() {
+        let sessions = Arc::new(Sessions::new());
+        let connection = Sessions::connect(sessions.clone());
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(60),
+                sessions.wait_idle_for(Duration::from_secs(1))
+            )
+            .await
+            .is_err(),
+            "a connection in its handshake must defer the exit"
         );
 
         drop(connection);
-        tokio::time::sleep(Duration::from_secs(10)).await;
-        assert!(
-            waiting.is_finished(),
-            "the wait must end after the connection closes"
-        );
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            sessions.wait_idle_for(Duration::from_secs(1)),
+        )
+        .await
+        .expect("the exit follows once the connection is gone");
     }
 }
