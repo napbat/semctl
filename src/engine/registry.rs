@@ -283,6 +283,16 @@ impl CheckoutRegistry {
         debug!(checkouts = self.len(), "idle sweep finished");
     }
 
+    /// Every coordinator this process owns, for `semctl daemon status`.
+    ///
+    /// The handles are cloned under the map lock and reported outside it: a
+    /// status snapshot awaits each coordinator's own locks, and nothing may
+    /// hold the map lock across an await. A coordinator released while the
+    /// report is built keeps answering, because the clone kept it alive.
+    pub(crate) fn coordinators(&self) -> Vec<Arc<CheckoutCoordinator>> {
+        lock(&self.coordinators).values().cloned().collect()
+    }
+
     /// How many checkouts this process keeps in sync.
     pub(crate) fn len(&self) -> usize {
         lock(&self.coordinators).len()

@@ -159,11 +159,36 @@ impl McpServer {
     }
 
     /// Ask the engine for its one update check, on this session's behalf.
-    fn start_update_check(&self) {
+    ///
+    /// Every session does this, in both roles: the engine answers the first
+    /// caller and reuses the note for the rest.
+    pub(crate) fn start_update_check(&self) {
         self.shared.engine.start_update_check(
             self.shared.context.server.clone(),
             self.shared.context.update_check,
         );
+    }
+
+    /// Resolve this session's codebase before the first tool call.
+    ///
+    /// Binding eagerly makes the happy path ready — codebase resolved and the
+    /// checkout's reconcile started — before the host asks anything. It is one
+    /// round-trip; the heavy walk and upload run in the checkout's
+    /// coordinator, so serving still starts promptly.
+    ///
+    /// Best effort: on failure the session serves anyway and the code tools
+    /// self-heal (see [`Self::bound`]). Both roles call this, so a session
+    /// behaves the same in the daemon and in a standalone process.
+    pub(crate) async fn bind_at_startup(&self) {
+        match self.bound().await {
+            Ok(_) if self.shared.pinned => info!(
+                "codebase pinned explicitly; launch directory will not be synced into the pinned id"
+            ),
+            Ok(_) => {}
+            Err(reason) => {
+                warn!(%reason, "codebase not bound at startup; code tools will retry on demand");
+            }
+        }
     }
 
     /// The one-line "a newer semctl is published" prompt, if this session asked
@@ -739,21 +764,7 @@ pub async fn run(cli: &Cli) -> Result<()> {
 
     // Detached, best-effort check for a newer published CLI.
     server.start_update_check();
-
-    // Bind eagerly so the happy path is ready — codebase resolved and the
-    // background index kicked off — before the first tool call. This is one
-    // round-trip; the heavy walk/upload runs in the checkout's coordinator, so
-    // `serve` still starts promptly. Best-effort: on failure we serve anyway
-    // and the code tools self-heal (see `bound`).
-    match server.bound().await {
-        Ok(_) if server.shared.pinned => info!(
-            "codebase pinned explicitly; launch directory will not be synced into the pinned id"
-        ),
-        Ok(_) => {}
-        Err(reason) => {
-            warn!(%reason, "codebase not bound at startup; code tools will retry on demand");
-        }
-    }
+    server.bind_at_startup().await;
 
     let service = server
         .serve(rmcp::transport::stdio())

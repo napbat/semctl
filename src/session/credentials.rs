@@ -9,7 +9,7 @@
 use std::fmt;
 
 /// The environment variable that carries a headless access token.
-const TOKEN_VAR: &str = "SEMCTX_TOKEN";
+pub(super) const TOKEN_VAR: &str = "SEMCTX_TOKEN";
 
 /// A credential value that must not reach a log, an error message, or any other
 /// output.
@@ -96,7 +96,11 @@ impl CredentialSource {
     }
 
     /// The pure mapping behind [`Self::from_environment`].
-    fn from_token(value: Option<&str>) -> Self {
+    ///
+    /// [`super::SessionContext::from_handshake`] uses it for the token an
+    /// attach body carries, so one rule decides what counts as a credential
+    /// however the session was invoked.
+    pub(super) fn from_token(value: Option<&str>) -> Self {
         match value.filter(|token| !token.trim().is_empty()) {
             Some(token) => Self::Invocation(Secret::new(token.to_string())),
             None => Self::Stored,

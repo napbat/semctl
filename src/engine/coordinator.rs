@@ -39,6 +39,7 @@ use std::time::{Duration, Instant};
 
 use notify::event::{AccessKind, AccessMode};
 use notify::{Event, EventKind};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{Interval, MissedTickBehavior, interval_at};
@@ -159,7 +160,10 @@ impl Reconciler for IdleReconciler {
 }
 
 /// Whether this checkout has a realtime watcher.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// The daemon status line carries this value, so it is also a wire type.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum WatcherState {
     Active,
     /// No watcher, and why. The periodic re-sync runs at its short interval.
@@ -181,7 +185,10 @@ struct RunState {
 }
 
 /// One checkout, as `sync_status` and the daemon status see it.
-#[derive(Clone, Debug)]
+///
+/// `semctl daemon status` reports one of these per checkout, so this is the
+/// single source of truth for that part of the status line as well.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct CoordinatorStatus {
     pub(crate) root: PathBuf,
     pub(crate) codebase_id: Option<String>,

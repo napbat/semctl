@@ -99,6 +99,11 @@ pub enum Command {
     /// first). Speaks JSON-RPC over stdin/stdout — don't redirect them.
     Mcp,
 
+    /// The shared local daemon: `status`, `stop`. One daemon serves every
+    /// `semctl mcp` session of this user and configuration directory.
+    #[command(subcommand)]
+    Daemon(commands::daemon::DaemonCommand),
+
     /// Claude Code / Codex hook and OMP extension entry point: reads a hook event
     /// as JSON on stdin and emits prompt/session context when the repo is indexed.
     /// Invoked by the packaged integration, not run by hand.
@@ -134,6 +139,7 @@ impl Cli {
                 Ok(())
             }
             Command::Mcp => crate::mcp::run(&self).await,
+            Command::Daemon(cmd) => commands::daemon::run(cmd).await,
             Command::Hook(args) => commands::hook::run(args, &self).await,
         }
     }

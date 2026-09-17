@@ -19,6 +19,7 @@ mod client;
 mod codebase;
 mod commands;
 mod config;
+mod daemon;
 mod editing;
 mod engine;
 // Stage 1b of the shared local daemon adds the endpoint, the handshake, and the

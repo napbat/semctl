@@ -26,7 +26,7 @@ use crate::client::HttpTransport;
 
 pub(crate) use coordinator::{CoordinatorStatus, Trigger};
 pub(crate) use registry::{CheckoutKey, CheckoutRegistry, CoordinatorLease};
-pub(crate) use scheduler::{Scheduler, SchedulerSettings};
+pub(crate) use scheduler::{Scheduler, SchedulerSettings, SchedulerUsage};
 pub(crate) use watch_hub::WatchHub;
 
 /// How long a coordinator with no lease stays alive. A session that reconnects

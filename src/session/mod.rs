@@ -13,9 +13,10 @@ pub(crate) mod credentials;
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 
 use crate::cli::Cli;
+use crate::ipc::handshake::{SessionRequest, Token};
 
 pub(crate) use credentials::{CredentialScope, CredentialSource};
 
@@ -24,10 +25,28 @@ const RESYNC_SECS_VAR: &str = "SEMCTX_MCP_RESYNC_SECS";
 /// `0` turns the startup update check off. Any other value leaves it on.
 const UPDATE_CHECK_VAR: &str = "SEMCTX_MCP_UPDATE_CHECK";
 
+/// Every environment variable that describes one session.
+///
+/// A daemon serves several sessions, so none of these may describe the daemon
+/// process itself. The client removes them from the environment of a daemon it
+/// spawns, and a daemon that still finds one warns that it is ignored.
+///
+/// `SEMCTX_SERVER`, `SEMCTX_TENANT`, and `SEMCTX_CODEBASE` are declared as
+/// clap fallbacks on the global flags in [`crate::cli`]; the other two are read
+/// in this module.
+pub(crate) const PER_SESSION_VARS: [&str; 6] = [
+    credentials::TOKEN_VAR,
+    "SEMCTX_SERVER",
+    "SEMCTX_TENANT",
+    "SEMCTX_CODEBASE",
+    RESYNC_SECS_VAR,
+    UPDATE_CHECK_VAR,
+];
+
 /// Validated invocation context for one session.
 ///
-/// A later stage builds this from an attach handshake as well. Until then it is
-/// built only by [`SessionContext::from_process`].
+/// A standalone process builds it with [`SessionContext::from_process`]. A
+/// daemon builds one per connection with [`SessionContext::from_handshake`].
 #[derive(Debug)]
 pub(crate) struct SessionContext {
     /// The directory the caller invoked from. Absolute. Relative selectors
@@ -75,6 +94,32 @@ impl SessionContext {
             update_check: std::env::var(UPDATE_CHECK_VAR).ok(),
         };
         Ok(Self::build(cwd, cli, environment))
+    }
+
+    /// Build the context of a session that runs in another process.
+    ///
+    /// This is the daemon side of the attach handshake, and the only other way
+    /// a context exists. The body is external data, so it is validated here:
+    /// `cwd` must be absolute, because every relative selector resolves
+    /// against it and the daemon never falls back to its own working
+    /// directory.
+    pub(crate) fn from_handshake(request: SessionRequest) -> Result<Self> {
+        ensure!(
+            request.cwd.is_absolute(),
+            "session working directory {} is not absolute",
+            request.cwd.display()
+        );
+        Ok(Self {
+            cwd: request.cwd,
+            server: request.server,
+            tenant: request.tenant,
+            codebase: request.codebase,
+            // One rule decides what counts as a credential, whether the token
+            // came from this process or from an attach body.
+            credentials: CredentialSource::from_token(request.token.as_ref().map(Token::expose)),
+            resync_secs: request.resync_secs,
+            update_check: request.update_check,
+        })
     }
 
     /// A context for tests that never act on its fields. The working directory
@@ -129,7 +174,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        CredentialSource, Environment, SessionContext, parse_resync_secs, update_check_enabled,
+        CredentialSource, Environment, PER_SESSION_VARS, SessionContext, SessionRequest, Token,
+        parse_resync_secs, update_check_enabled,
     };
     use crate::cli::{Cli, Command};
 
@@ -197,6 +243,74 @@ mod tests {
         assert_eq!(parse_resync_secs(Some("")), None);
         assert_eq!(parse_resync_secs(Some("soon")), None);
         assert_eq!(parse_resync_secs(Some("-5")), None);
+    }
+
+    fn request(cwd: &str, token: Option<&str>) -> SessionRequest {
+        SessionRequest {
+            cwd: PathBuf::from(cwd),
+            server: Some("https://example.invalid".to_string()),
+            tenant: Some("acme".to_string()),
+            codebase: Some("id".to_string()),
+            token: token.map(Token::new),
+            resync_secs: Some(15),
+            update_check: false,
+        }
+    }
+
+    #[test]
+    fn an_attach_body_becomes_the_session_context() {
+        let context = SessionContext::from_handshake(request("/work/checkout", Some("wire-token")))
+            .expect("an absolute working directory is accepted");
+
+        assert_eq!(context.cwd, PathBuf::from("/work/checkout"));
+        assert_eq!(context.server.as_deref(), Some("https://example.invalid"));
+        assert_eq!(context.tenant.as_deref(), Some("acme"));
+        assert_eq!(context.codebase.as_deref(), Some("id"));
+        assert_eq!(context.resync_secs, Some(15));
+        assert!(!context.update_check);
+        match context.credentials {
+            CredentialSource::Invocation(secret) => assert_eq!(secret.expose(), "wire-token"),
+            CredentialSource::Stored => panic!("the attach token must authorize this session"),
+        }
+    }
+
+    /// The daemon resolves every relative selector against this field and must
+    /// never fall back to its own working directory.
+    #[test]
+    fn a_relative_working_directory_is_refused() {
+        let error = SessionContext::from_handshake(request("relative/path", None))
+            .expect_err("a relative working directory cannot resolve a selector");
+
+        assert!(error.to_string().contains("is not absolute"), "{error:#}");
+    }
+
+    #[test]
+    fn an_absent_or_blank_attach_token_means_the_stored_login() {
+        for token in [None, Some(""), Some("   ")] {
+            let context = SessionContext::from_handshake(request("/work", token))
+                .expect("an absolute working directory is accepted");
+            assert!(
+                matches!(context.credentials, CredentialSource::Stored),
+                "{token:?} must not be treated as a credential"
+            );
+        }
+    }
+
+    /// The list is what a client strips from a daemon's environment. A missing
+    /// entry would let the daemon describe every session with its own value.
+    #[test]
+    fn the_per_session_variables_are_the_documented_six() {
+        assert_eq!(
+            PER_SESSION_VARS,
+            [
+                "SEMCTX_TOKEN",
+                "SEMCTX_SERVER",
+                "SEMCTX_TENANT",
+                "SEMCTX_CODEBASE",
+                "SEMCTX_MCP_RESYNC_SECS",
+                "SEMCTX_MCP_UPDATE_CHECK",
+            ]
+        );
     }
 
     #[test]

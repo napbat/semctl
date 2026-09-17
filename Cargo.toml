@@ -140,6 +140,10 @@ windows-sys = { version = "0.61", features = [
 [dev-dependencies]
 # Throwaway directory trees for the walker's gitignore / hygiene tests.
 tempfile = "3"
+# Paused time in unit tests, so a test of the daemon's idle timer measures the
+# decision instead of waiting for a real clock. Test-only: the shipped binary
+# is built without this feature.
+tokio = { version = "1", features = ["test-util"] }
 
 [lints]
 workspace = true

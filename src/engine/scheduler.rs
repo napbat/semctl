@@ -11,6 +11,7 @@
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Concurrent full-tree scans across every coordinator.
@@ -81,6 +82,25 @@ fn permits(raw: Option<&str>, default: usize) -> usize {
         .clamp(*PERMIT_RANGE.start(), *PERMIT_RANGE.end())
 }
 
+/// How much of one permit class is free.
+///
+/// `semctl daemon status` reports this, so it is also a wire type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PermitUsage {
+    /// Permits no holder has taken.
+    pub(crate) available: usize,
+    /// Permits this class was built with.
+    pub(crate) total: usize,
+}
+
+/// How much of every permit class is free.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SchedulerUsage {
+    pub(crate) scan: PermitUsage,
+    pub(crate) upload: PermitUsage,
+    pub(crate) remote: PermitUsage,
+}
+
 /// The permits every checkout and every session competes for.
 ///
 /// The handles are `Arc` because a permit outlives the call that took it: an
@@ -90,6 +110,9 @@ pub(crate) struct Scheduler {
     scan: Arc<Semaphore>,
     upload: Arc<Semaphore>,
     remote: Arc<Semaphore>,
+    /// What each class was built with. A semaphore reports what is available,
+    /// not what it started with, and the status line needs both.
+    settings: SchedulerSettings,
 }
 
 impl Scheduler {
@@ -98,6 +121,7 @@ impl Scheduler {
             scan: Arc::new(Semaphore::new(settings.scan)),
             upload: Arc::new(Semaphore::new(settings.upload)),
             remote: Arc::new(Semaphore::new(settings.remote)),
+            settings,
         }
     }
 
@@ -120,6 +144,27 @@ impl Scheduler {
     /// request attempt.
     pub(crate) fn remote_permits(&self) -> Arc<Semaphore> {
         self.remote.clone()
+    }
+
+    /// How much of every class is free right now.
+    ///
+    /// The three readings are taken one after another, so the snapshot is not
+    /// one instant of the whole scheduler. It is a report, not a decision.
+    pub(crate) fn usage(&self) -> SchedulerUsage {
+        SchedulerUsage {
+            scan: PermitUsage {
+                available: self.scan.available_permits(),
+                total: self.settings.scan,
+            },
+            upload: PermitUsage {
+                available: self.upload.available_permits(),
+                total: self.settings.upload,
+            },
+            remote: PermitUsage {
+                available: self.remote.available_permits(),
+                total: self.settings.remote,
+            },
+        }
     }
 }
 
@@ -199,6 +244,28 @@ mod tests {
                 .is_ok_and(|permit| permit.is_some()),
             "releasing a permit must admit the waiter"
         );
+    }
+
+    /// The status line reports what is free and what the class started with.
+    #[tokio::test]
+    async fn the_usage_snapshot_reports_available_and_total_permits() {
+        let scheduler = Scheduler::new(SchedulerSettings::resolve(
+            Some("2"),
+            Some("3"),
+            Some("4"),
+            4,
+        ));
+        let uploads = scheduler.upload_permits();
+        let _held = super::permit(&uploads).await.expect("upload permit");
+
+        let usage = scheduler.usage();
+        assert_eq!((usage.scan.available, usage.scan.total), (2, 2));
+        assert_eq!(
+            (usage.upload.available, usage.upload.total),
+            (2, 3),
+            "a held permit must be missing from the available count"
+        );
+        assert_eq!((usage.remote.available, usage.remote.total), (4, 4));
     }
 
     /// Each class is counted on its own. An exhausted upload class must not
