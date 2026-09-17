@@ -401,7 +401,9 @@ async fn reject(stream: &mut Stream, reason: &str) {
 /// Answer one `status` request with one JSON line, then close.
 async fn answer_status(daemon: &Arc<Daemon>, stream: &mut Stream) {
     let report = status::snapshot(daemon).await;
-    if let Err(error) = handshake::write_line_async(stream, &report).await {
+    // One line per checkout: the answer outgrows a handshake line long before
+    // the daemon outgrows the scale it serves.
+    if let Err(error) = handshake::write_answer_async(stream, &report).await {
         debug!(%error, "could not deliver the status line");
     }
 }
@@ -416,7 +418,7 @@ async fn answer_stop(daemon: &Arc<Daemon>, stream: &mut Stream) {
         pid: daemon.pid,
         version: VERSION.to_string(),
     };
-    if let Err(error) = handshake::write_line_async(stream, &ack).await {
+    if let Err(error) = handshake::write_answer_async(stream, &ack).await {
         debug!(%error, "could not acknowledge the stop request");
     }
     info!("a client asked this daemon to stop");

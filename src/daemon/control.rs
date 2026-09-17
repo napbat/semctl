@@ -73,7 +73,7 @@ async fn exchange(stream: &mut Stream, request: &Request, name: &str) -> Result<
     handshake::write_line_async(stream, request)
         .await
         .with_context(|| format!("send the {name} request"))?;
-    handshake::read_line_async(stream)
+    handshake::read_answer_async(stream)
         .await
         .with_context(|| format!("read the {name} answer"))
 }

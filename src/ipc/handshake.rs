@@ -26,10 +26,20 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub(crate) const PROTOCOL: u32 = 1;
 
 /// Largest handshake line, including the terminating newline byte.
+///
+/// A handshake line arrives from a peer, so the bound is tight: it decides how
+/// much a connection can make this process allocate before it is trusted.
 pub(crate) const MAX_LINE_BYTES: usize = 64 * 1024;
 
-/// Largest handshake line without its terminating newline byte.
-const MAX_PAYLOAD_BYTES: usize = MAX_LINE_BYTES - 1;
+/// Largest control answer, including the terminating newline byte.
+///
+/// A control answer is the other direction: this daemon builds it for a client
+/// that already reached this endpoint, and its size grows with the number of
+/// checkouts the daemon keeps in sync. One checkout costs a few hundred bytes,
+/// so the handshake bound would cut the answer off at a few hundred checkouts,
+/// well inside the scale this daemon serves. The bound stays finite so a
+/// client still refuses an answer that cannot be a status line.
+pub(crate) const MAX_ANSWER_BYTES: usize = 8 * 1024 * 1024;
 
 /// Longest time one handshake exchange may take.
 pub(crate) const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -243,10 +253,16 @@ impl From<io::Error> for HandshakeError {
 }
 
 /// Serialize one message as a complete line, including the newline byte.
-pub(crate) fn encode<T: Serialize>(message: &T) -> Result<Vec<u8>, HandshakeError> {
+#[cfg(test)]
+fn encode<T: Serialize>(message: &T) -> Result<Vec<u8>, HandshakeError> {
+    encode_bounded(message, MAX_LINE_BYTES)
+}
+
+/// Encode one message as a complete line, within `limit` bytes.
+fn encode_bounded<T: Serialize>(message: &T, limit: usize) -> Result<Vec<u8>, HandshakeError> {
     let mut line = serde_json::to_vec(message)
         .map_err(|error| HandshakeError::Malformed(error.to_string()))?;
-    if line.len() > MAX_PAYLOAD_BYTES {
+    if line.len() > limit - 1 {
         return Err(HandshakeError::LineTooLong);
     }
     line.push(b'\n');
@@ -309,15 +325,35 @@ async fn read_byte_async<R: AsyncRead + Unpin + ?Sized>(reader: &mut R) -> io::R
 pub(crate) async fn read_line_async<R: AsyncRead + Unpin + ?Sized>(
     reader: &mut R,
 ) -> Result<Vec<u8>, HandshakeError> {
-    match tokio::time::timeout(EXCHANGE_TIMEOUT, read_line_unbounded(reader)).await {
+    read_bounded(reader, MAX_LINE_BYTES).await
+}
+
+/// Read one control answer, which may be longer than a handshake line.
+///
+/// Nothing follows a control answer on that connection: the daemon closes it
+/// after one answer. The byte loop is kept all the same, so one reader serves
+/// both directions.
+pub(crate) async fn read_answer_async<R: AsyncRead + Unpin + ?Sized>(
+    reader: &mut R,
+) -> Result<Vec<u8>, HandshakeError> {
+    read_bounded(reader, MAX_ANSWER_BYTES).await
+}
+
+/// Read one line of at most `limit` bytes, inside [`EXCHANGE_TIMEOUT`].
+async fn read_bounded<R: AsyncRead + Unpin + ?Sized>(
+    reader: &mut R,
+    limit: usize,
+) -> Result<Vec<u8>, HandshakeError> {
+    match tokio::time::timeout(EXCHANGE_TIMEOUT, read_line_unbounded(reader, limit)).await {
         Ok(result) => result,
         Err(_elapsed) => Err(HandshakeError::TimedOut),
     }
 }
 
-/// The body of [`read_line_async`], without the timeout.
+/// The body of [`read_bounded`], without the timeout.
 async fn read_line_unbounded<R: AsyncRead + Unpin + ?Sized>(
     reader: &mut R,
+    limit: usize,
 ) -> Result<Vec<u8>, HandshakeError> {
     let mut line = Vec::new();
     loop {
@@ -325,7 +361,7 @@ async fn read_line_unbounded<R: AsyncRead + Unpin + ?Sized>(
             None => return Err(HandshakeError::Closed),
             Some(b'\n') => return Ok(line),
             Some(byte) => {
-                if line.len() == MAX_PAYLOAD_BYTES {
+                if line.len() == limit - 1 {
                     return Err(HandshakeError::LineTooLong);
                 }
                 line.push(byte);
@@ -341,7 +377,24 @@ pub(crate) async fn write_line_async<W: AsyncWrite + Unpin + ?Sized, T: Serializ
     writer: &mut W,
     message: &T,
 ) -> Result<(), HandshakeError> {
-    let line = encode(message)?;
+    write_bounded(writer, message, MAX_LINE_BYTES).await
+}
+
+/// Write one control answer, which may be longer than a handshake line.
+pub(crate) async fn write_answer_async<W: AsyncWrite + Unpin + ?Sized, T: Serialize>(
+    writer: &mut W,
+    message: &T,
+) -> Result<(), HandshakeError> {
+    write_bounded(writer, message, MAX_ANSWER_BYTES).await
+}
+
+/// Write one message as a complete line of at most `limit` bytes.
+async fn write_bounded<W: AsyncWrite + Unpin + ?Sized, T: Serialize>(
+    writer: &mut W,
+    message: &T,
+    limit: usize,
+) -> Result<(), HandshakeError> {
+    let line = encode_bounded(message, limit)?;
     let write = async {
         writer.write_all(&line).await?;
         writer.flush().await
@@ -355,8 +408,9 @@ pub(crate) async fn write_line_async<W: AsyncWrite + Unpin + ?Sized, T: Serializ
 #[cfg(test)]
 mod tests {
     use super::{
-        HandshakeError, MAX_LINE_BYTES, PROTOCOL, Request, Response, SessionRequest, Token, decode,
-        decode_request, decode_response, encode, read_line_async, write_line_async,
+        HandshakeError, MAX_ANSWER_BYTES, MAX_LINE_BYTES, PROTOCOL, Request, Response,
+        SessionRequest, Token, decode, decode_request, decode_response, encode, read_answer_async,
+        read_line_async, write_answer_async, write_line_async,
     };
     use std::path::PathBuf;
 
@@ -460,6 +514,36 @@ mod tests {
             .await
             .expect("line at the limit");
         assert_eq!(read.len(), MAX_LINE_BYTES - 1);
+    }
+
+    /// A status answer carries one entry per checkout. The daemon serves a
+    /// thousand of them, so the answer must not be cut off at the handshake
+    /// bound.
+    #[tokio::test]
+    async fn a_control_answer_may_be_longer_than_a_handshake_line() {
+        let long = "c".repeat(MAX_LINE_BYTES * 2);
+        let mut wire = Vec::new();
+        write_answer_async(&mut wire, &long)
+            .await
+            .expect("write an answer above the handshake bound");
+        let error = read_line_async(&mut wire.as_slice())
+            .await
+            .expect_err("the handshake bound still applies to a handshake line");
+        assert!(matches!(error, HandshakeError::LineTooLong), "{error:?}");
+
+        let read = read_answer_async(&mut wire.as_slice())
+            .await
+            .expect("read the answer");
+        let decoded: String = serde_json::from_slice(&read).expect("decode the answer");
+        assert_eq!(decoded, long);
+    }
+
+    #[tokio::test]
+    async fn an_answer_above_the_answer_bound_is_refused() {
+        let error = write_answer_async(&mut Vec::new(), &"c".repeat(MAX_ANSWER_BYTES))
+            .await
+            .expect_err("above the answer bound");
+        assert!(matches!(error, HandshakeError::LineTooLong), "{error:?}");
     }
 
     #[test]
