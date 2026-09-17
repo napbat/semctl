@@ -115,6 +115,11 @@ type Routes = HashMap<u64, Route>;
 /// The platform watcher and the watches it holds.
 struct WatcherState {
     debouncer: Debouncer<RecommendedWatcher, RecommendedCache>,
+    /// How many registrations depend on each recursive root watch. Two
+    /// registrations share one root when two sessions attach the same checkout
+    /// at the same time, and when two credential scopes need two coordinators
+    /// for one root. The watch is released when the last of them goes.
+    roots: HashMap<PathBuf, usize>,
     /// How many registrations depend on each non-recursive external watch.
     /// The watch is released when the last of them goes.
     externals: HashMap<PathBuf, usize>,
@@ -158,6 +163,7 @@ impl WatchHub {
             Some(watcher) => watcher,
             None => state.insert(WatcherState {
                 debouncer: self.new_debouncer()?,
+                roots: HashMap::new(),
                 externals: HashMap::new(),
                 registrations: 0,
             }),
@@ -173,7 +179,11 @@ impl WatchHub {
                 sink,
             },
         );
-        if let Err(error) = watcher
+        // Another registration may already watch this root. One watch serves
+        // both, and the route table decides who hears each event.
+        if let Some(holders) = watcher.roots.get_mut(&root) {
+            *holders += 1;
+        } else if let Err(error) = watcher
             .debouncer
             .watch(&root, RecursiveMode::Recursive)
             .with_context(|| format!("watch {}", root.display()))
@@ -184,6 +194,8 @@ impl WatchHub {
                 *state = None;
             }
             return Err(error);
+        } else {
+            watcher.roots.insert(root.clone(), 1);
         }
         watcher.registrations += 1;
         info!(root = %root.display(), debounce_ms = DEBOUNCE.as_millis(), "fs watcher active");
@@ -268,8 +280,18 @@ impl WatchHub {
             return;
         };
         let route = write_routes(&self.routes).remove(&id);
-        if let Err(error) = watcher.debouncer.unwatch(root) {
-            debug!(%error, root = %root.display(), "unwatch after release");
+        // The root watch is shared, so only the last holder may release it.
+        // Releasing it earlier would leave every other registration on this
+        // root with a coordinator that believes it is watched and never hears
+        // another event.
+        if let Some(holders) = watcher.roots.get_mut(root) {
+            *holders -= 1;
+            if *holders == 0 {
+                watcher.roots.remove(root);
+                if let Err(error) = watcher.debouncer.unwatch(root) {
+                    debug!(%error, root = %root.display(), "unwatch after release");
+                }
+            }
         }
         for external in route.into_iter().flat_map(|route| route.externals) {
             let Some(holders) = watcher.externals.get_mut(&external) else {
@@ -306,6 +328,15 @@ impl WatchHub {
     #[cfg(test)]
     fn has_watcher(&self) -> bool {
         lock(&self.watcher).is_some()
+    }
+
+    /// How many registrations share the watch on `root`. Test-only.
+    #[cfg(test)]
+    fn root_holders(&self, root: &Path) -> usize {
+        lock(&self.watcher)
+            .as_ref()
+            .and_then(|watcher| watcher.roots.get(root).copied())
+            .unwrap_or(0)
     }
 }
 
@@ -547,6 +578,40 @@ mod tests {
         assert_eq!(hub.watched_roots(), 1);
 
         drop(second);
+        assert!(
+            !hub.has_watcher(),
+            "the last registration must release the platform watcher"
+        );
+    }
+
+    /// Two sessions can hold two registrations on one root: they attach at the
+    /// same time, or they use two credential scopes. The first release must
+    /// keep the watch, or the remaining coordinator never hears another event.
+    #[test]
+    fn a_root_watch_is_shared_and_released_with_its_last_holder() {
+        let root = tempfile::tempdir().expect("temporary checkout");
+        let hub = Arc::new(WatchHub::new());
+        let (first_sink, _first) = sink(BATCH_CAPACITY);
+        let (second_sink, _second) = sink(BATCH_CAPACITY);
+        let first = hub
+            .register(root.path().to_path_buf(), first_sink)
+            .expect("watch the checkout once");
+        let second = hub
+            .register(root.path().to_path_buf(), second_sink)
+            .expect("watch the checkout twice");
+        assert_eq!(hub.root_holders(root.path()), 2);
+        assert_eq!(hub.watched_roots(), 2, "two registrations, one root watch");
+
+        drop(first);
+        assert_eq!(
+            hub.root_holders(root.path()),
+            1,
+            "the remaining holder keeps the root watch"
+        );
+        assert!(hub.has_watcher());
+
+        drop(second);
+        assert_eq!(hub.root_holders(root.path()), 0);
         assert!(
             !hub.has_watcher(),
             "the last registration must release the platform watcher"
