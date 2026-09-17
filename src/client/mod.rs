@@ -14,7 +14,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Serialize, de::DeserializeOwned};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 use tracing::{debug, warn};
 
 use crate::auth;
@@ -67,6 +67,11 @@ pub struct Client {
     /// and asking again per call would put a round-trip in front of work
     /// that has nothing to do with it.
     capabilities: Arc<tokio::sync::OnceCell<Vec<String>>>,
+    /// The engine's bound on concurrent request attempts, when this client was
+    /// built by one. `None` for a one-shot command, which has nothing to bound.
+    /// The handle comes from the caller: this module never reads the
+    /// environment, so a session cannot raise a process-wide bound.
+    remote_permits: Option<Arc<Semaphore>>,
 }
 
 impl Client {
@@ -80,6 +85,7 @@ impl Client {
             None,
             Some(codebase.into()),
             false,
+            None,
         );
         client.local_root = local_root;
         client
@@ -92,6 +98,7 @@ impl Client {
         tenant: Option<String>,
         codebase: Option<String>,
         repair_configured_tenant: bool,
+        remote_permits: Option<Arc<Semaphore>>,
     ) -> Self {
         Self {
             http: transport.http().clone(),
@@ -104,6 +111,7 @@ impl Client {
             local_root: None,
             checkout_source_id: None,
             capabilities: Arc::new(tokio::sync::OnceCell::new()),
+            remote_permits,
         }
     }
 
@@ -212,6 +220,19 @@ impl Client {
         Ok((req, url, tenant))
     }
 
+    /// One in-flight request attempt, when this client is bound to an engine.
+    ///
+    /// The permit covers sending the request and receiving its response head.
+    /// It is released before the caller reads the body, so a slow reader does
+    /// not hold a permit, and it is released across a loading retry's sleep, so
+    /// a restoring server does not pin the process's permits.
+    async fn remote_permit(&self) -> Option<OwnedSemaphorePermit> {
+        match &self.remote_permits {
+            Some(permits) => crate::engine::scheduler::permit(permits).await,
+            None => None,
+        }
+    }
+
     /// Send one request, repairing a stale persisted tenant once and honoring
     /// the server's bounded `Retry-After` contract for transient graph/file
     /// projection restores.
@@ -224,10 +245,14 @@ impl Client {
         let mut tenant_retried = false;
         let loading_deadline = Instant::now() + LOADING_RETRY_BUDGET;
         loop {
+            // Acquired after the token fetch: that request is authorization, not
+            // an interactive read, and waiting for a permit while holding one
+            // would make the bound self-blocking.
             let (mut req, url, rejected_tenant) = self.authed(method.clone(), path).await?;
             if let Some(json) = &body {
                 req = req.json(json);
             }
+            let permit = self.remote_permit().await;
             let resp = req
                 .send()
                 .await
@@ -242,6 +267,7 @@ impl Client {
                     retry_after_ms = delay.as_millis(),
                     "server projection is restoring; retrying request"
                 );
+                drop(permit);
                 tokio::time::sleep(delay).await;
                 continue;
             }
@@ -255,6 +281,9 @@ impl Client {
                 .text()
                 .await
                 .with_context(|| format!("{method} {url}: read body"))?;
+            // Tenant repair queries identity and rewrites config. That is not
+            // this request attempt, so it must not hold this attempt's permit.
+            drop(permit);
             if !tenant_retried
                 && tenant_binding_denied(&response_body)
                 && self
@@ -642,8 +671,14 @@ fn tenant_selection(configured: Option<String>, explicit: Option<&str>) -> (Opti
 ///
 /// This is the real constructor: every selection the client makes comes from
 /// `context` and the loaded config, never from the process. `transport` supplies
-/// the shared HTTP client.
-pub(crate) fn from_context(context: &SessionContext, transport: &HttpTransport) -> Result<Client> {
+/// the shared HTTP client, and `remote_permits` the engine's bound on
+/// concurrent request attempts. Both are supplied by the caller that owns them,
+/// so a session cannot create a second connection pool or raise a bound.
+pub(crate) fn from_context(
+    context: &SessionContext,
+    transport: &HttpTransport,
+    remote_permits: Option<Arc<Semaphore>>,
+) -> Result<Client> {
     let cfg = crate::config::load()?;
     let server = auth::normalize_server_url(&cfg.server_url(context.server.as_deref()))?;
     let configured_tenant = (auth::normalize_server_url(&cfg.persisted_server_url())? == server)
@@ -659,6 +694,7 @@ pub(crate) fn from_context(context: &SessionContext, transport: &HttpTransport) 
         tenant,
         codebase,
         repair_configured_tenant,
+        remote_permits,
     ))
 }
 
@@ -668,7 +704,9 @@ pub(crate) fn from_context(context: &SessionContext, transport: &HttpTransport) 
 /// [`from_context`].
 pub fn from_cli(cli: &crate::cli::Cli) -> Result<Client> {
     let context = SessionContext::from_process(cli)?;
-    from_context(&context, &HttpTransport::new())
+    // A one-shot command sends one interactive request at a time, so it needs
+    // no remote bound. Its uploads are bounded by the sync limits it builds.
+    from_context(&context, &HttpTransport::new(), None)
 }
 
 /// Like [`from_cli`], but ensures a codebase is set — resolving the session's
@@ -676,7 +714,7 @@ pub fn from_cli(cli: &crate::cli::Cli) -> Result<Client> {
 /// codebase-scoped commands (`projects`, `graph …`) run inside a repo.
 pub async fn for_cwd(cli: &crate::cli::Cli) -> Result<Client> {
     let context = SessionContext::from_process(cli)?;
-    let client = from_context(&context, &HttpTransport::new())?;
+    let client = from_context(&context, &HttpTransport::new(), None)?;
     let dir = context.cwd;
     if client.codebase_raw().is_some() {
         return Ok(client.with_cached_local_root(Some(&dir)));
@@ -713,6 +751,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
     }
 

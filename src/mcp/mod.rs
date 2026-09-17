@@ -28,9 +28,10 @@ use tracing::{debug, info, warn};
 
 use crate::cli::Cli;
 use crate::client::{self, Client, HttpTransport};
+use crate::engine::Scheduler;
 use crate::query;
 use crate::session::SessionContext;
-use crate::sync::{self, JobRegistry};
+use crate::sync::{self, JobRegistry, SyncLimits};
 
 mod readiness;
 mod tool_types;
@@ -108,10 +109,19 @@ struct Shared {
     /// `None` until/unless a newer version is seen. Notify-only: applying the
     /// update stays the explicit `semctl upgrade`.
     update_note: Arc<Mutex<Option<String>>>,
+    /// The process-wide permits this session's work takes. Shared, so the
+    /// bounds hold however many sessions the process serves.
+    scheduler: Arc<Scheduler>,
 }
 
 impl McpServer {
-    fn new(context: SessionContext, base: Client, dir: PathBuf, pinned: bool) -> Self {
+    fn new(
+        context: SessionContext,
+        base: Client,
+        dir: PathBuf,
+        pinned: bool,
+        scheduler: Arc<Scheduler>,
+    ) -> Self {
         Self {
             shared: Arc::new(Shared {
                 context,
@@ -124,9 +134,15 @@ impl McpServer {
                 initial_indexes: RwLock::new(InitialIndexes::default()),
                 freshness: Arc::new(Mutex::new(None)),
                 update_note: Arc::new(Mutex::new(None)),
+                scheduler,
             }),
             tool_router: tools::router(),
         }
+    }
+
+    /// The upload bound this session's syncs must respect.
+    fn sync_limits(&self) -> SyncLimits {
+        SyncLimits::new(self.shared.scheduler.upload_permits())
     }
 
     /// A freshness warning for search results, derived from the most recent
@@ -423,6 +439,7 @@ impl McpServer {
                 dir,
                 self.shared.jobs.clone(),
                 self.shared.context.resync_secs,
+                self.sync_limits(),
             );
         }
     }
@@ -472,6 +489,7 @@ impl McpServer {
             dir,
             self.shared.jobs.clone(),
             self.shared.context.resync_secs,
+            self.sync_limits(),
         ))
     }
 
@@ -673,7 +691,8 @@ pub async fn run(cli: &Cli) -> Result<()> {
     // session's values from `context`.
     let context = SessionContext::from_process(cli)?;
     let transport = HttpTransport::new();
-    let base = client::from_context(&context, &transport)?;
+    let scheduler = Arc::new(Scheduler::from_environment());
+    let base = client::from_context(&context, &transport, Some(scheduler.remote_permits()))?;
 
     // Pinned == a codebase was set up front (`--codebase` / `SEMCTX_CODEBASE` /
     // config). The launch directory may be unrelated, so it is never synced into
@@ -687,7 +706,7 @@ pub async fn run(cli: &Cli) -> Result<()> {
 
     let update_check = context.update_check;
     let server_override = context.server.clone();
-    let server = McpServer::new(context, base, dir, pinned);
+    let server = McpServer::new(context, base, dir, pinned, scheduler);
 
     // Detached, best-effort check for a newer published CLI; see `spawn_update_check`.
     spawn_update_check(

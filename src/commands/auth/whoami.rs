@@ -11,7 +11,8 @@ use crate::session::SessionContext;
 pub async fn run(cli: &Cli) -> Result<()> {
     let context = SessionContext::from_process(cli)?;
     let transport = HttpTransport::new();
-    let client = client::from_context(&context, &transport)?;
+    // One command, one request at a time: no remote bound to share.
+    let client = client::from_context(&context, &transport, None)?;
     let token =
         auth::get_valid_access_token(transport.http(), client.server_url(), &context.credentials)
             .await?;

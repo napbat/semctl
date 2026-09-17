@@ -12,7 +12,7 @@ use std::time::Duration;
 use tokio::sync::{Mutex, oneshot};
 use tracing::{debug, info, warn};
 
-use super::{JobRegistry, SyncCache, SyncOutcome, record_job, sync, watcher};
+use super::{JobRegistry, SyncCache, SyncLimits, SyncOutcome, record_job, sync, watcher};
 use crate::client::Client;
 
 /// Keep the launch directory indexed for the server's lifetime: a startup walk
@@ -22,26 +22,28 @@ use crate::client::Client;
 ///
 /// `resync_secs` is the session's periodic interval. `None` selects
 /// [`DEFAULT_RESYNC_SECS`].
-pub fn spawn_indexing(
+pub(crate) fn spawn_indexing(
     client: Client,
     dir: PathBuf,
     jobs: Arc<JobRegistry>,
     resync_secs: Option<u64>,
+    limits: SyncLimits,
 ) {
-    spawn(client, dir, jobs, resync_secs, None);
+    spawn(client, dir, jobs, resync_secs, limits, None);
 }
 
 /// Start the normal indexing/watcher lifecycle and return a one-shot result for
 /// its startup sync. The MCP first-index readiness gate awaits this handle, then
 /// polls the queued server job through embedding completion.
-pub fn spawn_indexing_tracked(
+pub(crate) fn spawn_indexing_tracked(
     client: Client,
     dir: PathBuf,
     jobs: Arc<JobRegistry>,
     resync_secs: Option<u64>,
+    limits: SyncLimits,
 ) -> oneshot::Receiver<Result<SyncOutcome, String>> {
     let (tx, rx) = oneshot::channel();
-    spawn(client, dir, jobs, resync_secs, Some(tx));
+    spawn(client, dir, jobs, resync_secs, limits, Some(tx));
     rx
 }
 
@@ -50,6 +52,7 @@ fn spawn(
     dir: PathBuf,
     jobs: Arc<JobRegistry>,
     resync_secs: Option<u64>,
+    limits: SyncLimits,
     initial_result: Option<oneshot::Sender<Result<SyncOutcome, String>>>,
 ) {
     tokio::spawn(async move {
@@ -69,6 +72,7 @@ fn spawn(
             dir.clone(),
             cache.clone(),
             jobs.clone(),
+            limits.clone(),
             initial_result,
         );
         match resync_secs.unwrap_or(DEFAULT_RESYNC_SECS) {
@@ -81,6 +85,7 @@ fn spawn(
                     secs,
                     cache.clone(),
                     jobs.clone(),
+                    limits.clone(),
                 );
             }
         }
@@ -90,10 +95,11 @@ fn spawn(
         // the blocking pool rather than a runtime worker. The returned debouncer
         // guard is held here for the task's (and thus the server's) lifetime;
         // dropping it would stop the watch.
-        let watcher = tokio::task::spawn_blocking(move || watcher::spawn(client, dir, cache, jobs))
-            .await
-            .ok()
-            .flatten();
+        let watcher =
+            tokio::task::spawn_blocking(move || watcher::spawn(client, dir, cache, jobs, limits))
+                .await
+                .ok()
+                .flatten();
         if watcher.is_some() {
             std::future::pending::<()>().await;
         }
@@ -108,10 +114,11 @@ fn spawn_startup_reconcile(
     dir: PathBuf,
     cache: Arc<Mutex<SyncCache>>,
     jobs: Arc<JobRegistry>,
+    limits: SyncLimits,
     initial_result: Option<oneshot::Sender<Result<SyncOutcome, String>>>,
 ) {
     tokio::spawn(async move {
-        match sync(&client, &dir, &cache).await {
+        match sync(&client, &dir, &cache, &limits).await {
             Ok(o) => {
                 info!(
                     codebase = %o.codebase_id,
@@ -154,6 +161,7 @@ fn spawn_periodic_resync(
     secs: u64,
     cache: Arc<Mutex<SyncCache>>,
     jobs: Arc<JobRegistry>,
+    limits: SyncLimits,
 ) {
     tokio::spawn(async move {
         let period = Duration::from_secs(secs);
@@ -164,7 +172,7 @@ fn spawn_periodic_resync(
             // `sync` logs its step-by-step progress at debug; here we surface an
             // info line only when the tick actually changed something, so an
             // idle server doesn't chatter every interval.
-            match sync(&client, &dir, &cache).await {
+            match sync(&client, &dir, &cache, &limits).await {
                 Ok(o) if o.uploaded > 0 || o.to_delete > 0 => {
                     info!(
                         uploaded = o.uploaded,

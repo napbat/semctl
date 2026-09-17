@@ -24,7 +24,13 @@ use crate::session::SessionContext;
 /// An MCP server for one throwaway session. These tests never read the session's
 /// working directory, so a path that does not exist serves as the launch root.
 fn server(base: client::Client, dir: impl Into<std::path::PathBuf>, pinned: bool) -> McpServer {
-    McpServer::new(SessionContext::for_test(), base, dir.into(), pinned)
+    McpServer::new(
+        SessionContext::for_test(),
+        base,
+        dir.into(),
+        pinned,
+        std::sync::Arc::new(crate::engine::Scheduler::from_environment()),
+    )
 }
 
 fn job(completed: bool, failed: i64, error: Option<&str>) -> client::api::JobStatus {

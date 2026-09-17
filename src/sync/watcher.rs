@@ -24,7 +24,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use super::{
-    SyncCache,
+    SyncCache, SyncLimits,
     blocking::Cancellation,
     policy::{SourcePolicy, event_may_affect_policy},
 };
@@ -44,6 +44,7 @@ pub(super) fn spawn(
     dir: PathBuf,
     cache: Arc<Mutex<SyncCache>>,
     jobs: Arc<super::JobRegistry>,
+    limits: SyncLimits,
 ) -> Option<Arc<WatchControl>> {
     // Wake-only channel: the re-sync re-walks the whole tree, so we forward
     // "something interesting changed", not which paths.
@@ -119,7 +120,7 @@ pub(super) fn spawn(
     tokio::spawn(async move {
         while rx.recv().await.is_some() {
             while rx.try_recv().is_ok() {}
-            match super::sync(&client, &dir, &cache).await {
+            match super::sync(&client, &dir, &cache, &limits).await {
                 Ok(o) if o.uploaded > 0 || o.to_delete > 0 => {
                     info!(
                         uploaded = o.uploaded,

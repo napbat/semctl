@@ -16,7 +16,8 @@ use tracing::{debug, info};
 
 use crate::cli::Cli;
 use crate::client::{self, Client, api};
-use crate::sync::SyncProgress;
+use crate::engine::Scheduler;
+use crate::sync::{SyncLimits, SyncProgress};
 
 #[derive(Debug, Args)]
 pub struct IndexArgs {
@@ -90,8 +91,12 @@ pub async fn run(args: IndexArgs, cli: &Cli) -> Result<()> {
     // Persist hashes and filter decisions. Every scan verifies current bytes
     // before reusing a decision. Source contents are not cached on disk.
     let cache = Mutex::new(crate::sync::SyncCache::persistent());
+    // One command is one process, so its scheduler is its own. It exists to
+    // bound this sync's uploads with the same rule the shared engine applies.
+    let limits = SyncLimits::new(Scheduler::from_environment().upload_permits());
     let outcome =
-        crate::sync::sync_with_progress(&client, &dir, &cache, report_sync_progress).await?;
+        crate::sync::sync_with_progress(&client, &dir, &cache, &limits, report_sync_progress)
+            .await?;
     if outcome.uploaded == 0 && outcome.to_delete == 0 {
         info!(codebase = %outcome.codebase_id, "up to date — nothing to upload");
     } else {

@@ -21,18 +21,41 @@ mod upload;
 mod walker;
 mod watcher;
 
-pub use background::{spawn_indexing, spawn_indexing_tracked};
-pub use cache::SyncCache;
+pub(crate) use background::{spawn_indexing, spawn_indexing_tracked};
+pub(crate) use cache::SyncCache;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tracing::debug;
 
 use crate::client::{Client, api};
 use scan::ScanResult;
+
+/// The process-wide bounds one sync must respect.
+///
+/// A sync keeps its own limit of four parallel upload requests. That limit
+/// bounds one checkout; these permits bound the process, so a thousand
+/// checkouts syncing at once still open a bounded number of requests.
+#[derive(Clone)]
+pub(crate) struct SyncLimits {
+    upload: Arc<Semaphore>,
+}
+
+impl SyncLimits {
+    pub(crate) fn new(upload: Arc<Semaphore>) -> Self {
+        Self { upload }
+    }
+
+    /// One in-flight upload request. See [`crate::engine::scheduler::permit`]
+    /// for why a closed semaphore lets the upload proceed unbounded.
+    async fn upload_permit(&self) -> Option<OwnedSemaphorePermit> {
+        crate::engine::scheduler::permit(&self.upload).await
+    }
+}
 
 /// What a [`sync`] queued, for the caller to report on.
 pub struct SyncOutcome {
@@ -92,16 +115,22 @@ pub(crate) async fn record_job(registry: &JobRegistry, o: &SyncOutcome) {
 /// *and* serializes overlapping syncs to one codebase into one job at a time.
 /// Step-by-step progress is logged at `debug`; callers emit the `info`-level
 /// summary so a no-op periodic tick stays quiet.
-pub async fn sync(client: &Client, dir: &Path, cache: &Mutex<SyncCache>) -> Result<SyncOutcome> {
-    sync_with_progress(client, dir, cache, |_| {}).await
+pub(crate) async fn sync(
+    client: &Client,
+    dir: &Path,
+    cache: &Mutex<SyncCache>,
+    limits: &SyncLimits,
+) -> Result<SyncOutcome> {
+    sync_with_progress(client, dir, cache, limits, |_| {}).await
 }
 
 /// The interactive form of [`sync`], reporting scan, plan, and completed
 /// upload-batch progress through `on_progress`.
-pub async fn sync_with_progress<F>(
+pub(crate) async fn sync_with_progress<F>(
     client: &Client,
     dir: &Path,
     cache: &Mutex<SyncCache>,
+    limits: &SyncLimits,
     on_progress: F,
 ) -> Result<SyncOutcome>
 where
@@ -172,6 +201,7 @@ where
         &plan.job_id,
         files,
         &source_id,
+        limits,
         &on_progress,
     )
     .await?;

@@ -8,11 +8,12 @@ use tracing::debug;
 
 use super::blocking::Cancellation;
 use super::scan::PreparedFile;
-use super::{SyncProgress, blocking, source, walker};
+use super::{SyncLimits, SyncProgress, blocking, source, walker};
 use crate::client::{Client, api};
 
 const UPLOAD_BATCH_BYTES: usize = 4 * 1024 * 1024;
 const UPLOAD_BATCH_FILES: usize = 256;
+/// One checkout's own limit. The process-wide limit is [`SyncLimits`].
 const UPLOAD_PARALLEL_REQUESTS: usize = 4;
 
 /// Only entries from the submitted manifest can become pending uploads.
@@ -112,6 +113,7 @@ pub(super) async fn run(
     job_id: &str,
     files: Files,
     source_id: &str,
+    limits: &SyncLimits,
     on_progress: &impl Fn(&SyncProgress),
 ) -> Result<usize> {
     let total = files.pending.len();
@@ -123,7 +125,7 @@ pub(super) async fn run(
     let (mut files, mut batch) = files.next().await?;
     // Preserve the single-request wire format used by older servers.
     if files.pending.is_empty() {
-        let uploaded = upload_batch(client, &url, source_id, batch, None).await?;
+        let uploaded = upload_batch(client, &url, source_id, batch, None, limits).await?;
         report_upload_progress(on_progress, uploaded, total);
         return Ok(uploaded);
     }
@@ -139,6 +141,7 @@ pub(super) async fn run(
         let upload_client = client.clone();
         let upload_url = url.clone();
         let upload_source = source_id.to_string();
+        let upload_limits = limits.clone();
         set.spawn(async move {
             upload_batch(
                 &upload_client,
@@ -146,6 +149,7 @@ pub(super) async fn run(
                 &upload_source,
                 batch,
                 Some(false),
+                &upload_limits,
             )
             .await
         });
@@ -159,6 +163,7 @@ pub(super) async fn run(
         report_upload_progress(on_progress, uploaded, total);
     }
     on_progress(&SyncProgress::Finalizing);
+    let permit = limits.upload_permit().await;
     client
         .put::<_, serde_json::Value>(
             &url,
@@ -170,6 +175,7 @@ pub(super) async fn run(
         )
         .await
         .context("complete upload")?;
+    drop(permit);
     Ok(uploaded)
 }
 
@@ -184,14 +190,18 @@ fn report_upload_progress(
     });
 }
 
+/// Send one batch. The permit is held for the whole request, so the process
+/// never has more upload requests in flight than the engine allows.
 async fn upload_batch(
     client: &Client,
     url: &str,
     source_id: &str,
     files: Vec<api::SyncFileContent>,
     final_batch: Option<bool>,
+    limits: &SyncLimits,
 ) -> Result<usize> {
     let n = files.len();
+    let _permit = limits.upload_permit().await;
     client
         .put::<_, serde_json::Value>(
             url,

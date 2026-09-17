@@ -19,6 +19,7 @@ mod codebase;
 mod commands;
 mod config;
 mod editing;
+mod engine;
 mod mcp;
 mod query;
 mod session;
