@@ -1,54 +1,107 @@
 //! First-index readiness for checkout and cross-codebase retrieval.
+//!
+//! A first index is owned by the checkout's coordinator, not by a session, so
+//! readiness asks the coordinators this session holds leases on. A session
+//! therefore never waits for another session's first index, and every checkout
+//! this session did bring in is waited for.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use tokio::sync::{Mutex, Notify, RwLock, RwLockReadGuard};
 
-#[derive(Clone, Default)]
-pub(super) struct InitialIndexes {
-    // Membership only grows for the lifetime of the MCP session. A path keeps
-    // its original gate, including after completion or failure.
-    pub(super) by_path: HashMap<PathBuf, Arc<InitialIndexGate>>,
-}
+use crate::engine::{CheckoutKey, CoordinatorLease};
 
-impl InitialIndexes {
-    /// Empty ids mean a server-defined scope. Its membership is unknown here,
-    /// so every initial index in this session must complete.
-    pub(super) async fn wait_for_codebases(&self, ids: &[String]) -> Result<(), String> {
-        for gate in self.by_path.values() {
-            gate.wait_for_codebases(ids)
-                .await
-                .map_err(|error| format!("initial index failed — {error}"))?;
+/// The coordinators one session holds, keyed by checkout.
+pub(super) type SessionLeases = RwLock<HashMap<CheckoutKey, CoordinatorLease>>;
+
+/// The first-index gates of the checkouts this session holds.
+async fn session_gates(
+    leases: &HashMap<CheckoutKey, CoordinatorLease>,
+) -> Vec<Arc<InitialIndexGate>> {
+    let mut gates = Vec::with_capacity(leases.len());
+    for lease in leases.values() {
+        if let Some(gate) = lease.coordinator().gate().await {
+            gates.push(gate);
         }
-        Ok(())
     }
+    gates
 }
 
-/// Wait without holding the registry, then reserve the checked membership for
-/// the query. Registration can run during embedding. If it adds a gate, repeat
-/// the readiness check before allowing the query to include the new codebase.
-pub(super) async fn ready_for_codebases<'a>(
-    indexes: &'a RwLock<InitialIndexes>,
+/// Wait for every gate that the query's scope can include.
+///
+/// Empty ids mean a server-defined scope. Its membership is unknown here, so
+/// every first index this session brought in must complete.
+pub(super) async fn wait_for_gates(
+    gates: &[Arc<InitialIndexGate>],
     ids: &[String],
-) -> Result<RwLockReadGuard<'a, InitialIndexes>, String> {
+) -> Result<(), String> {
+    for gate in gates {
+        gate.wait_for_codebases(ids)
+            .await
+            .map_err(|error| format!("initial index failed — {error}"))?;
+    }
+    Ok(())
+}
+
+/// Wait without holding the lease map, then reserve the checked membership for
+/// the query. A tool call can attach a checkout while embedding runs. If it
+/// does, repeat the readiness check before allowing the query to include the
+/// new codebase.
+pub(super) async fn ready_for_codebases<'a>(
+    leases: &'a SessionLeases,
+    ids: &[String],
+) -> Result<RwLockReadGuard<'a, HashMap<CheckoutKey, CoordinatorLease>>, String> {
     loop {
-        let snapshot = indexes.read().await.clone();
-        snapshot.wait_for_codebases(ids).await?;
-        let current = indexes.read().await;
-        if current.by_path.len() == snapshot.by_path.len() {
+        let checked = {
+            let held = leases.read().await;
+            Membership::of(&held).await
+        };
+        wait_for_gates(&checked.gates, ids).await?;
+        let current = leases.read().await;
+        if Membership::of(&current).await.counts() == checked.counts() {
             return Ok(current);
         }
     }
 }
 
-/// Release the registry before waiting for a single checkout.
+/// What a readiness check covered: which checkouts this session held, and how
+/// many of them had a first index to wait for.
+struct Membership {
+    checkouts: usize,
+    gates: Vec<Arc<InitialIndexGate>>,
+}
+
+impl Membership {
+    async fn of(leases: &HashMap<CheckoutKey, CoordinatorLease>) -> Self {
+        Self {
+            checkouts: leases.len(),
+            gates: session_gates(leases).await,
+        }
+    }
+
+    /// A new checkout, or a new first index on a checkout this session already
+    /// held, both change what the query would include.
+    fn counts(&self) -> (usize, usize) {
+        (self.checkouts, self.gates.len())
+    }
+}
+
+/// Release the lease map before waiting for a single checkout.
+///
+/// `dir` must be canonical: a coordinator is keyed by its canonical root.
 pub(super) async fn initial_gate_for_path(
-    indexes: &RwLock<InitialIndexes>,
+    leases: &SessionLeases,
     dir: &Path,
 ) -> Option<Arc<InitialIndexGate>> {
-    indexes.read().await.by_path.get(dir).cloned()
+    let held = leases.read().await;
+    for lease in held.values() {
+        if lease.coordinator().root() == dir {
+            return lease.coordinator().gate().await;
+        }
+    }
+    None
 }
 
 pub(crate) struct InitialIndexGate {
@@ -72,7 +125,7 @@ impl InitialIndexGate {
         }
     }
 
-    /// Registration updates the existing gate. Its path membership stays fixed.
+    /// Registration updates the existing gate. Its checkout stays fixed.
     pub(crate) async fn register_codebase(&self, id: String) {
         self.state.lock().await.codebase_id = Some(id);
         self.changed.notify_waiters();

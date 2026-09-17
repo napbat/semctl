@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::readiness::wait_for_gates;
 use super::tool_types::{
     AnalysisPageArgs, BatchArgs, CallGraphArgs, CallPathArgs, ExpandArgs, FlowBetweenArgs,
     FlowFromArgs, FlowToArgs, GrepArgs, InsertSymbolArgs, ListFilesArgs, NoArgs, OutlineArgs,
@@ -18,7 +19,7 @@ use super::tool_types::{
     UndoEditArgs, render_edit_action_outcome,
 };
 use super::{
-    DIRECT_EDIT_TOOLS, InitialIndexGate, InitialIndexes, McpServer, client, initial_gate_for_path,
+    DIRECT_EDIT_TOOLS, InitialIndexGate, McpServer, client, initial_gate_for_path,
     ready_for_codebases,
 };
 use crate::engine::Engine;
@@ -32,13 +33,32 @@ use crate::session::SessionContext;
 /// performing them, and a root that does not exist also leaves every coordinator
 /// without a platform watcher, so no test touches the filesystem watcher.
 fn server(base: client::Client, dir: impl Into<PathBuf>, pinned: bool) -> McpServer {
-    McpServer::new(
-        SessionContext::for_test(),
+    session(
         base,
-        dir.into(),
+        dir,
         pinned,
         Engine::for_test(Arc::new(IdleReconciler)),
     )
+}
+
+/// One session on a shared engine, for tests about what one session sees.
+fn session(
+    base: client::Client,
+    dir: impl Into<PathBuf>,
+    pinned: bool,
+    engine: Arc<Engine>,
+) -> McpServer {
+    McpServer::with_parts(SessionContext::for_test(), base, dir.into(), pinned, engine)
+}
+
+/// Claim `root` for a first index on this session's behalf, as
+/// `index_codebase` does, and return the gate retrieval waits on.
+async fn first_index(server: &McpServer, codebase: &str, root: &Path) -> Arc<InitialIndexGate> {
+    let client = client::Client::for_test(codebase, Some(root.to_path_buf()));
+    server
+        .watch_first_once(client, root.to_path_buf())
+        .await
+        .expect("claim the first index")
 }
 
 /// Attach this session to `root`, as a resolved tool call does, and return the
@@ -100,27 +120,28 @@ async fn first_index_failure_releases_an_active_waiter() {
     assert_eq!(result, Err("embedding failed".into()));
 }
 
+/// A query reserves the membership it checked, so a checkout attached during
+/// the query cannot join its scope. Attaching must stay possible while
+/// embedding runs, or a first index would block every other tool call.
 #[tokio::test]
 async fn scoped_readiness_allows_registration_and_holds_new_indexes_out() {
-    let indexes = tokio::sync::RwLock::new(InitialIndexes::default());
-    let gate = std::sync::Arc::new(InitialIndexGate::pending());
-    indexes
-        .write()
-        .await
-        .by_path
-        .insert("checkout".into(), gate.clone());
+    let server = server(client::Client::for_test("codebase", None), "launch", false);
+    let gate = first_index(&server, "codebase", Path::new("checkout")).await;
+    let leases = &server.shared.leases;
     let searching = async {
-        let guard = ready_for_codebases(&indexes, &["A".into()]).await.unwrap();
+        let guard = ready_for_codebases(leases, &["A".into()])
+            .await
+            .expect("the gate completes");
         assert!(
-            indexes.try_write().is_err(),
-            "registration must wait for the query"
+            leases.try_write().is_err(),
+            "attaching a checkout must wait for the query"
         );
         drop(guard);
     };
     let registering = async {
         assert!(
-            indexes.try_write().is_ok(),
-            "registration must remain available while embedding runs"
+            leases.try_write().is_ok(),
+            "attaching must remain available while embedding runs"
         );
         gate.register_codebase("A".into()).await;
         gate.finish(Ok(())).await;
@@ -129,16 +150,17 @@ async fn scoped_readiness_allows_registration_and_holds_new_indexes_out() {
         tokio::join!(biased; searching, registering);
     })
     .await
-    .expect("registration and completion must not require the registry write lock");
-    assert!(indexes.try_write().is_ok());
+    .expect("registration and completion must not require the lease write lock");
+    assert!(leases.try_write().is_ok());
 }
 
+/// A named scope must not wait for a checkout it cannot include, before or
+/// after that checkout's first index fails.
 #[tokio::test]
 async fn explicit_ids_ignore_unrelated_pending_and_failed_indexes_after_registration() {
-    let mut indexes = InitialIndexes::default();
-    let gate = std::sync::Arc::new(InitialIndexGate::pending());
-    indexes.by_path.insert("checkout".into(), gate.clone());
-    let waiting = async { indexes.wait_for_codebases(&["B".into()]).await };
+    let gate = Arc::new(InitialIndexGate::pending());
+    let gates = vec![gate.clone()];
+    let waiting = async { wait_for_gates(&gates, &["B".into()]).await };
     let registering = async { gate.register_codebase("A".into()).await };
     let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
         tokio::join!(biased; waiting, registering)
@@ -146,64 +168,60 @@ async fn explicit_ids_ignore_unrelated_pending_and_failed_indexes_after_registra
     .await
     .expect("the unrelated index need not finish");
     assert_eq!(result, Ok(()));
+
     gate.finish(Err("embedding failed".into())).await;
-    assert_eq!(indexes.wait_for_codebases(&["B".into()]).await, Ok(()));
-    assert!(indexes.wait_for_codebases(&["A".into()]).await.is_err());
-    assert!(indexes.wait_for_codebases(&[]).await.is_err());
+    assert_eq!(wait_for_gates(&gates, &["B".into()]).await, Ok(()));
+    assert!(wait_for_gates(&gates, &["A".into()]).await.is_err());
+    assert!(
+        wait_for_gates(&gates, &[]).await.is_err(),
+        "a server-defined scope can include it, so its failure counts"
+    );
 }
 
+/// A checkout attached while the query waits must be waited for too: its
+/// codebase would otherwise be searched before its first index finished.
 #[tokio::test]
 async fn scoped_readiness_rechecks_indexes_registered_while_it_waits() {
-    let indexes = tokio::sync::RwLock::new(InitialIndexes::default());
-    let first = std::sync::Arc::new(InitialIndexGate::pending());
+    let server = server(client::Client::for_test("A", None), "launch", false);
+    let first = first_index(&server, "A", Path::new("first")).await;
     first.register_codebase("A".into()).await;
-    indexes
-        .write()
-        .await
-        .by_path
-        .insert("first".into(), first.clone());
-    let search = ready_for_codebases(&indexes, &[]);
+
+    let search = ready_for_codebases(&server.shared.leases, &[]);
     tokio::pin!(search);
     assert!(
         tokio::time::timeout(Duration::from_millis(5), &mut search)
             .await
             .is_err()
     );
-    let second = std::sync::Arc::new(InitialIndexGate::pending());
+
+    let second = first_index(&server, "B", Path::new("second")).await;
     second.register_codebase("B".into()).await;
-    indexes
-        .write()
-        .await
-        .by_path
-        .insert("second".into(), second.clone());
     first.finish(Ok(())).await;
     assert!(
         tokio::time::timeout(Duration::from_millis(5), &mut search)
             .await
-            .is_err()
+            .is_err(),
+        "the checkout attached while waiting must also be ready"
     );
+
     second.finish(Ok(())).await;
     let guard = tokio::time::timeout(Duration::from_secs(1), &mut search)
         .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(guard.by_path.len(), 2);
-    assert!(indexes.try_write().is_err());
+        .expect("both gates completed")
+        .expect("both first indexes succeeded");
+    assert_eq!(guard.len(), 2);
+    assert!(server.shared.leases.try_write().is_err());
 }
 
+/// Waiting for one checkout must not hold the lease map: registration needs it.
 #[tokio::test]
 async fn repeated_index_waiting_allows_registration_to_finish() {
-    let indexes = tokio::sync::RwLock::new(InitialIndexes::default());
-    let gate = std::sync::Arc::new(InitialIndexGate::pending());
-    let path = std::path::Path::new("checkout");
-    indexes
-        .write()
-        .await
-        .by_path
-        .insert(path.to_path_buf(), gate.clone());
+    let server = server(client::Client::for_test("codebase", None), "launch", false);
+    let path = Path::new("checkout");
+    let gate = first_index(&server, "codebase", path).await;
     let waiting = async {
-        if let Some(gate) = initial_gate_for_path(&indexes, path).await {
-            gate.wait().await.unwrap();
+        if let Some(gate) = initial_gate_for_path(&server.shared.leases, path).await {
+            gate.wait().await.expect("the first index succeeds");
         }
     };
     let registering = async {
@@ -214,7 +232,40 @@ async fn repeated_index_waiting_allows_registration_to_finish() {
         tokio::join!(biased; waiting, registering);
     })
     .await
-    .expect("an active index request must release the registry lock");
+    .expect("an active index request must release the lease map");
+}
+
+/// A session waits for the checkouts it brought in, and for no others. One
+/// host's first index must never block another host's search.
+#[tokio::test]
+async fn an_empty_selector_waits_only_on_this_sessions_gates() {
+    let engine = Engine::for_test(Arc::new(IdleReconciler));
+    let mine = session(
+        client::Client::for_test("mine", None),
+        "my-launch",
+        false,
+        engine.clone(),
+    );
+    let theirs = session(
+        client::Client::for_test("theirs", None),
+        "their-launch",
+        false,
+        engine,
+    );
+    // The other session's first index never finishes.
+    let _their_gate = first_index(&theirs, "theirs", Path::new("their-checkout")).await;
+    let my_gate = first_index(&mine, "mine", Path::new("my-checkout")).await;
+    my_gate.finish(Ok(())).await;
+
+    let guard = tokio::time::timeout(
+        Duration::from_secs(1),
+        ready_for_codebases(&mine.shared.leases, &[]),
+    )
+    .await
+    .expect("a gate this session does not hold must not block it")
+    .expect("this session's own first index succeeded");
+
+    assert_eq!(guard.len(), 1);
 }
 
 /// A first index owns its checkout before the codebase is registered. A plain
@@ -274,25 +325,20 @@ async fn canonical_search_omits_cached_checkout_freshness() {
     assert_eq!(server.index_freshness(&base.for_canonical()).await, None);
 }
 
+/// Two checkouts can share one codebase id. A bound checkout waits for its own
+/// first index; a request with no checkout waits for every one of them.
 #[tokio::test]
 async fn checkout_readiness_does_not_use_another_checkouts_codebase_gate() {
-    let first_root = std::path::PathBuf::from("first-checkout");
+    let first_root = PathBuf::from("first-checkout");
     let first = client::Client::for_test("shared-codebase", Some(first_root.clone()));
     let server = server(first.clone(), "launch", false);
-    let first_gate = std::sync::Arc::new(InitialIndexGate::pending());
-    let second_gate = std::sync::Arc::new(InitialIndexGate::pending());
+    let first_gate = first_index(&server, "shared-codebase", &first_root).await;
+    let second_gate = first_index(&server, "shared-codebase", Path::new("second-checkout")).await;
     first_gate.register_codebase("shared-codebase".into()).await;
     second_gate
         .register_codebase("shared-codebase".into())
         .await;
     second_gate.finish(Ok(())).await;
-    {
-        let mut indexes = server.shared.initial_indexes.write().await;
-        indexes.by_path.insert(first_root, first_gate.clone());
-        indexes
-            .by_path
-            .insert("second-checkout".into(), second_gate.clone());
-    }
 
     assert!(
         tokio::time::timeout(
@@ -307,6 +353,7 @@ async fn checkout_readiness_does_not_use_another_checkouts_codebase_gate() {
         .finish(Err("another checkout failed".into()))
         .await;
     assert_eq!(server.await_initial_client(&first).await, Ok(()));
+
     let rootless = client::Client::for_test("shared-codebase", None);
     assert!(
         server

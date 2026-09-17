@@ -14,10 +14,13 @@ pub(crate) mod registry;
 pub(crate) mod scheduler;
 pub(crate) mod watch_hub;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use tokio::sync::Mutex;
 use tokio::time::MissedTickBehavior;
+use tracing::info;
 
 use crate::client::HttpTransport;
 
@@ -57,6 +60,14 @@ pub(crate) struct Engine {
     registry: Arc<CheckoutRegistry>,
     scheduler: Arc<Scheduler>,
     transport: HttpTransport,
+    /// One-line "a newer semctl is published" prompt, set by the one update
+    /// check this process runs and consumed by one search footer. `None` until
+    /// a newer version is seen. Notify-only: applying the update stays the
+    /// explicit `semctl upgrade`.
+    update_note: Arc<Mutex<Option<String>>>,
+    /// Whether the update check has been started. One process asks once,
+    /// however many sessions it serves.
+    update_check_started: AtomicBool,
 }
 
 impl Engine {
@@ -76,6 +87,8 @@ impl Engine {
             registry,
             scheduler,
             transport: HttpTransport::new(),
+            update_note: Arc::new(Mutex::new(None)),
+            update_check_started: AtomicBool::new(false),
         })
     }
 
@@ -87,6 +100,8 @@ impl Engine {
             registry: Arc::new(CheckoutRegistry::for_test(reconciler, DEFAULT_IDLE_GRACE)),
             scheduler,
             transport: HttpTransport::new(),
+            update_note: Arc::new(Mutex::new(None)),
+            update_check_started: AtomicBool::new(false),
         })
     }
 
@@ -102,6 +117,40 @@ impl Engine {
     /// shares its connection pool.
     pub(crate) fn transport(&self) -> &HttpTransport {
         &self.transport
+    }
+
+    /// The update note, for a session that asked for the check.
+    pub(crate) fn update_note(&self) -> &Arc<Mutex<Option<String>>> {
+        &self.update_note
+    }
+
+    /// Start the one update check of this process.
+    ///
+    /// The first session whose context asks for it starts it; every later
+    /// session reuses the note. A session with the check off neither starts it
+    /// nor reads the note, so one session cannot make another pay for a
+    /// lookup it declined.
+    ///
+    /// Detached and best effort: a failed check records nothing, because a
+    /// missed notice must not affect a tool call.
+    pub(crate) fn start_update_check(&self, server_override: Option<String>, enabled: bool) {
+        if !enabled || self.update_check_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let note = self.update_note.clone();
+        tokio::spawn(async move {
+            let Some(latest) =
+                crate::commands::upgrade::check_for_update(server_override.as_deref()).await
+            else {
+                return;
+            };
+            let current = env!("CARGO_PKG_VERSION");
+            info!(current, %latest, "a newer semctl is available — run `semctl upgrade`");
+            *note.lock().await = Some(format!(
+                "(semctl update available: v{latest} — you're on v{current}; \
+                 run `semctl upgrade` to update)"
+            ));
+        });
     }
 }
 

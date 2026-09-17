@@ -77,7 +77,7 @@ impl McpServer {
         // Reserve checked registry membership only for the query. A new
         // codebase cannot appear between readiness and scope evaluation.
         let indexes = if opts.scope.is_some() || !opts.codebase_ids.is_empty() {
-            match ready_for_codebases(&self.shared.initial_indexes, &opts.codebase_ids).await {
+            match ready_for_codebases(&self.shared.leases, &opts.codebase_ids).await {
                 Ok(indexes) => Some(indexes),
                 Err(error) => return format!("search_codebase unavailable — {error}"),
             }
@@ -104,7 +104,7 @@ impl McpServer {
         // One-shot ride-along fallback when a newer CLI is published. The
         // SessionStart hook is the primary user-facing notice; consuming this
         // note prevents repeated search results from spending tokens on it.
-        if let Some(note) = self.shared.update_note.lock().await.take() {
+        if let Some(note) = self.update_note().await {
             out.push_str("\n\n");
             out.push_str(&note);
         }
@@ -605,7 +605,7 @@ impl McpServer {
         // awaited: it falls through below, where the engine replaces it with a
         // fresh one, so a failed first index stays retryable while a partial
         // one can never be reported as ready.
-        if let Some(gate) = initial_gate_for_path(&self.shared.initial_indexes, &dir).await
+        if let Some(gate) = initial_gate_for_path(&self.shared.leases, &dir).await
             && !matches!(gate.outcome().await, Some(Err(_)))
         {
             return match gate.wait().await {
@@ -658,12 +658,6 @@ impl McpServer {
             Ok(gate) => gate,
             Err(e) => return format!("index_codebase failed for {}: {e}", dir.display()),
         };
-        self.shared
-            .initial_indexes
-            .write()
-            .await
-            .by_path
-            .insert(dir.clone(), gate.clone());
         if !gate.claim_registration().await {
             return match gate.wait().await {
                 Ok(()) => format!(

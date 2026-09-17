@@ -10,6 +10,11 @@
 //! Retrieval bodies live in [`crate::query`]. Symbolic edit tools also consume
 //! the server's immutable plan through [`crate::editing`] and apply it to the
 //! bound checkout in the same approved MCP action.
+//!
+//! Nothing here owns a checkout. Keeping a working copy indexed belongs to
+//! [`crate::engine`], which owns one coordinator per checkout for the whole
+//! process. A session holds a lease on each checkout it uses, and that set of
+//! leases is also what its first-index readiness waits on.
 
 use anyhow::Result;
 use rmcp::{
@@ -27,9 +32,7 @@ use tracing::{debug, info, warn};
 
 use crate::cli::Cli;
 use crate::client::{self, Client};
-use crate::engine::{
-    CheckoutKey, CoordinatorLease, CoordinatorStatus, Engine, EngineSettings, Trigger,
-};
+use crate::engine::{CheckoutKey, CoordinatorStatus, Engine, EngineSettings, Trigger};
 use crate::query;
 use crate::session::SessionContext;
 
@@ -37,7 +40,7 @@ pub(crate) mod readiness;
 mod tool_types;
 mod tools;
 
-use readiness::{InitialIndexGate, InitialIndexes, initial_gate_for_path, ready_for_codebases};
+use readiness::{InitialIndexGate, SessionLeases, initial_gate_for_path, ready_for_codebases};
 
 use tool_types::{InsertSymbolArgs, render_edit_action_outcome};
 
@@ -96,24 +99,44 @@ struct Shared {
     engine: Arc<Engine>,
     /// The coordinators this session keeps alive. Dropping the map releases
     /// them, and the engine frees a coordinator no session holds any more.
-    leases: RwLock<HashMap<CheckoutKey, CoordinatorLease>>,
-    /// First-ever indexes currently building (or completed/failed in this
-    /// process). Retrieval tools await these gates; `sync_status` deliberately
-    /// bypasses them so progress remains observable.
-    initial_indexes: RwLock<InitialIndexes>,
+    ///
+    /// It is also this session's readiness scope: retrieval tools await the
+    /// first-index gates of these checkouts and of no others. `sync_status`
+    /// deliberately bypasses the gates so progress remains observable.
+    leases: SessionLeases,
     /// Cached search freshness footer, keyed by the job id it describes; filled
     /// only once that job is terminal so repeated searches don't re-poll. See
     /// [`McpServer::index_freshness`].
     freshness: FreshnessCache,
-    /// One-line "a newer semctl is published" prompt, set once by the startup
-    /// update check ([`spawn_update_check`]) and consumed by one search footer.
-    /// `None` until/unless a newer version is seen. Notify-only: applying the
-    /// update stays the explicit `semctl upgrade`.
-    update_note: Arc<Mutex<Option<String>>>,
 }
 
 impl McpServer {
-    fn new(
+    /// Build the server for one session.
+    ///
+    /// `engine` is shared with every other session in this process. Everything
+    /// else here belongs to this session: its client, its launch directory, and
+    /// its codebase binding.
+    pub(crate) async fn new(context: SessionContext, engine: Arc<Engine>) -> Result<Self> {
+        let base = client::from_context(
+            &context,
+            engine.transport(),
+            Some(engine.scheduler().remote_permits()),
+        )?;
+        // Pinned == a codebase was set up front (`--codebase` / `SEMCTX_CODEBASE`
+        // / config). The launch directory may be unrelated, so it is never
+        // synced into the pinned id. A cached checkout root for that id can
+        // still be watched safely.
+        let pinned = base.codebase_raw().is_some();
+        // The launch directory: what we resolve against and, once indexed,
+        // auto-sync. The session context always carries one.
+        let launch = std::fs::canonicalize(&context.cwd).unwrap_or_else(|_| context.cwd.clone());
+        let dir = crate::codebase::working_copy_root(&launch).await;
+        Ok(Self::with_parts(context, base, dir, pinned, engine))
+    }
+
+    /// The parts of one session, already resolved. Tests use it to serve a
+    /// session without reading the configuration or the filesystem.
+    fn with_parts(
         context: SessionContext,
         base: Client,
         dir: PathBuf,
@@ -129,12 +152,31 @@ impl McpServer {
                 bound: Mutex::new(None),
                 engine,
                 leases: RwLock::new(HashMap::new()),
-                initial_indexes: RwLock::new(InitialIndexes::default()),
                 freshness: Arc::new(Mutex::new(None)),
-                update_note: Arc::new(Mutex::new(None)),
             }),
             tool_router: tools::router(),
         }
+    }
+
+    /// Ask the engine for its one update check, on this session's behalf.
+    fn start_update_check(&self) {
+        self.shared.engine.start_update_check(
+            self.shared.context.server.clone(),
+            self.shared.context.update_check,
+        );
+    }
+
+    /// The one-line "a newer semctl is published" prompt, if this session asked
+    /// for the check and the engine found one.
+    ///
+    /// Taken once: it is a nudge, and repeated search results must not spend
+    /// tokens on it. A session that turned the check off never reads it, so it
+    /// cannot receive a notice another session asked for.
+    async fn update_note(&self) -> Option<String> {
+        if !self.shared.context.update_check {
+            return None;
+        }
+        self.shared.engine.update_note().lock().await.take()
     }
 
     /// A freshness warning for search results, derived from the most recent
@@ -395,7 +437,7 @@ impl McpServer {
 
     async fn await_initial_path(&self, dir: &Path) -> std::result::Result<(), String> {
         let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-        let gate = initial_gate_for_path(&self.shared.initial_indexes, &dir).await;
+        let gate = initial_gate_for_path(&self.shared.leases, &dir).await;
         match gate {
             Some(gate) => gate
                 .wait()
@@ -406,7 +448,7 @@ impl McpServer {
     }
 
     async fn await_initial_codebase(&self, id: &str) -> std::result::Result<(), String> {
-        ready_for_codebases(&self.shared.initial_indexes, &[id.to_string()])
+        ready_for_codebases(&self.shared.leases, &[id.to_string()])
             .await
             .map(|_| ())
     }
@@ -677,8 +719,8 @@ impl McpServer {
 /// only when declared an umbrella root, and an unindexed folder resolves to
 /// nothing so the startup hook/tools ask for user opt-in to `index_codebase`
 /// rather than guessing by Git remote/name or auto-registering it (see
-/// `bound`). A resolved codebase is then kept indexed in the background (see
-/// `spawn_indexing`).
+/// `bound`). A resolved codebase is then kept indexed by the engine's
+/// coordinator for that checkout (see [`crate::engine::coordinator`]).
 ///
 /// We do NOT abort the process when that binding fails. A failure (not logged
 /// in, server down) is reported honestly by the code tools and retried on a
@@ -693,40 +735,18 @@ pub async fn run(cli: &Cli) -> Result<()> {
     // One engine per process. In standalone mode it serves exactly one session;
     // the type and the ownership are the same either way.
     let engine = Engine::new(EngineSettings::from_environment());
-    let base = client::from_context(
-        &context,
-        engine.transport(),
-        Some(engine.scheduler().remote_permits()),
-    )?;
+    let server = McpServer::new(context, engine).await?;
 
-    // Pinned == a codebase was set up front (`--codebase` / `SEMCTX_CODEBASE` /
-    // config). The launch directory may be unrelated, so it is never synced into
-    // the pinned id. A cached checkout root for that id can still be watched safely.
-    let pinned = base.codebase_raw().is_some();
-
-    // The launch directory: what we resolve against and, once indexed, auto-sync.
-    // The session context always carries one, so it is always known.
-    let launch = std::fs::canonicalize(&context.cwd).unwrap_or_else(|_| context.cwd.clone());
-    let dir = crate::codebase::working_copy_root(&launch).await;
-
-    let update_check = context.update_check;
-    let server_override = context.server.clone();
-    let server = McpServer::new(context, base, dir, pinned, engine);
-
-    // Detached, best-effort check for a newer published CLI; see `spawn_update_check`.
-    spawn_update_check(
-        server.shared.update_note.clone(),
-        server_override,
-        update_check,
-    );
+    // Detached, best-effort check for a newer published CLI.
+    server.start_update_check();
 
     // Bind eagerly so the happy path is ready — codebase resolved and the
     // background index kicked off — before the first tool call. This is one
-    // round-trip; the heavy walk/upload runs on a detached task, so `serve`
-    // still starts promptly. Best-effort: on failure we serve anyway and the
-    // code tools self-heal (see `bound`).
+    // round-trip; the heavy walk/upload runs in the checkout's coordinator, so
+    // `serve` still starts promptly. Best-effort: on failure we serve anyway
+    // and the code tools self-heal (see `bound`).
     match server.bound().await {
-        Ok(_) if pinned => info!(
+        Ok(_) if server.shared.pinned => info!(
             "codebase pinned explicitly; launch directory will not be synced into the pinned id"
         ),
         Ok(_) => {}
@@ -745,35 +765,6 @@ pub async fn run(cli: &Cli) -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("rmcp wait: {e}"))?;
     Ok(())
-}
-
-/// One-shot, best-effort check for a newer published CLI, run detached at
-/// startup. On a hit it records a one-line prompt in `note` (surfaced via one
-/// search footer and an stderr line) — it never downloads or swaps the binary; that
-/// stays the explicit `semctl upgrade`. The server caches the release lookup, so
-/// there's no client-side throttle. `enabled` carries the session's
-/// `SEMCTX_MCP_UPDATE_CHECK` choice; `false` skips the check.
-fn spawn_update_check(
-    note: Arc<Mutex<Option<String>>>,
-    server_override: Option<String>,
-    enabled: bool,
-) {
-    if !enabled {
-        return;
-    }
-    tokio::spawn(async move {
-        let Some(latest) =
-            crate::commands::upgrade::check_for_update(server_override.as_deref()).await
-        else {
-            return;
-        };
-        let current = env!("CARGO_PKG_VERSION");
-        info!(current, %latest, "a newer semctl is available — run `semctl upgrade`");
-        *note.lock().await = Some(format!(
-            "(semctl update available: v{latest} — you're on v{current}; \
-             run `semctl upgrade` to update)"
-        ));
-    });
 }
 
 /// Best-effort: look up the active codebase's local checkout root (recorded by
