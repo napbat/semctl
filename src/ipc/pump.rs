@@ -50,9 +50,26 @@ pub(crate) enum HalfClose {
     /// A shutdown ends only the write direction. A Unix domain socket does
     /// this. The pump keeps draining the connection until the daemon closes
     /// it.
+    // Reported by the Unix transport only. The pump must stay free of
+    // platform knowledge, so both states exist on every target.
+    #[cfg_attr(
+        windows,
+        allow(
+            dead_code,
+            reason = "reported by the Unix transport and by this module's tests"
+        )
+    )]
     Supported,
     /// The transport has no half-close. A Windows named pipe is in this
     /// group. The pump ends the connection and finishes when input ends.
+    // Reported by the Windows transport only, for the same reason.
+    #[cfg_attr(
+        not(windows),
+        allow(
+            dead_code,
+            reason = "reported by the Windows transport and by this module's tests"
+        )
+    )]
     Unsupported,
 }
 

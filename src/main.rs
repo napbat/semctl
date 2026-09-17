@@ -22,12 +22,6 @@ mod config;
 mod daemon;
 mod editing;
 mod engine;
-// Stage 1b of the shared local daemon adds the endpoint, the handshake, and the
-// byte pump. The daemon and client roles in stage 3 are the first consumers.
-#[expect(
-    dead_code,
-    reason = "consumed by the daemon and client roles in stage 3"
-)]
 mod ipc;
 mod mcp;
 mod query;
@@ -40,11 +34,17 @@ use clap::Parser;
 
 use crate::cli::Command;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Parse the command line, install the log subscriber, then run the role this
+/// invocation asks for.
+///
+/// `main` builds no runtime. The three roles need different ones — the client
+/// needs one current thread, the daemon needs a bounded pool, and every other
+/// command needs the default pool — and the choice is made in
+/// [`daemon::run_role`] before any of them exists.
+fn main() -> Result<()> {
     let cli = cli::Cli::parse();
     init_tracing(&cli.command);
-    cli.run().await
+    daemon::run_role(cli)
 }
 
 /// Install the process-wide log subscriber. Everything goes to **stderr**:

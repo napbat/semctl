@@ -28,6 +28,7 @@ mod unix;
 #[cfg(windows)]
 mod windows;
 
+use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -145,6 +146,20 @@ impl Endpoint {
     /// The daemon log file.
     pub(crate) fn log_path(&self) -> &Path {
         &self.log_path
+    }
+
+    /// Open the daemon log file for appending, creating what is missing.
+    ///
+    /// A client calls this before it starts a daemon: the daemon's standard
+    /// error is that log. Unix creates the file owner-only, inside the
+    /// verified private runtime directory. Windows creates the parent
+    /// directory under the local application data directory.
+    pub(crate) fn open_log(&self) -> Result<std::fs::File> {
+        #[cfg(unix)]
+        let file = unix::open_log(self)?;
+        #[cfg(windows)]
+        let file = windows::open_log(self)?;
+        Ok(file)
     }
 
     /// The private directory that holds the socket and the lock.
@@ -339,20 +354,30 @@ pub(crate) async fn connect(endpoint: &Endpoint, deadline: Instant) -> Result<St
 
 /// Attach to the daemon and copy bytes until the connection ends.
 ///
-/// This is the whole client role. It builds its own current-thread Tokio
-/// runtime, because the role decision happens before any runtime exists, and
-/// one connection with two directions needs no worker pool.
-pub(crate) fn run_client(
-    endpoint: &Endpoint,
-    session: SessionRequest,
-    deadline: Instant,
-) -> Result<pump::Exit> {
+/// This is the transport half of the client role. It builds its own
+/// current-thread Tokio runtime, because the role decision happens before any
+/// runtime exists, and one connection with two directions needs no worker
+/// pool.
+///
+/// `connect` is the caller's connection strategy, run inside that runtime. The
+/// client role uses it to try a daemon that is already listening, start one
+/// when none is, and try again. Keeping it here rather than in this module
+/// leaves the endpoint free of any knowledge about starting processes.
+///
+/// An `Err` means no session was served: the connection, the handshake, or the
+/// daemon's answer failed, and the caller may still serve the session another
+/// way. An `Ok` means the pump ran, and the exit belongs to the host.
+pub(crate) fn run_client<C, F>(session: SessionRequest, connect: C) -> Result<pump::Exit>
+where
+    C: FnOnce() -> F,
+    F: Future<Output = Result<Stream>>,
+{
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
         .build()
         .context("build the client runtime")?;
-    let outcome = runtime.block_on(attach_and_pump(endpoint, session, deadline));
+    let outcome = runtime.block_on(attach_and_pump(session, connect));
     // The outbound task can still be waiting for standard input. Dropping the
     // runtime would wait for that read, so shut it down in the background and
     // let process exit release the handles.
@@ -362,12 +387,12 @@ pub(crate) fn run_client(
 
 /// Perform the attach handshake, then pump bytes between the standard streams
 /// and the connection.
-async fn attach_and_pump(
-    endpoint: &Endpoint,
-    session: SessionRequest,
-    deadline: Instant,
-) -> Result<pump::Exit> {
-    let mut stream = connect(endpoint, deadline).await?;
+async fn attach_and_pump<C, F>(session: SessionRequest, connect: C) -> Result<pump::Exit>
+where
+    C: FnOnce() -> F,
+    F: Future<Output = Result<Stream>>,
+{
+    let mut stream = connect().await?;
     handshake::write_line_async(&mut stream, &Request::attach(VERSION, session))
         .await
         .context("send the attach request")?;

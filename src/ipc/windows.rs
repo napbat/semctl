@@ -8,6 +8,7 @@
 
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
+use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
@@ -53,6 +54,24 @@ pub(super) fn log_path(id: &str) -> Result<PathBuf> {
     let base = dirs::data_local_dir()
         .ok_or_else(|| anyhow!("no local application data directory for the daemon log"))?;
     Ok(base.join("semctl").join(format!("daemon-{id}.log")))
+}
+
+/// Open the daemon log file for appending.
+///
+/// The log lives under the local application data directory, which is already
+/// private to this user, so the parent directory is created without a
+/// descriptor of its own.
+pub(super) fn open_log(endpoint: &Endpoint) -> Result<File> {
+    let path = endpoint.log_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create daemon log directory {}", parent.display()))?;
+    }
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("open daemon log {}", path.display()))
 }
 
 /// Encode a string as a null-terminated UTF-16 sequence.

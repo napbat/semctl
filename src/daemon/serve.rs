@@ -20,6 +20,7 @@
 //!   went away, and its host reconnects if it wants another session.
 
 use std::io;
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -44,14 +45,45 @@ const DEFAULT_IDLE: Duration = Duration::from_secs(600);
 /// Longest the drain waits for the session tasks it aborted.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Worker threads of the daemon runtime. Two keep a small machine serving
+/// while one worker waits; eight bound the cost on a large one.
+const WORKER_RANGE: RangeInclusive<usize> = 2..=8;
+
+/// Blocking threads of the daemon runtime. Every tree scan, policy load, and
+/// watch registration runs on one of these.
+const MAX_BLOCKING_THREADS: usize = 64;
+
+/// Run the daemon role, including its own runtime.
+///
+/// `main` calls this before it builds any other runtime: this runtime is
+/// bounded on purpose, because one daemon serves every session of this user
+/// and must not size itself as if it served one.
+pub(crate) fn run() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads(std::thread::available_parallelism().ok()))
+        .max_blocking_threads(MAX_BLOCKING_THREADS)
+        .enable_all()
+        .build()
+        .context("build the daemon runtime")?;
+    runtime.block_on(serve())
+}
+
+/// How many worker threads the daemon runtime gets.
+fn worker_threads(parallelism: Option<std::num::NonZero<usize>>) -> usize {
+    parallelism
+        .map_or(*WORKER_RANGE.start(), std::num::NonZero::get)
+        .clamp(*WORKER_RANGE.start(), *WORKER_RANGE.end())
+}
+
 /// Serve the local endpoint until this daemon drains.
 ///
 /// A lost election is a normal outcome and not an error: another daemon
 /// already serves this endpoint, so this process has nothing to do and exits
 /// with status 0.
 ///
-/// Call this inside a Tokio runtime. The command dispatcher in
-/// [`crate::commands::daemon`] does exactly that.
+/// Call this inside a Tokio runtime. [`run`] builds the daemon's own; the
+/// command dispatcher in [`crate::commands::daemon`] reaches this function
+/// when a runtime already exists.
 pub(crate) async fn serve() -> Result<()> {
     let endpoint = Endpoint::current().context("locate the local daemon endpoint")?;
     let listener = match Listener::bind(&endpoint).context("bind the local daemon endpoint")? {
@@ -516,7 +548,9 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use super::{DEFAULT_IDLE, PROTOCOL, Sessions, VERSION, idle_after, version_mismatch};
+    use super::{
+        DEFAULT_IDLE, PROTOCOL, Sessions, VERSION, idle_after, version_mismatch, worker_threads,
+    };
 
     #[test]
     fn the_idle_delay_falls_back_to_the_default() {
@@ -527,6 +561,14 @@ mod tests {
         assert_eq!(idle_after(Some("")), DEFAULT_IDLE);
         assert_eq!(idle_after(Some("soon")), DEFAULT_IDLE);
         assert_eq!(idle_after(Some("-5")), DEFAULT_IDLE);
+    }
+
+    #[test]
+    fn the_worker_count_stays_inside_the_documented_bounds() {
+        assert_eq!(worker_threads(None), 2, "an unknown machine still serves");
+        assert_eq!(worker_threads(std::num::NonZero::new(1)), 2);
+        assert_eq!(worker_threads(std::num::NonZero::new(4)), 4);
+        assert_eq!(worker_threads(std::num::NonZero::new(64)), 8);
     }
 
     #[test]

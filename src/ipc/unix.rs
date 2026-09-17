@@ -4,10 +4,10 @@
 //! elects itself with a lock file next to the socket, so two daemons can never
 //! serve one endpoint. Every accepted peer must run under the same user id.
 
-use std::fs::{self, DirBuilder, File, Permissions, TryLockError};
+use std::fs::{self, DirBuilder, File, OpenOptions, Permissions, TryLockError};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -154,6 +154,22 @@ fn verify_runtime_dir(dir: &Path, uid: u32) -> Result<()> {
         dir.display()
     );
     Ok(())
+}
+
+/// Open the daemon log file for appending.
+///
+/// The runtime directory is created and verified first, so the log cannot be
+/// written into a directory another user could read. The mode applies when
+/// this call creates the file; a log this endpoint created earlier keeps the
+/// mode it was created with.
+pub(super) fn open_log(endpoint: &Endpoint) -> Result<File> {
+    ensure_runtime_dir(endpoint.runtime_dir(), endpoint.uid())?;
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(endpoint.log_path())
+        .with_context(|| format!("open daemon log {}", endpoint.log_path().display()))
 }
 
 /// A bound Unix domain socket and the election lock that protects it.

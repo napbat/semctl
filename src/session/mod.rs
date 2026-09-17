@@ -158,6 +158,33 @@ impl SessionContext {
     }
 }
 
+impl SessionRequest {
+    /// The attach body that describes `context`.
+    ///
+    /// This is the client side of the same mapping
+    /// [`SessionContext::from_handshake`] reads, and it lives beside it so the
+    /// two cannot drift: what the client sends is exactly what the context
+    /// holds.
+    ///
+    /// The in-memory [`credentials::Secret`] becomes a wire [`Token`] here,
+    /// and nowhere else. The two types stay separate on purpose: one is
+    /// serializable and one is not.
+    pub(crate) fn from_context(context: &SessionContext) -> Self {
+        Self {
+            cwd: context.cwd.clone(),
+            server: context.server.clone(),
+            tenant: context.tenant.clone(),
+            codebase: context.codebase.clone(),
+            token: match &context.credentials {
+                CredentialSource::Invocation(secret) => Some(Token::new(secret.expose())),
+                CredentialSource::Stored => None,
+            },
+            resync_secs: context.resync_secs,
+            update_check: context.update_check,
+        }
+    }
+}
+
 /// Parse the re-sync interval. An absent or unreadable value means "use the
 /// indexing default", which keeps a typo from disabling the drift backstop.
 fn parse_resync_secs(raw: Option<&str>) -> Option<u64> {
@@ -298,6 +325,33 @@ mod tests {
 
     /// The list is what a client strips from a daemon's environment. A missing
     /// entry would let the daemon describe every session with its own value.
+    /// The client sends exactly what its context holds, and the daemon reads
+    /// exactly that back. A field added to one side without the other would
+    /// fail here.
+    #[test]
+    fn a_context_round_trips_through_an_attach_body() {
+        let context = SessionContext::build(
+            PathBuf::from("/work/checkout"),
+            &cli(Some("https://example.invalid"), Some("acme"), Some("id")),
+            Environment {
+                credentials: CredentialSource::from_test_token("round-trip-token"),
+                resync_secs: Some("45".to_string()),
+                update_check: Some("0".to_string()),
+            },
+        );
+
+        let restored = SessionContext::from_handshake(SessionRequest::from_context(&context))
+            .expect("the body of a valid context is valid");
+
+        assert_eq!(restored.cwd, context.cwd);
+        assert_eq!(restored.server, context.server);
+        assert_eq!(restored.tenant, context.tenant);
+        assert_eq!(restored.codebase, context.codebase);
+        assert_eq!(restored.resync_secs, Some(45));
+        assert!(!restored.update_check);
+        assert_eq!(restored.credentials.scope(), context.credentials.scope());
+    }
+
     #[test]
     fn the_per_session_variables_are_the_documented_six() {
         assert_eq!(
