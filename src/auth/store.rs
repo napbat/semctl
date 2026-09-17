@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 
 use crate::config::{self, StateStore};
+use crate::session::CredentialSource;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TokenSet {
@@ -43,8 +44,9 @@ pub(super) struct StoredCredentials {
     pub session: Option<SessionBinding>,
 }
 
-pub fn load_tokens() -> Result<Option<TokenSet>> {
-    if let Some(tokens) = environment_tokens() {
+/// The tokens `credentials` names, or `None` when nothing is stored.
+pub fn load_tokens(credentials: &CredentialSource) -> Result<Option<TokenSet>> {
+    if let Some(tokens) = invocation_tokens(credentials) {
         return Ok(Some(tokens));
     }
     Ok(CredentialStore::configured()?
@@ -52,15 +54,20 @@ pub fn load_tokens() -> Result<Option<TokenSet>> {
         .map(|stored| stored.tokens))
 }
 
-pub(super) fn environment_tokens() -> Option<TokenSet> {
-    std::env::var("SEMCTX_TOKEN")
-        .ok()
-        .filter(|token| !token.trim().is_empty())
-        .map(|access_token| TokenSet {
-            access_token,
+/// Present an invocation token as a token set.
+///
+/// The token belongs to this session alone, so it carries no refresh token and
+/// never expires from this program's point of view: there is nothing to refresh
+/// it with, and the server decides when it stops being accepted.
+pub(super) fn invocation_tokens(credentials: &CredentialSource) -> Option<TokenSet> {
+    match credentials {
+        CredentialSource::Invocation(secret) => Some(TokenSet {
+            access_token: secret.expose().to_string(),
             refresh_token: None,
             expires_at_unix: u64::MAX,
-        })
+        }),
+        CredentialSource::Stored => None,
+    }
 }
 
 #[derive(Clone)]

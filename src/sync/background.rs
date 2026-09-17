@@ -19,8 +19,16 @@ use crate::client::Client;
 /// and sync, a realtime FS watcher for low-latency pickup, and a periodic
 /// re-sync as the drift backstop — entirely off the serving path so none of it
 /// can stall the JSON-RPC channel. Detached; best-effort.
-pub fn spawn_indexing(client: Client, dir: PathBuf, jobs: Arc<JobRegistry>) {
-    spawn(client, dir, jobs, None);
+///
+/// `resync_secs` is the session's periodic interval. `None` selects
+/// [`DEFAULT_RESYNC_SECS`].
+pub fn spawn_indexing(
+    client: Client,
+    dir: PathBuf,
+    jobs: Arc<JobRegistry>,
+    resync_secs: Option<u64>,
+) {
+    spawn(client, dir, jobs, resync_secs, None);
 }
 
 /// Start the normal indexing/watcher lifecycle and return a one-shot result for
@@ -30,9 +38,10 @@ pub fn spawn_indexing_tracked(
     client: Client,
     dir: PathBuf,
     jobs: Arc<JobRegistry>,
+    resync_secs: Option<u64>,
 ) -> oneshot::Receiver<Result<SyncOutcome, String>> {
     let (tx, rx) = oneshot::channel();
-    spawn(client, dir, jobs, Some(tx));
+    spawn(client, dir, jobs, resync_secs, Some(tx));
     rx
 }
 
@@ -40,6 +49,7 @@ fn spawn(
     client: Client,
     dir: PathBuf,
     jobs: Arc<JobRegistry>,
+    resync_secs: Option<u64>,
     initial_result: Option<oneshot::Sender<Result<SyncOutcome, String>>>,
 ) {
     tokio::spawn(async move {
@@ -61,7 +71,7 @@ fn spawn(
             jobs.clone(),
             initial_result,
         );
-        match resync_secs() {
+        match resync_secs.unwrap_or(DEFAULT_RESYNC_SECS) {
             0 => info!("periodic re-sync disabled (SEMCTX_MCP_RESYNC_SECS=0)"),
             secs => {
                 info!(secs, "periodic re-sync enabled");
@@ -128,16 +138,10 @@ fn spawn_startup_reconcile(
     });
 }
 
-/// Default interval for the MCP server's periodic re-sync. Override with
-/// `SEMCTX_MCP_RESYNC_SECS`; `0` disables it (the startup index still runs).
+/// Default interval for the MCP server's periodic re-sync. A session overrides
+/// it with `SEMCTX_MCP_RESYNC_SECS`, which reaches this module as the
+/// `resync_secs` argument; `0` disables it (the startup index still runs).
 const DEFAULT_RESYNC_SECS: u64 = 60;
-
-fn resync_secs() -> u64 {
-    std::env::var("SEMCTX_MCP_RESYNC_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(DEFAULT_RESYNC_SECS)
-}
 
 /// Spawn the periodic re-sync loop: every `secs` seconds, re-walk `dir` and push
 /// whatever changed. The drift backstop behind the realtime watcher — it catches

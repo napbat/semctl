@@ -27,8 +27,9 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 use crate::cli::Cli;
-use crate::client::{self, Client};
+use crate::client::{self, Client, HttpTransport};
 use crate::query;
+use crate::session::SessionContext;
 use crate::sync::{self, JobRegistry};
 
 mod readiness;
@@ -71,12 +72,17 @@ type FreshnessCache = Arc<Mutex<Option<(String, Option<String>)>>>;
 /// repo was reachable) self-heals on the first code-tool call after the problem
 /// is fixed — e.g. after `semctl auth login` — without the host having to reconnect.
 struct Shared {
+    /// This session's invocation context. Every per-session value — working
+    /// directory, credentials, re-sync interval, update-check choice — is read
+    /// from here, never from the process.
+    context: SessionContext,
     /// Client with no codebase bound (or the pinned one). Serves `list_domains`
     /// and is the template selected codebase clients are derived from.
     base: Client,
-    /// Launch directory we resolve the current codebase against. Registration
-    /// occurs only through the explicit `index_codebase` tool.
-    dir: Option<std::path::PathBuf>,
+    /// Launch working-copy root we resolve the current codebase against, derived
+    /// from `context.cwd`. Registration occurs only through the explicit
+    /// `index_codebase` tool.
+    dir: PathBuf,
     /// Codebase pinned up front (`--codebase` / `SEMCTX_CODEBASE` / config).
     /// The launch cwd is never synced into it; a separately cached local root can
     /// still be watched safely.
@@ -105,9 +111,10 @@ struct Shared {
 }
 
 impl McpServer {
-    fn new(base: Client, dir: Option<std::path::PathBuf>, pinned: bool) -> Self {
+    fn new(context: SessionContext, base: Client, dir: PathBuf, pinned: bool) -> Self {
         Self {
             shared: Arc::new(Shared {
+                context,
                 base,
                 dir,
                 pinned,
@@ -172,9 +179,7 @@ impl McpServer {
     /// unreachable" from "not indexed" — which the tool surfaces to the model
     /// verbatim. Self-healing: a later call retries from scratch.
     async fn bound(&self) -> std::result::Result<Client, String> {
-        if let Some(dir) = &self.shared.dir {
-            self.await_initial_path(dir).await?;
-        }
+        self.await_initial_path(&self.shared.dir).await?;
         let client = self.bound_unchecked().await?;
         self.await_initial_client(&client).await?;
         Ok(client)
@@ -192,21 +197,19 @@ impl McpServer {
         // launch cwd, which may be unrelated; only watch a cached root previously
         // recorded by an explicit index.
         if self.shared.pinned {
-            let c = attach_local_root(self.shared.base.clone());
+            let c = attach_local_root(self.shared.base.clone(), &self.shared.context.cwd);
             *guard = Some(c.clone());
             drop(guard);
             self.watch_checkout_once(&c).await;
             return Ok(c);
         }
 
-        let Some(dir) = self.shared.dir.clone() else {
-            return Err("launch directory unknown — set SEMCTX_CODEBASE / --codebase".into());
-        };
+        let dir = self.shared.dir.clone();
 
         // Honest, local pre-check: an unauthenticated server can't resolve
         // anything, and that failure has nothing to do with the codebase — so
         // say so, rather than the misleading "no codebase for this directory".
-        match crate::auth::load_tokens() {
+        match crate::auth::load_tokens(&self.shared.context.credentials) {
             Ok(None) => {
                 return Err(
                     "not logged in — run `semctl auth login`, then just retry (no reconnect needed)"
@@ -243,7 +246,10 @@ impl McpServer {
             }
         };
 
-        let client = attach_local_root(self.shared.base.clone().with_codebase(id));
+        let client = attach_local_root(
+            self.shared.base.clone().with_codebase(id),
+            &self.shared.context.cwd,
+        );
         *guard = Some(client.clone());
         // Watcher ownership takes the index registry lock. Do not retain the
         // binding lock while another index may need it to finish registration.
@@ -272,7 +278,7 @@ impl McpServer {
             || raw.contains('/')
             || raw.contains('\\');
         let client = if path_like {
-            let dir = canonical_directory(&candidate)?;
+            let dir = canonical_directory(&self.shared.context.cwd, &candidate)?;
             let dir = crate::codebase::working_copy_root(&dir).await;
             self.await_initial_path(&dir).await?;
             let selector = dir.to_string_lossy().into_owned();
@@ -319,7 +325,7 @@ impl McpServer {
             || raw.contains('/')
             || raw.contains('\\');
         if path_like {
-            let dir = canonical_directory(&candidate)?;
+            let dir = canonical_directory(&self.shared.context.cwd, &candidate)?;
             let resolved = crate::codebase::resolve(&self.shared.base, &dir)
                 .await
                 .map_err(|e| format!("can't resolve codebase for {}: {e:#}", dir.display()))?
@@ -354,8 +360,10 @@ impl McpServer {
             .await
         {
             Ok(Some(_)) => {
-                let client =
-                    attach_local_root(self.shared.base.clone().with_codebase(raw.to_string()));
+                let client = attach_local_root(
+                    self.shared.base.clone().with_codebase(raw.to_string()),
+                    &self.shared.context.cwd,
+                );
                 self.watch_checkout_once(&client).await;
                 Ok(client)
             }
@@ -410,7 +418,12 @@ impl McpServer {
             return;
         };
         if self.claim_untracked_watch(&dir, &codebase_id).await {
-            sync::spawn_indexing(client, dir, self.shared.jobs.clone());
+            sync::spawn_indexing(
+                client,
+                dir,
+                self.shared.jobs.clone(),
+                self.shared.context.resync_secs,
+            );
         }
     }
 
@@ -458,6 +471,7 @@ impl McpServer {
             client,
             dir,
             self.shared.jobs.clone(),
+            self.shared.context.resync_secs,
         ))
     }
 
@@ -543,8 +557,18 @@ fn initial_job_result(
     Some(Ok(()))
 }
 
-fn canonical_directory(path: &Path) -> std::result::Result<PathBuf, String> {
-    let dir = std::fs::canonicalize(path)
+/// Resolve a selector path to a canonical directory.
+///
+/// A relative selector resolves against the session's working directory, not
+/// against the process working directory. One process can serve sessions
+/// invoked from different directories, and it must never move its own.
+fn canonical_directory(cwd: &Path, path: &Path) -> std::result::Result<PathBuf, String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let dir = std::fs::canonicalize(&absolute)
         .map_err(|e| format!("can't resolve directory {}: {e}", path.display()))?;
     if !dir.is_dir() {
         return Err(format!("{} is not a directory", dir.display()));
@@ -645,30 +669,32 @@ impl McpServer {
 /// those away too. Logs go to stderr (via the `tracing` subscriber); stdout is the
 /// JSON-RPC channel and must stay clean.
 pub async fn run(cli: &Cli) -> Result<()> {
-    let base = client::from_cli(cli)?;
+    // The one place this process reads itself. Everything below takes the
+    // session's values from `context`.
+    let context = SessionContext::from_process(cli)?;
+    let transport = HttpTransport::new();
+    let base = client::from_context(&context, &transport)?;
 
     // Pinned == a codebase was set up front (`--codebase` / `SEMCTX_CODEBASE` /
-    // config). The launch cwd may be unrelated, so it is never synced into the
-    // pinned id. A cached checkout root for that id can still be watched safely.
+    // config). The launch directory may be unrelated, so it is never synced into
+    // the pinned id. A cached checkout root for that id can still be watched safely.
     let pinned = base.codebase_raw().is_some();
 
     // The launch directory: what we resolve against and, once indexed, auto-sync.
-    // `None` means we can't read the cwd — code tools then need SEMCTX_CODEBASE.
-    let dir = match std::env::current_dir() {
-        Ok(dir) => {
-            let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
-            Some(crate::codebase::working_copy_root(&dir).await)
-        }
-        Err(e) => {
-            warn!(error = %e, "can't read working directory; code tools need SEMCTX_CODEBASE");
-            None
-        }
-    };
+    // The session context always carries one, so it is always known.
+    let launch = std::fs::canonicalize(&context.cwd).unwrap_or_else(|_| context.cwd.clone());
+    let dir = crate::codebase::working_copy_root(&launch).await;
 
-    let server = McpServer::new(base, dir, pinned);
+    let update_check = context.update_check;
+    let server_override = context.server.clone();
+    let server = McpServer::new(context, base, dir, pinned);
 
     // Detached, best-effort check for a newer published CLI; see `spawn_update_check`.
-    spawn_update_check(server.shared.update_note.clone(), cli.server.clone());
+    spawn_update_check(
+        server.shared.update_note.clone(),
+        server_override,
+        update_check,
+    );
 
     // Bind eagerly so the happy path is ready — codebase resolved and the
     // background index kicked off — before the first tool call. This is one
@@ -701,9 +727,14 @@ pub async fn run(cli: &Cli) -> Result<()> {
 /// startup. On a hit it records a one-line prompt in `note` (surfaced via one
 /// search footer and an stderr line) — it never downloads or swaps the binary; that
 /// stays the explicit `semctl upgrade`. The server caches the release lookup, so
-/// there's no client-side throttle. Set `SEMCTX_MCP_UPDATE_CHECK=0` to skip it.
-fn spawn_update_check(note: Arc<Mutex<Option<String>>>, server_override: Option<String>) {
-    if std::env::var("SEMCTX_MCP_UPDATE_CHECK").as_deref() == Ok("0") {
+/// there's no client-side throttle. `enabled` carries the session's
+/// `SEMCTX_MCP_UPDATE_CHECK` choice; `false` skips the check.
+fn spawn_update_check(
+    note: Arc<Mutex<Option<String>>>,
+    server_override: Option<String>,
+    enabled: bool,
+) {
+    if !enabled {
         return;
     }
     tokio::spawn(async move {
@@ -725,8 +756,11 @@ fn spawn_update_check(note: Arc<Mutex<Option<String>>>, server_override: Option<
 /// `semctl index`) and fold it into the client, so hit paths render as absolute
 /// and the host can open them directly. A miss (canonical / server-pulled
 /// codebase, or one never indexed locally) leaves paths codebase-relative.
-fn attach_local_root(client: Client) -> Client {
-    let client = client.with_cached_local_root(std::env::current_dir().ok().as_deref());
+///
+/// `cwd` is the session's working directory. It picks the recorded checkout
+/// that contains it when a codebase has several.
+fn attach_local_root(client: Client, cwd: &Path) -> Client {
+    let client = client.with_cached_local_root(Some(cwd));
     if let Some(r) = client.local_root() {
         debug!(root = %r.display(), "hit paths absolutized against local checkout");
     }

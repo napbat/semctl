@@ -2,14 +2,19 @@ use anyhow::Result;
 
 use crate::auth;
 use crate::cli::Cli;
+use crate::client::{self, HttpTransport};
+use crate::session::SessionContext;
 
 /// The server doesn't expose `/v1/me` yet — until it does, we decode
 /// the JWT's `sub` / `email` claims locally and print those, plus
 /// check that the server accepts our token by pinging `/v1/domains`.
 pub async fn run(cli: &Cli) -> Result<()> {
-    let http = reqwest::Client::new();
-    let client = crate::client::from_cli(cli)?;
-    let token = auth::get_valid_access_token(&http, client.server_url()).await?;
+    let context = SessionContext::from_process(cli)?;
+    let transport = HttpTransport::new();
+    let client = client::from_context(&context, &transport)?;
+    let token =
+        auth::get_valid_access_token(transport.http(), client.server_url(), &context.credentials)
+            .await?;
 
     let claims = decode_jwt_payload(&token)?;
     let sub = claims

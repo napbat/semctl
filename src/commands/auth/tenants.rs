@@ -5,7 +5,9 @@ use clap::Args;
 
 use crate::auth;
 use crate::cli::Cli;
+use crate::client::HttpTransport;
 use crate::config;
+use crate::session::SessionContext;
 
 #[derive(Debug, Args)]
 pub struct TenantsArgs {
@@ -17,12 +19,14 @@ pub struct TenantsArgs {
 }
 
 pub async fn run(args: TenantsArgs, cli: &Cli) -> Result<()> {
+    let context = SessionContext::from_process(cli)?;
     let cfg = config::load()?;
-    let server_url = cfg.server_url(cli.server.as_deref());
+    let server_url = cfg.server_url(context.server.as_deref());
 
-    let http = reqwest::Client::new();
-    let session = auth::authenticated_session(&http, &server_url).await?;
-    let items = auth::fetch_tenants(&http, &session.authority_url, &session.access_token).await?;
+    let transport = HttpTransport::new();
+    let http = transport.http();
+    let session = auth::authenticated_session(http, &server_url, &context.credentials).await?;
+    let items = auth::fetch_tenants(http, &session.authority_url, &session.access_token).await?;
 
     if items.is_empty() {
         println!("(no tenant memberships)");

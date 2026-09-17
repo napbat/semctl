@@ -18,6 +18,11 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, warn};
 
 use crate::auth;
+use crate::session::{CredentialSource, SessionContext};
+
+pub(crate) mod transport;
+
+pub(crate) use transport::HttpTransport;
 
 const TENANT_HEADER: &str = "X-Tenant-Id";
 /// The checkout a request is made from. The server prefers that copy of a
@@ -33,6 +38,9 @@ const LOADING_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
 #[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
+    /// How this client's session authorizes its requests. Carried explicitly so
+    /// two clients in one process can hold different credentials.
+    credentials: CredentialSource,
     base_url: String,
     /// Shared so an MCP server and every codebase-bound clone can recover from
     /// a persisted tenant that identity no longer lists for this principal.
@@ -65,23 +73,29 @@ impl Client {
     /// Build isolated client state for tests that do not send HTTP requests.
     #[cfg(test)]
     pub(crate) fn for_test(codebase: &str, local_root: Option<PathBuf>) -> Self {
-        let mut client = Self::new("http://127.0.0.1:1", None, Some(codebase.into()), false);
+        let mut client = Self::new(
+            &HttpTransport::new(),
+            CredentialSource::Stored,
+            "http://127.0.0.1:1",
+            None,
+            Some(codebase.into()),
+            false,
+        );
         client.local_root = local_root;
         client
     }
 
     fn new(
+        transport: &HttpTransport,
+        credentials: CredentialSource,
         base_url: &str,
         tenant: Option<String>,
         codebase: Option<String>,
         repair_configured_tenant: bool,
     ) -> Self {
-        let http = reqwest::Client::builder()
-            .user_agent(concat!("semctx-cli/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .expect("reqwest client build is infallible with default config");
         Self {
-            http,
+            http: transport.http().clone(),
+            credentials,
             base_url: base_url.trim_end_matches('/').to_string(),
             tenant: Arc::new(RwLock::new(tenant)),
             repair_configured_tenant,
@@ -184,7 +198,8 @@ impl Client {
         method: reqwest::Method,
         path: &str,
     ) -> Result<(reqwest::RequestBuilder, String, Option<String>)> {
-        let token = auth::get_valid_access_token(&self.http, &self.base_url).await?;
+        let token =
+            auth::get_valid_access_token(&self.http, &self.base_url, &self.credentials).await?;
         let url = self.url(path);
         let mut req = self.http.request(method, &url).bearer_auth(&token);
         let tenant = self.tenant.read().await.clone();
@@ -277,7 +292,13 @@ impl Client {
             return current.is_some();
         }
 
-        let session = match auth::authenticated_session(&self.http, &self.base_url).await {
+        let session = match auth::authenticated_session(
+            &self.http,
+            &self.base_url,
+            &self.credentials,
+        )
+        .await
+        {
             Ok(session) => session,
             Err(error) => {
                 warn!(%error, "could not read the current login while repairing tenant selection");
@@ -617,17 +638,23 @@ fn tenant_selection(configured: Option<String>, explicit: Option<&str>) -> (Opti
     }
 }
 
-/// Build an authenticated `Client` from the loaded config + the global CLI flags.
-pub fn from_cli(cli: &crate::cli::Cli) -> Result<Client> {
+/// Build an authenticated `Client` for one session.
+///
+/// This is the real constructor: every selection the client makes comes from
+/// `context` and the loaded config, never from the process. `transport` supplies
+/// the shared HTTP client.
+pub(crate) fn from_context(context: &SessionContext, transport: &HttpTransport) -> Result<Client> {
     let cfg = crate::config::load()?;
-    let server = auth::normalize_server_url(&cfg.server_url(cli.server.as_deref()))?;
+    let server = auth::normalize_server_url(&cfg.server_url(context.server.as_deref()))?;
     let configured_tenant = (auth::normalize_server_url(&cfg.persisted_server_url())? == server)
         .then(|| cfg.active_tenant.clone())
         .flatten();
     let (tenant, repair_configured_tenant) =
-        tenant_selection(configured_tenant, cli.tenant.as_deref());
-    let codebase = cfg.active_codebase(cli.codebase.as_deref());
+        tenant_selection(configured_tenant, context.tenant.as_deref());
+    let codebase = cfg.active_codebase(context.codebase.as_deref());
     Ok(Client::new(
+        transport,
+        context.credentials.clone(),
         &server,
         tenant,
         codebase,
@@ -635,12 +662,22 @@ pub fn from_cli(cli: &crate::cli::Cli) -> Result<Client> {
     ))
 }
 
-/// Like [`from_cli`], but ensures a codebase is set — resolving the working
-/// directory's codebase when one wasn't configured explicitly. For the
+/// Convenience for a one-shot command: read this process as one session, give
+/// it its own transport, and build its client. Long-lived callers that serve
+/// several sessions build the context and the transport themselves and use
+/// [`from_context`].
+pub fn from_cli(cli: &crate::cli::Cli) -> Result<Client> {
+    let context = SessionContext::from_process(cli)?;
+    from_context(&context, &HttpTransport::new())
+}
+
+/// Like [`from_cli`], but ensures a codebase is set — resolving the session's
+/// working directory's codebase when one wasn't configured explicitly. For the
 /// codebase-scoped commands (`projects`, `graph …`) run inside a repo.
 pub async fn for_cwd(cli: &crate::cli::Cli) -> Result<Client> {
-    let client = from_cli(cli)?;
-    let dir = std::env::current_dir().context("read working directory")?;
+    let context = SessionContext::from_process(cli)?;
+    let client = from_context(&context, &HttpTransport::new())?;
+    let dir = context.cwd;
     if client.codebase_raw().is_some() {
         return Ok(client.with_cached_local_root(Some(&dir)));
     }
@@ -663,9 +700,21 @@ mod tests {
     use serde::Deserialize;
 
     use super::{
-        Client, PageEnvelope, gateway_error, loading_retry_delay, tenant_binding_denied,
-        tenant_selection,
+        Client, CredentialSource, HttpTransport, PageEnvelope, gateway_error, loading_retry_delay,
+        tenant_binding_denied, tenant_selection,
     };
+
+    /// A client with no codebase and no checkout, for the pure selection tests.
+    fn test_client() -> Client {
+        Client::new(
+            &HttpTransport::new(),
+            CredentialSource::Stored,
+            "https://example.invalid",
+            None,
+            None,
+            false,
+        )
+    }
 
     #[derive(Debug, Deserialize, PartialEq, Eq)]
     struct Row {
@@ -786,7 +835,7 @@ mod tests {
     /// "tell me what the project publishes".
     #[test]
     fn asking_for_canonical_stops_claiming_a_checkout() {
-        let mut client = Client::new("https://example.invalid", None, None, false);
+        let mut client = test_client();
         client.checkout_source_id = Some("digest".into());
         client.local_root = Some(std::path::PathBuf::from("checkout"));
 
@@ -804,7 +853,7 @@ mod tests {
     /// what every read resolves to.
     #[test]
     fn canonical_is_a_no_op_when_no_checkout_is_claimed() {
-        let client = Client::new("https://example.invalid", None, None, false);
+        let client = test_client();
 
         assert_eq!(client.for_canonical().checkout_source_id, None);
     }

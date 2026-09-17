@@ -19,6 +19,13 @@ use super::{
     DIRECT_EDIT_TOOLS, InitialIndexGate, InitialIndexes, McpServer, client, initial_gate_for_path,
     initial_job_result, ready_for_codebases,
 };
+use crate::session::SessionContext;
+
+/// An MCP server for one throwaway session. These tests never read the session's
+/// working directory, so a path that does not exist serves as the launch root.
+fn server(base: client::Client, dir: impl Into<std::path::PathBuf>, pinned: bool) -> McpServer {
+    McpServer::new(SessionContext::for_test(), base, dir.into(), pinned)
+}
 
 fn job(completed: bool, failed: i64, error: Option<&str>) -> client::api::JobStatus {
     client::api::JobStatus {
@@ -191,7 +198,7 @@ async fn repeated_index_waiting_allows_registration_to_finish() {
 #[tokio::test]
 async fn first_index_gate_reserves_watcher_startup_before_registration() {
     let base = client::Client::for_test("codebase", None);
-    let server = McpServer::new(base, None, false);
+    let server = server(base, "launch", false);
     let root = std::path::Path::new("first-checkout");
     let gate = std::sync::Arc::new(InitialIndexGate::pending());
     server
@@ -218,7 +225,7 @@ async fn first_index_gate_reserves_watcher_startup_before_registration() {
 #[tokio::test]
 async fn canonical_search_omits_cached_checkout_freshness() {
     let base = client::Client::for_test("codebase", Some("checkout".into()));
-    let server = McpServer::new(base.clone(), None, true);
+    let server = server(base.clone(), "launch", true);
     server.shared.jobs.lock().await.insert(
         "codebase".into(),
         crate::sync::LastJob {
@@ -239,7 +246,7 @@ async fn canonical_search_omits_cached_checkout_freshness() {
 async fn checkout_readiness_does_not_use_another_checkouts_codebase_gate() {
     let first_root = std::path::PathBuf::from("first-checkout");
     let first = client::Client::for_test("shared-codebase", Some(first_root.clone()));
-    let server = McpServer::new(first.clone(), None, false);
+    let server = server(first.clone(), "launch", false);
     let first_gate = std::sync::Arc::new(InitialIndexGate::pending());
     let second_gate = std::sync::Arc::new(InitialIndexGate::pending());
     first_gate.register_codebase("shared-codebase".into()).await;
@@ -282,7 +289,7 @@ async fn checkout_readiness_does_not_use_another_checkouts_codebase_gate() {
 async fn automatic_watching_uses_the_bound_umbrella_root() {
     let umbrella = std::path::PathBuf::from("umbrella");
     let base = client::Client::for_test("codebase", Some(umbrella.clone()));
-    let server = McpServer::new(base.clone(), Some(umbrella.join("child")), false);
+    let server = server(base.clone(), umbrella.join("child"), false);
     let gate = std::sync::Arc::new(InitialIndexGate::pending());
     server
         .shared

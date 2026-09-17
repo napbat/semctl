@@ -21,6 +21,7 @@ mod config;
 mod editing;
 mod mcp;
 mod query;
+mod session;
 mod sync;
 mod term;
 

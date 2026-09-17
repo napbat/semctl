@@ -3,8 +3,9 @@
 use anyhow::{Context, Result, anyhow, ensure};
 use base64::Engine;
 
-use super::store::{CredentialStore, SessionBinding, StoredCredentials, environment_tokens};
+use super::store::{CredentialStore, SessionBinding, StoredCredentials, invocation_tokens};
 use super::{SessionStamp, TokenSet, discover_authority, refresh};
+use crate::session::CredentialSource;
 
 pub struct LoginAttempt {
     server_url: String,
@@ -100,22 +101,32 @@ pub async fn clear_tokens() -> Result<()> {
     .context("wait for logout")?
 }
 
-pub async fn get_valid_access_token(http: &reqwest::Client, server_url: &str) -> Result<String> {
+/// The access token `credentials` names, refreshing a stored login if needed.
+pub async fn get_valid_access_token(
+    http: &reqwest::Client,
+    server_url: &str,
+    credentials: &CredentialSource,
+) -> Result<String> {
     // This explicit headless override belongs to this invocation. It never
     // borrows a persisted refresh token or changes stored login state.
-    if let Some(tokens) = environment_tokens() {
+    if let Some(tokens) = invocation_tokens(credentials) {
         return Ok(tokens.access_token);
     }
-    Ok(authenticated_session(http, server_url).await?.access_token)
+    Ok(authenticated_session(http, server_url, credentials)
+        .await?
+        .access_token)
 }
 
+/// The login `credentials` names, as the authority, stamp, and tenant the
+/// caller needs to act on it.
 pub async fn authenticated_session(
     http: &reqwest::Client,
     server_url: &str,
+    credentials: &CredentialSource,
 ) -> Result<AuthenticatedSession> {
     let server_url = normalize_server_url(server_url)?;
     let store = CredentialStore::configured()?;
-    if let Some(tokens) = environment_tokens() {
+    if let Some(tokens) = invocation_tokens(credentials) {
         let authority_url = discover_authority(http, &server_url).await?;
         let _lock = store.state.lock().await?;
         let cfg = store.state.load_config()?;

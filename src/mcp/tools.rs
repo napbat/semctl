@@ -589,14 +589,8 @@ impl McpServer {
         let requested = args
             .path
             .as_deref()
-            .map(PathBuf::from)
-            .or_else(|| self.shared.dir.clone());
-        let Some(requested) = requested else {
-            return "index_codebase unavailable — no path was provided and the launch directory \
-                    is unknown"
-                .into();
-        };
-        let dir = match canonical_directory(&requested) {
+            .map_or_else(|| self.shared.dir.clone(), PathBuf::from);
+        let dir = match canonical_directory(&self.shared.context.cwd, &requested) {
             Ok(dir) => dir,
             Err(e) => return format!("index_codebase unavailable — {e}"),
         };
@@ -630,7 +624,7 @@ impl McpServer {
                     .clone()
                     .with_codebase(resolved.id.clone())
                     .with_local_root(Some(dir.clone()));
-                if !self.shared.pinned && self.shared.dir.as_deref() == Some(dir.as_path()) {
+                if !self.shared.pinned && self.shared.dir == dir {
                     *self.shared.bound.lock().await = Some(client.clone());
                 }
                 self.watch_once(client, dir.clone()).await;
@@ -682,7 +676,7 @@ impl McpServer {
             .clone()
             .with_codebase(id.clone())
             .with_local_root(Some(dir.clone()));
-        if !self.shared.pinned && self.shared.dir.as_deref() == Some(dir.as_path()) {
+        if !self.shared.pinned && self.shared.dir == dir {
             *self.shared.bound.lock().await = Some(client.clone());
         }
         let initial_sync = match self.watch_first_once(client.clone(), dir.clone()).await {
