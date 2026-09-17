@@ -50,8 +50,13 @@ tokio = { version = "1", features = [
     "time",
     "sync",
     # Unix domain socket and Windows named pipe transport for the shared local
-    # daemon (`src/ipc`).
+    # daemon (`src/ipc`). A Windows named pipe must be opened for overlapped
+    # input and output, so the client role pumps bytes asynchronously; that
+    # pump needs `io-util` for `split`/`shutdown` and `io-std` for the process
+    # standard streams.
     "net",
+    "io-util",
+    "io-std",
     # Killable child processes (`kill_on_drop`) so a hung `git` on the hook path
     # is cancelled by a timeout instead of stalling process exit.
     "process",

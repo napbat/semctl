@@ -6,9 +6,17 @@
 //! keeps attaching to the old daemon, and a new client starts a new one.
 //!
 //! The module holds three parts. [`Endpoint`] names the endpoint and owns the
-//! platform paths. [`Listener`] is the daemon side and runs on Tokio.
-//! [`connect_blocking`] is the client side and uses blocking input and output,
-//! because the client role must not build an asynchronous runtime.
+//! platform paths. [`Listener`] is the daemon side. [`run_client`] is the
+//! client side: it builds its own current-thread Tokio runtime, attaches, and
+//! pumps bytes.
+//!
+//! Both sides are asynchronous. A Windows named pipe must be opened for
+//! overlapped input and output, because Windows serializes the operations on
+//! one file object opened for synchronous input and output. Two blocking
+//! threads on one pipe would deadlock: the read of the answer would hold back
+//! the write of the request. Tokio's named pipe types already open the pipe
+//! for overlapped operation, so the client uses them instead of hand-written
+//! overlapped code.
 //!
 //! Platform code stays in the `unix` and `windows` child modules. No
 //! platform type is visible above this module.
@@ -20,14 +28,16 @@ mod unix;
 #[cfg(windows)]
 mod windows;
 
-use std::io::{self, Read, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+use self::handshake::{Request, Response, SessionRequest};
 
 /// The build version that takes part in the endpoint identity.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -221,19 +231,42 @@ impl Listener {
             #[cfg(unix)]
             Self::Socket(listener) => Ok(Stream::Socket(listener.accept().await?)),
             #[cfg(windows)]
-            Self::Pipe(listener) => Ok(Stream::Pipe(listener.accept().await?)),
+            Self::Pipe(listener) => Ok(Stream::PipeServer(listener.accept().await?)),
         }
     }
 }
 
-/// One accepted connection, seen by the daemon.
+/// One connection over the local endpoint.
+///
+/// A Unix domain socket has one type for both ends. A named pipe has one type
+/// for the daemon side and another for the client side, so this enum carries
+/// both.
+#[derive(Debug)]
 pub(crate) enum Stream {
-    /// A Unix domain socket connection.
+    /// A Unix domain socket connection, on either side.
     #[cfg(unix)]
     Socket(tokio::net::UnixStream),
-    /// A connected named pipe instance.
+    /// A connected named pipe instance, on the daemon side.
     #[cfg(windows)]
-    Pipe(tokio::net::windows::named_pipe::NamedPipeServer),
+    PipeServer(tokio::net::windows::named_pipe::NamedPipeServer),
+    /// An open named pipe, on the client side.
+    #[cfg(windows)]
+    PipeClient(tokio::net::windows::named_pipe::NamedPipeClient),
+}
+
+impl Stream {
+    /// Whether this transport can end its outbound direction on its own.
+    ///
+    /// A Unix domain socket shuts down its write direction and stays
+    /// readable. A named pipe has no half-close: `poll_shutdown` only flushes.
+    pub(crate) fn half_close(&self) -> pump::HalfClose {
+        match self {
+            #[cfg(unix)]
+            Self::Socket(_) => pump::HalfClose::Supported,
+            #[cfg(windows)]
+            Self::PipeServer(_) | Self::PipeClient(_) => pump::HalfClose::Unsupported,
+        }
+    }
 }
 
 impl AsyncRead for Stream {
@@ -246,7 +279,9 @@ impl AsyncRead for Stream {
             #[cfg(unix)]
             Self::Socket(stream) => Pin::new(stream).poll_read(context, buffer),
             #[cfg(windows)]
-            Self::Pipe(stream) => Pin::new(stream).poll_read(context, buffer),
+            Self::PipeServer(stream) => Pin::new(stream).poll_read(context, buffer),
+            #[cfg(windows)]
+            Self::PipeClient(stream) => Pin::new(stream).poll_read(context, buffer),
         }
     }
 }
@@ -261,7 +296,9 @@ impl AsyncWrite for Stream {
             #[cfg(unix)]
             Self::Socket(stream) => Pin::new(stream).poll_write(context, bytes),
             #[cfg(windows)]
-            Self::Pipe(stream) => Pin::new(stream).poll_write(context, bytes),
+            Self::PipeServer(stream) => Pin::new(stream).poll_write(context, bytes),
+            #[cfg(windows)]
+            Self::PipeClient(stream) => Pin::new(stream).poll_write(context, bytes),
         }
     }
 
@@ -270,7 +307,9 @@ impl AsyncWrite for Stream {
             #[cfg(unix)]
             Self::Socket(stream) => Pin::new(stream).poll_flush(context),
             #[cfg(windows)]
-            Self::Pipe(stream) => Pin::new(stream).poll_flush(context),
+            Self::PipeServer(stream) => Pin::new(stream).poll_flush(context),
+            #[cfg(windows)]
+            Self::PipeClient(stream) => Pin::new(stream).poll_flush(context),
         }
     }
 
@@ -279,152 +318,84 @@ impl AsyncWrite for Stream {
             #[cfg(unix)]
             Self::Socket(stream) => Pin::new(stream).poll_shutdown(context),
             #[cfg(windows)]
-            Self::Pipe(stream) => Pin::new(stream).poll_shutdown(context),
+            Self::PipeServer(stream) => Pin::new(stream).poll_shutdown(context),
+            #[cfg(windows)]
+            Self::PipeClient(stream) => Pin::new(stream).poll_shutdown(context),
         }
     }
 }
 
-/// One connection to the daemon, seen by the client.
-///
-/// The client role uses blocking input and output. It must not build a Tokio
-/// runtime, because the daemon decision happens before any runtime exists.
-#[derive(Debug)]
-pub(crate) enum BlockingStream {
-    /// A Unix domain socket connection.
-    #[cfg(unix)]
-    Socket(std::os::unix::net::UnixStream),
-    /// An open named pipe.
-    #[cfg(windows)]
-    Pipe(std::fs::File),
-}
-
-impl BlockingStream {
-    /// A second handle to the same connection, for the other pump thread.
-    pub(crate) fn try_clone(&self) -> io::Result<Self> {
-        match self {
-            #[cfg(unix)]
-            Self::Socket(socket) => socket.try_clone().map(Self::Socket),
-            #[cfg(windows)]
-            Self::Pipe(file) => file.try_clone().map(Self::Pipe),
-        }
-    }
-
-    /// Limit how long one blocking read or write may take.
-    ///
-    /// The client sets [`handshake::EXCHANGE_TIMEOUT`] for the handshake and
-    /// clears the limit before the byte pump starts.
-    #[cfg_attr(
-        windows,
-        allow(clippy::unnecessary_wraps, reason = "the Unix form can fail")
-    )]
-    pub(crate) fn set_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
-        match self {
-            #[cfg(unix)]
-            Self::Socket(socket) => {
-                socket.set_read_timeout(timeout)?;
-                socket.set_write_timeout(timeout)
-            }
-            #[cfg(windows)]
-            Self::Pipe(_) => {
-                // A named pipe opened for synchronous input and output carries
-                // no timeout of its own. The connect deadline bounds the
-                // client, and the daemon closes an idle connection.
-                let _ = timeout;
-                Ok(())
-            }
-        }
-    }
-}
-
-impl Read for BlockingStream {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        match self {
-            #[cfg(unix)]
-            Self::Socket(socket) => socket.read(buffer),
-            #[cfg(windows)]
-            Self::Pipe(file) => file.read(buffer),
-        }
-    }
-}
-
-impl Write for BlockingStream {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        match self {
-            #[cfg(unix)]
-            Self::Socket(socket) => socket.write(buffer),
-            #[cfg(windows)]
-            Self::Pipe(file) => file.write(buffer),
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        match self {
-            #[cfg(unix)]
-            Self::Socket(socket) => socket.flush(),
-            #[cfg(windows)]
-            Self::Pipe(file) => file.flush(),
-        }
-    }
-}
-
-impl pump::Connection for BlockingStream {
-    type Outbound = Self;
-    type Inbound = Self;
-
-    fn split(self) -> io::Result<(Self, Self)> {
-        let outbound = self.try_clone()?;
-        Ok((outbound, self))
-    }
-
-    fn end_outbound(mut outbound: Self) -> io::Result<pump::OutboundEnd> {
-        outbound.flush()?;
-        match outbound {
-            #[cfg(unix)]
-            Self::Socket(socket) => {
-                socket.shutdown(std::net::Shutdown::Write)?;
-                // The inbound handle keeps the socket open, so the daemon can
-                // still answer after the client stops writing.
-                drop(socket);
-                Ok(pump::OutboundEnd::HalfClosed)
-            }
-            #[cfg(windows)]
-            Self::Pipe(file) => {
-                // A named pipe has no half-close. The client closes its write
-                // handle and the pump ends, as the design states.
-                drop(file);
-                Ok(pump::OutboundEnd::Closed)
-            }
-        }
-    }
-}
-
-/// Connect to the endpoint with blocking input and output.
+/// Connect to the endpoint.
 ///
 /// The call retries while no daemon listens yet, until `deadline`. A client
-/// that spawned a daemon uses the deadline to wait for it to bind.
-pub(crate) fn connect_blocking(endpoint: &Endpoint, deadline: Instant) -> Result<BlockingStream> {
+/// that spawned a daemon uses the deadline to wait for that daemon to bind.
+pub(crate) async fn connect(endpoint: &Endpoint, deadline: Instant) -> Result<Stream> {
     #[cfg(unix)]
-    let stream = unix::connect(endpoint, deadline)?;
+    let stream = unix::connect(endpoint, deadline).await?;
     #[cfg(windows)]
-    let stream = windows::connect(endpoint, deadline)?;
+    let stream = windows::connect(endpoint, deadline).await?;
     Ok(stream)
+}
+
+/// Attach to the daemon and copy bytes until the connection ends.
+///
+/// This is the whole client role. It builds its own current-thread Tokio
+/// runtime, because the role decision happens before any runtime exists, and
+/// one connection with two directions needs no worker pool.
+pub(crate) fn run_client(
+    endpoint: &Endpoint,
+    session: SessionRequest,
+    deadline: Instant,
+) -> Result<pump::Exit> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .context("build the client runtime")?;
+    let outcome = runtime.block_on(attach_and_pump(endpoint, session, deadline));
+    // The outbound task can still be waiting for standard input. Dropping the
+    // runtime would wait for that read, so shut it down in the background and
+    // let process exit release the handles.
+    runtime.shutdown_background();
+    outcome
+}
+
+/// Perform the attach handshake, then pump bytes between the standard streams
+/// and the connection.
+async fn attach_and_pump(
+    endpoint: &Endpoint,
+    session: SessionRequest,
+    deadline: Instant,
+) -> Result<pump::Exit> {
+    let mut stream = connect(endpoint, deadline).await?;
+    handshake::write_line_async(&mut stream, &Request::attach(VERSION, session))
+        .await
+        .context("send the attach request")?;
+    let line = handshake::read_line_async(&mut stream)
+        .await
+        .context("read the attach answer")?;
+    match handshake::decode_response(&line).context("decode the attach answer")? {
+        Response::Attached { .. } => {}
+        Response::Rejected { reason, .. } => {
+            return Err(anyhow!("the daemon refused the session: {reason}"));
+        }
+    }
+    let half_close = stream.half_close();
+    Ok(pump::run(stream, half_close, tokio::io::stdin(), tokio::io::stdout()).await)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{BlockingStream, Endpoint, IDENTITY_HEX_CHARS, Stream, VERSION, identity};
-    use std::io::{Read, Write};
+    use super::{Endpoint, IDENTITY_HEX_CHARS, Stream, VERSION, identity};
     use std::path::Path;
     use tokio::io::{AsyncRead, AsyncWrite};
 
-    /// The daemon runs each session on its own task, and the client pumps the
-    /// connection from two threads. Both need these bounds.
+    /// The daemon serves each session on its own task, and the client splits
+    /// one connection into two pump tasks. Both need these bounds.
     #[test]
-    fn the_stream_types_satisfy_the_transport_bounds() {
-        fn accepts_asynchronous<T: AsyncRead + AsyncWrite + Unpin + Send>() {}
-        fn accepts_blocking<T: Read + Write + Send>() {}
-        accepts_asynchronous::<Stream>();
-        accepts_blocking::<BlockingStream>();
+    fn the_stream_type_satisfies_the_transport_bounds() {
+        fn accepts_transport<T: AsyncRead + AsyncWrite + Unpin + Send>() {}
+        accepts_transport::<Stream>();
     }
 
     #[test]

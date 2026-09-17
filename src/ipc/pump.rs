@@ -1,19 +1,25 @@
-//! Blocking byte pump used by the client role.
+//! Asynchronous byte pump used by the client role.
 //!
 //! The client copies bytes between the process standard streams and one
-//! daemon connection. It never parses the stream. Two threads do the work, so
-//! neither direction can block the other. This file uses no asynchronous
-//! runtime: the client role must decide its role before a runtime exists.
+//! daemon connection. It never parses the stream. Two tasks do the work, so
+//! neither direction can block the other.
+//!
+//! The pump is asynchronous on every platform. A Windows named pipe must be
+//! opened for overlapped input and output: two blocking calls on one
+//! synchronous file object are serialized, so a blocking read of the answer
+//! would block the write of the request. The client therefore builds a small
+//! current-thread runtime and uses the same code path as Unix.
 
-use std::io::{self, Read, Write};
-use std::sync::mpsc;
-use std::thread;
+use std::io;
 use std::time::Duration;
+
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::mpsc;
 
 /// Copy buffer size for each direction.
 const BUFFER_BYTES: usize = 16 * 1024;
 
-/// Longest wait for the outbound thread after the inbound thread ends.
+/// Longest wait for the outbound task after the inbound task ends.
 const OUTBOUND_WAIT: Duration = Duration::from_secs(2);
 
 /// Process exit status of the client role.
@@ -35,138 +41,147 @@ impl Exit {
     }
 }
 
+/// Whether the transport can end its outbound direction on its own.
+///
+/// The value belongs to the transport, so the pump itself stays free of
+/// platform knowledge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HalfClose {
+    /// A shutdown ends only the write direction. A Unix domain socket does
+    /// this. The pump keeps draining the connection until the daemon closes
+    /// it.
+    Supported,
+    /// The transport has no half-close. A Windows named pipe is in this
+    /// group. The pump ends the connection and finishes when input ends.
+    Unsupported,
+}
+
 /// What remains readable after the outbound direction ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OutboundEnd {
-    /// The inbound direction stays open. This is the Unix half-close.
+enum OutboundEnd {
+    /// The inbound direction stays open.
     HalfClosed,
     /// The whole connection is closed. Nothing more will arrive.
     Closed,
 }
 
-/// One duplex connection two pump threads can drive at the same time.
-pub(crate) trait Connection: Send {
-    /// The handle the outbound thread writes to.
-    type Outbound: Write + Send + 'static;
-    /// The handle the inbound thread reads from.
-    type Inbound: Read + Send + 'static;
-
-    /// Split the connection into one write handle and one read handle.
-    ///
-    /// Both handles address the same connection.
-    fn split(self) -> io::Result<(Self::Outbound, Self::Inbound)>;
-
-    /// End the outbound direction after standard input reaches end of file.
-    ///
-    /// A transport that supports a half-close ends only the write direction
-    /// and reports [`OutboundEnd::HalfClosed`]. A transport without one closes
-    /// the connection and reports [`OutboundEnd::Closed`].
-    fn end_outbound(outbound: Self::Outbound) -> io::Result<OutboundEnd>;
-}
-
-/// What one pump thread reports when it finishes.
+/// What one pump task reports when it finishes.
 enum Report {
-    /// The inbound thread finished with this outcome.
+    /// The inbound task finished with this outcome.
     Inbound(Exit),
-    /// The outbound thread finished and the outbound direction ended.
+    /// The outbound task finished and the outbound direction ended.
     Outbound(OutboundEnd),
-    /// The outbound thread failed. The connection is broken.
+    /// The outbound task failed. The connection is broken.
     OutboundFailed,
 }
 
 /// Copy bytes between the process standard streams and one connection.
 ///
 /// `input` is standard input and `output` is standard output in the client
-/// role. Both are parameters so a test can drive the pump with pipes.
+/// role. Both are parameters so a test can drive the pump with in-memory
+/// duplex pairs.
 ///
-/// The call returns when the connection ends. It does not wait for a thread
-/// that is still blocked on standard input for longer than [`OUTBOUND_WAIT`].
-pub(crate) fn run<C, I, O>(connection: C, input: I, output: O) -> io::Result<Exit>
+/// The call returns when the connection ends. It waits at most
+/// [`OUTBOUND_WAIT`] for an outbound task that is still blocked on input.
+pub(crate) async fn run<C, I, O>(connection: C, half_close: HalfClose, input: I, output: O) -> Exit
 where
-    C: Connection,
-    I: Read + Send + 'static,
-    O: Write + Send + 'static,
+    C: AsyncRead + AsyncWrite + Send + 'static,
+    I: AsyncRead + Unpin + Send + 'static,
+    O: AsyncWrite + Unpin + Send + 'static,
 {
-    let (outbound, inbound) = connection.split()?;
-    let (reports, inbox) = mpsc::channel();
+    let (reader, writer) = tokio::io::split(connection);
+    let (reports, mut inbox) = mpsc::channel(2);
     let outbound_reports = reports.clone();
 
     // A send failure means the receiver is gone, which happens only after the
     // pump already returned. Nothing is left to report, so it is safe to drop.
-    thread::Builder::new()
-        .name("semctl-ipc-out".to_string())
-        .spawn(move || {
-            let report = match copy_outbound::<C, I>(input, outbound) {
-                Ok(end) => Report::Outbound(end),
-                Err(_) => Report::OutboundFailed,
-            };
-            let _ = outbound_reports.send(report);
-        })?;
-    thread::Builder::new()
-        .name("semctl-ipc-in".to_string())
-        .spawn(move || {
-            let _ = reports.send(Report::Inbound(copy_inbound(inbound, output)));
-        })?;
+    tokio::spawn(async move {
+        let report = match copy_outbound(input, writer, half_close).await {
+            Ok(end) => Report::Outbound(end),
+            Err(_) => Report::OutboundFailed,
+        };
+        let _ = outbound_reports.send(report).await;
+    });
+    tokio::spawn(async move {
+        let _ = reports
+            .send(Report::Inbound(copy_inbound(reader, output).await))
+            .await;
+    });
 
-    Ok(collect(&inbox))
+    collect(&mut inbox).await
 }
 
-/// Wait for the thread reports and decide the exit status.
-fn collect(inbox: &mpsc::Receiver<Report>) -> Exit {
+/// Wait for the task reports and decide the exit status.
+async fn collect(inbox: &mut mpsc::Receiver<Report>) -> Exit {
     let mut outbound_pending = true;
     loop {
-        match inbox.recv() {
-            Ok(Report::Inbound(exit)) => {
+        match inbox.recv().await {
+            Some(Report::Inbound(exit)) => {
                 if outbound_pending {
-                    // Best effort. The outbound thread is usually still
-                    // blocked reading standard input, and process exit ends
-                    // it. Waiting longer would delay the exit.
-                    let _ = inbox.recv_timeout(OUTBOUND_WAIT);
+                    // Best effort. The outbound task is usually still waiting
+                    // for standard input, and process exit ends it. Waiting
+                    // longer would delay the exit.
+                    let _ = tokio::time::timeout(OUTBOUND_WAIT, inbox.recv()).await;
                 }
                 return exit;
             }
             // A closed connection has nothing left to deliver, so the pump
-            // ends without waiting for the inbound thread.
-            Ok(Report::Outbound(OutboundEnd::Closed)) => return Exit::Clean,
-            Ok(Report::Outbound(OutboundEnd::HalfClosed) | Report::OutboundFailed) => {
+            // ends without waiting for the inbound task.
+            Some(Report::Outbound(OutboundEnd::Closed)) => return Exit::Clean,
+            Some(Report::Outbound(OutboundEnd::HalfClosed) | Report::OutboundFailed) => {
                 outbound_pending = false;
             }
-            // Both threads ended without a report. Treat that as a failure,
-            // because no thread observed a clean close.
-            Err(_) => return Exit::TransportFailed,
+            // Both tasks ended without a report. Treat that as a failure,
+            // because no task observed a clean close.
+            None => return Exit::TransportFailed,
         }
     }
 }
 
 /// Copy standard input into the connection, then end the outbound direction.
-fn copy_outbound<C, I>(mut input: I, mut outbound: C::Outbound) -> io::Result<OutboundEnd>
+async fn copy_outbound<I, W>(
+    mut input: I,
+    mut writer: W,
+    half_close: HalfClose,
+) -> io::Result<OutboundEnd>
 where
-    C: Connection,
-    I: Read,
+    I: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
 {
     let mut buffer = vec![0u8; BUFFER_BYTES];
     loop {
-        let read = match input.read(&mut buffer) {
+        let read = match input.read(&mut buffer).await {
             Ok(0) => break,
             Ok(count) => count,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
         };
-        outbound.write_all(&buffer[..read])?;
-        outbound.flush()?;
+        writer.write_all(&buffer[..read]).await?;
+        writer.flush().await?;
     }
-    C::end_outbound(outbound)
+    match half_close {
+        HalfClose::Supported => {
+            writer.shutdown().await?;
+            Ok(OutboundEnd::HalfClosed)
+        }
+        HalfClose::Unsupported => {
+            // Dropping the write half releases this end of the connection.
+            // The pump then stops, and process exit closes the rest.
+            drop(writer);
+            Ok(OutboundEnd::Closed)
+        }
+    }
 }
 
 /// Copy the connection into standard output.
-fn copy_inbound<R, W>(mut inbound: R, mut output: W) -> Exit
+async fn copy_inbound<R, O>(mut reader: R, mut output: O) -> Exit
 where
-    R: Read,
-    W: Write,
+    R: AsyncRead + Unpin,
+    O: AsyncWrite + Unpin,
 {
     let mut buffer = vec![0u8; BUFFER_BYTES];
     loop {
-        let read = match inbound.read(&mut buffer) {
+        let read = match reader.read(&mut buffer).await {
             Ok(0) => return Exit::Clean,
             Ok(count) => count,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -174,11 +189,7 @@ where
         };
         // A closed standard output ends the process cleanly: the host went
         // away, and there is nothing left to deliver to it.
-        if output
-            .write_all(&buffer[..read])
-            .and_then(|()| output.flush())
-            .is_err()
-        {
+        if output.write_all(&buffer[..read]).await.is_err() || output.flush().await.is_err() {
             return Exit::Clean;
         }
     }
@@ -186,209 +197,174 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{Connection, Exit, OutboundEnd, run};
-    use std::io::{self, PipeReader, PipeWriter, Read, Write};
+    use super::{Exit, HalfClose, run};
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 
-    /// A connection built from two one-way pipes, one for each direction.
-    struct TestConnection {
-        outbound: PipeWriter,
-        inbound: Box<dyn Read + Send>,
-        end: OutboundEnd,
-    }
+    /// Capacity of every in-memory pair in this module's tests.
+    const PAIR_BYTES: usize = 1024;
 
-    /// The write handle, which remembers what the transport does at the end.
-    struct TestOutbound {
-        writer: PipeWriter,
-        end: OutboundEnd,
-    }
+    /// A connection that always fails to read and accepts every write.
+    struct BrokenConnection;
 
-    impl Write for TestOutbound {
-        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-            self.writer.write(buffer)
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            self.writer.flush()
+    impl AsyncRead for BrokenConnection {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            _buffer: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::from(io::ErrorKind::ConnectionReset)))
         }
     }
 
-    impl Connection for TestConnection {
-        type Outbound = TestOutbound;
-        type Inbound = Box<dyn Read + Send>;
-
-        fn split(self) -> io::Result<(Self::Outbound, Self::Inbound)> {
-            Ok((
-                TestOutbound {
-                    writer: self.outbound,
-                    end: self.end,
-                },
-                self.inbound,
-            ))
+    impl AsyncWrite for BrokenConnection {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(bytes.len()))
         }
 
-        fn end_outbound(outbound: Self::Outbound) -> io::Result<OutboundEnd> {
-            let end = outbound.end;
-            // Dropping the write handle makes the far end read end of file.
-            drop(outbound);
-            Ok(end)
+        fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
         }
     }
 
-    /// A standard output that always fails, as a closed pipe does.
-    struct FailingWriter;
-
-    impl Write for FailingWriter {
-        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
-            Err(io::Error::from(io::ErrorKind::BrokenPipe))
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// A connection that always fails to read.
-    struct FailingReader;
-
-    impl Read for FailingReader {
-        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
-            Err(io::Error::from(io::ErrorKind::ConnectionReset))
-        }
-    }
-
-    fn read_exactly(reader: &mut PipeReader, count: usize) -> Vec<u8> {
+    /// Read exactly `count` bytes, so a test never depends on chunk sizes.
+    async fn read_exactly(stream: &mut DuplexStream, count: usize) -> Vec<u8> {
         let mut buffer = vec![0u8; count];
-        reader
+        stream
             .read_exact(&mut buffer)
+            .await
             .expect("read the expected bytes");
         buffer
     }
 
-    #[test]
-    fn bytes_flow_in_both_directions() {
-        let (input_reader, mut input_writer) = io::pipe().expect("standard input pipe");
-        let (mut output_reader, output_writer) = io::pipe().expect("standard output pipe");
-        let (mut to_daemon, from_client) = io::pipe().expect("outbound pipe");
-        let (to_client, mut from_daemon) = io::pipe().expect("inbound pipe");
+    #[tokio::test]
+    async fn bytes_flow_in_both_directions() {
+        let (client_side, mut daemon_side) = tokio::io::duplex(PAIR_BYTES);
+        let (mut host_input, pump_input) = tokio::io::duplex(PAIR_BYTES);
+        let (pump_output, mut host_output) = tokio::io::duplex(PAIR_BYTES);
 
-        let connection = TestConnection {
-            outbound: from_client,
-            inbound: Box::new(to_client),
-            end: OutboundEnd::HalfClosed,
-        };
-        let pump = std::thread::spawn(move || {
-            run(connection, input_reader, output_writer).expect("start the pump")
-        });
+        let pump = tokio::spawn(run(
+            client_side,
+            HalfClose::Supported,
+            pump_input,
+            pump_output,
+        ));
 
-        input_writer
+        host_input
             .write_all(b"ping\n")
+            .await
             .expect("write to the pump");
-        assert_eq!(read_exactly(&mut to_daemon, 5), b"ping\n");
+        assert_eq!(read_exactly(&mut daemon_side, 5).await, b"ping\n");
 
-        from_daemon
+        daemon_side
             .write_all(b"pong\n")
+            .await
             .expect("write to the client");
-        assert_eq!(read_exactly(&mut output_reader, 5), b"pong\n");
+        assert_eq!(read_exactly(&mut host_output, 5).await, b"pong\n");
 
         // End of file on standard input half-closes the outbound direction.
-        drop(input_writer);
+        drop(host_input);
         let mut drained = Vec::new();
-        to_daemon
+        daemon_side
             .read_to_end(&mut drained)
-            .expect("outbound direction ends");
-        assert!(drained.is_empty());
+            .await
+            .expect("the outbound direction ends");
+        assert!(drained.is_empty(), "{drained:?}");
 
         // The daemon closes its end, which ends the pump cleanly.
-        drop(from_daemon);
-        assert_eq!(pump.join().expect("join the pump"), Exit::Clean);
+        drop(daemon_side);
+        assert_eq!(pump.await.expect("the pump task finished"), Exit::Clean);
     }
 
-    #[test]
-    fn standard_input_end_of_file_half_closes_and_waits_for_the_daemon() {
-        let (input_reader, input_writer) = io::pipe().expect("standard input pipe");
-        let (_output_reader, output_writer) = io::pipe().expect("standard output pipe");
-        let (mut to_daemon, from_client) = io::pipe().expect("outbound pipe");
-        let (to_client, from_daemon) = io::pipe().expect("inbound pipe");
+    #[tokio::test]
+    async fn input_end_of_file_half_closes_and_waits_for_the_daemon() {
+        let (client_side, mut daemon_side) = tokio::io::duplex(PAIR_BYTES);
+        let (host_input, pump_input) = tokio::io::duplex(PAIR_BYTES);
+        let (pump_output, _host_output) = tokio::io::duplex(PAIR_BYTES);
 
-        let connection = TestConnection {
-            outbound: from_client,
-            inbound: Box::new(to_client),
-            end: OutboundEnd::HalfClosed,
-        };
-        let pump = std::thread::spawn(move || {
-            run(connection, input_reader, output_writer).expect("start the pump")
-        });
+        let pump = tokio::spawn(run(
+            client_side,
+            HalfClose::Supported,
+            pump_input,
+            pump_output,
+        ));
 
         // End of file on standard input ends only the outbound direction.
-        drop(input_writer);
+        drop(host_input);
         let mut drained = Vec::new();
-        to_daemon
+        daemon_side
             .read_to_end(&mut drained)
-            .expect("outbound direction ends");
-        assert!(drained.is_empty());
+            .await
+            .expect("the outbound direction ends");
+        assert!(drained.is_empty(), "{drained:?}");
+        assert!(!pump.is_finished(), "the pump must still drain");
 
-        // The pump is still running. It ends when the daemon closes its end.
-        drop(from_daemon);
-        assert_eq!(pump.join().expect("join the pump"), Exit::Clean);
+        // The pump ends when the daemon closes its end.
+        drop(daemon_side);
+        assert_eq!(pump.await.expect("the pump task finished"), Exit::Clean);
     }
 
-    #[test]
-    fn standard_input_end_of_file_ends_the_pump_when_the_transport_closes() {
-        let (input_reader, input_writer) = io::pipe().expect("standard input pipe");
-        let (_output_reader, output_writer) = io::pipe().expect("standard output pipe");
-        let (_to_daemon, from_client) = io::pipe().expect("outbound pipe");
-        let (to_client, _from_daemon) = io::pipe().expect("inbound pipe");
+    #[tokio::test]
+    async fn input_end_of_file_ends_the_pump_when_the_transport_cannot_half_close() {
+        let (client_side, _daemon_side) = tokio::io::duplex(PAIR_BYTES);
+        let (host_input, pump_input) = tokio::io::duplex(PAIR_BYTES);
+        let (pump_output, _host_output) = tokio::io::duplex(PAIR_BYTES);
 
-        let connection = TestConnection {
-            outbound: from_client,
-            inbound: Box::new(to_client),
-            end: OutboundEnd::Closed,
-        };
-        let pump = std::thread::spawn(move || {
-            run(connection, input_reader, output_writer).expect("start the pump")
-        });
+        let pump = tokio::spawn(run(
+            client_side,
+            HalfClose::Unsupported,
+            pump_input,
+            pump_output,
+        ));
 
         // The inbound direction stays open, so only the closed transport can
         // end the pump.
-        drop(input_writer);
-        assert_eq!(pump.join().expect("join the pump"), Exit::Clean);
+        drop(host_input);
+        assert_eq!(pump.await.expect("the pump task finished"), Exit::Clean);
     }
 
-    #[test]
-    fn a_closed_standard_output_ends_the_pump_cleanly() {
-        let (_to_daemon, from_client) = io::pipe().expect("outbound pipe");
-        let (to_client, mut from_daemon) = io::pipe().expect("inbound pipe");
+    #[tokio::test]
+    async fn a_closed_output_ends_the_pump_cleanly() {
+        let (client_side, mut daemon_side) = tokio::io::duplex(PAIR_BYTES);
+        let (pump_output, host_output) = tokio::io::duplex(PAIR_BYTES);
 
-        let connection = TestConnection {
-            outbound: from_client,
-            inbound: Box::new(to_client),
-            end: OutboundEnd::HalfClosed,
-        };
-        let pump = std::thread::spawn(move || {
-            run(connection, io::empty(), FailingWriter).expect("start the pump")
-        });
+        // Dropping the reading end makes every write to the pump output fail.
+        drop(host_output);
+        let pump = tokio::spawn(run(
+            client_side,
+            HalfClose::Supported,
+            tokio::io::empty(),
+            pump_output,
+        ));
 
-        from_daemon
+        daemon_side
             .write_all(b"pong\n")
+            .await
             .expect("write to the client");
-        assert_eq!(pump.join().expect("join the pump"), Exit::Clean);
+        assert_eq!(pump.await.expect("the pump task finished"), Exit::Clean);
     }
 
-    #[test]
-    fn a_broken_connection_ends_the_pump_with_the_failure_status() {
-        let (_output_reader, output_writer) = io::pipe().expect("standard output pipe");
-        let (_to_daemon, from_client) = io::pipe().expect("outbound pipe");
-
-        let connection = TestConnection {
-            outbound: from_client,
-            inbound: Box::new(FailingReader),
-            end: OutboundEnd::HalfClosed,
-        };
-        let pump = std::thread::spawn(move || {
-            run(connection, io::empty(), output_writer).expect("start the pump")
-        });
-
-        assert_eq!(pump.join().expect("join the pump"), Exit::TransportFailed);
+    #[tokio::test]
+    async fn a_broken_connection_ends_the_pump_with_the_failure_status() {
+        let (pump_output, _host_output) = tokio::io::duplex(PAIR_BYTES);
+        let exit = run(
+            BrokenConnection,
+            HalfClose::Supported,
+            tokio::io::empty(),
+            pump_output,
+        )
+        .await;
+        assert_eq!(exit, Exit::TransportFailed);
     }
 
     #[test]

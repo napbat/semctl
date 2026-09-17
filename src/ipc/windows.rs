@@ -8,17 +8,15 @@
 
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
-use std::fs::OpenOptions;
 use std::io;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
-use std::os::windows::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use tokio::net::windows::named_pipe::{NamedPipeServer, PipeMode, ServerOptions};
+use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeServer, PipeMode, ServerOptions};
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER,
     ERROR_PIPE_BUSY, HANDLE, LocalFree,
@@ -34,7 +32,7 @@ use windows_sys::Win32::Storage::FileSystem::SECURITY_IDENTIFICATION;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows_sys::core::PWSTR;
 
-use super::{BlockingStream, Election, Endpoint, Listener};
+use super::{Election, Endpoint, Listener, Stream};
 
 /// How many pipe instances listen at the same time.
 const POOL_INSTANCES: usize = 4;
@@ -332,30 +330,32 @@ pub(super) fn bind(endpoint: &Endpoint) -> Result<Election> {
     Ok(Election::Won(Listener::Pipe(listener)))
 }
 
-/// Connect to the endpoint with blocking input and output.
+/// Connect to the endpoint.
 ///
 /// The call retries a busy or missing pipe until `deadline`, because a daemon
 /// this client just spawned needs a moment to create its instances.
-pub(super) fn connect(endpoint: &Endpoint, deadline: Instant) -> Result<BlockingStream> {
+///
+/// `ClientOptions` opens the pipe for overlapped input and output, so one
+/// task can read while another writes. A pipe opened for synchronous input and
+/// output would serialize the two directions and deadlock the byte pump.
+pub(super) async fn connect(endpoint: &Endpoint, deadline: Instant) -> Result<Stream> {
     let name = endpoint.pipe_name();
     let mut backoff = FIRST_BACKOFF;
     loop {
         // Identification quality of service lets the daemon check the client's
         // identity but not act as the client.
-        match OpenOptions::new()
-            .read(true)
-            .write(true)
+        match ClientOptions::new()
             .security_qos_flags(SECURITY_IDENTIFICATION)
             .open(name)
         {
-            Ok(file) => return Ok(BlockingStream::Pipe(file)),
+            Ok(client) => return Ok(Stream::PipeClient(client)),
             Err(error) if is_absent(&error) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     return Err(error)
                         .with_context(|| format!("connect {name} before the deadline"));
                 }
-                std::thread::sleep(backoff.min(remaining));
+                tokio::time::sleep(backoff.min(remaining)).await;
                 backoff = (backoff * 2).min(LAST_BACKOFF);
             }
             Err(error) => return Err(error).with_context(|| format!("connect {name}")),

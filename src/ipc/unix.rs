@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 
-use super::{BlockingStream, Election, Endpoint, Listener};
+use super::{Election, Endpoint, Listener, Stream};
 
 /// Largest socket path this module will use.
 ///
@@ -246,16 +246,16 @@ fn remove_stale_socket(path: &Path) -> Result<()> {
     }
 }
 
-/// Connect to the endpoint with blocking input and output.
+/// Connect to the endpoint.
 ///
 /// The call retries a missing or refused socket until `deadline`, because a
 /// daemon this client just spawned needs a moment to bind.
-pub(super) fn connect(endpoint: &Endpoint, deadline: Instant) -> Result<BlockingStream> {
+pub(super) async fn connect(endpoint: &Endpoint, deadline: Instant) -> Result<Stream> {
     let path = endpoint.socket_path();
     let mut backoff = FIRST_BACKOFF;
     loop {
-        match std::os::unix::net::UnixStream::connect(path) {
-            Ok(stream) => return Ok(BlockingStream::Socket(stream)),
+        match tokio::net::UnixStream::connect(path).await {
+            Ok(stream) => return Ok(Stream::Socket(stream)),
             Err(error) if is_absent(&error) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
@@ -263,7 +263,7 @@ pub(super) fn connect(endpoint: &Endpoint, deadline: Instant) -> Result<Blocking
                         format!("connect {} before the deadline", path.display())
                     });
                 }
-                std::thread::sleep(backoff.min(remaining));
+                tokio::time::sleep(backoff.min(remaining)).await;
                 backoff = (backoff * 2).min(LAST_BACKOFF);
             }
             Err(error) => {
@@ -290,10 +290,12 @@ mod tests {
     use crate::ipc::handshake::{
         self, Request, Response, SessionRequest, Token, decode_request, decode_response,
     };
+    use crate::ipc::pump;
     use std::fs::{self, Permissions};
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const TEST_ID: &str = "0123456789abcdef";
 
@@ -471,25 +473,21 @@ mod tests {
             handshake::write_line_async(&mut stream, &Response::attached("0.2.0", "session-1"))
                 .await
                 .expect("write the attached line");
-            // Hold the listener until the client has read its answer.
-            listener
+            // Hold both ends until the client has read its answer.
+            (listener, stream)
         });
 
-        let client_endpoint = endpoint;
-        let client = tokio::task::spawn_blocking(move || {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let mut stream =
-                super::connect(&client_endpoint, deadline).expect("connect to the daemon");
-            stream
-                .set_timeout(Some(handshake::EXCHANGE_TIMEOUT))
-                .expect("set the handshake timeout");
-            handshake::write_line_blocking(&mut stream, &attach_request())
-                .expect("write the attach line");
-            let line = handshake::read_line_blocking(&mut stream).expect("read the answer");
-            decode_response(&line).expect("decode the answer")
-        });
-
-        let response = client.await.expect("the client thread finished");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut stream = super::connect(&endpoint, deadline)
+            .await
+            .expect("connect to the daemon");
+        handshake::write_line_async(&mut stream, &attach_request())
+            .await
+            .expect("write the attach line");
+        let line = handshake::read_line_async(&mut stream)
+            .await
+            .expect("read the answer");
+        let response = decode_response(&line).expect("decode the answer");
         assert!(
             matches!(response, Response::Attached { .. }),
             "{response:?}"
@@ -497,14 +495,68 @@ mod tests {
         drop(daemon.await.expect("the daemon task finished"));
     }
 
+    /// One connection carries both directions at the same time. A transport
+    /// that serializes its operations would deadlock here.
+    #[tokio::test]
+    async fn the_client_pump_carries_bytes_in_both_directions() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let endpoint = endpoint_in(dir.path());
+        let Election::Won(listener) = bind(&endpoint).expect("bind") else {
+            panic!("the first bind must win the election");
+        };
+
+        let daemon = tokio::spawn(async move {
+            let mut stream = listener.accept().await.expect("accept a connection");
+            let mut request = [0u8; 5];
+            stream
+                .read_exact(&mut request)
+                .await
+                .expect("read the request");
+            assert_eq!(&request, b"ping\n");
+            stream.write_all(b"pong\n").await.expect("write the answer");
+            stream.flush().await.expect("flush the answer");
+            (listener, stream)
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stream = super::connect(&endpoint, deadline)
+            .await
+            .expect("connect to the daemon");
+        let half_close = stream.half_close();
+        let (mut host_input, pump_input) = tokio::io::duplex(256);
+        let (pump_output, mut host_output) = tokio::io::duplex(256);
+        let pump = tokio::spawn(pump::run(stream, half_close, pump_input, pump_output));
+
+        host_input
+            .write_all(b"ping\n")
+            .await
+            .expect("write to the pump");
+        let mut answer = [0u8; 5];
+        host_output
+            .read_exact(&mut answer)
+            .await
+            .expect("read from the pump");
+        assert_eq!(&answer, b"pong\n");
+
+        // End of file on the input half-closes; the daemon then closes its
+        // end, which ends the pump cleanly.
+        drop(host_input);
+        let (listener, daemon_stream) = daemon.await.expect("the daemon task finished");
+        drop(daemon_stream);
+        assert_eq!(
+            pump.await.expect("the pump task finished"),
+            pump::Exit::Clean
+        );
+        drop(listener);
+    }
+
     #[tokio::test]
     async fn a_client_without_a_daemon_fails_at_the_deadline() {
         let dir = tempfile::tempdir().expect("temporary directory");
         let endpoint = endpoint_in(dir.path());
         let deadline = Instant::now() + Duration::from_millis(30);
-        let error = tokio::task::spawn_blocking(move || super::connect(&endpoint, deadline))
+        let error = super::connect(&endpoint, deadline)
             .await
-            .expect("the client thread finished")
             .expect_err("no daemon is listening");
         assert!(error.to_string().contains("before the deadline"), "{error}");
     }

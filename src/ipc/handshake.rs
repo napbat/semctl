@@ -4,21 +4,23 @@
 //! before the connection carries Model Context Protocol (MCP) traffic. Each
 //! line is UTF-8 and ends with one newline byte.
 //!
+//! Both sides are asynchronous. The daemon serves its connections on Tokio,
+//! and the client role builds a small current-thread runtime, because a
+//! Windows named pipe must be opened for overlapped input and output.
+//!
 //! Every reader here reads one byte at a time and stops at the first newline
 //! byte. It must not buffer past that byte: the bytes that follow the
 //! handshake belong to the MCP stream, and a buffered remainder would be lost.
 //! A handshake line is short, so the cost of the byte loop is not material.
 
 use std::fmt;
-use std::io::{self, Read, Write};
+use std::io;
 use std::path::PathBuf;
-use std::pin::Pin;
-use std::task::Poll;
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Wire version of the attach and control messages.
 pub(crate) const PROTOCOL: u32 = 1;
@@ -288,59 +290,17 @@ pub(crate) fn decode_response(line: &[u8]) -> Result<Response, HandshakeError> {
     decode(line, RESPONSE_KINDS)
 }
 
-/// Read one line from a blocking stream, without the newline byte.
-///
-/// The caller sets a read timeout on the stream. A blocking stream carries no
-/// timeout of its own.
-pub(crate) fn read_line_blocking<R: Read + ?Sized>(
-    reader: &mut R,
-) -> Result<Vec<u8>, HandshakeError> {
-    let mut line = Vec::new();
+/// Read one byte, or report the end of the stream.
+async fn read_byte_async<R: AsyncRead + Unpin + ?Sized>(reader: &mut R) -> io::Result<Option<u8>> {
     let mut byte = [0u8; 1];
     loop {
-        match reader.read(&mut byte) {
-            Ok(0) => return Err(HandshakeError::Closed),
-            Ok(_) => {
-                if byte[0] == b'\n' {
-                    return Ok(line);
-                }
-                if line.len() == MAX_PAYLOAD_BYTES {
-                    return Err(HandshakeError::LineTooLong);
-                }
-                line.push(byte[0]);
-            }
+        match reader.read(&mut byte).await {
+            Ok(0) => return Ok(None),
+            Ok(_) => return Ok(Some(byte[0])),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(HandshakeError::Transport(error)),
+            Err(error) => return Err(error),
         }
     }
-}
-
-/// Write one message as a complete line to a blocking stream.
-pub(crate) fn write_line_blocking<W: Write + ?Sized, T: Serialize>(
-    writer: &mut W,
-    message: &T,
-) -> Result<(), HandshakeError> {
-    let line = encode(message)?;
-    writer.write_all(&line)?;
-    writer.flush()?;
-    Ok(())
-}
-
-/// Read one byte from an asynchronous stream.
-///
-/// This uses [`AsyncRead::poll_read`] directly so the module needs no
-/// `tokio` `io-util` feature.
-async fn read_byte_async<R: AsyncRead + Unpin + ?Sized>(reader: &mut R) -> io::Result<Option<u8>> {
-    std::future::poll_fn(|context| {
-        let mut storage = [0u8; 1];
-        let mut buffer = ReadBuf::new(&mut storage);
-        match Pin::new(&mut *reader).poll_read(context, &mut buffer) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(buffer.filled().first().copied())),
-        }
-    })
-    .await
 }
 
 /// Read one line from an asynchronous stream, without the newline byte.
@@ -382,37 +342,21 @@ pub(crate) async fn write_line_async<W: AsyncWrite + Unpin + ?Sized, T: Serializ
     message: &T,
 ) -> Result<(), HandshakeError> {
     let line = encode(message)?;
-    match tokio::time::timeout(EXCHANGE_TIMEOUT, write_all_async(writer, &line)).await {
+    let write = async {
+        writer.write_all(&line).await?;
+        writer.flush().await
+    };
+    match tokio::time::timeout(EXCHANGE_TIMEOUT, write).await {
         Ok(result) => result.map_err(HandshakeError::Transport),
         Err(_elapsed) => Err(HandshakeError::TimedOut),
     }
-}
-
-/// Write every byte, then flush, using [`AsyncWrite`] alone.
-async fn write_all_async<W: AsyncWrite + Unpin + ?Sized>(
-    writer: &mut W,
-    bytes: &[u8],
-) -> io::Result<()> {
-    let mut offset = 0;
-    while offset < bytes.len() {
-        let written = std::future::poll_fn(|context| {
-            Pin::new(&mut *writer).poll_write(context, &bytes[offset..])
-        })
-        .await?;
-        if written == 0 {
-            return Err(io::Error::from(io::ErrorKind::WriteZero));
-        }
-        offset += written;
-    }
-    std::future::poll_fn(|context| Pin::new(&mut *writer).poll_flush(context)).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         HandshakeError, MAX_LINE_BYTES, PROTOCOL, Request, Response, SessionRequest, Token, decode,
-        decode_request, decode_response, encode, read_line_async, read_line_blocking,
-        write_line_async, write_line_blocking,
+        decode_request, decode_response, encode, read_line_async, write_line_async,
     };
     use std::path::PathBuf;
 
@@ -498,19 +442,23 @@ mod tests {
         assert!(text.contains("\"kind\":\"attached\""), "{text}");
     }
 
-    #[test]
-    fn oversized_line_is_rejected_before_it_is_parsed() {
+    #[tokio::test]
+    async fn oversized_line_is_rejected_before_it_is_parsed() {
         let mut oversized = vec![b'x'; MAX_LINE_BYTES + 16];
         oversized.push(b'\n');
-        let error = read_line_blocking(&mut oversized.as_slice()).expect_err("too long");
+        let error = read_line_async(&mut oversized.as_slice())
+            .await
+            .expect_err("too long");
         assert!(matches!(error, HandshakeError::LineTooLong), "{error:?}");
     }
 
-    #[test]
-    fn a_line_at_the_limit_is_accepted() {
+    #[tokio::test]
+    async fn a_line_at_the_limit_is_accepted() {
         let mut line = vec![b'x'; MAX_LINE_BYTES - 1];
         line.push(b'\n');
-        let read = read_line_blocking(&mut line.as_slice()).expect("line at the limit");
+        let read = read_line_async(&mut line.as_slice())
+            .await
+            .expect("line at the limit");
         assert_eq!(read.len(), MAX_LINE_BYTES - 1);
     }
 
@@ -577,16 +525,8 @@ mod tests {
         assert_eq!(rendered, "Token(redacted)");
     }
 
-    #[test]
-    fn blocking_write_and_read_agree() {
-        let mut wire = Vec::new();
-        write_line_blocking(&mut wire, &Request::status()).expect("write status");
-        let line = read_line_blocking(&mut wire.as_slice()).expect("read status");
-        assert!(matches!(decode_request(&line), Ok(Request::Status { .. })));
-    }
-
     #[tokio::test]
-    async fn asynchronous_write_and_read_agree() {
+    async fn a_written_line_reads_back_as_the_same_message() {
         let mut wire: Vec<u8> = Vec::new();
         write_line_async(&mut wire, &Response::attached("0.2.0", "s"))
             .await
@@ -597,6 +537,14 @@ mod tests {
             decode_response(&line),
             Ok(Response::Attached { .. })
         ));
+
+        let mut wire: Vec<u8> = Vec::new();
+        write_line_async(&mut wire, &Request::status())
+            .await
+            .expect("write status");
+        let mut source = wire.as_slice();
+        let line = read_line_async(&mut source).await.expect("read status");
+        assert!(matches!(decode_request(&line), Ok(Request::Status { .. })));
     }
 
     #[tokio::test]
