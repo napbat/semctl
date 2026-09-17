@@ -1,0 +1,696 @@
+{
+  "date_utc": "2026-09-17T03:24:01.795971+00:00",
+  "platform": "Linux-7.0.0-31-generic-x86_64-with-glibc2.43",
+  "available_cpus": 16,
+  "revision": "c9215a1e5b25b88520ccedc93816b13870e73a31",
+  "binary_version": "semctl 0.1.19",
+  "binary_sha256": "5f035ddcee80f9b75a1c06fe01e731f1c6447abf2dfa72783152db1e6da988f7",
+  "mode": "standalone",
+  "method": "release binary; loopback mock; no uploads; periodic sync disabled; synthetic files; one run per case",
+  "kernel_limits": {
+    "rlimit_nofile": [
+      524288,
+      524288
+    ],
+    "rlimit_nproc": [
+      426364,
+      426364
+    ],
+    "inotify_max_user_instances": 128,
+    "inotify_max_user_watches": 1005716
+  },
+  "cases": [
+    {
+      "mode": "standalone",
+      "processes": 1,
+      "checkouts": 0,
+      "clients_per_checkout": null,
+      "watched": false,
+      "files_per_checkout": 0,
+      "directories_per_checkout": 0,
+      "tokio_worker_threads": "default",
+      "setup_seconds": 0.0,
+      "attach_batch_seconds": 0.005,
+      "latency": {
+        "initialize": {
+          "clients": 1,
+          "p50_seconds": 0.0034,
+          "p95_seconds": 0.0034,
+          "max_seconds": 0.0034
+        },
+        "tools/list": {
+          "clients": 1,
+          "p50_seconds": 0.0008,
+          "p95_seconds": 0.0008,
+          "max_seconds": 0.0008
+        }
+      },
+      "settled_totals": {
+        "rss_kib": 12972,
+        "pss_kib": 10344,
+        "uss_kib": 10272,
+        "threads": 19,
+        "fds": 9,
+        "inotify_watches": 0,
+        "inotify_instances": 0,
+        "cpu_seconds": 0.0
+      },
+      "daemon_totals": null,
+      "combined_totals": {
+        "rss_kib": 12972,
+        "pss_kib": 10344,
+        "uss_kib": 10272,
+        "threads": 19,
+        "fds": 9,
+        "inotify_watches": 0,
+        "inotify_instances": 0,
+        "cpu_seconds": 0.0
+      },
+      "watch_registrations_active": 0,
+      "watch_registrations_unavailable": 0,
+      "expected_startup_manifests": 1,
+      "startup_manifests_complete": true,
+      "watch_outcomes_complete": true,
+      "startup": {
+        "total": 0,
+        "bytes": 0,
+        "file_counts": [],
+        "distinct_source_ids": 0,
+        "checkouts_reported": 0,
+        "per_checkout_min": 0,
+        "per_checkout_max": 0
+      },
+      "edit": {
+        "total": 0,
+        "bytes": 0,
+        "file_counts": [],
+        "distinct_source_ids": 0,
+        "checkouts_reported": 0,
+        "per_checkout_min": 0,
+        "per_checkout_max": 0
+      },
+      "edit_manifests_complete": null,
+      "edit_process_cpu_seconds": null,
+      "edit_daemon_cpu_seconds": null,
+      "edit_total_cpu_seconds": null,
+      "daemon_status_attempts": null,
+      "daemon_status": null,
+      "environment": {
+        "GIT_CONFIG_GLOBAL": "/tmp/semctl-mcp-measure-hvcz6xhx/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "RUST_LOG": "info",
+        "SEMCTX_MCP_DAEMON": "off",
+        "SEMCTX_MCP_RESYNC_SECS": "0",
+        "SEMCTX_MCP_UPDATE_CHECK": "0",
+        "SEMCTX_SERVER": "http://127.0.0.1:34103",
+        "SEMCTX_TOKEN": "synthetic-benchmark-token",
+        "XDG_CONFIG_HOME": "/tmp/semctl-mcp-measure-hvcz6xhx/config",
+        "XDG_RUNTIME_DIR": "/tmp/semctl-mcp-measure-hvcz6xhx/run"
+      },
+      "harness_descriptor_limit": {
+        "soft": 524288,
+        "hard": 524288,
+        "raised_to": 524288
+      },
+      "kernel_limits": {
+        "rlimit_nofile": [
+          524288,
+          524288
+        ],
+        "rlimit_nproc": [
+          426364,
+          426364
+        ],
+        "inotify_max_user_instances": 128,
+        "inotify_max_user_watches": 1005716
+      },
+      "revision": "c9215a1e5b25b88520ccedc93816b13870e73a31",
+      "binary_version": "semctl 0.1.19",
+      "notes": [],
+      "startup_manifests": 0,
+      "edit_manifests": 0
+    },
+    {
+      "mode": "standalone",
+      "processes": 30,
+      "checkouts": 0,
+      "clients_per_checkout": null,
+      "watched": false,
+      "files_per_checkout": 0,
+      "directories_per_checkout": 0,
+      "tokio_worker_threads": "default",
+      "setup_seconds": 0.0,
+      "attach_batch_seconds": 0.035,
+      "latency": {
+        "initialize": {
+          "clients": 30,
+          "p50_seconds": 0.013,
+          "p95_seconds": 0.0178,
+          "max_seconds": 0.0182
+        },
+        "tools/list": {
+          "clients": 30,
+          "p50_seconds": 0.0085,
+          "p95_seconds": 0.0126,
+          "max_seconds": 0.0128
+        }
+      },
+      "settled_totals": {
+        "rss_kib": 387092,
+        "pss_kib": 58296,
+        "uss_kib": 47636,
+        "threads": 574,
+        "fds": 270,
+        "inotify_watches": 0,
+        "inotify_instances": 0,
+        "cpu_seconds": 0.0
+      },
+      "daemon_totals": null,
+      "combined_totals": {
+        "rss_kib": 387092,
+        "pss_kib": 58296,
+        "uss_kib": 47636,
+        "threads": 574,
+        "fds": 270,
+        "inotify_watches": 0,
+        "inotify_instances": 0,
+        "cpu_seconds": 0.0
+      },
+      "watch_registrations_active": 0,
+      "watch_registrations_unavailable": 0,
+      "expected_startup_manifests": 30,
+      "startup_manifests_complete": true,
+      "watch_outcomes_complete": true,
+      "startup": {
+        "total": 0,
+        "bytes": 0,
+        "file_counts": [],
+        "distinct_source_ids": 0,
+        "checkouts_reported": 0,
+        "per_checkout_min": 0,
+        "per_checkout_max": 0
+      },
+      "edit": {
+        "total": 0,
+        "bytes": 0,
+        "file_counts": [],
+        "distinct_source_ids": 0,
+        "checkouts_reported": 0,
+        "per_checkout_min": 0,
+        "per_checkout_max": 0
+      },
+      "edit_manifests_complete": null,
+      "edit_process_cpu_seconds": null,
+      "edit_daemon_cpu_seconds": null,
+      "edit_total_cpu_seconds": null,
+      "daemon_status_attempts": null,
+      "daemon_status": null,
+      "environment": {
+        "GIT_CONFIG_GLOBAL": "/tmp/semctl-mcp-measure-xheb6mgh/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "RUST_LOG": "info",
+        "SEMCTX_MCP_DAEMON": "off",
+        "SEMCTX_MCP_RESYNC_SECS": "0",
+        "SEMCTX_MCP_UPDATE_CHECK": "0",
+        "SEMCTX_SERVER": "http://127.0.0.1:45169",
+        "SEMCTX_TOKEN": "synthetic-benchmark-token",
+        "XDG_CONFIG_HOME": "/tmp/semctl-mcp-measure-xheb6mgh/config",
+        "XDG_RUNTIME_DIR": "/tmp/semctl-mcp-measure-xheb6mgh/run"
+      },
+      "harness_descriptor_limit": {
+        "soft": 524288,
+        "hard": 524288,
+        "raised_to": 524288
+      },
+      "kernel_limits": {
+        "rlimit_nofile": [
+          524288,
+          524288
+        ],
+        "rlimit_nproc": [
+          426364,
+          426364
+        ],
+        "inotify_max_user_instances": 128,
+        "inotify_max_user_watches": 1005716
+      },
+      "revision": "c9215a1e5b25b88520ccedc93816b13870e73a31",
+      "binary_version": "semctl 0.1.19",
+      "notes": [],
+      "startup_manifests": 0,
+      "edit_manifests": 0
+    },
+    {
+      "mode": "standalone",
+      "processes": 100,
+      "checkouts": 0,
+      "clients_per_checkout": null,
+      "watched": false,
+      "files_per_checkout": 0,
+      "directories_per_checkout": 0,
+      "tokio_worker_threads": "default",
+      "setup_seconds": 0.0,
+      "attach_batch_seconds": 0.089,
+      "latency": {
+        "initialize": {
+          "clients": 100,
+          "p50_seconds": 0.0297,
+          "p95_seconds": 0.0499,
+          "max_seconds": 0.051
+        },
+        "tools/list": {
+          "clients": 100,
+          "p50_seconds": 0.0184,
+          "p95_seconds": 0.0318,
+          "max_seconds": 0.0332
+        }
+      },
+      "settled_totals": {
+        "rss_kib": 1289720,
+        "pss_kib": 170046,
+        "uss_kib": 158388,
+        "threads": 1907,
+        "fds": 900,
+        "inotify_watches": 0,
+        "inotify_instances": 0,
+        "cpu_seconds": 0.0
+      },
+      "daemon_totals": null,
+      "combined_totals": {
+        "rss_kib": 1289720,
+        "pss_kib": 170046,
+        "uss_kib": 158388,
+        "threads": 1907,
+        "fds": 900,
+        "inotify_watches": 0,
+        "inotify_instances": 0,
+        "cpu_seconds": 0.0
+      },
+      "watch_registrations_active": 0,
+      "watch_registrations_unavailable": 0,
+      "expected_startup_manifests": 100,
+      "startup_manifests_complete": true,
+      "watch_outcomes_complete": true,
+      "startup": {
+        "total": 0,
+        "bytes": 0,
+        "file_counts": [],
+        "distinct_source_ids": 0,
+        "checkouts_reported": 0,
+        "per_checkout_min": 0,
+        "per_checkout_max": 0
+      },
+      "edit": {
+        "total": 0,
+        "bytes": 0,
+        "file_counts": [],
+        "distinct_source_ids": 0,
+        "checkouts_reported": 0,
+        "per_checkout_min": 0,
+        "per_checkout_max": 0
+      },
+      "edit_manifests_complete": null,
+      "edit_process_cpu_seconds": null,
+      "edit_daemon_cpu_seconds": null,
+      "edit_total_cpu_seconds": null,
+      "daemon_status_attempts": null,
+      "daemon_status": null,
+      "environment": {
+        "GIT_CONFIG_GLOBAL": "/tmp/semctl-mcp-measure-ay0tbuyu/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "RUST_LOG": "info",
+        "SEMCTX_MCP_DAEMON": "off",
+        "SEMCTX_MCP_RESYNC_SECS": "0",
+        "SEMCTX_MCP_UPDATE_CHECK": "0",
+        "SEMCTX_SERVER": "http://127.0.0.1:42711",
+        "SEMCTX_TOKEN": "synthetic-benchmark-token",
+        "XDG_CONFIG_HOME": "/tmp/semctl-mcp-measure-ay0tbuyu/config",
+        "XDG_RUNTIME_DIR": "/tmp/semctl-mcp-measure-ay0tbuyu/run"
+      },
+      "harness_descriptor_limit": {
+        "soft": 524288,
+        "hard": 524288,
+        "raised_to": 524288
+      },
+      "kernel_limits": {
+        "rlimit_nofile": [
+          524288,
+          524288
+        ],
+        "rlimit_nproc": [
+          426364,
+          426364
+        ],
+        "inotify_max_user_instances": 128,
+        "inotify_max_user_watches": 1005716
+      },
+      "revision": "c9215a1e5b25b88520ccedc93816b13870e73a31",
+      "binary_version": "semctl 0.1.19",
+      "notes": [],
+      "startup_manifests": 0,
+      "edit_manifests": 0
+    },
+    {
+      "mode": "standalone",
+      "processes": 1,
+      "checkouts": 1,
+      "clients_per_checkout": 1.0,
+      "watched": true,
+      "files_per_checkout": 2000,
+      "directories_per_checkout": 20,
+      "tokio_worker_threads": "default",
+      "setup_seconds": 0.075,
+      "attach_batch_seconds": 0.008,
+      "latency": {
+        "initialize": {
+          "clients": 1,
+          "p50_seconds": 0.0068,
+          "p95_seconds": 0.0068,
+          "max_seconds": 0.0068
+        },
+        "tools/list": {
+          "clients": 1,
+          "p50_seconds": 0.0009,
+          "p95_seconds": 0.0009,
+          "max_seconds": 0.0009
+        }
+      },
+      "settled_totals": {
+        "rss_kib": 24544,
+        "pss_kib": 21875,
+        "uss_kib": 21796,
+        "threads": 21,
+        "fds": 12,
+        "inotify_watches": 25,
+        "inotify_instances": 1,
+        "cpu_seconds": 0.08
+      },
+      "daemon_totals": null,
+      "combined_totals": {
+        "rss_kib": 24544,
+        "pss_kib": 21875,
+        "uss_kib": 21796,
+        "threads": 21,
+        "fds": 12,
+        "inotify_watches": 25,
+        "inotify_instances": 1,
+        "cpu_seconds": 0.08
+      },
+      "watch_registrations_active": 1,
+      "watch_registrations_unavailable": 0,
+      "expected_startup_manifests": 1,
+      "startup_manifests_complete": true,
+      "watch_outcomes_complete": true,
+      "startup": {
+        "total": 1,
+        "bytes": 8178000,
+        "file_counts": [
+          2000
+        ],
+        "distinct_source_ids": 1,
+        "checkouts_reported": 1,
+        "per_checkout_min": 1,
+        "per_checkout_max": 1
+      },
+      "edit": {
+        "total": 1,
+        "bytes": 8178012,
+        "file_counts": [
+          2000
+        ],
+        "distinct_source_ids": 1,
+        "checkouts_reported": 1,
+        "per_checkout_min": 1,
+        "per_checkout_max": 1
+      },
+      "edit_manifests_complete": true,
+      "edit_process_cpu_seconds": 0.07,
+      "edit_daemon_cpu_seconds": null,
+      "edit_total_cpu_seconds": 0.07,
+      "daemon_status_attempts": null,
+      "daemon_status": null,
+      "environment": {
+        "GIT_CONFIG_GLOBAL": "/tmp/semctl-mcp-measure-clyh7vyg/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "RUST_LOG": "info",
+        "SEMCTX_MCP_DAEMON": "off",
+        "SEMCTX_MCP_RESYNC_SECS": "0",
+        "SEMCTX_MCP_UPDATE_CHECK": "0",
+        "SEMCTX_SERVER": "http://127.0.0.1:36983",
+        "SEMCTX_TOKEN": "synthetic-benchmark-token",
+        "XDG_CONFIG_HOME": "/tmp/semctl-mcp-measure-clyh7vyg/config",
+        "XDG_RUNTIME_DIR": "/tmp/semctl-mcp-measure-clyh7vyg/run"
+      },
+      "harness_descriptor_limit": {
+        "soft": 524288,
+        "hard": 524288,
+        "raised_to": 524288
+      },
+      "kernel_limits": {
+        "rlimit_nofile": [
+          524288,
+          524288
+        ],
+        "rlimit_nproc": [
+          426364,
+          426364
+        ],
+        "inotify_max_user_instances": 128,
+        "inotify_max_user_watches": 1005716
+      },
+      "revision": "c9215a1e5b25b88520ccedc93816b13870e73a31",
+      "binary_version": "semctl 0.1.19",
+      "notes": [],
+      "startup_manifests": 1,
+      "edit_manifests": 1
+    },
+    {
+      "mode": "standalone",
+      "processes": 30,
+      "checkouts": 1,
+      "clients_per_checkout": 30.0,
+      "watched": true,
+      "files_per_checkout": 2000,
+      "directories_per_checkout": 20,
+      "tokio_worker_threads": "default",
+      "setup_seconds": 0.095,
+      "attach_batch_seconds": 0.078,
+      "latency": {
+        "initialize": {
+          "clients": 30,
+          "p50_seconds": 0.0208,
+          "p95_seconds": 0.0245,
+          "max_seconds": 0.0279
+        },
+        "tools/list": {
+          "clients": 30,
+          "p50_seconds": 0.0177,
+          "p95_seconds": 0.0265,
+          "max_seconds": 0.0275
+        }
+      },
+      "settled_totals": {
+        "rss_kib": 1166560,
+        "pss_kib": 782606,
+        "uss_kib": 770060,
+        "threads": 661,
+        "fds": 360,
+        "inotify_watches": 750,
+        "inotify_instances": 30,
+        "cpu_seconds": 9.400000000000002
+      },
+      "daemon_totals": null,
+      "combined_totals": {
+        "rss_kib": 1166560,
+        "pss_kib": 782606,
+        "uss_kib": 770060,
+        "threads": 661,
+        "fds": 360,
+        "inotify_watches": 750,
+        "inotify_instances": 30,
+        "cpu_seconds": 9.400000000000002
+      },
+      "watch_registrations_active": 30,
+      "watch_registrations_unavailable": 0,
+      "expected_startup_manifests": 30,
+      "startup_manifests_complete": true,
+      "watch_outcomes_complete": true,
+      "startup": {
+        "total": 30,
+        "bytes": 245340000,
+        "file_counts": [
+          2000
+        ],
+        "distinct_source_ids": 1,
+        "checkouts_reported": 1,
+        "per_checkout_min": 30,
+        "per_checkout_max": 30
+      },
+      "edit": {
+        "total": 30,
+        "bytes": 245340360,
+        "file_counts": [
+          2000
+        ],
+        "distinct_source_ids": 1,
+        "checkouts_reported": 1,
+        "per_checkout_min": 30,
+        "per_checkout_max": 30
+      },
+      "edit_manifests_complete": true,
+      "edit_process_cpu_seconds": 10.49,
+      "edit_daemon_cpu_seconds": null,
+      "edit_total_cpu_seconds": 10.49,
+      "daemon_status_attempts": null,
+      "daemon_status": null,
+      "environment": {
+        "GIT_CONFIG_GLOBAL": "/tmp/semctl-mcp-measure-07vjji8u/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "RUST_LOG": "info",
+        "SEMCTX_MCP_DAEMON": "off",
+        "SEMCTX_MCP_RESYNC_SECS": "0",
+        "SEMCTX_MCP_UPDATE_CHECK": "0",
+        "SEMCTX_SERVER": "http://127.0.0.1:42169",
+        "SEMCTX_TOKEN": "synthetic-benchmark-token",
+        "XDG_CONFIG_HOME": "/tmp/semctl-mcp-measure-07vjji8u/config",
+        "XDG_RUNTIME_DIR": "/tmp/semctl-mcp-measure-07vjji8u/run"
+      },
+      "harness_descriptor_limit": {
+        "soft": 524288,
+        "hard": 524288,
+        "raised_to": 524288
+      },
+      "kernel_limits": {
+        "rlimit_nofile": [
+          524288,
+          524288
+        ],
+        "rlimit_nproc": [
+          426364,
+          426364
+        ],
+        "inotify_max_user_instances": 128,
+        "inotify_max_user_watches": 1005716
+      },
+      "revision": "c9215a1e5b25b88520ccedc93816b13870e73a31",
+      "binary_version": "semctl 0.1.19",
+      "notes": [],
+      "startup_manifests": 30,
+      "edit_manifests": 30
+    },
+    {
+      "mode": "standalone",
+      "processes": 100,
+      "checkouts": 1,
+      "clients_per_checkout": 100.0,
+      "watched": true,
+      "files_per_checkout": 2000,
+      "directories_per_checkout": 20,
+      "tokio_worker_threads": "default",
+      "setup_seconds": 0.075,
+      "attach_batch_seconds": 1.389,
+      "latency": {
+        "initialize": {
+          "clients": 100,
+          "p50_seconds": 0.1962,
+          "p95_seconds": 0.2467,
+          "max_seconds": 0.2801
+        },
+        "tools/list": {
+          "clients": 100,
+          "p50_seconds": 0.4002,
+          "p95_seconds": 0.823,
+          "max_seconds": 0.8663
+        }
+      },
+      "settled_totals": {
+        "rss_kib": 3991620,
+        "pss_kib": 2682637,
+        "uss_kib": 2669296,
+        "threads": 2203,
+        "fds": 1200,
+        "inotify_watches": 2500,
+        "inotify_instances": 100,
+        "cpu_seconds": 54.63000000000004
+      },
+      "daemon_totals": null,
+      "combined_totals": {
+        "rss_kib": 3991620,
+        "pss_kib": 2682637,
+        "uss_kib": 2669296,
+        "threads": 2203,
+        "fds": 1200,
+        "inotify_watches": 2500,
+        "inotify_instances": 100,
+        "cpu_seconds": 54.63000000000004
+      },
+      "watch_registrations_active": 100,
+      "watch_registrations_unavailable": 0,
+      "expected_startup_manifests": 100,
+      "startup_manifests_complete": true,
+      "watch_outcomes_complete": true,
+      "startup": {
+        "total": 100,
+        "bytes": 817800000,
+        "file_counts": [
+          2000
+        ],
+        "distinct_source_ids": 1,
+        "checkouts_reported": 1,
+        "per_checkout_min": 100,
+        "per_checkout_max": 100
+      },
+      "edit": {
+        "total": 100,
+        "bytes": 817801200,
+        "file_counts": [
+          2000
+        ],
+        "distinct_source_ids": 1,
+        "checkouts_reported": 1,
+        "per_checkout_min": 100,
+        "per_checkout_max": 100
+      },
+      "edit_manifests_complete": true,
+      "edit_process_cpu_seconds": 58.37,
+      "edit_daemon_cpu_seconds": null,
+      "edit_total_cpu_seconds": 58.37,
+      "daemon_status_attempts": null,
+      "daemon_status": null,
+      "environment": {
+        "GIT_CONFIG_GLOBAL": "/tmp/semctl-mcp-measure-_8qs1n0l/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "RUST_LOG": "info",
+        "SEMCTX_MCP_DAEMON": "off",
+        "SEMCTX_MCP_RESYNC_SECS": "0",
+        "SEMCTX_MCP_UPDATE_CHECK": "0",
+        "SEMCTX_SERVER": "http://127.0.0.1:36373",
+        "SEMCTX_TOKEN": "synthetic-benchmark-token",
+        "XDG_CONFIG_HOME": "/tmp/semctl-mcp-measure-_8qs1n0l/config",
+        "XDG_RUNTIME_DIR": "/tmp/semctl-mcp-measure-_8qs1n0l/run"
+      },
+      "harness_descriptor_limit": {
+        "soft": 524288,
+        "hard": 524288,
+        "raised_to": 524288
+      },
+      "kernel_limits": {
+        "rlimit_nofile": [
+          524288,
+          524288
+        ],
+        "rlimit_nproc": [
+          426364,
+          426364
+        ],
+        "inotify_max_user_instances": 128,
+        "inotify_max_user_watches": 1005716
+      },
+      "revision": "c9215a1e5b25b88520ccedc93816b13870e73a31",
+      "binary_version": "semctl 0.1.19",
+      "notes": [],
+      "startup_manifests": 100,
+      "edit_manifests": 100
+    }
+  ]
+}
