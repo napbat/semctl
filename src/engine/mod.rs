@@ -7,5 +7,6 @@
 //! a second copy of.
 
 pub(crate) mod scheduler;
+pub(crate) mod watch_hub;
 
 pub(crate) use scheduler::Scheduler;

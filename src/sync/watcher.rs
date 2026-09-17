@@ -1,125 +1,94 @@
-//! Realtime filesystem watcher for `semctl mcp`.
+//! Realtime filesystem watching for `semctl mcp`.
 //!
 //! The periodic re-sync (`spawn_periodic_resync` in [`super::background`]) is the
-//! drift backstop; this is the low-latency complement. `notify` (debounced) wakes us
-//! on each burst of edits and we trigger a full manifest re-sync — the same
-//! reconcile path as the periodic timer, just event-driven. Re-walking and
-//! diffing the whole tree handles creates, edits, deletes and renames uniformly,
-//! with no incremental delete endpoint needed.
+//! drift backstop; this is the low-latency complement. The process watch hub
+//! ([`WatchHub`]) wakes us on each debounced burst of edits and we trigger a
+//! full manifest re-sync — the same reconcile path as the periodic timer, just
+//! event-driven. Re-walking and diffing the whole tree handles creates, edits,
+//! deletes and renames uniformly, with no incremental delete endpoint needed.
 //!
 //! Read/open access events are ignored because the re-sync itself walks and opens
 //! the watched tree. Letting those events through makes each completed sync queue
 //! its successor forever on platforms whose watcher reports file access. Events
 //! under the VCS dir or matched by the root gitignore are filtered out too, so a
 //! `cargo build` / `git` operation doesn't spin the sync.
+//!
+//! Every decision that needs the source policy runs on the blocking pool. The
+//! hub's notify thread serves every watched checkout in the process, so it must
+//! never read a file.
 
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use notify::event::{AccessKind, AccessMode};
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode};
-use notify_debouncer_full::{DebouncedEvent, Debouncer, RecommendedCache, new_debouncer};
+use notify::{Event, EventKind};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use super::{
-    SyncCache, SyncLimits,
+    SyncCache, SyncLimits, blocking,
     blocking::Cancellation,
     policy::{SourcePolicy, event_may_affect_policy},
 };
 use crate::client::Client;
+use crate::engine::watch_hub::{BATCH_CAPACITY, WatchHub, WatchRegistration, WatchSink};
 
-/// Debounce window: collapse a burst of saves into a single re-sync.
-const DEBOUNCE_MS: u64 = 750;
-
-type WatchControl = std::sync::Mutex<Debouncer<RecommendedWatcher, RecommendedCache>>;
-
-/// Begin watching `dir`. Returns the watcher guard — dropping it stops the
-/// watch, so the caller keeps it alive for the server's lifetime. `None` when
-/// the platform watch can't be established, in which case the periodic re-sync
-/// still covers drift.
+/// Begin watching `dir`. Returns whether the watch is active; when it is not,
+/// the periodic re-sync still covers drift.
+///
+/// **Blocking.** Registration walks the tree to seed the watcher's file-id
+/// cache, so the caller runs this on the blocking pool.
 pub(super) fn spawn(
     client: Client,
     dir: PathBuf,
     cache: Arc<Mutex<SyncCache>>,
     jobs: Arc<super::JobRegistry>,
     limits: SyncLimits,
-) -> Option<Arc<WatchControl>> {
-    // Wake-only channel: the re-sync re-walks the whole tree, so we forward
-    // "something interesting changed", not which paths.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
-
-    let initial_policy = SourcePolicy::load(&dir, &Cancellation::default()).ok();
-    let mut observed: std::collections::HashSet<_> = initial_policy
-        .as_ref()
-        .into_iter()
-        .flat_map(SourcePolicy::observed_sources)
-        .collect();
-
-    let ignore_root = dir.clone();
-    let mut debouncer = match new_debouncer(
-        Duration::from_millis(DEBOUNCE_MS),
-        None,
-        move |result: Result<Vec<DebouncedEvent>, Vec<notify::Error>>| match result {
-            Ok(events) => {
-                if !events.iter().any(|event| {
-                    can_change_tree(&event.event)
-                        && event
-                            .paths
-                            .iter()
-                            .any(|path| event_may_affect_policy(&ignore_root, path, &observed))
-                }) {
-                    return;
-                }
-                // Notifications and manifests share the checked policy engine.
-                // A load error still wakes the scanner, which reports the error
-                // and refuses upload instead of treating unreadable rules as empty.
-                let interesting = match SourcePolicy::load(&ignore_root, &Cancellation::default()) {
-                    Ok(mut policy) => {
-                        let interesting = events
-                            .iter()
-                            .any(|event| is_interesting(&event.event, &mut policy));
-                        observed.extend(policy.observed_sources());
-                        interesting
-                    }
-                    Err(_) => true,
-                };
-                if interesting {
-                    let _ = tx.try_send(());
-                }
-            }
-            Err(errs) => {
-                for e in errs {
-                    warn!(error = %e, "watcher error");
-                }
-            }
-        },
-    ) {
-        Ok(d) => d,
-        Err(e) => {
-            warn!(error = %e, "fs watcher unavailable; relying on periodic re-sync");
-            return None;
+) -> bool {
+    let hub = Arc::new(WatchHub::new());
+    let (sender, mut batches) = tokio::sync::mpsc::channel(BATCH_CAPACITY);
+    let overflow = Arc::new(AtomicBool::new(false));
+    // The registration owns this checkout's share of the hub, including the hub
+    // itself: dropping it releases the root watch and every external watch it
+    // alone held.
+    let registration = match hub.register(dir.clone(), WatchSink::new(sender, overflow.clone())) {
+        Ok(registration) => Arc::new(registration),
+        Err(error) => {
+            warn!(
+                error = %format!("{error:#}"),
+                "fs watch registration failed; relying on periodic re-sync"
+            );
+            return false;
         }
     };
 
-    if let Err(e) = debouncer.watch(&dir, RecursiveMode::Recursive) {
-        warn!(error = %e, "fs watch registration failed; relying on periodic re-sync");
-        return None;
+    let mut observed = HashSet::new();
+    if let Ok(policy) = SourcePolicy::load(&dir, &Cancellation::default()) {
+        observed.extend(policy.observed_sources());
+        for path in policy.external_sources() {
+            registration.watch_external(&path);
+        }
     }
-    let mut registered = std::collections::HashSet::new();
-    if let Some(policy) = initial_policy {
-        register_external_watches(&mut debouncer, &policy, &mut registered);
-    }
-    let debouncer = Arc::new(std::sync::Mutex::new(debouncer));
-    let control = Arc::downgrade(&debouncer);
-    info!(dir = %dir.display(), debounce_ms = DEBOUNCE_MS, "fs watcher active");
 
-    // Single-flight consumer: await each re-sync before taking the next wake,
-    // draining wakes that piled up during it so a burst collapses to one pass.
+    // Single-flight consumer: await each re-sync before taking the next batch,
+    // draining batches that piled up during it so a burst collapses to one pass.
     tokio::spawn(async move {
-        while rx.recv().await.is_some() {
-            while rx.try_recv().is_ok() {}
+        let registration = registration;
+        while let Some(batch) = batches.recv().await {
+            let mut events = batch.events;
+            while let Ok(next) = batches.try_recv() {
+                events.extend(next.events);
+            }
+            // Dropped events can name any path, so an overflow makes this run
+            // unconditional instead of judging it by what survived.
+            let dropped = overflow.swap(false, Ordering::AcqRel);
+            let (relevant, next_observed) = relevance(&dir, events, observed).await;
+            observed = next_observed;
+            if !dropped && !relevant {
+                continue;
+            }
             match super::sync(&client, &dir, &cache, &limits).await {
                 Ok(o) if o.uploaded > 0 || o.to_delete > 0 => {
                     info!(
@@ -135,55 +104,67 @@ pub(super) fn spawn(
             }
             // A config change can select a rule in a different directory. Add
             // that directory after reconciliation so later rule edits wake us.
-            let Some(control) = control.upgrade() else {
-                break;
-            };
-            let root = dir.clone();
-            let mut previous = registered.clone();
-            match super::blocking::run(move |cancellation| {
-                let policy = SourcePolicy::load(&root, &cancellation)?;
-                let mut watcher = control
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("watch control lock is poisoned"))?;
-                register_external_watches(&mut watcher, &policy, &mut previous);
-                Ok(previous)
-            })
-            .await
-            {
-                Ok(current) => registered = current,
-                Err(error) => {
-                    warn!(%error, "source policy watch refresh failed; periodic sync covers changes");
-                }
-            }
+            refresh_external_watches(&registration, &dir).await;
         }
     });
-
-    Some(debouncer)
+    true
 }
 
-/// Watch rule parents so creation and atomic replacement are visible. For a
-/// parent that does not exist yet, watch its closest existing ancestor first.
-fn register_external_watches(
-    watcher: &mut Debouncer<RecommendedWatcher, RecommendedCache>,
-    policy: &SourcePolicy,
-    registered: &mut std::collections::HashSet<PathBuf>,
-) {
-    for path in policy.external_sources() {
-        let parent = path
-            .parent()
-            .and_then(|parent| parent.ancestors().find(|ancestor| ancestor.is_dir()));
-        let Some(parent) = parent else { continue };
-        if registered.contains(parent) {
-            continue;
+/// Whether this batch justifies a re-sync, and the policy sources to keep
+/// watching for the next one.
+///
+/// Runs on the blocking pool: the cheap event filter is followed by a policy
+/// load, which reads rule files. A load error reports the batch as relevant, so
+/// the authoritative scanner runs, reports the error, and refuses to upload
+/// rather than treating unreadable rules as empty.
+async fn relevance(
+    root: &Path,
+    events: Vec<Event>,
+    observed: HashSet<PathBuf>,
+) -> (bool, HashSet<PathBuf>) {
+    let root = root.to_path_buf();
+    blocking::run(move |cancellation| {
+        if !events.iter().any(|event| {
+            can_change_tree(event)
+                && event
+                    .paths
+                    .iter()
+                    .any(|path| event_may_affect_policy(&root, path, &observed))
+        }) {
+            return Ok((false, observed));
         }
-        match watcher.watch(parent, RecursiveMode::NonRecursive) {
-            Ok(()) => {
-                registered.insert(parent.to_path_buf());
-            }
-            Err(error) => {
-                warn!(%error, "external source policy watch unavailable; periodic sync covers changes");
-            }
+        // Notifications and manifests share the checked policy engine.
+        let Ok(mut policy) = SourcePolicy::load(&root, &cancellation) else {
+            return Ok((true, observed));
+        };
+        let relevant = events
+            .iter()
+            .any(|event| is_interesting(event, &mut policy));
+        let mut observed = observed;
+        observed.extend(policy.observed_sources());
+        Ok((relevant, observed))
+    })
+    .await
+    // A cancelled or panicking worker leaves the decision to the scanner.
+    .unwrap_or_else(|_| (true, HashSet::new()))
+}
+
+/// Re-read the policy and subscribe to every rule directory it now names.
+///
+/// Best effort: a failure is logged and the periodic sync covers the change.
+async fn refresh_external_watches(registration: &Arc<WatchRegistration>, root: &Path) {
+    let registration = registration.clone();
+    let root = root.to_path_buf();
+    let refreshed = blocking::run(move |cancellation| {
+        let policy = SourcePolicy::load(&root, &cancellation)?;
+        for path in policy.external_sources() {
+            registration.watch_external(&path);
         }
+        Ok(())
+    })
+    .await;
+    if let Err(error) = refreshed {
+        warn!(%error, "source policy watch refresh failed; periodic sync covers changes");
     }
 }
 
@@ -208,7 +189,6 @@ fn can_change_tree(event: &Event) -> bool {
 #[cfg(test)]
 mod tests {
     use notify::event::{CreateKind, ModifyKind, RemoveKind};
-    use std::path::Path;
 
     use super::*;
     use crate::sync::walker::IGNORE_FILES;
@@ -293,5 +273,34 @@ mod tests {
                 Event::new(EventKind::Modify(ModifyKind::Any)).add_path(temp.path().join(name));
             assert!(is_interesting(&event, &mut policy));
         }
+    }
+
+    /// An event the policy excludes must not schedule a sync, and the rule
+    /// files the check read must stay observed for the next batch.
+    #[tokio::test]
+    async fn the_relevance_check_applies_the_source_policy() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        std::fs::write(root.join(".gitignore"), "ignored.txt\n").unwrap();
+
+        let (relevant, observed) = relevance(
+            &root,
+            vec![Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.join("ignored.txt"))],
+            HashSet::new(),
+        )
+        .await;
+        assert!(!relevant, "an ignored file must not schedule a sync");
+        assert!(
+            observed.iter().any(|path| path.ends_with(".gitignore")),
+            "the rule files it read must stay observed"
+        );
+
+        let (relevant, _) = relevance(
+            &root,
+            vec![Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.join("src/lib.rs"))],
+            HashSet::new(),
+        )
+        .await;
+        assert!(relevant, "a source edit must schedule a sync");
     }
 }

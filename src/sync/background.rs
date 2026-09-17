@@ -92,16 +92,15 @@ fn spawn(
 
         // The watcher's recursive registration walks the tree to seed its file-id
         // cache — blocking and potentially long on a big directory — so run it on
-        // the blocking pool rather than a runtime worker. The returned debouncer
-        // guard is held here for the task's (and thus the server's) lifetime;
-        // dropping it would stop the watch.
-        let watcher =
+        // the blocking pool rather than a runtime worker. The watch registration
+        // is owned by the consumer task the call starts, which lives as long as
+        // the process does.
+        let watching =
             tokio::task::spawn_blocking(move || watcher::spawn(client, dir, cache, jobs, limits))
                 .await
-                .ok()
-                .flatten();
-        if watcher.is_some() {
-            std::future::pending::<()>().await;
+                .unwrap_or(false);
+        if !watching {
+            info!("no realtime watch; the periodic re-sync covers drift");
         }
     });
 }
