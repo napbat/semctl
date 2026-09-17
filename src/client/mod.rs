@@ -18,7 +18,7 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 use tracing::{debug, warn};
 
 use crate::auth;
-use crate::session::{CredentialSource, SessionContext};
+use crate::session::{CredentialScope, CredentialSource, SessionContext};
 
 pub(crate) mod transport;
 
@@ -141,6 +141,17 @@ impl Client {
         self
     }
 
+    /// The same client with no codebase selected.
+    ///
+    /// A first index must not write into a codebase that was pinned for the
+    /// session: the checkout being indexed gets the codebase its own
+    /// registration names.
+    #[must_use]
+    pub(crate) fn without_codebase(mut self) -> Self {
+        self.codebase = None;
+        self
+    }
+
     /// Attach a checkout only when its source identity can be derived. A failed
     /// identity leaves both the request selector and local rendering unbound.
     pub fn with_local_root(mut self, root: Option<PathBuf>) -> Self {
@@ -189,6 +200,20 @@ impl Client {
     /// Effective resource-server base URL. Contains no credentials.
     pub fn server_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// The same client, authorized differently. Tests use it to build the two
+    /// credential scopes one root can be attached under.
+    #[cfg(test)]
+    pub(crate) fn with_credentials(mut self, credentials: CredentialSource) -> Self {
+        self.credentials = credentials;
+        self
+    }
+
+    /// The comparable identity of this client's credentials. Shared state keyed
+    /// by it can never be reused across authorizations.
+    pub(crate) fn credential_scope(&self) -> CredentialScope {
+        self.credentials.scope()
     }
 
     /// Effective active tenant selector. Contains only the configured slug/id,

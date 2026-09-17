@@ -148,7 +148,7 @@ struct DirectoryRules {
     global: Option<Gitignore>,
 }
 
-pub(super) struct SourcePolicy {
+pub(crate) struct SourcePolicy {
     root: PathBuf,
     sources: Sources,
     directories: BTreeMap<PathBuf, DirectoryRules>,
@@ -157,7 +157,7 @@ pub(super) struct SourcePolicy {
 }
 
 impl SourcePolicy {
-    pub(super) fn load(root: &Path, cancellation: &Cancellation) -> Result<Self> {
+    pub(crate) fn load(root: &Path, cancellation: &Cancellation) -> Result<Self> {
         let mut sources = Sources::default();
         let configuration = git::Configuration::load(root, &mut sources, cancellation)?;
         let global = sources.rules(root, configuration.excludes.iter().cloned())?;
@@ -269,7 +269,7 @@ impl SourcePolicy {
 
     /// Events use the same rules as the scan. A changed rule always wakes the
     /// scanner, even if that rule file is itself excluded from the manifest.
-    pub(super) fn event_is_relevant(
+    pub(crate) fn event_is_relevant(
         &mut self,
         path: &Path,
         is_dir: bool,
@@ -313,12 +313,12 @@ impl SourcePolicy {
         self.sources.verify(cancellation)
     }
 
-    pub(super) fn external_sources(&self) -> impl Iterator<Item = PathBuf> {
+    pub(crate) fn external_sources(&self) -> impl Iterator<Item = PathBuf> {
         self.observed_sources()
             .filter(|path| !path.starts_with(&self.root))
     }
 
-    pub(super) fn observed_sources(&self) -> impl Iterator<Item = PathBuf> {
+    pub(crate) fn observed_sources(&self) -> impl Iterator<Item = PathBuf> {
         // Watch both the logical path and its target. The former detects a
         // retargeted symlink; the latter detects edits through another alias.
         self.sources
@@ -341,7 +341,7 @@ fn watch_target(path: &Path) -> PathBuf {
 
 /// Recovery bytes and private process output are never source, even when a
 /// project whitelist includes hidden files. Check ancestors to cover contents.
-pub(super) fn is_private_path(path: &Path) -> bool {
+pub(crate) fn is_private_path(path: &Path) -> bool {
     path.components().any(|part| {
         part.as_os_str().to_str().is_some_and(|name| {
             let Some(stem) = name
@@ -369,7 +369,7 @@ pub(super) fn is_private_path(path: &Path) -> bool {
 /// Filter unrelated events before loading policy. In particular, probing Git
 /// creates private scratch files under the temporary directory; those events
 /// must not cause another policy probe through an external parent watch.
-pub(super) fn event_may_affect_policy(
+pub(crate) fn event_may_affect_policy(
     root: &Path,
     path: &Path,
     observed: &std::collections::HashSet<PathBuf>,

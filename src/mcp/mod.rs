@@ -21,19 +21,19 @@ use rmcp::{
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 use crate::cli::Cli;
-use crate::client::{self, Client, HttpTransport};
-use crate::engine::Scheduler;
+use crate::client::{self, Client};
+use crate::engine::{
+    CheckoutKey, CoordinatorLease, CoordinatorStatus, Engine, EngineSettings, Trigger,
+};
 use crate::query;
 use crate::session::SessionContext;
-use crate::sync::{self, JobRegistry, SyncLimits};
 
-mod readiness;
+pub(crate) mod readiness;
 mod tool_types;
 mod tools;
 
@@ -91,11 +91,12 @@ struct Shared {
     /// The codebase-bound client, once resolved. Held across the resolve so
     /// concurrent first calls can't race into a double-registration.
     bound: Mutex<Option<Client>>,
-    /// Most recent index job per codebase queued by this session's watchers.
-    jobs: Arc<JobRegistry>,
-    /// Canonical local roots already being kept in sync. A path-scoped tool call
-    /// activates its checkout once; subsequent calls reuse the existing watcher.
-    watched: Mutex<HashMap<PathBuf, String>>,
+    /// The shared engine. It owns every checkout this process keeps in sync,
+    /// so a second session on the same checkout adds a lease and nothing else.
+    engine: Arc<Engine>,
+    /// The coordinators this session keeps alive. Dropping the map releases
+    /// them, and the engine frees a coordinator no session holds any more.
+    leases: RwLock<HashMap<CheckoutKey, CoordinatorLease>>,
     /// First-ever indexes currently building (or completed/failed in this
     /// process). Retrieval tools await these gates; `sync_status` deliberately
     /// bypasses them so progress remains observable.
@@ -109,9 +110,6 @@ struct Shared {
     /// `None` until/unless a newer version is seen. Notify-only: applying the
     /// update stays the explicit `semctl upgrade`.
     update_note: Arc<Mutex<Option<String>>>,
-    /// The process-wide permits this session's work takes. Shared, so the
-    /// bounds hold however many sessions the process serves.
-    scheduler: Arc<Scheduler>,
 }
 
 impl McpServer {
@@ -120,7 +118,7 @@ impl McpServer {
         base: Client,
         dir: PathBuf,
         pinned: bool,
-        scheduler: Arc<Scheduler>,
+        engine: Arc<Engine>,
     ) -> Self {
         Self {
             shared: Arc::new(Shared {
@@ -129,20 +127,14 @@ impl McpServer {
                 dir,
                 pinned,
                 bound: Mutex::new(None),
-                jobs: Arc::new(Mutex::new(std::collections::HashMap::new())),
-                watched: Mutex::new(HashMap::new()),
+                engine,
+                leases: RwLock::new(HashMap::new()),
                 initial_indexes: RwLock::new(InitialIndexes::default()),
                 freshness: Arc::new(Mutex::new(None)),
                 update_note: Arc::new(Mutex::new(None)),
-                scheduler,
             }),
             tool_router: tools::router(),
         }
-    }
-
-    /// The upload bound this session's syncs must respect.
-    fn sync_limits(&self) -> SyncLimits {
-        SyncLimits::new(self.shared.scheduler.upload_permits())
     }
 
     /// A freshness warning for search results, derived from the most recent
@@ -153,17 +145,16 @@ impl McpServer {
     /// Cached once the job is terminal, keyed by job id so a later sync recomputes.
     async fn index_freshness(&self, client: &Client) -> Option<String> {
         client.local_root()?;
-        let codebase_id = client.codebase_raw()?;
-        let job = self.shared.jobs.lock().await.get(codebase_id).cloned()?;
+        let job_id = self.checkout_status(client).await?.last_job_id?;
         if let Some((id, footer)) = self.shared.freshness.lock().await.as_ref()
-            && *id == job.job_id
+            && *id == job_id
         {
             return footer.clone();
         }
         let status = self
             .shared
             .base
-            .get::<client::api::JobStatus>(&format!("/v1/jobs/{}", job.job_id))
+            .get::<client::api::JobStatus>(&format!("/v1/jobs/{job_id}"))
             .await
             .ok()?;
         let footer = if status.error.is_some() {
@@ -182,7 +173,7 @@ impl McpServer {
         };
         // Cache only terminal states (done/failed); a running/queued job changes.
         if status.completed_at.is_some() || status.error.is_some() {
-            *self.shared.freshness.lock().await = Some((job.job_id.clone(), footer.clone()));
+            *self.shared.freshness.lock().await = Some((job_id, footer.clone()));
         }
         footer
     }
@@ -427,82 +418,115 @@ impl McpServer {
         }
     }
 
-    /// Start one background sync/watcher per canonical local root.
+    /// Keep one canonical local root in sync for the rest of this session.
+    ///
+    /// The engine owns the coordinator, so this only adds a lease. Calling it
+    /// again for the same checkout is free, and a checkout another session
+    /// already attached keeps its warm cache and its existing watch.
     async fn watch_once(&self, client: Client, dir: PathBuf) {
-        let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
-        let Some(codebase_id) = client.codebase_raw().map(str::to_string) else {
+        if client.codebase_raw().is_none() {
             return;
-        };
-        if self.claim_untracked_watch(&dir, &codebase_id).await {
-            sync::spawn_indexing(
-                client,
-                dir,
-                self.shared.jobs.clone(),
-                self.shared.context.resync_secs,
-                self.sync_limits(),
-            );
+        }
+        if let Err(reason) = self.attach(client, dir.clone()).await {
+            warn!(root = %dir.display(), %reason, "could not keep this checkout in sync");
         }
     }
 
-    /// A first-index gate owns watcher startup even before registration returns.
-    /// Status calls must not replace that startup with an untracked watcher.
-    async fn claim_untracked_watch(&self, dir: &Path, codebase_id: &str) -> bool {
-        // Always lock the index registry before the watcher registry. Keep the
-        // first lock until the claim completes so a gate cannot appear between
-        // the ownership check and the watcher claim.
-        let indexes = self.shared.initial_indexes.read().await;
-        if indexes.by_path.contains_key(dir) {
-            return false;
-        }
-        let mut watched = self.shared.watched.lock().await;
-        if watched.contains_key(dir) {
-            return false;
-        }
-        watched.insert(dir.to_path_buf(), codebase_id.to_string());
-        true
+    /// Take a lease on `dir`'s coordinator and keep it with this session.
+    async fn attach(
+        &self,
+        client: Client,
+        dir: PathBuf,
+    ) -> std::result::Result<CheckoutKey, String> {
+        let lease = self
+            .shared
+            .engine
+            .registry()
+            .attach(client, dir, self.shared.context.resync_secs)
+            .await?;
+        let key = lease.key().clone();
+        // A second lease on the same checkout is dropped here, which releases
+        // it again: one session holds one lease per checkout.
+        self.shared
+            .leases
+            .write()
+            .await
+            .entry(key.clone())
+            .or_insert(lease);
+        Ok(key)
     }
 
-    /// Claim a new local root and start the exact same watcher lifecycle as
-    /// [`Self::watch_once`], but retain its startup-sync completion handle for the
-    /// first-index readiness gate.
+    /// Claim `dir` for a first index and return the gate to report it through.
+    ///
+    /// The gate exists before the codebase is registered on the server, so a
+    /// retrieval call that arrives during registration has something to wait on.
     async fn watch_first_once(
         &self,
         client: Client,
         dir: PathBuf,
-    ) -> std::result::Result<
-        tokio::sync::oneshot::Receiver<std::result::Result<sync::SyncOutcome, String>>,
-        String,
-    > {
-        let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
-        let codebase_id = client
-            .codebase_raw()
-            .ok_or_else(|| "first index has no codebase id".to_string())?
-            .to_string();
-        let mut watched = self.shared.watched.lock().await;
-        if watched.contains_key(&dir) {
-            return Err(format!("{} is already being watched", dir.display()));
-        }
-        watched.insert(dir.clone(), codebase_id);
-        drop(watched);
-        Ok(sync::spawn_indexing_tracked(
-            client,
-            dir,
-            self.shared.jobs.clone(),
-            self.shared.context.resync_secs,
-            self.sync_limits(),
-        ))
+    ) -> std::result::Result<Arc<InitialIndexGate>, String> {
+        let (lease, gate) = self
+            .shared
+            .engine
+            .registry()
+            .attach_first_index(client, dir, self.shared.context.resync_secs)
+            .await?;
+        let key = lease.key().clone();
+        self.shared.leases.write().await.entry(key).or_insert(lease);
+        Ok(gate)
     }
 
+    /// The coordinator this session leases for `client`, as a status snapshot.
+    ///
+    /// A client with a local root names its checkout exactly. A pinned client
+    /// without one can only be answered by codebase: any leased coordinator
+    /// bound to that id reports on the same index.
+    async fn checkout_status(&self, client: &Client) -> Option<CoordinatorStatus> {
+        let leases = self.shared.leases.read().await;
+        if let Some(root) = client.local_root() {
+            let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+            for lease in leases.values() {
+                if lease.coordinator().root() == root {
+                    return Some(lease.coordinator().status().await);
+                }
+            }
+        }
+        let codebase_id = client.codebase_raw()?;
+        for lease in leases.values() {
+            if lease.coordinator().codebase_id().await.as_deref() == Some(codebase_id) {
+                return Some(lease.coordinator().status().await);
+            }
+        }
+        None
+    }
+
+    /// Whether this session keeps a checkout of `client`'s codebase in sync.
+    /// An edit then lands in an index that is already being reconciled.
     async fn watcher_active(&self, client: &Client) -> bool {
         let Some(codebase_id) = client.codebase_raw() else {
             return false;
         };
-        self.shared
-            .watched
-            .lock()
-            .await
-            .values()
-            .any(|candidate| candidate == codebase_id)
+        let leases = self.shared.leases.read().await;
+        for lease in leases.values() {
+            if lease.coordinator().codebase_id().await.as_deref() == Some(codebase_id) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Ask every checkout this session leases for `client`'s codebase to
+    /// reconcile now.
+    async fn trigger_sync(&self, client: &Client) {
+        let Some(codebase_id) = client.codebase_raw() else {
+            return;
+        };
+        let leases = self.shared.leases.read().await;
+        for lease in leases.values() {
+            if lease.coordinator().codebase_id().await.as_deref() == Some(codebase_id) {
+                lease.coordinator().trigger(Trigger::Explicit);
+            }
+        }
     }
 
     async fn apply_server_plan(
@@ -514,8 +538,14 @@ impl McpServer {
     ) -> String {
         let watching = self.watcher_active(client).await;
         match crate::editing::apply(client, &plan, run_formatter, watching).await {
-            Ok(outcome) => render_edit_action_outcome(&outcome)
-                .unwrap_or_else(|error| format!("{operation} result render failed: {error}")),
+            Ok(outcome) => {
+                // The edit is on disk. Ask for the sync now instead of waiting
+                // for the watcher's debounce; a burst of edits still costs one
+                // reconcile, because the coordinator coalesces triggers.
+                self.trigger_sync(client).await;
+                render_edit_action_outcome(&outcome)
+                    .unwrap_or_else(|error| format!("{operation} result render failed: {error}"))
+            }
             Err(error) => format!("{operation} refused: {error:#}"),
         }
     }
@@ -543,36 +573,6 @@ impl McpServer {
             Err(error) => format!("{operation} planning failed: {error:#}"),
         }
     }
-}
-
-async fn wait_for_initial_job(client: &Client, job_id: &str) -> std::result::Result<(), String> {
-    loop {
-        let job = client
-            .get::<client::api::JobStatus>(&format!("/v1/jobs/{job_id}"))
-            .await
-            .map_err(|e| format!("poll initial index job {job_id}: {e}"))?;
-        if let Some(result) = initial_job_result(job_id, &job) {
-            return result;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-}
-
-fn initial_job_result(
-    job_id: &str,
-    job: &client::api::JobStatus,
-) -> Option<std::result::Result<(), String>> {
-    if let Some(error) = &job.error {
-        return Some(Err(format!("embedding job {job_id} failed: {error}")));
-    }
-    job.completed_at.as_ref()?;
-    if job.files_failed > 0 {
-        return Some(Err(format!(
-            "embedding job {job_id} completed with {} failed file(s)",
-            job.files_failed
-        )));
-    }
-    Some(Ok(()))
 }
 
 /// Resolve a selector path to a canonical directory.
@@ -690,9 +690,14 @@ pub async fn run(cli: &Cli) -> Result<()> {
     // The one place this process reads itself. Everything below takes the
     // session's values from `context`.
     let context = SessionContext::from_process(cli)?;
-    let transport = HttpTransport::new();
-    let scheduler = Arc::new(Scheduler::from_environment());
-    let base = client::from_context(&context, &transport, Some(scheduler.remote_permits()))?;
+    // One engine per process. In standalone mode it serves exactly one session;
+    // the type and the ownership are the same either way.
+    let engine = Engine::new(EngineSettings::from_environment());
+    let base = client::from_context(
+        &context,
+        engine.transport(),
+        Some(engine.scheduler().remote_permits()),
+    )?;
 
     // Pinned == a codebase was set up front (`--codebase` / `SEMCTX_CODEBASE` /
     // config). The launch directory may be unrelated, so it is never synced into
@@ -706,7 +711,7 @@ pub async fn run(cli: &Cli) -> Result<()> {
 
     let update_check = context.update_check;
     let server_override = context.server.clone();
-    let server = McpServer::new(context, base, dir, pinned, scheduler);
+    let server = McpServer::new(context, base, dir, pinned, engine);
 
     // Detached, best-effort check for a newer published CLI; see `spawn_update_check`.
     spawn_update_check(

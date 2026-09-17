@@ -1,7 +1,6 @@
 //! MCP tool-router definitions.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use anyhow::Result;
 use rmcp::{
@@ -21,8 +20,7 @@ use super::tool_types::{
     render_edit_action_outcome,
 };
 use super::{
-    InitialIndexGate, McpServer, canonical_directory, client, initial_gate_for_path, query,
-    ready_for_codebases, wait_for_initial_job,
+    McpServer, canonical_directory, client, initial_gate_for_path, query, ready_for_codebases,
 };
 
 // Tool descriptions come entirely from `docs/tools/<name>.md`: the `#[tool]`
@@ -351,17 +349,14 @@ impl McpServer {
             Ok(client) => client,
             Err(error) => return format!("current_context unavailable — {error}"),
         };
-        let codebase_id = client.codebase_raw().map(str::to_string);
-        let watching = self.watcher_active(&client).await;
-        let job = if let Some(id) = &codebase_id {
-            self.shared.jobs.lock().await.get(id).cloned()
-        } else {
-            None
-        };
+        let status = self.checkout_status(&client).await;
+        let watching = status.is_some();
         query::current_context(
             &client,
             watching,
-            job.as_ref().map(|job| job.job_id.as_str()),
+            status
+                .as_ref()
+                .and_then(|status| status.last_job_id.as_deref()),
         )
         .await
     }
@@ -578,8 +573,13 @@ impl McpServer {
         };
         let watching = self.watcher_active(&client).await;
         match crate::editing::undo(&client, &args.edit_id, watching).await {
-            Ok(outcome) => render_edit_action_outcome(&outcome)
-                .unwrap_or_else(|error| format!("undo_edit result render failed: {error}")),
+            Ok(outcome) => {
+                // As in `apply_server_plan`: the bytes changed, so ask for the
+                // reconcile rather than waiting for the watcher.
+                self.trigger_sync(&client).await;
+                render_edit_action_outcome(&outcome)
+                    .unwrap_or_else(|error| format!("undo_edit result render failed: {error}"))
+            }
             Err(error) => format!("undo_edit refused: {error:#}"),
         }
     }
@@ -600,10 +600,14 @@ impl McpServer {
         // later launches from `repo` incorrectly look unindexed.
         let dir = crate::codebase::working_copy_root(&dir).await;
 
-        // A concurrent/recent first-index call owns the gate. Await it rather
-        // than queueing another full upload. Failure stays closed for this MCP
-        // process, so retrieval can never fall through to a partial first index.
-        if let Some(gate) = initial_gate_for_path(&self.shared.initial_indexes, &dir).await {
+        // A concurrent or recent first-index call owns the gate. Await it
+        // rather than queueing another full upload. A gate that FAILED is not
+        // awaited: it falls through below, where the engine replaces it with a
+        // fresh one, so a failed first index stays retryable while a partial
+        // one can never be reported as ready.
+        if let Some(gate) = initial_gate_for_path(&self.shared.initial_indexes, &dir).await
+            && !matches!(gate.outcome().await, Some(Err(_)))
+        {
             return match gate.wait().await {
                 Ok(()) => format!(
                     "initial indexing complete\npath {}\nretrieval tools are now available",
@@ -638,20 +642,29 @@ impl McpServer {
             Err(e) => return format!("index_codebase failed for {}: {e:#}", dir.display()),
         }
 
-        // Publish the path gate before registration. Once `ensure` creates the
-        // server codebase, concurrent current/path-scoped retrieval calls already
-        // have something to wait on.
-        let (gate, starts_work) = {
-            let mut indexes = self.shared.initial_indexes.write().await;
-            if let Some(gate) = indexes.by_path.get(&dir) {
-                (gate.clone(), false)
-            } else {
-                let gate = Arc::new(InitialIndexGate::pending());
-                indexes.by_path.insert(dir.clone(), gate.clone());
-                (gate, true)
-            }
+        // Claim the checkout and its gate before anything is registered on the
+        // server. The coordinator waits for the codebase this call registers
+        // instead of registering one of its own, so one first index creates one
+        // codebase. The gate is published for this session's readiness checks
+        // at the same time, so a concurrent path-scoped retrieval call already
+        // has something to wait on.
+        let first_index_client = self
+            .shared
+            .base
+            .clone()
+            .without_codebase()
+            .with_local_root(Some(dir.clone()));
+        let gate = match self.watch_first_once(first_index_client, dir.clone()).await {
+            Ok(gate) => gate,
+            Err(e) => return format!("index_codebase failed for {}: {e}", dir.display()),
         };
-        if !starts_work {
+        self.shared
+            .initial_indexes
+            .write()
+            .await
+            .by_path
+            .insert(dir.clone(), gate.clone());
+        if !gate.claim_registration().await {
             return match gate.wait().await {
                 Ok(()) => format!(
                     "initial indexing complete\npath {}\nretrieval tools are now available",
@@ -679,24 +692,6 @@ impl McpServer {
         if !self.shared.pinned && self.shared.dir == dir {
             *self.shared.bound.lock().await = Some(client.clone());
         }
-        let initial_sync = match self.watch_first_once(client.clone(), dir.clone()).await {
-            Ok(initial_sync) => initial_sync,
-            Err(e) => {
-                gate.finish(Err(e.clone())).await;
-                return format!("index_codebase failed for {}: {e}", dir.display());
-            }
-        };
-        let task_gate = gate.clone();
-        let task_client = client.clone();
-        tokio::spawn(async move {
-            let result = match initial_sync.await {
-                Ok(Ok(outcome)) => wait_for_initial_job(&task_client, &outcome.job_id).await,
-                Ok(Err(reason)) => Err(format!("initial scan/upload failed: {reason}")),
-                Err(_) => Err("initial indexing task ended before reporting its result".into()),
-            };
-            task_gate.finish(result).await;
-        });
-
         match gate.wait().await {
             Ok(()) => format!(
                 "initial indexing complete\ncodebase {id}\npath {}\nretrieval tools are now available",
@@ -715,19 +710,21 @@ impl McpServer {
             Ok(client) => client,
             Err(e) => return format!("sync_status unavailable — {e}"),
         };
-        let codebase_id = match client.codebase() {
-            Ok(id) => id.to_string(),
-            Err(e) => return format!("sync_status unavailable — {e}"),
-        };
-        let job = self.shared.jobs.lock().await.get(&codebase_id).cloned();
-        let watching = self
-            .shared
-            .watched
-            .lock()
-            .await
-            .values()
-            .any(|id| id == &codebase_id);
-        query::sync_status(&client, job.as_ref().map(|j| j.job_id.as_str()), watching).await
+        if let Err(e) = client.codebase() {
+            return format!("sync_status unavailable — {e}");
+        }
+        // Reported from the coordinator that owns this checkout, not from
+        // per-session bookkeeping: any session's sync is this index's sync.
+        let status = self.checkout_status(&client).await;
+        let watching = status.is_some();
+        query::sync_status(
+            &client,
+            status
+                .as_ref()
+                .and_then(|status| status.last_job_id.as_deref()),
+            watching,
+        )
+        .await
     }
 }
 

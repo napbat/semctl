@@ -6,6 +6,8 @@
 //! These tests check all three against the router to detect missing
 //! documentation and references to tools that were renamed or removed.
 
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::tool_types::{
@@ -17,34 +19,48 @@ use super::tool_types::{
 };
 use super::{
     DIRECT_EDIT_TOOLS, InitialIndexGate, InitialIndexes, McpServer, client, initial_gate_for_path,
-    initial_job_result, ready_for_codebases,
+    ready_for_codebases,
 };
+use crate::engine::Engine;
+use crate::engine::coordinator::{CheckoutCoordinator, IdleReconciler};
 use crate::session::SessionContext;
 
-/// An MCP server for one throwaway session. These tests never read the session's
-/// working directory, so a path that does not exist serves as the launch root.
-fn server(base: client::Client, dir: impl Into<std::path::PathBuf>, pinned: bool) -> McpServer {
+/// An MCP server for one throwaway session.
+///
+/// These tests never read the session's working directory, so a path that does
+/// not exist serves as the launch root. The engine counts reconciles instead of
+/// performing them, and a root that does not exist also leaves every coordinator
+/// without a platform watcher, so no test touches the filesystem watcher.
+fn server(base: client::Client, dir: impl Into<PathBuf>, pinned: bool) -> McpServer {
     McpServer::new(
         SessionContext::for_test(),
         base,
         dir.into(),
         pinned,
-        std::sync::Arc::new(crate::engine::Scheduler::from_environment()),
+        Engine::for_test(Arc::new(IdleReconciler)),
     )
 }
 
-fn job(completed: bool, failed: i64, error: Option<&str>) -> client::api::JobStatus {
-    client::api::JobStatus {
-        files_to_embed: 3,
-        files_to_delete: 0,
-        files_embedded: if completed { 3 - failed } else { 1 },
-        files_deleted: 0,
-        files_failed: failed,
-        chunk_count: completed.then_some(12),
-        error: error.map(str::to_string),
-        started_at: Some("2026-07-31T00:00:00Z".into()),
-        completed_at: completed.then(|| "2026-07-31T00:00:01Z".into()),
-    }
+/// Attach this session to `root`, as a resolved tool call does, and return the
+/// coordinator the engine gave it.
+async fn attach(
+    server: &McpServer,
+    client: &client::Client,
+    root: &Path,
+) -> Arc<CheckoutCoordinator> {
+    let key = server
+        .attach(client.clone(), root.to_path_buf())
+        .await
+        .expect("attach the checkout");
+    server
+        .shared
+        .leases
+        .read()
+        .await
+        .get(&key)
+        .expect("the session keeps the lease it took")
+        .coordinator()
+        .clone()
 }
 
 #[tokio::test]
@@ -201,43 +217,53 @@ async fn repeated_index_waiting_allows_registration_to_finish() {
     .expect("an active index request must release the registry lock");
 }
 
+/// A first index owns its checkout before the codebase is registered. A plain
+/// path-scoped call on the same checkout must join that coordinator, not start
+/// a second one, and must not disturb the gate retrieval is waiting on.
 #[tokio::test]
-async fn first_index_gate_reserves_watcher_startup_before_registration() {
-    let base = client::Client::for_test("codebase", None);
-    let server = server(base, "launch", false);
-    let root = std::path::Path::new("first-checkout");
-    let gate = std::sync::Arc::new(InitialIndexGate::pending());
-    server
-        .shared
-        .initial_indexes
-        .write()
+async fn a_plain_watch_joins_the_first_index_coordinator() {
+    let root = PathBuf::from("first-checkout");
+    let base = client::Client::for_test("codebase", Some(root.clone()));
+    let server = server(base.clone(), "launch", false);
+    let gate = server
+        .watch_first_once(base.clone(), root.clone())
         .await
-        .by_path
-        .insert(root.to_path_buf(), gate.clone());
+        .expect("claim the first index");
 
-    assert!(!server.claim_untracked_watch(root, "codebase").await);
-    assert!(server.shared.watched.lock().await.is_empty());
+    server.watch_once(base.clone(), root.clone()).await;
 
-    gate.finish(Ok(())).await;
-    assert!(!server.claim_untracked_watch(root, "codebase").await);
-    gate.finish(Err("upload failed".into())).await;
-    assert!(!server.claim_untracked_watch(root, "codebase").await);
+    let leases = server.shared.leases.read().await;
+    assert_eq!(leases.len(), 1, "one checkout is one coordinator");
+    let coordinator = leases
+        .values()
+        .next()
+        .expect("the session holds the lease")
+        .coordinator();
+    assert!(
+        Arc::ptr_eq(
+            &coordinator
+                .gate()
+                .await
+                .expect("the coordinator keeps the first-index gate"),
+            &gate
+        ),
+        "a plain watch must not replace the gate retrieval waits on"
+    );
+    drop(leases);
 
-    let other = std::path::Path::new("other-checkout");
-    assert!(server.claim_untracked_watch(other, "other-codebase").await);
-    assert!(!server.claim_untracked_watch(other, "other-codebase").await);
+    // A second checkout is a second coordinator.
+    let other_root = PathBuf::from("other-checkout");
+    let other = client::Client::for_test("other-codebase", Some(other_root.clone()));
+    server.watch_once(other, other_root).await;
+    assert_eq!(server.shared.leases.read().await.len(), 2);
 }
 
 #[tokio::test]
 async fn canonical_search_omits_cached_checkout_freshness() {
     let base = client::Client::for_test("codebase", Some("checkout".into()));
     let server = server(base.clone(), "launch", true);
-    server.shared.jobs.lock().await.insert(
-        "codebase".into(),
-        crate::sync::LastJob {
-            job_id: "job".into(),
-        },
-    );
+    let coordinator = attach(&server, &base, Path::new("checkout")).await;
+    coordinator.set_last_job("job").await;
     *server.shared.freshness.lock().await =
         Some(("job".into(), Some("checkout sync failed".into())));
 
@@ -291,22 +317,23 @@ async fn checkout_readiness_does_not_use_another_checkouts_codebase_gate() {
     );
 }
 
+/// The bound checkout can be an umbrella root above the launch directory. The
+/// sync manifest is complete desired state, so the watched root must be the
+/// umbrella the client is bound to, never the nested launch directory.
 #[tokio::test]
 async fn automatic_watching_uses_the_bound_umbrella_root() {
-    let umbrella = std::path::PathBuf::from("umbrella");
+    let umbrella = PathBuf::from("umbrella");
     let base = client::Client::for_test("codebase", Some(umbrella.clone()));
     let server = server(base.clone(), umbrella.join("child"), false);
-    let gate = std::sync::Arc::new(InitialIndexGate::pending());
-    server
-        .shared
-        .initial_indexes
-        .write()
-        .await
-        .by_path
-        .insert(umbrella, gate);
 
     server.watch_checkout_once(&base).await;
-    assert!(server.shared.watched.lock().await.is_empty());
+
+    let leases = server.shared.leases.read().await;
+    let roots: Vec<_> = leases
+        .values()
+        .map(|lease| lease.coordinator().root().to_path_buf())
+        .collect();
+    assert_eq!(roots, vec![umbrella]);
 }
 
 #[tokio::test]
@@ -314,24 +341,6 @@ async fn first_index_gate_propagates_failure() {
     let gate = InitialIndexGate::pending();
     gate.finish(Err("embedding failed".into())).await;
     assert_eq!(gate.wait().await, Err("embedding failed".into()));
-}
-
-#[test]
-fn first_index_requires_terminal_success() {
-    assert!(initial_job_result("j", &job(false, 0, None)).is_none());
-    assert_eq!(initial_job_result("j", &job(true, 0, None)), Some(Ok(())));
-    assert!(
-        initial_job_result("j", &job(true, 1, None))
-            .unwrap()
-            .unwrap_err()
-            .contains("1 failed file")
-    );
-    assert!(
-        initial_job_result("j", &job(true, 0, Some("worker died")))
-            .unwrap()
-            .unwrap_err()
-            .contains("worker died")
-    );
 }
 
 #[test]

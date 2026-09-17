@@ -7,24 +7,20 @@
 //! scan. A [`SyncCache`] reuses content-filter decisions only after an exact
 //! content hash match. Restored timestamps cannot hide changed bytes.
 //!
-//! [`background`] drives the mcp auto-index lifecycle (startup index, realtime
-//! [`watcher`], periodic re-sync) on top of this engine; [`spawn_indexing`] is
-//! its entry point.
+//! [`crate::engine::coordinator`] drives the auto-index lifecycle (startup
+//! index, realtime watching, periodic re-sync) on top of this engine. This
+//! module owns the reconcile itself and nothing about when it runs.
 
-mod background;
-mod blocking;
+pub(crate) mod blocking;
 mod cache;
-mod policy;
+pub(crate) mod policy;
 mod scan;
 mod source;
 mod upload;
-mod walker;
-mod watcher;
+pub(crate) mod walker;
 
-pub(crate) use background::{spawn_indexing, spawn_indexing_tracked};
 pub(crate) use cache::SyncCache;
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -85,25 +81,11 @@ pub enum SyncProgress {
     Finalizing,
 }
 
-/// Identifies the index job `sync_status` reports on.
+/// Identifies the index job `sync_status` reports on. One coordinator keeps one
+/// of these, so status for one checkout never reports another checkout's sync.
 #[derive(Clone)]
-pub struct LastJob {
+pub(crate) struct LastJob {
     pub(crate) job_id: String,
-}
-
-/// Per-codebase latest jobs queued by this MCP session. Multiple local checkouts
-/// can be active at once, so one global "last job" slot would make status for one
-/// codebase accidentally report another codebase's sync.
-pub type JobRegistry = Mutex<HashMap<String, LastJob>>;
-
-/// Record the job a background sync just queued, so `sync_status` can poll it.
-pub(crate) async fn record_job(registry: &JobRegistry, o: &SyncOutcome) {
-    registry.lock().await.insert(
-        o.codebase_id.clone(),
-        LastJob {
-            job_id: o.job_id.clone(),
-        },
-    );
 }
 
 /// Register (if new) the Local codebase for `dir`, walk it, diff against the

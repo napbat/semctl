@@ -13,6 +13,8 @@ use std::sync::Arc;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+/// Concurrent full-tree scans across every coordinator.
+const SCAN_PERMITS_VAR: &str = "SEMCTX_DAEMON_SCAN_PERMITS";
 /// Concurrent upload requests across every coordinator.
 const UPLOAD_PERMITS_VAR: &str = "SEMCTX_DAEMON_UPLOAD_PERMITS";
 /// Concurrent interactive remote requests across every session.
@@ -23,12 +25,16 @@ const REMOTE_PERMITS_VAR: &str = "SEMCTX_DAEMON_REMOTE_PERMITS";
 /// resource hint, and a typo must not stop the process from serving.
 const PERMIT_RANGE: std::ops::RangeInclusive<usize> = 1..=1024;
 
+/// A scan reads and hashes every candidate file, so half the cores keep the
+/// machine usable while several checkouts settle at once.
+const SCAN_RANGE: std::ops::RangeInclusive<usize> = 2..=8;
 const DEFAULT_UPLOAD_PERMITS: usize = 8;
 const DEFAULT_REMOTE_PERMITS: usize = 64;
 
 /// How many permits each class gets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SchedulerSettings {
+    scan: usize,
     upload: usize,
     remote: usize,
 }
@@ -40,15 +46,27 @@ impl SchedulerSettings {
     /// not session-level: they bound the whole engine, so a session must not be
     /// able to raise them.
     pub(crate) fn from_environment() -> Self {
+        let parallelism = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
         Self::resolve(
+            std::env::var(SCAN_PERMITS_VAR).ok().as_deref(),
             std::env::var(UPLOAD_PERMITS_VAR).ok().as_deref(),
             std::env::var(REMOTE_PERMITS_VAR).ok().as_deref(),
+            parallelism,
         )
     }
 
     /// The pure mapping behind [`Self::from_environment`].
-    fn resolve(upload: Option<&str>, remote: Option<&str>) -> Self {
+    fn resolve(
+        scan: Option<&str>,
+        upload: Option<&str>,
+        remote: Option<&str>,
+        parallelism: usize,
+    ) -> Self {
         Self {
+            scan: permits(
+                scan,
+                (parallelism / 2).clamp(*SCAN_RANGE.start(), *SCAN_RANGE.end()),
+            ),
             upload: permits(upload, DEFAULT_UPLOAD_PERMITS),
             remote: permits(remote, DEFAULT_REMOTE_PERMITS),
         }
@@ -69,6 +87,7 @@ fn permits(raw: Option<&str>, default: usize) -> usize {
 /// upload permit travels into an upload task, and a remote permit is held for
 /// one request attempt.
 pub(crate) struct Scheduler {
+    scan: Arc<Semaphore>,
     upload: Arc<Semaphore>,
     remote: Arc<Semaphore>,
 }
@@ -76,6 +95,7 @@ pub(crate) struct Scheduler {
 impl Scheduler {
     pub(crate) fn new(settings: SchedulerSettings) -> Self {
         Self {
+            scan: Arc::new(Semaphore::new(settings.scan)),
             upload: Arc::new(Semaphore::new(settings.upload)),
             remote: Arc::new(Semaphore::new(settings.remote)),
         }
@@ -84,6 +104,11 @@ impl Scheduler {
     /// A scheduler with the settings this process was started with.
     pub(crate) fn from_environment() -> Self {
         Self::new(SchedulerSettings::from_environment())
+    }
+
+    /// The handle a coordinator acquires one permit from per reconcile.
+    pub(crate) fn scan_permits(&self) -> Arc<Semaphore> {
+        self.scan.clone()
     }
 
     /// The handle a sync acquires one permit from per upload request.
@@ -116,30 +141,34 @@ mod tests {
 
     #[test]
     fn defaults_follow_the_documented_table() {
-        let settings = SchedulerSettings::resolve(None, None);
+        let settings = SchedulerSettings::resolve(None, None, None, 16);
 
+        assert_eq!(settings.scan, 8, "half of 16 cores, capped at 8");
         assert_eq!(settings.upload, DEFAULT_UPLOAD_PERMITS);
         assert_eq!(settings.remote, DEFAULT_REMOTE_PERMITS);
     }
 
     #[test]
-    fn overrides_are_clamped_into_the_supported_range() {
-        let settings = SchedulerSettings::resolve(Some("99999"), Some(" 12 "));
+    fn a_small_machine_still_scans_two_checkouts_at_once() {
+        assert_eq!(SchedulerSettings::resolve(None, None, None, 1).scan, 2);
+        assert_eq!(SchedulerSettings::resolve(None, None, None, 2).scan, 2);
+        assert_eq!(SchedulerSettings::resolve(None, None, None, 6).scan, 3);
+    }
 
+    #[test]
+    fn overrides_are_clamped_into_the_supported_range() {
+        let settings = SchedulerSettings::resolve(Some("0"), Some("99999"), Some(" 12 "), 4);
+
+        assert_eq!(settings.scan, 1, "zero permits cannot make progress");
         assert_eq!(settings.upload, 1024, "an override cannot remove the bound");
         assert_eq!(settings.remote, 12);
-
-        assert_eq!(
-            SchedulerSettings::resolve(Some("0"), None).upload,
-            1,
-            "zero permits cannot make progress"
-        );
     }
 
     #[test]
     fn an_unreadable_override_keeps_the_default() {
-        let settings = SchedulerSettings::resolve(Some("lots"), Some("-4"));
+        let settings = SchedulerSettings::resolve(Some(""), Some("lots"), Some("-4"), 4);
 
+        assert_eq!(settings.scan, 2);
         assert_eq!(settings.upload, DEFAULT_UPLOAD_PERMITS);
         assert_eq!(settings.remote, DEFAULT_REMOTE_PERMITS);
     }
@@ -147,7 +176,12 @@ mod tests {
     /// The bound is real: the second holder waits until the first releases.
     #[tokio::test]
     async fn a_permit_blocks_while_the_class_is_exhausted() {
-        let scheduler = Scheduler::new(SchedulerSettings::resolve(Some("1"), Some("1")));
+        let scheduler = Scheduler::new(SchedulerSettings::resolve(
+            Some("1"),
+            Some("1"),
+            Some("1"),
+            4,
+        ));
         let uploads = scheduler.upload_permits();
         let held = super::permit(&uploads).await.expect("first upload permit");
 
@@ -168,17 +202,23 @@ mod tests {
     }
 
     /// Each class is counted on its own. An exhausted upload class must not
-    /// stop an interactive request.
+    /// stop a scan or an interactive request.
     #[tokio::test]
     async fn the_classes_do_not_share_permits() {
-        let scheduler = Scheduler::new(SchedulerSettings::resolve(Some("1"), Some("1")));
+        let scheduler = Scheduler::new(SchedulerSettings::resolve(
+            Some("1"),
+            Some("1"),
+            Some("1"),
+            4,
+        ));
         let uploads = scheduler.upload_permits();
         let _held = super::permit(&uploads).await.expect("upload permit");
-        let remote = scheduler.remote_permits();
 
-        assert!(
-            super::permit(&remote).await.is_some(),
-            "an unrelated class must still admit a permit"
-        );
+        for permits in [scheduler.scan_permits(), scheduler.remote_permits()] {
+            assert!(
+                super::permit(&permits).await.is_some(),
+                "an unrelated class must still admit a permit"
+            );
+        }
     }
 }

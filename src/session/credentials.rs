@@ -38,6 +38,20 @@ impl fmt::Debug for Secret {
     }
 }
 
+/// Which credentials a piece of shared work is authorized by.
+///
+/// Two sessions with different scopes must never share a coordinator, because
+/// what one is allowed to read and write the other may not be. The scope is
+/// comparable but carries no credential: an invocation token appears only as a
+/// digest, so the key of a shared map cannot leak it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum CredentialScope {
+    /// The stored login. Every session that uses it has the same authorization.
+    Stored,
+    /// A token supplied with one invocation, identified by its blake3 digest.
+    Invocation(String),
+}
+
 /// How one session authorizes its requests.
 #[derive(Clone, Debug)]
 pub(crate) enum CredentialSource {
@@ -60,6 +74,27 @@ impl CredentialSource {
         Self::from_token(std::env::var(TOKEN_VAR).ok().as_deref())
     }
 
+    /// An invocation token for tests that need a second credential scope.
+    #[cfg(test)]
+    pub(crate) fn from_test_token(value: &str) -> Self {
+        Self::Invocation(Secret::new(value.to_string()))
+    }
+
+    /// The comparable identity of these credentials.
+    ///
+    /// The digest is computed here so the plain token never leaves this
+    /// module. A caller that holds a scope cannot recover the token from it.
+    pub(crate) fn scope(&self) -> CredentialScope {
+        match self {
+            Self::Invocation(secret) => CredentialScope::Invocation(
+                blake3::hash(secret.expose().as_bytes())
+                    .to_hex()
+                    .to_string(),
+            ),
+            Self::Stored => CredentialScope::Stored,
+        }
+    }
+
     /// The pure mapping behind [`Self::from_environment`].
     fn from_token(value: Option<&str>) -> Self {
         match value.filter(|token| !token.trim().is_empty()) {
@@ -71,7 +106,7 @@ impl CredentialSource {
 
 #[cfg(test)]
 mod tests {
-    use super::{CredentialSource, Secret};
+    use super::{CredentialScope, CredentialSource, Secret};
 
     #[test]
     fn an_invocation_token_replaces_the_stored_login() {
@@ -94,6 +129,25 @@ mod tests {
                 "{value:?} must not be treated as a credential"
             );
         }
+    }
+
+    /// The scope tells two authorizations apart without carrying either one.
+    #[test]
+    fn a_scope_identifies_credentials_without_exposing_them() {
+        let first = CredentialSource::from_token(Some("first-token")).scope();
+        let second = CredentialSource::from_token(Some("second-token")).scope();
+
+        assert_eq!(
+            first,
+            CredentialSource::from_token(Some("first-token")).scope(),
+            "one token must always map to one scope"
+        );
+        assert_ne!(first, second);
+        assert_ne!(first, CredentialScope::Stored);
+        assert!(
+            !format!("{first:?}").contains("first-token"),
+            "a scope must not carry the token it describes"
+        );
     }
 
     /// A token must not be recoverable from a `{:?}` in a log line or an error.

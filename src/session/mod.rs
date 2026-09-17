@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 
 use crate::cli::Cli;
 
-pub(crate) use credentials::CredentialSource;
+pub(crate) use credentials::{CredentialScope, CredentialSource};
 
 /// Seconds between periodic re-syncs. Unset means the built-in default.
 const RESYNC_SECS_VAR: &str = "SEMCTX_MCP_RESYNC_SECS";

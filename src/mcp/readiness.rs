@@ -51,19 +51,21 @@ pub(super) async fn initial_gate_for_path(
     indexes.read().await.by_path.get(dir).cloned()
 }
 
-pub(super) struct InitialIndexGate {
+pub(crate) struct InitialIndexGate {
     state: Mutex<InitialIndexState>,
     changed: Notify,
 }
 
 #[derive(Clone, Default)]
 struct InitialIndexState {
+    /// Whether a caller has taken responsibility for registering the codebase.
+    registering: bool,
     codebase_id: Option<String>,
     result: Option<Result<(), String>>,
 }
 
 impl InitialIndexGate {
-    pub(super) fn pending() -> Self {
+    pub(crate) fn pending() -> Self {
         Self {
             state: Mutex::new(InitialIndexState::default()),
             changed: Notify::new(),
@@ -71,13 +73,53 @@ impl InitialIndexGate {
     }
 
     /// Registration updates the existing gate. Its path membership stays fixed.
-    pub(super) async fn register_codebase(&self, id: String) {
+    pub(crate) async fn register_codebase(&self, id: String) {
         self.state.lock().await.codebase_id = Some(id);
         self.changed.notify_waiters();
     }
 
-    pub(super) async fn wait(&self) -> Result<(), String> {
+    pub(crate) async fn wait(&self) -> Result<(), String> {
         self.wait_for_codebases(&[]).await
+    }
+
+    /// Take responsibility for registering this first index's codebase.
+    ///
+    /// Exactly one caller is answered `true` for one gate. Every other caller
+    /// waits, so one explicit `index_codebase` on a checkout registers one
+    /// codebase however many callers ask at once.
+    pub(crate) async fn claim_registration(&self) -> bool {
+        let mut state = self.state.lock().await;
+        if state.registering {
+            return false;
+        }
+        state.registering = true;
+        true
+    }
+
+    /// The final result, or `None` while the first index is still running.
+    ///
+    /// Never waits. The registry uses it to tell a failed first index from a
+    /// pending one, and the coordinator uses it to avoid replacing a result its
+    /// caller already reported.
+    pub(crate) async fn outcome(&self) -> Option<Result<(), String>> {
+        self.state.lock().await.result.clone()
+    }
+
+    /// Wait until the first index has a codebase, or until it ends without one.
+    ///
+    /// The coordinator calls this before its startup reconcile. A first index
+    /// has no codebase until `index_codebase` registers it, and reconciling
+    /// before then would register a second codebase for the same checkout.
+    pub(crate) async fn registered_codebase(&self) -> Option<String> {
+        loop {
+            // Register before reading state so a transition cannot be missed.
+            let changed = self.changed.notified();
+            let state = self.state.lock().await.clone();
+            if state.codebase_id.is_some() || state.result.is_some() {
+                return state.codebase_id;
+            }
+            changed.await;
+        }
     }
 
     async fn wait_for_codebases(&self, ids: &[String]) -> Result<(), String> {
@@ -100,7 +142,7 @@ impl InitialIndexGate {
         }
     }
 
-    pub(super) async fn finish(&self, result: Result<(), String>) {
+    pub(crate) async fn finish(&self, result: Result<(), String>) {
         self.state.lock().await.result = Some(result);
         self.changed.notify_waiters();
     }

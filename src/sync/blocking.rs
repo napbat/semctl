@@ -8,10 +8,10 @@ use tokio::task::JoinHandle;
 
 /// A blocking worker checks this flag between filesystem operations.
 #[derive(Clone, Default)]
-pub(super) struct Cancellation(Arc<AtomicBool>);
+pub(crate) struct Cancellation(Arc<AtomicBool>);
 
 impl Cancellation {
-    pub(super) fn check(&self) -> Result<()> {
+    pub(crate) fn check(&self) -> Result<()> {
         ensure!(!self.0.load(Ordering::Acquire), "sync cancelled");
         Ok(())
     }
@@ -33,7 +33,7 @@ impl<T> Drop for Worker<T> {
 
 /// Run owned filesystem work outside the runtime workers. The closure must
 /// retain every lock it needs until it exits, including after cancellation.
-pub(super) async fn run<T, F>(operation: F) -> Result<T>
+pub(crate) async fn run<T, F>(operation: F) -> Result<T>
 where
     T: Send + 'static,
     F: FnOnce(Cancellation) -> Result<T> + Send + 'static,

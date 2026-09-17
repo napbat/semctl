@@ -25,7 +25,7 @@ use super::policy::SourcePolicy;
 pub(super) const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Both names remain supported at the indexing boundary.
-pub(super) const IGNORE_FILES: &[&str] = &[".semctxignore", ".semctlignore"];
+pub(crate) const IGNORE_FILES: &[&str] = &[".semctxignore", ".semctlignore"];
 
 /// A file accepted by the source policy. The scanner verifies its content.
 #[derive(Debug)]
