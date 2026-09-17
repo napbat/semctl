@@ -8,7 +8,8 @@
 //! typed request / response types in [`client::api`].
 //!
 //! Layout: [`cli`] parses the command line and dispatches into [`commands`];
-//! [`client`] is the shared HTTP layer; [`mcp`] runs the CLI as an MCP stdio
+//! [`client`] is the shared HTTP layer; [`ipc`] is the local endpoint of the
+//! shared daemon; [`mcp`] runs the CLI as an MCP stdio
 //! server; [`sync`] walks and uploads a codebase; [`config`]/[`auth`] own the
 //! on-disk config and credentials.
 
@@ -20,6 +21,13 @@ mod commands;
 mod config;
 mod editing;
 mod engine;
+// Stage 1b of the shared local daemon adds the endpoint, the handshake, and the
+// byte pump. The daemon and client roles in stage 3 are the first consumers.
+#[expect(
+    dead_code,
+    reason = "consumed by the daemon and client roles in stage 3"
+)]
+mod ipc;
 mod mcp;
 mod query;
 mod session;

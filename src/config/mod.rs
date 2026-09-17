@@ -267,7 +267,7 @@ pub fn remove_all() -> Result<bool> {
 /// We deliberately don't use the OS-native location (macOS would otherwise put
 /// this under `~/Library/Application Support`) so the path is identical
 /// everywhere. `XDG_CONFIG_HOME` overrides the `~/.config` base when set.
-fn config_dir() -> Result<PathBuf> {
+pub(crate) fn config_dir() -> Result<PathBuf> {
     let base = match std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
         Some(xdg) => PathBuf::from(xdg),
         None => dirs::home_dir()

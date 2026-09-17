@@ -49,6 +49,9 @@ tokio = { version = "1", features = [
     "signal",
     "time",
     "sync",
+    # Unix domain socket and Windows named pipe transport for the shared local
+    # daemon (`src/ipc`).
+    "net",
     # Killable child processes (`kill_on_drop`) so a hung `git` on the hook path
     # is cancelled by a timeout instead of stalling process exit.
     "process",
@@ -118,8 +121,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3"
 # Notify Explorer after changing the persistent user PATH so applications
 # launched afterward inherit the new environment without a sign-out.
+# Also used by the shared local daemon endpoint (`src/ipc/windows.rs`): the
+# named pipe security descriptor and the current user's security identifier.
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
 ] }
 
