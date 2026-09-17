@@ -103,15 +103,14 @@ impl Config {
             .unwrap_or_else(|| DEFAULT_SERVER_URL.to_string())
     }
 
-    /// Effective server URL — CLI flag / env > config file (the last server
-    /// `login` recorded, or a manual entry) > the built-in napbat default.
-    /// Blank/whitespace in any source is treated as unset.
-    pub fn server_url(&self, cli_override: Option<&str>) -> String {
-        server_url_from(
-            cli_override,
-            std::env::var("SEMCTX_SERVER").ok().as_deref(),
-            self.server_url.as_deref(),
-        )
+    /// Effective server URL — the invocation override > config file (the last
+    /// server `login` recorded, or a manual entry) > the built-in napbat default.
+    /// `SEMCTX_SERVER` reaches this function through `override_url`: clap folds
+    /// it into the invocation, so a process that serves several sessions never
+    /// reads its own environment here. Blank/whitespace in any source is
+    /// treated as unset.
+    pub fn server_url(&self, override_url: Option<&str>) -> String {
+        server_url_from(override_url, self.server_url.as_deref())
     }
 
     /// Effective active codebase — CLI flag / env > config file.
@@ -122,13 +121,9 @@ impl Config {
     }
 }
 
-fn server_url_from(
-    cli: Option<&str>,
-    environment: Option<&str>,
-    configured: Option<&str>,
-) -> String {
-    cli.filter(|s| !s.trim().is_empty())
-        .or_else(|| environment.filter(|s| !s.trim().is_empty()))
+fn server_url_from(override_url: Option<&str>, configured: Option<&str>) -> String {
+    override_url
+        .filter(|s| !s.trim().is_empty())
         .or_else(|| configured.filter(|s| !s.trim().is_empty()))
         .map_or_else(|| DEFAULT_SERVER_URL.to_string(), str::to_string)
 }

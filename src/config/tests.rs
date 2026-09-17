@@ -6,26 +6,19 @@ use super::*;
 fn blank_server_overrides_fall_through_to_the_next_candidate() {
     for blank in ["", " ", "\t\n"] {
         assert_eq!(
-            server_url_from(Some(blank), Some(blank), Some("http://configured")),
+            server_url_from(Some(blank), Some("http://configured")),
             "http://configured"
         );
         assert_eq!(
-            server_url_from(
-                Some(blank),
-                Some("http://environment"),
-                Some("http://configured")
-            ),
-            "http://environment"
+            server_url_from(Some(blank), Some(blank)),
+            DEFAULT_SERVER_URL
         );
     }
     assert_eq!(
-        server_url_from(
-            Some("http://cli"),
-            Some("http://environment"),
-            Some("http://configured")
-        ),
+        server_url_from(Some("http://cli"), Some("http://configured")),
         "http://cli"
     );
+    assert_eq!(server_url_from(None, None), DEFAULT_SERVER_URL);
 }
 
 #[test]
