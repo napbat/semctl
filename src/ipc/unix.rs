@@ -266,12 +266,23 @@ fn remove_stale_socket(path: &Path) -> Result<()> {
 ///
 /// The call retries a missing or refused socket until `deadline`, because a
 /// daemon this client just spawned needs a moment to bind.
+///
+/// The endpoint is authenticated before and after the connection, because the
+/// attach body that follows carries this session's token. The directory check
+/// is the same one the daemon runs: a fallback runtime directory under `/tmp`
+/// can be pre-created by another user, and a socket inside a directory this
+/// user does not own privately is not this user's endpoint. The peer check
+/// then proves that the process listening on the socket runs as this user.
 pub(super) async fn connect(endpoint: &Endpoint, deadline: Instant) -> Result<Stream> {
     let path = endpoint.socket_path();
+    ensure_runtime_dir(endpoint.runtime_dir(), endpoint.uid())?;
     let mut backoff = FIRST_BACKOFF;
     loop {
         match tokio::net::UnixStream::connect(path).await {
-            Ok(stream) => return Ok(Stream::Socket(stream)),
+            Ok(stream) => {
+                verify_peer_uid(&stream, endpoint.uid())?;
+                return Ok(Stream::Socket(stream));
+            }
             Err(error) if is_absent(&error) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
@@ -289,6 +300,23 @@ pub(super) async fn connect(endpoint: &Endpoint, deadline: Instant) -> Result<St
     }
 }
 
+/// Fail unless the peer of `stream` runs as `uid`.
+///
+/// `peer_cred` answers on the client side as well, where it reports the user
+/// id of the process that bound the socket. A client uses that to refuse a
+/// daemon another user placed at this endpoint, before it sends its token.
+fn verify_peer_uid(stream: &tokio::net::UnixStream, uid: u32) -> Result<()> {
+    let peer = stream
+        .peer_cred()
+        .context("read the credentials of the local daemon endpoint")?;
+    ensure!(
+        peer.uid() == uid,
+        "the local daemon endpoint is served by uid {}, not uid {uid}",
+        peer.uid()
+    );
+    Ok(())
+}
+
 /// Whether the failure means no daemon is listening yet.
 fn is_absent(error: &io::Error) -> bool {
     matches!(
@@ -301,8 +329,9 @@ fn is_absent(error: &io::Error) -> bool {
 mod tests {
     use super::{
         Election, Endpoint, MAX_SOCKET_PATH_BYTES, bind, current_uid, ensure_runtime_dir,
-        select_runtime_dir, socket_path, verify_runtime_dir,
+        select_runtime_dir, socket_path, verify_peer_uid, verify_runtime_dir,
     };
+    use crate::ipc::Stream;
     use crate::ipc::handshake::{
         self, Request, Response, SessionRequest, Token, decode_request, decode_response,
     };
@@ -563,6 +592,47 @@ mod tests {
             pump.await.expect("the pump task finished"),
             pump::Exit::Clean
         );
+        drop(listener);
+    }
+
+    /// The attach body carries this session's token, so the client checks the
+    /// runtime directory before it connects. A directory another user can
+    /// write to could hold that user's socket.
+    #[tokio::test]
+    async fn a_client_refuses_a_runtime_directory_that_is_not_private() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let endpoint = endpoint_in(dir.path());
+        fs::set_permissions(dir.path(), Permissions::from_mode(0o755)).expect("set mode 0755");
+
+        let deadline = Instant::now() + Duration::from_millis(30);
+        let error = super::connect(&endpoint, deadline)
+            .await
+            .expect_err("a shared runtime directory is not this user's endpoint");
+        assert!(
+            error.to_string().contains("group or other access"),
+            "{error}"
+        );
+    }
+
+    /// The test cannot make another user listen, so it varies the expected
+    /// user id instead. That exercises the same comparison the client makes.
+    #[tokio::test]
+    async fn a_client_refuses_an_endpoint_served_by_another_user() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let endpoint = endpoint_in(dir.path());
+        let Election::Won(listener) = bind(&endpoint).expect("bind") else {
+            panic!("the first bind must win the election");
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stream = super::connect(&endpoint, deadline)
+            .await
+            .expect("this user's own endpoint is accepted");
+        let Stream::Socket(stream) = stream;
+        verify_peer_uid(&stream, current_uid()).expect("the peer is this user");
+        let other = current_uid().wrapping_add(1);
+        let error = verify_peer_uid(&stream, other).expect_err("another user's daemon");
+        assert!(error.to_string().contains("is served by uid"), "{error}");
         drop(listener);
     }
 

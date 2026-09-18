@@ -199,14 +199,16 @@ impl Endpoint {
     }
 }
 
-/// The configuration directory, resolved when it already exists.
+/// The configuration directory, exactly as it is configured.
 ///
-/// The identity must be the same for one directory reached by two different
-/// paths. The directory is missing before the first run, and an unresolvable
-/// path is then used as it is.
+/// The path is not resolved. Resolving it would make the identity depend on
+/// whether the directory already exists: a directory under a symbolic link
+/// hashes one way before it is created and another way afterwards, and the
+/// client that created it would then start a second daemon for the same
+/// configuration. Every process of one user reads the same configured path,
+/// which is what the identity needs.
 fn config_directory() -> Result<PathBuf> {
-    let dir = crate::config::config_dir().context("locate the configuration directory")?;
-    Ok(std::fs::canonicalize(&dir).unwrap_or(dir))
+    crate::config::config_dir().context("locate the configuration directory")
 }
 
 /// The result of the daemon election for one endpoint.
@@ -399,19 +401,35 @@ where
     let line = handshake::read_line_async(&mut stream)
         .await
         .context("read the attach answer")?;
-    match handshake::decode_response(&line).context("decode the attach answer")? {
-        Response::Attached { .. } => {}
-        Response::Rejected { reason, .. } => {
-            return Err(anyhow!("the daemon refused the session: {reason}"));
-        }
-    }
+    accept_attach(handshake::decode_response(&line).context("decode the attach answer")?)?;
     let half_close = stream.half_close();
     Ok(pump::run(stream, half_close, tokio::io::stdin(), tokio::io::stdout()).await)
 }
 
+/// Decide whether the daemon's answer opens a session on this connection.
+///
+/// The version is checked as well as the answer kind. The endpoint identity
+/// already carries the version, so a daemon of another build reached this
+/// client another way, and one build's client cannot be served by another
+/// build's tool surface.
+fn accept_attach(response: Response) -> Result<()> {
+    match response {
+        Response::Attached { version, .. } if version != VERSION => Err(anyhow!(
+            "the daemon is semctl {version}; this client is semctl {VERSION}"
+        )),
+        Response::Attached { .. } => Ok(()),
+        Response::Rejected { reason, .. } => {
+            Err(anyhow!("the daemon refused the session: {reason}"))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Endpoint, IDENTITY_HEX_CHARS, Stream, VERSION, identity};
+    use super::{
+        Endpoint, IDENTITY_HEX_CHARS, Response, Stream, VERSION, accept_attach, config_directory,
+        identity,
+    };
     use std::path::Path;
     use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -496,5 +514,39 @@ mod tests {
     fn the_current_endpoint_is_built_from_this_process() {
         let endpoint = Endpoint::current().expect("build the endpoint for this process");
         assert_eq!(endpoint.id().len(), IDENTITY_HEX_CHARS);
+    }
+
+    /// The configuration directory is hashed as it is configured. Resolving it
+    /// would give one identity before the directory exists and another
+    /// afterwards, so one user would end up with two daemons.
+    #[test]
+    fn the_endpoint_identity_uses_the_configured_path_unresolved() {
+        let configured = config_directory().expect("locate the configuration directory");
+        assert_eq!(
+            configured,
+            crate::config::config_dir().expect("the configured path")
+        );
+    }
+
+    #[test]
+    fn a_session_opens_only_on_an_answer_from_this_build() {
+        accept_attach(Response::attached(VERSION, "1-1")).expect("this build's daemon serves");
+    }
+
+    /// The endpoint identity carries the version, so an answer from another
+    /// build means this client reached that daemon another way.
+    #[test]
+    fn an_attached_answer_from_another_build_is_refused() {
+        let error = accept_attach(Response::attached("0.0.1", "1-1"))
+            .expect_err("another build cannot serve this client");
+        assert!(error.to_string().contains("0.0.1"), "{error}");
+        assert!(error.to_string().contains(VERSION), "{error}");
+    }
+
+    #[test]
+    fn a_refusal_reports_the_reason_the_daemon_gave() {
+        let error = accept_attach(Response::rejected(VERSION, "no session for you"))
+            .expect_err("a refusal opens no session");
+        assert!(error.to_string().contains("no session for you"), "{error}");
     }
 }

@@ -5,19 +5,27 @@
 //! security descriptor that grants access to the current user alone, and it
 //! refuses remote clients. The client opens the pipe with identification
 //! quality of service, so the daemon cannot impersonate it.
+//!
+//! A client also authenticates the endpoint before it sends its attach body,
+//! which carries this session's token. Any user may create a pipe name first,
+//! so the client reads the user of the process that serves the pipe and
+//! refuses a server that is not this user.
 
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::io::AsRawHandle;
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
-use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeServer, PipeMode, ServerOptions};
+use anyhow::{Context, Result, anyhow, ensure};
+use tokio::net::windows::named_pipe::{
+    ClientOptions, NamedPipeClient, NamedPipeServer, PipeMode, ServerOptions,
+};
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER,
     ERROR_PIPE_BUSY, HANDLE, LocalFree,
@@ -30,7 +38,10 @@ use windows_sys::Win32::Security::{
     TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::SECURITY_IDENTIFICATION;
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows_sys::core::PWSTR;
 
 use super::{Election, Endpoint, Listener, Stream};
@@ -82,20 +93,92 @@ fn wide(value: &str) -> Vec<u16> {
         .collect()
 }
 
-/// An open access token for this process.
+/// An open handle to another process.
+struct Process(HANDLE);
+
+impl Process {
+    /// Open `pid` with the least privilege that reads its token.
+    fn open(pid: u32) -> Result<Self> {
+        // SAFETY: the call takes three values and returns a handle or null.
+        // `PROCESS_QUERY_LIMITED_INFORMATION` is the least access that opens
+        // the process token for reading.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return Err(io::Error::last_os_error())
+                .with_context(|| format!("open the process {pid} that serves this endpoint"));
+        }
+        Ok(Self(handle))
+    }
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from `OpenProcess` and is closed once,
+        // because this value owns it.
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+/// An open access token for one process.
 struct ProcessToken(HANDLE);
 
 impl ProcessToken {
     /// Open this process's token for reading.
     fn open() -> Result<Self> {
-        let mut handle: HANDLE = ptr::null_mut();
         // SAFETY: `GetCurrentProcess` returns a pseudo handle that needs no
-        // close, and `handle` is a writable slot for the new token handle.
-        let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut handle) };
+        // close and always names this process.
+        Self::for_process(unsafe { GetCurrentProcess() })
+    }
+
+    /// Open the token of the process `process` names, for reading.
+    fn for_process(process: HANDLE) -> Result<Self> {
+        let mut handle: HANDLE = ptr::null_mut();
+        // SAFETY: `process` is a live process handle with at least
+        // `PROCESS_QUERY_LIMITED_INFORMATION`, and `handle` is a writable slot
+        // for the new token handle.
+        let opened = unsafe { OpenProcessToken(process, TOKEN_QUERY, &raw mut handle) };
         if opened == 0 {
             return Err(io::Error::last_os_error()).context("open the process access token");
         }
         Ok(Self(handle))
+    }
+
+    /// The security identifier string of the user this token belongs to.
+    fn user_sid(&self) -> Result<String> {
+        let mut needed: u32 = 0;
+        // SAFETY: a null buffer of length zero asks only for the required
+        // size. The call is expected to fail with `ERROR_INSUFFICIENT_BUFFER`.
+        let sized =
+            unsafe { GetTokenInformation(self.0, TokenUser, ptr::null_mut(), 0, &raw mut needed) };
+        if sized == 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER.cast_signed()) {
+                return Err(error).context("size the token user information");
+            }
+        }
+        // `TOKEN_USER` holds a pointer, so the buffer must be pointer aligned.
+        // Storage of `u64` satisfies that on every Windows target.
+        let words = (needed as usize).div_ceil(size_of::<u64>()).max(1);
+        let mut buffer = vec![0u64; words];
+        let capacity = u32::try_from(words * size_of::<u64>()).unwrap_or(u32::MAX);
+        // SAFETY: the buffer holds `capacity` writable bytes and stays alive
+        // for the whole call.
+        let read = unsafe {
+            GetTokenInformation(
+                self.0,
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                capacity,
+                &raw mut needed,
+            )
+        };
+        if read == 0 {
+            return Err(io::Error::last_os_error()).context("read the token user information");
+        }
+        // SAFETY: the call filled the buffer with one `TOKEN_USER` whose `Sid`
+        // points inside that same buffer, which is alive until this call ends.
+        let sid = unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        sid_to_string(sid)
     }
 }
 
@@ -136,41 +219,33 @@ impl Drop for LocalString {
 
 /// The security identifier string of the user this process runs as.
 pub(super) fn current_user_sid() -> Result<String> {
-    let token = ProcessToken::open()?;
-    let mut needed: u32 = 0;
-    // SAFETY: a null buffer of length zero asks only for the required size.
-    // The call is expected to fail with `ERROR_INSUFFICIENT_BUFFER`.
-    let sized =
-        unsafe { GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &raw mut needed) };
-    if sized == 0 {
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER.cast_signed()) {
-            return Err(error).context("size the token user information");
-        }
-    }
-    // `TOKEN_USER` holds a pointer, so the buffer must be pointer aligned.
-    // Storage of `u64` satisfies that on every Windows target.
-    let words = (needed as usize).div_ceil(size_of::<u64>()).max(1);
-    let mut buffer = vec![0u64; words];
-    let capacity = u32::try_from(words * size_of::<u64>()).unwrap_or(u32::MAX);
-    // SAFETY: the buffer holds `capacity` writable bytes and stays alive for
-    // the whole call.
-    let read = unsafe {
-        GetTokenInformation(
-            token.0,
-            TokenUser,
-            buffer.as_mut_ptr().cast(),
-            capacity,
-            &raw mut needed,
-        )
-    };
+    ProcessToken::open()?.user_sid()
+}
+
+/// The security identifier string of the user that serves `pipe`.
+fn server_user_sid(pipe: &NamedPipeClient) -> Result<String> {
+    let mut pid: u32 = 0;
+    // SAFETY: the handle is a live named pipe this process owns, and `pid` is
+    // a writable slot for the server's process id.
+    let read = unsafe { GetNamedPipeServerProcessId(pipe.as_raw_handle(), &raw mut pid) };
     if read == 0 {
-        return Err(io::Error::last_os_error()).context("read the token user information");
+        return Err(io::Error::last_os_error())
+            .context("read the process id that serves the local daemon endpoint");
     }
-    // SAFETY: the call filled the buffer with one `TOKEN_USER` whose `Sid`
-    // points inside that same buffer, which is alive until this function ends.
-    let sid = unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid };
-    sid_to_string(sid)
+    ProcessToken::for_process(Process::open(pid)?.0)?.user_sid()
+}
+
+/// Fail unless the process that serves `pipe` runs as `sid`.
+///
+/// Any user may create a pipe name first, so a client proves who is listening
+/// before it sends an attach body that carries this session's token.
+fn verify_server_user(pipe: &NamedPipeClient, sid: &str) -> Result<()> {
+    let server = server_user_sid(pipe)?;
+    ensure!(
+        server == sid,
+        "the local daemon endpoint is served by {server}, not by {sid}"
+    );
+    Ok(())
 }
 
 /// Format a security identifier in its string form.
@@ -357,6 +432,8 @@ pub(super) fn bind(endpoint: &Endpoint) -> Result<Election> {
 /// `ClientOptions` opens the pipe for overlapped input and output, so one
 /// task can read while another writes. A pipe opened for synchronous input and
 /// output would serialize the two directions and deadlock the byte pump.
+///
+/// The endpoint is authenticated after the open and before anything is sent.
 pub(super) async fn connect(endpoint: &Endpoint, deadline: Instant) -> Result<Stream> {
     let name = endpoint.pipe_name();
     let mut backoff = FIRST_BACKOFF;
@@ -367,7 +444,10 @@ pub(super) async fn connect(endpoint: &Endpoint, deadline: Instant) -> Result<St
             .security_qos_flags(SECURITY_IDENTIFICATION)
             .open(name)
         {
-            Ok(client) => return Ok(Stream::PipeClient(client)),
+            Ok(client) => {
+                verify_server_user(&client, endpoint.user_sid())?;
+                return Ok(Stream::PipeClient(client));
+            }
             Err(error) if is_absent(&error) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
@@ -394,7 +474,10 @@ fn is_absent(error: &io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{SecurityDescriptor, current_user_sid, pipe_name, wide};
+    use super::{
+        ClientOptions, SECURITY_IDENTIFICATION, SecurityDescriptor, create_instance,
+        current_user_sid, pipe_name, verify_server_user, wide,
+    };
 
     #[test]
     fn the_pipe_name_is_local_and_carries_the_identity() {
@@ -421,6 +504,28 @@ mod tests {
         let sid = current_user_sid().expect("read the user security identifier");
         let descriptor = SecurityDescriptor::for_user(&sid).expect("build the descriptor");
         assert!(!descriptor.0.is_null());
+    }
+
+    /// The attach body carries this session's token, so the client checks who
+    /// serves the pipe first. This test serves it from this process, which
+    /// makes the server user this user; the refusal is exercised by varying
+    /// the expected identity, as the daemon-side directory test does.
+    #[tokio::test]
+    async fn a_client_refuses_an_endpoint_served_by_another_user() {
+        let sid = current_user_sid().expect("read the user security identifier");
+        let descriptor = SecurityDescriptor::for_user(&sid).expect("build the descriptor");
+        let name = pipe_name("test-endpoint-identity");
+        let server = create_instance(&name, &descriptor, true).expect("create the pipe");
+        let client = ClientOptions::new()
+            .security_qos_flags(SECURITY_IDENTIFICATION)
+            .open(&name)
+            .expect("open the pipe");
+        server.connect().await.expect("accept the connection");
+
+        verify_server_user(&client, &sid).expect("this user's own endpoint is accepted");
+        let error = verify_server_user(&client, "S-1-5-21-0-0-0-500")
+            .expect_err("another user's daemon must be refused");
+        assert!(error.to_string().contains("is served by"), "{error}");
     }
 
     #[test]
