@@ -23,7 +23,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use notify::{Event, RecommendedWatcher, RecursiveMode};
+use notify::event::{AccessKind, AccessMode};
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebouncedEvent, Debouncer, RecommendedCache, new_debouncer};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -87,25 +88,39 @@ struct Route {
     /// Directories outside `root` that hold a source-policy rule this
     /// registration depends on, such as a global gitignore file.
     externals: HashSet<PathBuf>,
+    /// The externals this registration holds a platform watch share of. A
+    /// directory inside a root that is already watched recursively needs no
+    /// watch of its own, so it is routed without being counted here.
+    watched: HashSet<PathBuf>,
     sink: WatchSink,
 }
 
 impl Route {
     /// Whether this registration observes `path`.
     ///
-    /// Ancestor match: a registration observes everything under its root, and
-    /// everything under an external directory it subscribed to.
+    /// The root matches by ancestor: it is watched recursively, so a
+    /// registration observes everything under it. An external directory
+    /// matches only itself and its direct children, because an external watch
+    /// is not recursive and reports nothing deeper. Matching an external by
+    /// ancestor would route far too much: the source policy records an absent
+    /// rule file for every ancestor of the root up to the filesystem root, so
+    /// every coordinator would observe every event on the machine.
     fn contains(&self, path: &Path) -> bool {
         path.starts_with(&self.root)
             || self
                 .externals
                 .iter()
-                .any(|external| path.starts_with(external))
+                .any(|external| observes_external(external, path))
     }
 
     fn observes(&self, event: &Event) -> bool {
         event.paths.iter().any(|path| self.contains(path))
     }
+}
+
+/// Whether a non-recursive watch on `external` can report `path`.
+fn observes_external(external: &Path, path: &Path) -> bool {
+    path == external || path.parent() == Some(external)
 }
 
 /// Registrations by id. An id is never reused, so a dropped registration
@@ -176,6 +191,7 @@ impl WatchHub {
             Route {
                 root: root.clone(),
                 externals: HashSet::new(),
+                watched: HashSet::new(),
                 sink,
             },
         );
@@ -183,6 +199,12 @@ impl WatchHub {
         // both, and the route table decides who hears each event.
         if let Some(holders) = watcher.roots.get_mut(&root) {
             *holders += 1;
+        } else if covered_by_a_root(watcher, &root) {
+            // A checkout inside another registered checkout. The outer root is
+            // watched recursively, so its watch already reports this tree.
+            // Adding a second watch for the same directory would overwrite the
+            // outer watch's recursive flag.
+            watcher.roots.insert(root.clone(), 1);
         } else if let Err(error) = watcher
             .debouncer
             .watch(&root, RecursiveMode::Recursive)
@@ -256,12 +278,22 @@ impl WatchHub {
         if !route.externals.insert(parent.to_path_buf()) {
             return;
         }
+        if covered_by_a_root(watcher, parent) {
+            // A recursive root watch already reports this directory. Watching
+            // it again without recursion would overwrite that root's flag and
+            // leave the whole checkout reporting one directory only.
+            return;
+        }
         match watcher.externals.get_mut(parent) {
             // Another registration already watches it. One watch serves both.
-            Some(holders) => *holders += 1,
+            Some(holders) => {
+                *holders += 1;
+                route.watched.insert(parent.to_path_buf());
+            }
             None => match watcher.debouncer.watch(parent, RecursiveMode::NonRecursive) {
                 Ok(()) => {
                     watcher.externals.insert(parent.to_path_buf(), 1);
+                    route.watched.insert(parent.to_path_buf());
                 }
                 Err(error) => {
                     route.externals.remove(parent);
@@ -291,9 +323,10 @@ impl WatchHub {
                 if let Err(error) = watcher.debouncer.unwatch(root) {
                     debug!(%error, root = %root.display(), "unwatch after release");
                 }
+                rewatch_around(watcher, root);
             }
         }
-        for external in route.into_iter().flat_map(|route| route.externals) {
+        for external in route.into_iter().flat_map(|route| route.watched) {
             let Some(holders) = watcher.externals.get_mut(&external) else {
                 continue;
             };
@@ -376,6 +409,55 @@ impl Drop for WatchRegistration {
     }
 }
 
+/// Whether some registered root already watches `path` recursively.
+///
+/// The root itself is not a cover for itself: the caller decides what to
+/// do about a watch on the same directory.
+fn covered_by_a_root(watcher: &WatcherState, path: &Path) -> bool {
+    watcher
+        .roots
+        .keys()
+        .any(|root| root != path && path.starts_with(root))
+}
+
+/// Restore the watches that removing the watch on `removed` also took.
+///
+/// `notify` keeps one entry per directory with a recursive flag, and
+/// removing a recursive entry removes every watch whose path starts with
+/// it. Two kinds of watch this hub still needs can therefore be gone: a
+/// nested root inside `removed`, and the coverage an enclosing root had of
+/// the `removed` subtree. Both are re-established here.
+///
+/// Best effort: a path that cannot be watched again is logged, and that
+/// checkout falls back to its periodic re-sync.
+fn rewatch_around(watcher: &mut WatcherState, removed: &Path) {
+    let affected: Vec<PathBuf> = watcher
+        .roots
+        .keys()
+        .filter(|root| root.starts_with(removed) || removed.starts_with(root))
+        .cloned()
+        .collect();
+    for root in affected {
+        if let Err(error) = watcher.debouncer.watch(&root, RecursiveMode::Recursive) {
+            warn!(%error, root = %root.display(), "could not watch this root again after a nested root was released");
+        }
+    }
+    let externals: Vec<PathBuf> = watcher
+        .externals
+        .keys()
+        .filter(|external| external.starts_with(removed))
+        .cloned()
+        .collect();
+    for external in externals {
+        if let Err(error) = watcher
+            .debouncer
+            .watch(&external, RecursiveMode::NonRecursive)
+        {
+            warn!(%error, path = %external.display(), "could not watch this rule directory again after a root was released");
+        }
+    }
+}
+
 /// Copy each event into every registration that observes one of its paths.
 ///
 /// Pure with respect to the filesystem: it reads the route table and the event
@@ -385,13 +467,28 @@ fn dispatch(routes: &Routes, events: &[Event]) {
     for route in routes.values() {
         let matched: Vec<Event> = events
             .iter()
-            .filter(|event| route.observes(event))
+            .filter(|event| can_change_tree(event) && route.observes(event))
             .cloned()
             .collect();
         if !matched.is_empty() {
             route.sink.deliver(WatchBatch { events: matched });
         }
     }
+}
+
+/// Whether an event can have changed the tree it names.
+///
+/// Read and open events are ignored: a reconcile walks and opens the watched
+/// tree itself, so letting them through would make each finished sync queue its
+/// successor forever on a platform that reports file access. The filter is
+/// applied here, before the event enters a channel, so an access burst costs no
+/// channel capacity and cannot overflow a registration that has nothing to do.
+pub(crate) fn can_change_tree(event: &Event) -> bool {
+    !matches!(event.kind, EventKind::Access(_))
+        || matches!(
+            event.kind,
+            EventKind::Access(AccessKind::Close(AccessMode::Write))
+        )
 }
 
 /// A poisoned hub lock means a previous holder panicked while the watcher was
@@ -414,14 +511,15 @@ fn write_routes(routes: &RwLock<Routes>) -> std::sync::RwLockWriteGuard<'_, Rout
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
     use notify::EventKind;
-    use notify::event::{CreateKind, ModifyKind};
+    use notify::event::{AccessKind, AccessMode, CreateKind, ModifyKind};
     use tokio::sync::mpsc;
 
     use super::{
-        BATCH_CAPACITY, Event, HashSet, PathBuf, Route, Routes, WatchBatch, WatchHub, WatchSink,
-        dispatch,
+        BATCH_CAPACITY, Event, HashSet, Path, PathBuf, Route, Routes, WatchBatch, WatchHub,
+        WatchSink, dispatch,
     };
 
     struct Receiver {
@@ -449,9 +547,11 @@ mod tests {
     }
 
     fn route(root: &str, externals: &[&str], sink: WatchSink) -> Route {
+        let externals = externals.iter().map(PathBuf::from).collect::<HashSet<_>>();
         Route {
             root: PathBuf::from(root),
-            externals: externals.iter().map(PathBuf::from).collect::<HashSet<_>>(),
+            watched: externals.clone(),
+            externals,
             sink,
         }
     }
@@ -485,6 +585,71 @@ mod tests {
         assert!(
             other.paths().is_empty(),
             "an unrelated root must not be woken"
+        );
+    }
+
+    /// A reconcile walks and opens the tree it watches. Delivering the access
+    /// events that walk produces would make every finished sync queue its
+    /// successor, so they never enter a channel.
+    #[test]
+    fn an_access_only_event_is_not_delivered() {
+        let (first_sink, mut first) = sink(BATCH_CAPACITY);
+        let mut routes = Routes::new();
+        routes.insert(0, route("/work/a", &[], first_sink));
+
+        dispatch(
+            &routes,
+            &[
+                Event::new(EventKind::Access(AccessKind::Open(AccessMode::Read)))
+                    .add_path(PathBuf::from("/work/a/src/lib.rs")),
+                Event::new(EventKind::Access(AccessKind::Read))
+                    .add_path(PathBuf::from("/work/a/src/lib.rs")),
+            ],
+        );
+        assert!(first.paths().is_empty(), "an access must not wake a run");
+
+        dispatch(
+            &routes,
+            &[
+                Event::new(EventKind::Access(AccessKind::Close(AccessMode::Write)))
+                    .add_path(PathBuf::from("/work/a/src/lib.rs")),
+            ],
+        );
+        assert_eq!(
+            first.paths(),
+            vec![PathBuf::from("/work/a/src/lib.rs")],
+            "a finished write is a change"
+        );
+    }
+
+    /// An external watch is not recursive, so it reports the directory itself
+    /// and its direct children only. The source policy records an absent rule
+    /// file for every ancestor of a root, so an ancestor match would route
+    /// every event on the machine to every coordinator.
+    #[test]
+    fn an_external_directory_observes_only_its_own_entries() {
+        let (root_sink, mut subscriber) = sink(BATCH_CAPACITY);
+        let mut routes = Routes::new();
+        routes.insert(0, route("/work/a", &["/"], root_sink));
+
+        dispatch(&routes, &[event("/tmp/other/file.rs")]);
+        assert!(
+            subscriber.paths().is_empty(),
+            "a deep path is not reported by a non-recursive watch"
+        );
+
+        dispatch(&routes, &[event("/.gitconfig")]);
+        assert_eq!(
+            subscriber.paths(),
+            vec![PathBuf::from("/.gitconfig")],
+            "a direct child of the external directory is reported"
+        );
+
+        dispatch(&routes, &[event("/")]);
+        assert_eq!(
+            subscriber.paths(),
+            vec![PathBuf::from("/")],
+            "the external directory itself is reported"
         );
     }
 
@@ -616,6 +781,119 @@ mod tests {
             !hub.has_watcher(),
             "the last registration must release the platform watcher"
         );
+    }
+
+    /// Wait until the registration reports an event, or give up.
+    ///
+    /// The debounce window is 750 ms and a platform watcher needs a moment to
+    /// arm, so this polls rather than reading once.
+    fn await_paths(receiver: &mut Receiver) -> Vec<PathBuf> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let paths = receiver.paths();
+            if !paths.is_empty() || std::time::Instant::now() >= deadline {
+                return paths;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Write a file under `root` and report whether `receiver` heard about it.
+    fn hears_a_write(root: &Path, receiver: &mut Receiver) -> bool {
+        let file = root.join("watched.txt");
+        std::fs::write(&file, b"an edit\n").expect("write a source file");
+        let paths = await_paths(receiver);
+        let heard = paths.iter().any(|path| path == &file);
+        // Leave nothing behind for the next write in the same test.
+        let _ = std::fs::remove_file(&file);
+        heard
+    }
+
+    /// One checkout inside another is a real layout. `notify` keeps one entry
+    /// per directory, so a second watch on a directory replaces the first, and
+    /// removing a recursive entry removes every watch below it. Either root
+    /// must keep receiving events when the other one goes, in either
+    /// registration order.
+    #[test]
+    fn nested_roots_keep_their_watches_when_the_other_is_released() {
+        for outer_first in [true, false] {
+            let outer_dir = tempfile::tempdir().expect("temporary checkout");
+            let outer = std::fs::canonicalize(outer_dir.path()).expect("canonical outer root");
+            let inner = outer.join("inner");
+            std::fs::create_dir(&inner).expect("create the nested checkout");
+
+            let hub = Arc::new(WatchHub::new());
+            let (outer_sink, _outer_events) = sink(BATCH_CAPACITY);
+            let (inner_sink, mut inner_events) = sink(BATCH_CAPACITY);
+            let (outer_registration, inner_registration) = if outer_first {
+                let first = hub
+                    .register(outer.clone(), outer_sink)
+                    .expect("watch the outer checkout");
+                let second = hub
+                    .register(inner.clone(), inner_sink)
+                    .expect("watch the inner checkout");
+                (first, second)
+            } else {
+                let second = hub
+                    .register(inner.clone(), inner_sink)
+                    .expect("watch the inner checkout");
+                let first = hub
+                    .register(outer.clone(), outer_sink)
+                    .expect("watch the outer checkout");
+                (first, second)
+            };
+
+            drop(outer_registration);
+            assert!(
+                hears_a_write(&inner, &mut inner_events),
+                "the inner root must still be watched (outer registered first: {outer_first})"
+            );
+            drop(inner_registration);
+            assert!(!hub.has_watcher(), "the last registration releases the hub");
+        }
+    }
+
+    /// The other direction: the inner root goes, and the outer one keeps
+    /// hearing about the tree the inner root stood in. Removing a recursive
+    /// entry also removes every watch below it, and those watches were the
+    /// outer root's coverage of that subtree.
+    #[test]
+    fn an_outer_root_keeps_its_watch_when_the_inner_root_is_released() {
+        for outer_first in [true, false] {
+            let outer_dir = tempfile::tempdir().expect("temporary checkout");
+            let outer = std::fs::canonicalize(outer_dir.path()).expect("canonical outer root");
+            let inner = outer.join("inner");
+            std::fs::create_dir(&inner).expect("create the nested checkout");
+
+            let hub = Arc::new(WatchHub::new());
+            let (outer_sink, mut outer_events) = sink(BATCH_CAPACITY);
+            let (inner_sink, _inner_events) = sink(BATCH_CAPACITY);
+            let (outer_registration, inner_registration) = if outer_first {
+                let first = hub
+                    .register(outer.clone(), outer_sink)
+                    .expect("watch the outer checkout");
+                let second = hub
+                    .register(inner.clone(), inner_sink)
+                    .expect("watch the inner checkout");
+                (first, second)
+            } else {
+                let second = hub
+                    .register(inner.clone(), inner_sink)
+                    .expect("watch the inner checkout");
+                let first = hub
+                    .register(outer.clone(), outer_sink)
+                    .expect("watch the outer checkout");
+                (first, second)
+            };
+
+            drop(inner_registration);
+            assert!(
+                hears_a_write(&inner, &mut outer_events),
+                "the outer root must still observe the released root's tree \
+                 (outer registered first: {outer_first})"
+            );
+            drop(outer_registration);
+        }
     }
 
     /// Two checkouts that depend on the same global rule file share one watch,

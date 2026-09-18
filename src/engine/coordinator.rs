@@ -37,8 +37,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
-use notify::event::{AccessKind, AccessMode};
-use notify::{Event, EventKind};
+use notify::Event;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio::task::JoinHandle;
@@ -47,7 +46,7 @@ use tracing::{debug, info, warn};
 
 use super::registry::CheckoutKey;
 use super::scheduler;
-use super::watch_hub::{WatchBatch, WatchRegistration};
+use super::watch_hub::{WatchBatch, WatchRegistration, can_change_tree};
 use crate::client::{self, Client};
 use crate::mcp::readiness::InitialIndexGate;
 use crate::sync::policy::{SourcePolicy, event_may_affect_policy};
@@ -865,17 +864,6 @@ fn is_interesting(event: &Event, policy: &mut SourcePolicy) -> bool {
                 .event_is_relevant(path, path.is_dir(), &blocking::Cancellation::default())
                 .unwrap_or(true)
         })
-}
-
-/// Read and open events are ignored: the reconcile itself walks and opens the
-/// watched tree, so letting them through would make each finished sync queue
-/// its successor forever on platforms that report file access.
-fn can_change_tree(event: &Event) -> bool {
-    !matches!(event.kind, EventKind::Access(_))
-        || matches!(
-            event.kind,
-            EventKind::Access(AccessKind::Close(AccessMode::Write))
-        )
 }
 
 /// Poll one embedding job to a terminal state.

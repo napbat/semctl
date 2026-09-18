@@ -7,13 +7,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
+use notify::EventKind;
 use notify::event::{CreateKind, ModifyKind, RemoveKind};
 use tokio::sync::{Semaphore, mpsc};
 
 use super::{
-    CheckoutCoordinator, CoordinatorSetup, CoordinatorTask, Event, EventKind, HashSet, PathBuf,
-    Reconciled, Reconciler, SourcePolicy, SyncLimits, SyncOutcome, TRIGGER_CAPACITY, Trigger,
-    blocking, initial_job_result, is_interesting, jitter, relevance,
+    CheckoutCoordinator, CoordinatorSetup, CoordinatorTask, Event, HashSet, PathBuf, Reconciled,
+    Reconciler, SourcePolicy, SyncLimits, SyncOutcome, TRIGGER_CAPACITY, Trigger, blocking,
+    initial_job_result, is_interesting, jitter, relevance,
 };
 use crate::client::{Client, api};
 use crate::engine::registry::CheckoutKey;
