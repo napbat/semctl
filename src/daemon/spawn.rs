@@ -9,6 +9,25 @@
 //! a zombie until this client exits, which is at most one short-lived entry per
 //! spawn; a winning daemon outlives the client that started it and must not be
 //! waited for at all.
+//!
+//! # What the daemon inherits
+//!
+//! The daemon inherits the environment of the client that started it, minus
+//! the six per-session variables in [`PER_SESSION_VARS`]. Every later session
+//! of that daemon therefore runs with the first client's environment, not with
+//! its own. That applies to the proxy settings (`HTTP_PROXY`, `HTTPS_PROXY`,
+//! `NO_PROXY`), to `PATH`, which decides which formatter an edit runs, and to
+//! the Git configuration variables (`GIT_CONFIG_GLOBAL`, `GIT_DIR`, and the
+//! rest), which decide which rules a source policy reads.
+//!
+//! `semctl daemon stop` is the way to change that: the next client to run
+//! `semctl mcp` starts a daemon with its own environment.
+//!
+//! The daemon's working directory is not inherited. A client is invoked inside
+//! a checkout, and a daemon that kept that directory would hold it open for
+//! its whole life and would resolve a relative path of one session against
+//! another session's checkout. Every session carries its own working directory
+//! in its attach body, so the daemon needs none of its own.
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -33,10 +52,13 @@ const DAEMON_ARGS: [&str; 2] = ["daemon", "run"];
 /// may describe one. Standard input and output are the null device, and
 /// standard error appends to the endpoint's log file, which is where the
 /// daemon's `tracing` output goes.
+///
+/// The working directory is the endpoint's own, which
+/// [`Endpoint::open_log`] has just created, and never this client's checkout.
 pub(crate) fn spawn_daemon(endpoint: &Endpoint) -> Result<()> {
     let program = std::env::current_exe().context("locate this executable")?;
     let log = endpoint.open_log()?;
-    let mut command = command_for(&program);
+    let mut command = command_for(&program, endpoint.daemon_dir());
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -55,12 +77,16 @@ pub(crate) fn spawn_daemon(endpoint: &Endpoint) -> Result<()> {
 /// The command that runs a daemon, without its platform detachment.
 ///
 /// Pure: it builds the command and reads nothing. The per-session variables
-/// are removed here, which is the rule this function exists to make testable.
-fn command_for(program: &Path) -> Command {
+/// and the working directory are decided here, which is the rule this function
+/// exists to make testable.
+fn command_for(program: &Path, working_dir: Option<&Path>) -> Command {
     let mut command = Command::new(program);
     command.args(DAEMON_ARGS);
     for name in PER_SESSION_VARS {
         command.env_remove(name);
+    }
+    if let Some(dir) = working_dir {
+        command.current_dir(dir);
     }
     command
 }
@@ -138,18 +164,30 @@ mod tests {
 
     #[test]
     fn the_daemon_is_started_with_the_run_subcommand() {
-        let command = command_for(Path::new("/opt/semctl/bin/semctl"));
+        let command = command_for(Path::new("/opt/semctl/bin/semctl"), None);
 
         assert_eq!(command.get_program(), OsStr::new("/opt/semctl/bin/semctl"));
         let args: Vec<&OsStr> = command.get_args().collect();
         assert_eq!(args, DAEMON_ARGS.map(OsStr::new).to_vec());
+        assert_eq!(command.get_current_dir(), None);
+    }
+
+    /// A daemon must not keep the checkout its first client was invoked in:
+    /// it would hold that directory open and resolve another session's
+    /// relative path against it.
+    #[test]
+    fn the_daemon_starts_in_the_endpoints_own_directory() {
+        let endpoint_dir = Path::new("/run/user/1000/semctl");
+        let command = command_for(Path::new("semctl"), Some(endpoint_dir));
+
+        assert_eq!(command.get_current_dir(), Some(endpoint_dir));
     }
 
     /// The daemon must not be able to describe a session with its own
     /// environment. These six, and only these six, are removed.
     #[test]
     fn the_daemon_environment_loses_exactly_the_per_session_variables() {
-        let command = command_for(Path::new("semctl"));
+        let command = command_for(Path::new("semctl"), None);
 
         let mut removed: Vec<String> = Vec::new();
         for (name, value) in command.get_envs() {

@@ -44,6 +44,20 @@ const IDLE_SECS_VAR: &str = "SEMCTX_DAEMON_IDLE_SECS";
 /// Idle delay when `SEMCTX_DAEMON_IDLE_SECS` is unset or unreadable.
 const DEFAULT_IDLE: Duration = Duration::from_secs(600);
 
+/// Shortest time a daemon that has served no session stays alive.
+///
+/// A daemon is started by a client that is still connecting. The idle delay
+/// may be shorter than that — `SEMCTX_DAEMON_IDLE_SECS=0` means "exit with the
+/// last session" — so the first deadline never depends on it. The grace ends
+/// with the first session: from then on the configured idle delay applies.
+const STARTUP_GRACE: Duration = Duration::from_secs(30);
+
+/// First wait after an accept failure.
+const FIRST_ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Longest wait after an accept failure.
+const LAST_ACCEPT_BACKOFF: Duration = Duration::from_secs(2);
+
 /// Longest the drain waits for the session tasks it aborted.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -192,11 +206,18 @@ enum DrainReason {
     Stop,
     /// No session was served for the idle delay.
     Idle,
-    /// The endpoint stopped accepting connections.
-    ListenerFailed,
 }
 
 /// Accept connections until something asks this daemon to stop.
+///
+/// An accept failure never ends the loop. `EMFILE`, `ENFILE`, `ECONNABORTED`,
+/// and `ENOBUFS` are transient, and draining every session because one
+/// connection could not be accepted would turn a momentary resource shortage
+/// into a lost session for every other client. The loop waits with a backoff
+/// instead, which also keeps a repeating failure from spinning a worker. The
+/// wait delays the other three stop reasons by at most
+/// [`LAST_ACCEPT_BACKOFF`]: a signal stays pending, and a `stop` request holds
+/// its notification.
 async fn accept_loop(
     listener: &Listener,
     daemon: &Arc<Daemon>,
@@ -207,6 +228,7 @@ async fn accept_loop(
     // installed before the first connection, and a signal that arrives while
     // another branch is running must not be lost.
     let mut shutdown = std::pin::pin!(shutdown_signal());
+    let mut backoff = FIRST_ACCEPT_BACKOFF;
     loop {
         tokio::select! {
             accepted = listener.accept() => match accepted {
@@ -228,10 +250,16 @@ async fn accept_loop(
                     let connection = Sessions::connect(daemon.sessions.clone());
                     let daemon = daemon.clone();
                     tasks.spawn(handle(daemon, stream, connection));
+                    backoff = FIRST_ACCEPT_BACKOFF;
                 }
                 Err(error) => {
-                    warn!(error = format!("{error:#}"), "the local endpoint stopped accepting");
-                    return DrainReason::ListenerFailed;
+                    warn!(
+                        error = format!("{error:#}"),
+                        backoff_ms = backoff.as_millis(),
+                        "could not accept a connection; this daemon keeps accepting"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = next_accept_backoff(backoff);
                 }
             },
             () = shutdown.as_mut() => return DrainReason::Signal,
@@ -239,6 +267,11 @@ async fn accept_loop(
             () = daemon.sessions.wait_idle_for(idle_after) => return DrainReason::Idle,
         }
     }
+}
+
+/// The wait after the next accept failure in a row.
+fn next_accept_backoff(current: Duration) -> Duration {
+    current.saturating_mul(2).min(LAST_ACCEPT_BACKOFF)
 }
 
 /// Resolve when the operating system asks this daemon to stop.
@@ -434,7 +467,9 @@ async fn answer_stop(daemon: &Arc<Daemon>, stream: &mut Stream) {
 /// - `idle_since` is when the last session ended, or when the daemon started.
 ///   The deadline is an absolute instant, so watching a daemon cannot keep it
 ///   alive: `semctl daemon status` in a loop must not stop an unused daemon
-///   from exiting.
+///   from exiting. Before the first session the deadline is also held back to
+///   [`STARTUP_GRACE`] after the start, so a daemon cannot exit while the
+///   client that started it is still connecting.
 /// - `in_flight` is every open connection, including one still in its
 ///   handshake. It never moves the deadline. It only defers the decision at
 ///   the instant the deadline passes, so a client that is attaching right then
@@ -445,8 +480,11 @@ pub(super) struct Sessions {
     /// `Some` while no session is attached: the instant that became true.
     idle_since: StdMutex<Option<Instant>>,
     /// Session ids issued so far. It only ever grows, so no two sessions of
-    /// one daemon share an id.
+    /// one daemon share an id. A value of zero also means that this daemon has
+    /// never served a session, which is what the startup grace applies to.
     issued: AtomicU64,
+    /// When this daemon started counting, for the startup grace.
+    started: Instant,
     /// Notified after every change to any of the above.
     changed: Notify,
 }
@@ -459,8 +497,25 @@ impl Sessions {
             // A daemon nothing ever uses exits after one idle delay.
             idle_since: StdMutex::new(Some(Instant::now())),
             issued: AtomicU64::new(0),
+            started: Instant::now(),
             changed: Notify::new(),
         }
+    }
+
+    /// When an idle wait that started at `since` may end.
+    ///
+    /// A daemon that has served no session yet was started by a client that is
+    /// still connecting. Its first deadline is therefore never earlier than
+    /// the startup grace, whatever the idle delay is: with
+    /// `SEMCTX_DAEMON_IDLE_SECS=0` the daemon would otherwise drain before its
+    /// own client attached, and with any other value a connection waiting in
+    /// the backlog would be closed with no answer.
+    fn deadline(&self, since: Instant, idle: Duration) -> Instant {
+        let deadline = since + idle;
+        if self.issued.load(Ordering::Acquire) == 0 {
+            return deadline.max(self.started + STARTUP_GRACE);
+        }
+        deadline
     }
 
     /// How many MCP sessions this daemon serves.
@@ -499,7 +554,7 @@ impl Sessions {
     /// session moves it.
     ///
     /// `idle` of zero resolves as soon as nothing is attached and nothing is
-    /// connected.
+    /// connected, except before the first session: see [`Self::deadline`].
     async fn wait_idle_for(&self, idle: Duration) {
         loop {
             let changed = self.changed.notified();
@@ -518,7 +573,7 @@ impl Sessions {
                 }
                 Some(since) => {
                     tokio::select! {
-                        () = tokio::time::sleep_until(since + idle) => {
+                        () = tokio::time::sleep_until(self.deadline(since, idle)) => {
                             // Re-read under the deadline: a client may have
                             // connected while the timer ran.
                             if self.in_flight.load(Ordering::Acquire) == 0
@@ -588,7 +643,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        DEFAULT_IDLE, PROTOCOL, Sessions, VERSION, idle_after, version_mismatch, worker_threads,
+        DEFAULT_IDLE, FIRST_ACCEPT_BACKOFF, LAST_ACCEPT_BACKOFF, PROTOCOL, STARTUP_GRACE, Sessions,
+        VERSION, idle_after, next_accept_backoff, version_mismatch, worker_threads,
     };
 
     #[test]
@@ -704,6 +760,70 @@ mod tests {
             started.elapsed() < Duration::from_secs(6),
             "the deadline moved to {:?}",
             started.elapsed()
+        );
+    }
+
+    /// A fresh daemon was started by a client that is still connecting. It
+    /// must not exit before that client attaches, whatever the idle delay is.
+    #[tokio::test(start_paused = true)]
+    async fn a_fresh_daemon_outlives_its_startup_grace() {
+        let sessions = Arc::new(Sessions::new());
+        let started = tokio::time::Instant::now();
+
+        tokio::time::timeout(
+            STARTUP_GRACE + Duration::from_secs(60),
+            sessions.wait_idle_for(Duration::ZERO),
+        )
+        .await
+        .expect("a daemon nothing ever used still exits");
+
+        assert_eq!(
+            started.elapsed(),
+            STARTUP_GRACE,
+            "an idle delay of zero must not drain a daemon before its client attaches"
+        );
+    }
+
+    /// The grace covers the start only. Once a session has been served, the
+    /// configured idle delay decides.
+    #[tokio::test(start_paused = true)]
+    async fn the_configured_idle_delay_applies_after_the_first_session() {
+        let sessions = Arc::new(Sessions::new());
+        drop(Sessions::attach(sessions.clone(), 1));
+        let started = tokio::time::Instant::now();
+
+        tokio::time::timeout(
+            STARTUP_GRACE + Duration::from_secs(60),
+            sessions.wait_idle_for(Duration::ZERO),
+        )
+        .await
+        .expect("the last session ended");
+
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    /// `EMFILE` and its neighbors are transient. The wait grows to a bound, so
+    /// a repeating failure costs neither a worker nor every session.
+    #[test]
+    fn the_accept_backoff_doubles_up_to_its_bound() {
+        let mut backoff = FIRST_ACCEPT_BACKOFF;
+        let mut waits = vec![backoff];
+        for _ in 0..6 {
+            backoff = next_accept_backoff(backoff);
+            waits.push(backoff);
+        }
+
+        assert_eq!(
+            waits,
+            vec![
+                Duration::from_millis(100),
+                Duration::from_millis(200),
+                Duration::from_millis(400),
+                Duration::from_millis(800),
+                Duration::from_millis(1600),
+                LAST_ACCEPT_BACKOFF,
+                LAST_ACCEPT_BACKOFF,
+            ]
         );
     }
 

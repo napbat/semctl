@@ -162,6 +162,24 @@ impl Endpoint {
         Ok(file)
     }
 
+    /// The working directory for a daemon started for this endpoint.
+    ///
+    /// It is a directory of the endpoint itself, never a checkout: a daemon
+    /// holds its working directory open for its whole life and serves sessions
+    /// invoked from many directories. [`Self::open_log`] creates it, so a
+    /// caller that opened the log may use this path.
+    ///
+    /// Unix uses the runtime directory, which holds the socket, the lock, and
+    /// the log. Windows uses the log's parent directory; `None` means the path
+    /// names no parent, and the daemon then keeps this client's directory.
+    pub(crate) fn daemon_dir(&self) -> Option<&Path> {
+        #[cfg(unix)]
+        let dir = Some(self.runtime_dir());
+        #[cfg(windows)]
+        let dir = self.log_path.parent();
+        dir
+    }
+
     /// The private directory that holds the socket and the lock.
     #[cfg(unix)]
     pub(crate) fn runtime_dir(&self) -> &Path {
@@ -371,7 +389,7 @@ pub(crate) async fn connect(endpoint: &Endpoint, deadline: Instant) -> Result<St
 /// way. An `Ok` means the pump ran, and the exit belongs to the host.
 pub(crate) fn run_client<C, F>(session: SessionRequest, connect: C) -> Result<pump::Exit>
 where
-    C: FnOnce() -> F,
+    C: Fn() -> F,
     F: Future<Output = Result<Stream>>,
 {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -389,21 +407,65 @@ where
 
 /// Perform the attach handshake, then pump bytes between the standard streams
 /// and the connection.
+///
+/// The handshake is retried once, and only when the connection closed before
+/// any answer arrived. A daemon that drained while this connection waited in
+/// its backlog produces exactly that, and the retry starts another daemon and
+/// attaches to it. A refusal is an answer and is never retried, and nothing is
+/// retried once the pump owns the standard streams.
 async fn attach_and_pump<C, F>(session: SessionRequest, connect: C) -> Result<pump::Exit>
 where
-    C: FnOnce() -> F,
+    C: Fn() -> F,
+    F: Future<Output = Result<Stream>>,
+{
+    let stream = match attach(&session, &connect).await? {
+        Some(stream) => stream,
+        None => attach(&session, &connect).await?.ok_or_else(|| {
+            anyhow!("the daemon closed the connection before it answered the attach request")
+        })?,
+    };
+    let half_close = stream.half_close();
+    Ok(pump::run(stream, half_close, tokio::io::stdin(), tokio::io::stdout()).await)
+}
+
+/// One attach attempt.
+///
+/// `Ok(None)` means the daemon went away before it answered, which the caller
+/// may retry. Every other failure is final.
+async fn attach<C, F>(session: &SessionRequest, connect: &C) -> Result<Option<Stream>>
+where
+    C: Fn() -> F,
     F: Future<Output = Result<Stream>>,
 {
     let mut stream = connect().await?;
-    handshake::write_line_async(&mut stream, &Request::attach(VERSION, session))
-        .await
-        .context("send the attach request")?;
-    let line = handshake::read_line_async(&mut stream)
-        .await
-        .context("read the attach answer")?;
+    let request = Request::attach(VERSION, session.clone());
+    if let Err(error) = handshake::write_line_async(&mut stream, &request).await {
+        if connection_lost(&error) {
+            return Ok(None);
+        }
+        return Err(error).context("send the attach request");
+    }
+    let line = match handshake::read_line_async(&mut stream).await {
+        Ok(line) => line,
+        Err(error) if connection_lost(&error) => return Ok(None),
+        Err(error) => return Err(error).context("read the attach answer"),
+    };
     accept_attach(handshake::decode_response(&line).context("decode the attach answer")?)?;
-    let half_close = stream.half_close();
-    Ok(pump::run(stream, half_close, tokio::io::stdin(), tokio::io::stdout()).await)
+    Ok(Some(stream))
+}
+
+/// Whether the daemon went away before it answered.
+fn connection_lost(error: &handshake::HandshakeError) -> bool {
+    match error {
+        handshake::HandshakeError::Closed => true,
+        handshake::HandshakeError::Transport(error) => matches!(
+            error.kind(),
+            io::ErrorKind::ConnectionReset
+                | io::ErrorKind::BrokenPipe
+                | io::ErrorKind::UnexpectedEof
+        ),
+        _ => false,
+    }
 }
 
 /// Decide whether the daemon's answer opens a session on this connection.
@@ -541,6 +603,33 @@ mod tests {
             .expect_err("another build cannot serve this client");
         assert!(error.to_string().contains("0.0.1"), "{error}");
         assert!(error.to_string().contains(VERSION), "{error}");
+    }
+
+    /// A daemon that drained while this connection waited in its backlog
+    /// closes it with no answer. That is the one failure the client retries.
+    #[test]
+    fn only_a_connection_that_closed_before_an_answer_is_retried() {
+        use super::connection_lost;
+        use crate::ipc::handshake::HandshakeError;
+        use std::io;
+
+        assert!(connection_lost(&HandshakeError::Closed));
+        for kind in [
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::UnexpectedEof,
+        ] {
+            assert!(
+                connection_lost(&HandshakeError::Transport(io::Error::from(kind))),
+                "{kind:?}"
+            );
+        }
+        assert!(!connection_lost(&HandshakeError::TimedOut));
+        assert!(!connection_lost(&HandshakeError::LineTooLong));
+        assert!(!connection_lost(&HandshakeError::Malformed("no".into())));
+        assert!(!connection_lost(&HandshakeError::Transport(
+            io::Error::from(io::ErrorKind::PermissionDenied)
+        )));
     }
 
     #[test]

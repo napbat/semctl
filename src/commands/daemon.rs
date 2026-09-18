@@ -19,7 +19,7 @@ pub enum DaemonCommand {
     /// and scheduler permits. Exits with status 1 when no daemon is running.
     Status(StatusArgs),
 
-    /// Ask the running daemon to finish its sessions and exit. Exits with
+    /// Ask the running daemon to end every session and exit. Exits with
     /// status 1 when no daemon is running.
     Stop,
 }

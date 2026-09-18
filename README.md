@@ -141,7 +141,7 @@ Two commands inspect and end a running daemon:
 ```sh
 semctl daemon status        # version, pid, uptime, sessions, permits, checkouts
 semctl daemon status --json # the same facts as one JSON object
-semctl daemon stop          # finish the sessions and exit
+semctl daemon stop          # end every session and exit
 ```
 
 Both exit with status 1 and report `no daemon is running for this
@@ -156,6 +156,16 @@ minutes with no session.
 | `SEMCTX_DAEMON_REMOTE_PERMITS` | Concurrent remote requests from tool calls. Default 64.                                         |
 
 Each permit override is clamped to the range 1 to 1024.
+
+A daemon inherits the environment of the client that started it, minus the six
+per-session variables (`SEMCTX_TOKEN`, `SEMCTX_SERVER`, `SEMCTX_TENANT`,
+`SEMCTX_CODEBASE`, `SEMCTX_MCP_RESYNC_SECS`, `SEMCTX_MCP_UPDATE_CHECK`). Every
+later session of that daemon therefore runs with the first client's proxy
+settings, its `PATH`, which decides which formatter an edit runs, and its Git
+configuration variables, which decide which rules a source policy reads. Run
+`semctl daemon stop` to change any of them: the next `semctl mcp` client starts
+a daemon with its own environment. The daemon's working directory is not
+inherited; each session carries its own in its attach request.
 
 The endpoint and the daemon log live in the same place on each platform:
 

@@ -541,6 +541,35 @@ async fn two_sessions_on_one_checkout_share_one_coordinator() {
     }
 }
 
+/// `SEMCTX_DAEMON_IDLE_SECS=0` means "exit with the last session". A fresh
+/// daemon must still serve the client that started it: its first deadline is
+/// the startup grace, not the idle delay.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_without_an_idle_delay_still_serves_its_first_client() {
+    let endpoint = Endpoint::new();
+    let mut client = endpoint.start_client(
+        "require",
+        ClientOptions {
+            idle_secs: "0",
+            ..ClientOptions::new()
+        },
+    );
+    client.initialize().await;
+    endpoint
+        .await_status("the session to be counted", |status| {
+            status["sessions"] == 1
+        })
+        .await;
+
+    client.close_input();
+    let exit = client.wait().await;
+    assert!(exit.success(), "the client exited with {exit}");
+
+    endpoint
+        .await_no_daemon("the daemon to exit with its last session")
+        .await;
+}
+
 /// A daemon that nothing uses exits by itself.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_daemon_exits_after_its_last_session_leaves() {
