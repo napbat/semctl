@@ -2,10 +2,9 @@
 
 Status: built on the `v0.2` branch, in the stages at the end of this document.
 This document describes the design as it was built. It is not a change log.
-The feasibility study that motivates the design is
-[reports/shared-daemon-feasibility.md](../reports/shared-daemon-feasibility.md).
-The measurements that decide the default are
-[reports/shared-daemon-results.md](../reports/shared-daemon-results.md).
+The feasibility study that motivated the design and the measurement results
+that decided the default are not part of the repository. The "Measurement gate"
+section records the numbers that decided the default.
 
 ## Goals
 
@@ -464,10 +463,9 @@ target's C toolchain. When the toolchain is missing, the stage summary says so.
 
 ## Measurement gate
 
-`reports/measure_mcp_processes.py` runs the same cases in both modes. Its
-`--mode daemon` records the daemon process beside its clients, and its
-`--checkouts` option spreads the clients over several checkouts. The gate for
-flipping the default to `auto`:
+A measurement harness runs the same cases in both modes. In daemon mode it
+records the daemon process beside its clients, and it can spread the clients
+over several checkouts. The gate for flipping the default to `auto`:
 
 - 100 clients on one checkout: one startup manifest and one manifest per settled
   edit burst.
@@ -475,8 +473,13 @@ flipping the default to `auto`:
 - Thread and file descriptor growth bounded by the client pump cost.
 - No tool latency regression beyond the budget set in the report.
 
-Each line is evaluated against measurements in
-[reports/shared-daemon-results.md](../reports/shared-daemon-results.md).
+The gate was evaluated on 2026-09-17 on Linux, with synthetic trees and a
+loopback mock server, in single runs. For 100 clients on one checkout the daemon
+measured 119 MiB of total PSS against 2,620 MiB standalone, 418 threads against
+2,203, one manifest for one edit against 100, 0.07 seconds of CPU for that edit
+against 58.4 seconds, and a `tools/list` p95 of 0.035 seconds against 0.82
+seconds. At 1,000 clients on 1,000 checkouts one daemon held 1,000 coordinators
+with one inotify instance. Every line passed, so the default is `auto`.
 
 ## Stages
 

@@ -42,9 +42,9 @@ pub(crate) enum DaemonMode {
     /// Attach to a daemon, start one when needed, and serve the session in
     /// this process when that fails. The default.
     ///
-    /// The measurements in `reports/shared-daemon-results.md` are why this is
-    /// the default: one daemon replaces one watcher, one reconcile queue, and
-    /// one runtime per session, and it falls back when it cannot serve.
+    /// Measurements with 100 sessions on one checkout are why this is the
+    /// default: one daemon replaces one watcher, one reconcile queue, and one
+    /// runtime per session, and it falls back when it cannot serve.
     Auto,
     /// Attach to a daemon, start one when needed, and fail when that fails.
     Require,
