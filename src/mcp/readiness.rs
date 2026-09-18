@@ -40,9 +40,18 @@ pub(super) async fn wait_for_gates(
     for gate in gates {
         gate.wait_for_codebases(ids)
             .await
-            .map_err(|error| format!("initial index failed — {error}"))?;
+            .map_err(|error| initial_index_failed(&error))?;
     }
     Ok(())
+}
+
+/// What a retrieval call reports when a first index failed.
+///
+/// A failed gate stays failed until something asks for that index again, so
+/// the message names the recovery. Without it the caller sees a permanent
+/// failure and no way out of it.
+pub(super) fn initial_index_failed(error: &str) -> String {
+    format!("initial index failed — {error}; call `index_codebase` for this path to retry")
 }
 
 /// Wait without holding the lease map, then reserve the checked membership for

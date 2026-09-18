@@ -40,7 +40,10 @@ pub(crate) mod readiness;
 mod tool_types;
 mod tools;
 
-use readiness::{InitialIndexGate, SessionLeases, initial_gate_for_path, ready_for_codebases};
+use readiness::{
+    InitialIndexGate, SessionLeases, initial_gate_for_path, initial_index_failed,
+    ready_for_codebases,
+};
 
 use tool_types::{InsertSymbolArgs, render_edit_action_outcome};
 
@@ -176,11 +179,17 @@ impl McpServer {
     /// round-trip; the heavy walk and upload run in the checkout's
     /// coordinator, so serving still starts promptly.
     ///
-    /// Best effort: on failure the session serves anyway and the code tools
-    /// self-heal (see [`Self::bound`]). Both roles call this, so a session
-    /// behaves the same in the daemon and in a standalone process.
+    /// It binds without waiting for a first-index gate. The gate belongs to
+    /// the checkout's coordinator, which is shared, so waiting here would hold
+    /// this session behind another session's embedding and behind a gate that
+    /// failed. A tool call still waits: [`Self::bound`] takes the same lock and
+    /// reuses this bind, and then waits for readiness on its own behalf.
+    ///
+    /// Both roles run this as a task of its own and serve at once, so the host
+    /// never waits for it. Best effort: on failure the session serves anyway
+    /// and the code tools self-heal (see [`Self::bound`]).
     pub(crate) async fn bind_at_startup(&self) {
-        match self.bound().await {
+        match self.bound_unchecked().await {
             Ok(_) if self.shared.pinned => info!(
                 "codebase pinned explicitly; launch directory will not be synced into the pinned id"
             ),
@@ -345,13 +354,7 @@ impl McpServer {
             return self.bound().await;
         };
         let candidate = PathBuf::from(raw);
-        let path_like = candidate.is_absolute()
-            || candidate.is_dir()
-            || raw == "."
-            || raw == ".."
-            || raw.contains('/')
-            || raw.contains('\\');
-        let client = if path_like {
+        let client = if selector_is_path_like(&self.shared.context.cwd, raw) {
             let dir = canonical_directory(&self.shared.context.cwd, &candidate)?;
             let dir = crate::codebase::working_copy_root(&dir).await;
             self.await_initial_path(&dir).await?;
@@ -392,13 +395,7 @@ impl McpServer {
             return self.bound_unchecked().await;
         };
         let candidate = PathBuf::from(raw);
-        let path_like = candidate.is_absolute()
-            || candidate.is_dir()
-            || raw == "."
-            || raw == ".."
-            || raw.contains('/')
-            || raw.contains('\\');
-        if path_like {
+        if selector_is_path_like(&self.shared.context.cwd, raw) {
             let dir = canonical_directory(&self.shared.context.cwd, &candidate)?;
             let resolved = crate::codebase::resolve(&self.shared.base, &dir)
                 .await
@@ -464,10 +461,7 @@ impl McpServer {
         let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
         let gate = initial_gate_for_path(&self.shared.leases, &dir).await;
         match gate {
-            Some(gate) => gate
-                .wait()
-                .await
-                .map_err(|e| format!("initial index failed — {e}")),
+            Some(gate) => gate.wait().await.map_err(|e| initial_index_failed(&e)),
             None => Ok(()),
         }
     }
@@ -642,6 +636,22 @@ impl McpServer {
     }
 }
 
+/// Whether a selector names a directory rather than a codebase id.
+///
+/// A bare relative name is probed against the session's working directory, not
+/// against the process working directory. One process serves sessions invoked
+/// from several directories, and the daemon's own directory is not any
+/// session's.
+fn selector_is_path_like(cwd: &Path, raw: &str) -> bool {
+    let candidate = Path::new(raw);
+    candidate.is_absolute()
+        || raw == "."
+        || raw == ".."
+        || raw.contains('/')
+        || raw.contains('\\')
+        || cwd.join(candidate).is_dir()
+}
+
 /// Resolve a selector path to a canonical directory.
 ///
 /// A relative selector resolves against the session's working directory, not
@@ -764,17 +774,21 @@ pub async fn run(cli: &Cli) -> Result<()> {
 
     // Detached, best-effort check for a newer published CLI.
     server.start_update_check();
-    server.bind_at_startup().await;
+    // Detached as well, so `initialize` is answered while the bind runs. This
+    // process owns the task and aborts it when the host disconnects.
+    let binding = tokio::spawn({
+        let server = server.clone();
+        async move { server.bind_at_startup().await }
+    });
 
     let service = server
         .serve(rmcp::transport::stdio())
         .await
         .map_err(|e| anyhow::anyhow!("rmcp serve: {e}"))?;
 
-    service
-        .waiting()
-        .await
-        .map_err(|e| anyhow::anyhow!("rmcp wait: {e}"))?;
+    let outcome = service.waiting().await;
+    binding.abort();
+    outcome.map_err(|e| anyhow::anyhow!("rmcp wait: {e}"))?;
     Ok(())
 }
 

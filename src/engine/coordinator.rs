@@ -443,7 +443,13 @@ impl CheckoutCoordinator {
         // cancelled coordinator has no gate waiter left to orphan.
         abort(&self.gate_task);
         // 2. The watch registration, so no event can reach a dead loop.
-        *lock(&self.watch) = Watch::Unavailable("coordinator cancelled".to_string());
+        let released = std::mem::replace(
+            &mut *lock(&self.watch),
+            Watch::Unavailable("coordinator cancelled".to_string()),
+        );
+        if let Watch::Active(registration) = released {
+            release_watch(registration);
+        }
         // 3. The client goes with the last handle to this coordinator.
         debug!(root = %self.root.display(), "coordinator cancelled");
     }
@@ -933,6 +939,25 @@ pub(crate) fn initial_job_result(
 /// served; refusing would strand it with no way to cancel it.
 fn lock<T>(value: &StdMutex<T>) -> MutexGuard<'_, T> {
     value.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Give up a watch registration on the blocking pool.
+///
+/// Releasing a registration takes the watch hub's mutex, and another
+/// registration can hold that mutex while it walks a tree. `cancel` runs on a
+/// runtime worker — the registry's idle sweeper and a draining daemon both
+/// call it — so dropping the registration there would block a worker for the
+/// length of that walk.
+///
+/// Without a runtime the drop happens here, on the caller's own thread, which
+/// is already outside any runtime.
+fn release_watch(registration: WatchRegistration) {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn_blocking(move || drop(registration));
+        }
+        Err(_) => drop(registration),
+    }
 }
 
 fn abort(slot: &StdMutex<Option<JoinHandle<()>>>) {

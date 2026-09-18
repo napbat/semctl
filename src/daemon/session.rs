@@ -70,7 +70,12 @@ pub(super) async fn serve(
     // engine for the process-wide update check on this session's behalf, then
     // resolve this session's codebase before the first tool call.
     server.start_update_check();
-    server.bind_at_startup().await;
+    // Detached, so `initialize` is answered while the bind runs. This session
+    // owns the task and aborts it below, so no bind outlives its session.
+    let binding = tokio::spawn({
+        let server = server.clone();
+        async move { server.bind_at_startup().await }
+    });
 
     match server.serve(stream).await {
         Ok(service) => {
@@ -83,6 +88,7 @@ pub(super) async fn serve(
         }
         Err(error) => warn!(%error, session = session.id(), "could not serve the session"),
     }
+    binding.abort();
     info!(session = session.id(), "session ended");
     // Dropping `session` here decrements the session count and wakes the idle
     // timer. The connection guard goes with the task.

@@ -20,7 +20,7 @@ use super::tool_types::{
 };
 use super::{
     DIRECT_EDIT_TOOLS, InitialIndexGate, McpServer, client, initial_gate_for_path,
-    ready_for_codebases,
+    initial_index_failed, ready_for_codebases, selector_is_path_like,
 };
 use crate::engine::Engine;
 use crate::engine::coordinator::{CheckoutCoordinator, IdleReconciler};
@@ -169,6 +169,74 @@ async fn scoped_readiness_allows_registration_and_holds_new_indexes_out() {
     .await
     .expect("registration and completion must not require the lease write lock");
     assert!(leases.try_write().is_ok());
+}
+
+/// A first index belongs to the checkout's coordinator, which every session on
+/// that checkout shares. A second session's startup bind must not wait for it:
+/// in the daemon that would hold this session's `initialize` behind another
+/// session's embedding, and behind a gate that failed it would hold it for the
+/// life of the session.
+#[tokio::test]
+async fn a_second_sessions_startup_bind_does_not_wait_for_another_first_index() {
+    let engine = Engine::for_test(Arc::new(IdleReconciler));
+    let root = PathBuf::from("shared-checkout");
+    let first = session(
+        client::Client::for_test("codebase", Some(root.clone())),
+        "first-launch",
+        true,
+        engine.clone(),
+    );
+    // Never finished: this is the first session's embedding, still running.
+    let _pending = first_index(&first, "codebase", &root).await;
+
+    let base = client::Client::for_test("codebase", Some(root.clone()));
+    let second = session(base.clone(), root.clone(), true, engine);
+    attach(&second, &base, &root).await;
+
+    tokio::time::timeout(Duration::from_secs(1), second.bind_at_startup())
+        .await
+        .expect("the startup bind must not wait for another session's first index");
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), second.bound())
+            .await
+            .is_err(),
+        "a retrieval call still waits for the first index"
+    );
+}
+
+/// A failed first index stays failed until something asks for that index
+/// again, so the message a retrieval call reports must name the recovery.
+#[test]
+fn a_failed_first_index_reports_how_to_retry() {
+    let message = initial_index_failed("embedding job 7 failed");
+
+    assert!(message.contains("embedding job 7 failed"), "{message}");
+    assert!(
+        message.contains("call `index_codebase` for this path to retry"),
+        "{message}"
+    );
+}
+
+/// A bare relative selector names a directory under the session's working
+/// directory, never under the process working directory: one daemon serves
+/// sessions invoked from many trees, and its own directory is not any
+/// session's.
+#[test]
+fn a_relative_selector_is_a_path_under_the_session_directory() {
+    let session_dir = tempfile::tempdir().expect("temporary session directory");
+    std::fs::create_dir(session_dir.path().join("sub")).expect("create the checkout");
+    let elsewhere = tempfile::tempdir().expect("another session directory");
+
+    assert!(selector_is_path_like(session_dir.path(), "sub"));
+    assert!(
+        !selector_is_path_like(elsewhere.path(), "sub"),
+        "another session's directory holds no such checkout"
+    );
+    assert!(!selector_is_path_like(session_dir.path(), "codebase-id"));
+    for raw in [".", "..", "a/b", "/absolute"] {
+        assert!(selector_is_path_like(elsewhere.path(), raw), "{raw}");
+    }
 }
 
 /// A named scope must not wait for a checkout it cannot include, before or
