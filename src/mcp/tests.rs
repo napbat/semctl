@@ -97,6 +97,23 @@ async fn first_index_gate_blocks_until_embedding_is_ready() {
     assert_eq!(gate.wait().await, Ok(()));
 }
 
+/// A gate is reported once. A later report describes another run of the same
+/// first index, and accepting it would turn a succeeded index into a failed
+/// one for every session that already read the result.
+#[tokio::test]
+async fn one_run_claims_the_gate_poll_and_the_first_result_stands() {
+    let gate = InitialIndexGate::pending();
+    assert!(gate.claim_poll().await, "the first run polls this gate");
+    assert!(
+        !gate.claim_poll().await,
+        "a second run must not start a second poll"
+    );
+
+    gate.finish(Ok(())).await;
+    gate.finish(Err("a later run failed".into())).await;
+    assert_eq!(gate.wait().await, Ok(()));
+}
+
 #[tokio::test]
 async fn first_index_completion_releases_active_waiters() {
     let gate = InitialIndexGate::pending();
@@ -338,7 +355,9 @@ async fn checkout_readiness_does_not_use_another_checkouts_codebase_gate() {
     second_gate
         .register_codebase("shared-codebase".into())
         .await;
-    second_gate.finish(Ok(())).await;
+    second_gate
+        .finish(Err("another checkout failed".into()))
+        .await;
 
     assert!(
         tokio::time::timeout(
@@ -346,12 +365,10 @@ async fn checkout_readiness_does_not_use_another_checkouts_codebase_gate() {
             server.await_initial_client(&first)
         )
         .await
-        .is_err()
+        .is_err(),
+        "another checkout's first index must not answer for this one"
     );
     first_gate.finish(Ok(())).await;
-    second_gate
-        .finish(Err("another checkout failed".into()))
-        .await;
     assert_eq!(server.await_initial_client(&first).await, Ok(()));
 
     let rootless = client::Client::for_test("shared-codebase", None);

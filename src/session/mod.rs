@@ -22,6 +22,14 @@ pub(crate) use credentials::{CredentialScope, CredentialSource};
 
 /// Seconds between periodic re-syncs. Unset means the built-in default.
 const RESYNC_SECS_VAR: &str = "SEMCTX_MCP_RESYNC_SECS";
+/// Longest re-sync interval a session may ask for: seven days.
+///
+/// The interval reaches a coordinator's periodic timer as an offset from now.
+/// A value near the numeric limit would overflow that arithmetic, and it is
+/// external data: it arrives from an environment variable or from an attach
+/// body. Seven days is far longer than any real backstop and safely inside
+/// every instant this program computes from it.
+const MAX_RESYNC_SECS: u64 = 7 * 24 * 60 * 60;
 /// `0` turns the startup update check off. Any other value leaves it on.
 const UPDATE_CHECK_VAR: &str = "SEMCTX_MCP_UPDATE_CHECK";
 
@@ -117,7 +125,8 @@ impl SessionContext {
             // One rule decides what counts as a credential, whether the token
             // came from this process or from an attach body.
             credentials: CredentialSource::from_token(request.token.as_ref().map(Token::expose)),
-            resync_secs: request.resync_secs,
+            // External data, clamped exactly as the environment value is.
+            resync_secs: clamp_resync_secs(request.resync_secs),
             update_check: request.update_check,
         })
     }
@@ -188,7 +197,14 @@ impl SessionRequest {
 /// Parse the re-sync interval. An absent or unreadable value means "use the
 /// indexing default", which keeps a typo from disabling the drift backstop.
 fn parse_resync_secs(raw: Option<&str>) -> Option<u64> {
-    raw.and_then(|value| value.trim().parse().ok())
+    clamp_resync_secs(raw.and_then(|value| value.trim().parse().ok()))
+}
+
+/// Hold a re-sync interval to [`MAX_RESYNC_SECS`].
+///
+/// One rule for both sources: the process environment and the attach body.
+fn clamp_resync_secs(secs: Option<u64>) -> Option<u64> {
+    secs.map(|secs| secs.min(MAX_RESYNC_SECS))
 }
 
 /// Only the exact value `0` turns the update check off.
@@ -201,8 +217,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        CredentialSource, Environment, PER_SESSION_VARS, SessionContext, SessionRequest, Token,
-        parse_resync_secs, update_check_enabled,
+        CredentialSource, Environment, MAX_RESYNC_SECS, PER_SESSION_VARS, SessionContext,
+        SessionRequest, Token, parse_resync_secs, update_check_enabled,
     };
     use crate::cli::{Cli, Command};
 
@@ -270,6 +286,26 @@ mod tests {
         assert_eq!(parse_resync_secs(Some("")), None);
         assert_eq!(parse_resync_secs(Some("soon")), None);
         assert_eq!(parse_resync_secs(Some("-5")), None);
+    }
+
+    /// The interval becomes an offset from now in a coordinator's periodic
+    /// timer. A value near the numeric limit is external data, so it is held
+    /// to the documented maximum on both paths into a context.
+    #[test]
+    fn an_impossible_resync_interval_is_held_to_the_maximum() {
+        assert_eq!(parse_resync_secs(Some("604800")), Some(MAX_RESYNC_SECS));
+        assert_eq!(
+            parse_resync_secs(Some(&u64::MAX.to_string())),
+            Some(MAX_RESYNC_SECS)
+        );
+        assert_eq!(parse_resync_secs(Some("604801")), Some(MAX_RESYNC_SECS));
+
+        let context = SessionContext::from_handshake(SessionRequest {
+            resync_secs: Some(u64::MAX),
+            ..request("/work", None)
+        })
+        .expect("an absolute working directory is accepted");
+        assert_eq!(context.resync_secs, Some(MAX_RESYNC_SECS));
     }
 
     fn request(cwd: &str, token: Option<&str>) -> SessionRequest {

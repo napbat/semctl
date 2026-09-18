@@ -460,7 +460,20 @@ impl CheckoutCoordinator {
             WatcherState::Unavailable(_) => 1,
         };
         let period = Duration::from_secs(secs.saturating_mul(multiplier));
-        let first = Instant::now() + period + jitter(&self.root, period);
+        // The interval comes from a session, so it is external data. An
+        // interval that cannot name an instant disables the backstop rather
+        // than ending this loop with an arithmetic overflow; the session's
+        // startup run and its explicit triggers still reconcile.
+        let Some(first) = period
+            .checked_add(jitter(&self.root, period))
+            .and_then(|offset| Instant::now().checked_add(offset))
+        else {
+            warn!(
+                secs = period.as_secs(),
+                "periodic re-sync interval is out of range; the periodic re-sync is disabled"
+            );
+            return None;
+        };
         info!(secs = period.as_secs(), "periodic re-sync enabled");
         let mut timer = interval_at(tokio::time::Instant::from_std(first), period);
         timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -483,23 +496,29 @@ impl CheckoutCoordinator {
     /// for that registration is what keeps the coordinator from racing the
     /// caller into a second codebase for the same checkout.
     async fn await_codebase(&self, gate: Option<&Arc<InitialIndexGate>>) -> bool {
-        if self.codebase_id.lock().await.is_some() {
-            return true;
-        }
         let Some(gate) = gate else {
             // No first index is in progress. `sync` resolves or registers the
             // codebase itself, which is the `semctl index` contract.
             return true;
         };
+        // A present gate is always awaited, and its codebase wins over the one
+        // this coordinator holds. A checkout is re-indexed into a new codebase
+        // when the server deleted the old one, and the gate carries that new
+        // id; reconciling into the stored id would upload into a codebase that
+        // no longer exists.
         if let Some(id) = gate.registered_codebase().await {
             *self.codebase_id.lock().await = Some(id);
             return true;
         }
-        // The caller finished the gate before it named a codebase. There is
-        // nothing to sync into, and registering one here would index a checkout
-        // nobody asked to index.
-        debug!(root = %self.root.display(), "first index ended before it named a codebase");
-        false
+        // The caller finished the gate before it named a codebase. A codebase
+        // this coordinator already holds still names something to reconcile
+        // into; with none there is nothing to sync into, and registering one
+        // here would index a checkout nobody asked to index.
+        let stored = self.codebase_id.lock().await.clone();
+        if stored.is_none() {
+            debug!(root = %self.root.display(), "first index ended before it named a codebase");
+        }
+        stored.is_some()
     }
 
     /// One reconcile, from permit to recorded result.
@@ -542,7 +561,8 @@ impl CheckoutCoordinator {
                 reconciler,
                 client,
                 result.map(|outcome| outcome.job_id),
-            );
+            )
+            .await;
         }
         let status = self.status().await.to_string();
         debug!(%status, trigger = trigger.as_str(), "reconcile finished");
@@ -607,13 +627,22 @@ impl CheckoutCoordinator {
     /// Detached: embedding can take minutes, and the loop must stay free to
     /// pick up edits made while it runs. The handle is kept so cancellation
     /// stops the poll.
-    fn finish_gate(
+    ///
+    /// Exactly one run polls one gate. A second reconcile that starts while
+    /// embedding runs sees the same pending gate, and a second poll would both
+    /// replace the tracked handle and let the poll that finished last decide
+    /// the result. The claim is taken before the task is spawned, so the
+    /// handle this call records always belongs to the poll that reports.
+    async fn finish_gate(
         self: &Arc<Self>,
         gate: Arc<InitialIndexGate>,
         reconciler: &Arc<dyn Reconciler>,
         client: Client,
         job: Result<String, String>,
     ) {
+        if !gate.claim_poll().await {
+            return;
+        }
         let reconciler = reconciler.clone();
         let handle = tokio::spawn(async move {
             if gate.outcome().await.is_some() {

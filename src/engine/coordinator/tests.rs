@@ -18,6 +18,7 @@ use super::{
 };
 use crate::client::{Client, api};
 use crate::engine::registry::CheckoutKey;
+use crate::mcp::readiness::InitialIndexGate;
 use crate::sync::policy;
 
 /// Somewhere no test writes, so a coordinator that starts reading the
@@ -28,25 +29,43 @@ const TEST_ROOT: &str = "/semctl-test-checkout";
 /// lets it.
 struct CountingReconciler {
     runs: AtomicUsize,
+    /// How many embedding-job polls this reconciler was asked for.
+    polls: AtomicUsize,
     started: mpsc::UnboundedSender<()>,
     /// Each run takes one permit. A test that adds none holds the run open.
     release: Arc<Semaphore>,
+    /// Each job poll takes one permit, so a test can hold a first index open.
+    finish_polls: Arc<Semaphore>,
 }
 
 impl CountingReconciler {
     fn new() -> (Arc<Self>, Runs) {
         let (started, starts) = mpsc::unbounded_channel();
         let release = Arc::new(Semaphore::new(0));
+        let finish_polls = Arc::new(Semaphore::new(0));
         let reconciler = Arc::new(Self {
             runs: AtomicUsize::new(0),
+            polls: AtomicUsize::new(0),
             started,
             release: release.clone(),
+            finish_polls: finish_polls.clone(),
         });
-        (reconciler.clone(), Runs { starts, release })
+        (
+            reconciler.clone(),
+            Runs {
+                starts,
+                release,
+                finish_polls,
+            },
+        )
     }
 
     fn count(&self) -> usize {
         self.runs.load(Ordering::Acquire)
+    }
+
+    fn polls(&self) -> usize {
+        self.polls.load(Ordering::Acquire)
     }
 }
 
@@ -54,12 +73,18 @@ impl CountingReconciler {
 struct Runs {
     starts: mpsc::UnboundedReceiver<()>,
     release: Arc<Semaphore>,
+    finish_polls: Arc<Semaphore>,
 }
 
 impl Runs {
     /// Let `count` runs finish.
     fn release(&self, count: usize) {
         self.release.add_permits(count);
+    }
+
+    /// Let `count` embedding-job polls finish.
+    fn release_polls(&self, count: usize) {
+        self.finish_polls.add_permits(count);
     }
 
     /// Wait for the next run to start.
@@ -102,7 +127,15 @@ impl Reconciler for CountingReconciler {
     }
 
     fn await_job(&self, _client: Client, _job_id: String) -> super::JobAwaited {
-        Box::pin(async { Ok(()) })
+        self.polls.fetch_add(1, Ordering::AcqRel);
+        let finish = self.finish_polls.clone();
+        Box::pin(async move {
+            // Only a closed semaphore fails, and no test closes one.
+            if let Ok(permit) = finish.acquire().await {
+                permit.forget();
+            }
+            Ok(())
+        })
     }
 }
 
@@ -111,17 +144,27 @@ impl Reconciler for CountingReconciler {
 async fn coordinator(
     reconciler: Arc<dyn Reconciler>,
 ) -> (Arc<CheckoutCoordinator>, CoordinatorTask) {
+    // A unit test must not depend on a timer.
+    build(reconciler, None, Some(0)).await
+}
+
+/// [`coordinator`], with the first-index gate and the re-sync interval a test
+/// needs.
+async fn build(
+    reconciler: Arc<dyn Reconciler>,
+    gate: Option<Arc<InitialIndexGate>>,
+    resync_secs: Option<u64>,
+) -> (Arc<CheckoutCoordinator>, CoordinatorTask) {
     let client = Client::for_test("codebase", None);
     let (_sender, batches) = mpsc::channel(4);
     CheckoutCoordinator::new(CoordinatorSetup {
         key: CheckoutKey::for_client(&client, PathBuf::from(TEST_ROOT)).await,
         client,
-        // A unit test must not depend on a timer.
-        resync_secs: Some(0),
+        resync_secs,
         watch: Err("no watcher in tests".to_string()),
         batches,
         overflow: Arc::new(AtomicBool::new(false)),
-        gate: None,
+        gate,
         reconciler,
         scan_permits: Arc::new(Semaphore::new(2)),
         limits: SyncLimits::new(Arc::new(Semaphore::new(2))),
@@ -243,6 +286,87 @@ async fn status_reports_the_last_job_and_the_watcher_state() {
     assert!(!status.running);
     assert!(status.last_error.is_none());
     assert!(status.to_string().contains("job job"));
+}
+
+/// A second reconcile during embedding sees the same pending gate. It must not
+/// start a second poll: the poll that finished last would otherwise decide the
+/// result for every session, and a succeeded first index could turn failed.
+#[tokio::test]
+async fn a_second_run_does_not_poll_a_gate_that_is_already_polled() {
+    let (reconciler, mut runs) = CountingReconciler::new();
+    let gate = Arc::new(InitialIndexGate::pending());
+    let (coordinator, task) = build(reconciler.clone(), Some(gate.clone()), Some(0)).await;
+    gate.register_codebase("codebase".to_string()).await;
+    task.spawn();
+
+    coordinator.trigger(Trigger::Startup);
+    runs.release(1);
+    runs.next_start().await;
+    // The second run starts after the first finished, so the first run's claim
+    // on the gate is already taken when the second reports its job.
+    coordinator.trigger(Trigger::Explicit);
+    runs.release(1);
+    runs.next_start().await;
+    runs.no_further_start().await;
+
+    assert_eq!(reconciler.count(), 2, "both runs must reconcile");
+    assert_eq!(reconciler.polls(), 1, "one gate is polled once");
+
+    runs.release_polls(1);
+    let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(outcome) = gate.outcome().await {
+                return outcome;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the one poll reports the first index");
+    assert_eq!(outcome, Ok(()));
+}
+
+/// A checkout is re-indexed into a new codebase when the server deleted the
+/// old one. The gate carries the new id, and reconciling into the stored one
+/// would upload into a codebase that no longer exists.
+#[tokio::test]
+async fn the_gates_codebase_replaces_the_one_the_coordinator_holds() {
+    let (reconciler, _runs) = CountingReconciler::new();
+    let gate = Arc::new(InitialIndexGate::pending());
+    let (coordinator, _task) = build(reconciler, Some(gate.clone()), Some(0)).await;
+    assert_eq!(coordinator.codebase_id().await.as_deref(), Some("codebase"));
+
+    gate.register_codebase("re-indexed".to_string()).await;
+
+    assert!(coordinator.await_codebase(Some(&gate)).await);
+    assert_eq!(
+        coordinator.codebase_id().await.as_deref(),
+        Some("re-indexed")
+    );
+}
+
+/// A gate that ended without naming a codebase leaves the stored one in place,
+/// so a later explicit sync still has somewhere to reconcile into.
+#[tokio::test]
+async fn a_gate_without_a_codebase_keeps_the_stored_one() {
+    let (reconciler, _runs) = CountingReconciler::new();
+    let gate = Arc::new(InitialIndexGate::pending());
+    let (coordinator, _task) = build(reconciler, Some(gate.clone()), Some(0)).await;
+    gate.finish(Err("embedding failed".to_string())).await;
+
+    assert!(coordinator.await_codebase(Some(&gate)).await);
+    assert_eq!(coordinator.codebase_id().await.as_deref(), Some("codebase"));
+}
+
+/// The interval reaches this timer from a session, so it is external data. An
+/// interval that cannot name an instant must disable the backstop rather than
+/// end the reconcile loop.
+#[tokio::test]
+async fn an_impossible_resync_interval_disables_the_periodic_timer() {
+    let (reconciler, _runs) = CountingReconciler::new();
+    let (coordinator, _task) = build(reconciler, None, Some(u64::MAX)).await;
+
+    assert!(coordinator.periodic_timer().is_none());
 }
 
 /// The offset spreads coordinators without a random-number source, and one

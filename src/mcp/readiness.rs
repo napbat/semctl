@@ -113,6 +113,9 @@ pub(crate) struct InitialIndexGate {
 struct InitialIndexState {
     /// Whether a caller has taken responsibility for registering the codebase.
     registering: bool,
+    /// Whether a reconcile has taken responsibility for polling the embedding
+    /// job of this first index.
+    polling: bool,
     codebase_id: Option<String>,
     result: Option<Result<(), String>>,
 }
@@ -146,6 +149,25 @@ impl InitialIndexGate {
             return false;
         }
         state.registering = true;
+        true
+    }
+
+    /// Take responsibility for polling this first index's embedding job.
+    ///
+    /// Exactly one reconcile is answered `true` for one gate. A second
+    /// reconcile that starts while embedding runs sees the same pending gate;
+    /// without this claim it would start a second poll of a second job, and
+    /// whichever poll finished last would decide the result for every session.
+    ///
+    /// The claim is never given back. A gate that failed is replaced with a
+    /// fresh one by [`crate::engine::coordinator::CheckoutCoordinator::renew_first_index_gate`],
+    /// and a cancelled coordinator has no waiter left to answer.
+    pub(crate) async fn claim_poll(&self) -> bool {
+        let mut state = self.state.lock().await;
+        if state.polling {
+            return false;
+        }
+        state.polling = true;
         true
     }
 
@@ -195,8 +217,18 @@ impl InitialIndexGate {
         }
     }
 
+    /// Record the outcome of this first index, first writer wins.
+    ///
+    /// A gate is reported once. A later report describes another run of the
+    /// same first index, and accepting it would let a succeeded index turn
+    /// into a failed one for every session that already read the result.
     pub(crate) async fn finish(&self, result: Result<(), String>) {
-        self.state.lock().await.result = Some(result);
+        let mut state = self.state.lock().await;
+        if state.result.is_some() {
+            return;
+        }
+        state.result = Some(result);
+        drop(state);
         self.changed.notify_waiters();
     }
 }
