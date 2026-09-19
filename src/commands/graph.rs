@@ -12,25 +12,22 @@ use crate::query;
 
 #[derive(Debug, Subcommand)]
 pub enum GraphCommand {
-    /// File→file import edges (the resolution layer). Coverage depends on the
-    /// language pack: Rust resolves these, C# declines (namespaces aren't
-    /// files), and C++ include edges were empty in the last audit.
+    /// File→file import edges (the resolution layer). Rust resolves these; C#
+    /// has no file-level imports; C++ include edges are not resolved yet.
     Imports,
     /// Reference→definition symbol bindings via the project-qualified moniker
     /// index (the resolution layer). Any resolving language pack; C++ needs
-    /// build context in the checkout (a CMakeLists.txt or compile database).
+    /// build context.
     SymbolEdges,
     /// Cross-codebase links — this codebase's imports resolved into other
     /// codebases you can see.
     ExternalLinks,
-    /// Chunks that define a symbol (symbol graph — every registered language
-    /// pack; C++ needs build context).
+    /// Chunks that define a symbol (symbol graph — any registered language pack).
     Definitions {
         /// Exact symbol name.
         symbol: String,
     },
-    /// Chunks that reference a symbol (symbol graph — every registered
-    /// language pack; C++ needs build context).
+    /// Chunks that reference a symbol (symbol graph — any registered language pack).
     References {
         /// Exact symbol name.
         symbol: String,

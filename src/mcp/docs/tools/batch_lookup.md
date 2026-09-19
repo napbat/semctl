@@ -14,4 +14,4 @@ Resolve many symbols in one call — for each name, its definitions (or referenc
 ## Notes
 
 - Each result echoes its `symbol`, so you can match results back without re-deriving keys; a name with no match comes back with an empty hit list (not an error).
-- Same symbol graph as `find_definition` — exact, case-sensitive name match, scoped to the selected codebase (the launch/current codebase by default). Graph coverage follows the language packs registered on the server (Rust, C#, Go, TypeScript/JavaScript, and C++ on the current service). C++ needs build context in the checkout and can miss member declarations, so treat an empty C++ hit list as unconfirmed rather than as proof of absence.
+- Same symbol graph as `find_definition` — exact, case-sensitive name match, scoped to the selected codebase (the launch/current codebase by default). Graph coverage: the server's registered language packs — Rust, C#, Go, TypeScript/JavaScript, and C++ (C++ needs build context and can miss member declarations).

@@ -34,9 +34,7 @@ compact `path:line-range symbol` list. An empty group prints `(none)`. If the
 symbol has no definition, returns the same "did you mean" suggestions as
 `find_definition`.
 
-Symbol-graph coverage follows the language packs registered on the server —
-Rust, C#, Go, TypeScript/JavaScript, and C++ resolve on the current service.
-C++ callers and callees need build context in the checkout (a CMakeLists.txt
-or a compile database) and can still miss member calls, so cross-check an
-empty C++ group with `grep`. Files in a language without a registered pack
-aren't on the graph; use `search_codebase` or `grep` there.
+Coverage follows the server's registered language packs: Rust, C#, Go,
+TypeScript/JavaScript, and C++. C++ needs build context (a CMakeLists.txt or
+compile database) and can miss member calls — confirm an empty C++ group with
+`grep`. Other languages aren't on the graph — use `search_codebase` or `grep`.

@@ -14,6 +14,6 @@ Returns each implementing type as a chunk at its declaration. Deterministic and 
 
 ## Coverage
 
-Symbol-graph coverage follows the language packs registered on the server, not a fixed list. Rust, C#, Go, TypeScript/JavaScript, and C++ resolve on the current service. C++ needs build context in the checkout (a CMakeLists.txt or a compile database): without it, calls appear as plain names and cross-file bindings are missing, and even with it the graph can miss member declarations and member calls, so cross-check an empty C++ result with `grep`. A file in a language without a registered pack has no graph entries — use `search_codebase` or `grep` there.
+Coverage follows the server's registered language packs: Rust, C#, Go, TypeScript/JavaScript, and C++. C++ needs build context (a CMakeLists.txt or compile database) and can miss member declarations and calls — confirm an empty C++ result with `grep`. Other languages aren't on the graph — use `search_codebase` or `grep`.
 
-C++ records inheritance as an extends relation, not as implements, so this tool returns nothing for a C++ base class even when derived classes exist. Use `type_hierarchy` for C++ base and derived classes; an empty result here is not evidence that the hierarchy is missing.
+C++ inheritance is an extends relation, not implements: use `type_hierarchy` for C++ base and derived classes.
