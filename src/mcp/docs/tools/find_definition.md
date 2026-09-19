@@ -16,4 +16,4 @@ On a miss you get "Did you mean" suggestions (from a backing search) — retry w
 
 ## Coverage
 
-Symbol-graph languages: Rust, C#, Go, TypeScript/JavaScript. Files in other languages aren't on the graph — use `search_codebase` or `grep` there.
+Symbol-graph coverage follows the language packs registered on the server, not a fixed list. Rust, C#, Go, TypeScript/JavaScript, and C++ resolve on the current service. C++ needs build context in the checkout (a CMakeLists.txt or a compile database): without it, calls appear as plain names and cross-file bindings are missing, and even with it the graph can miss member declarations and member calls, so cross-check an empty C++ result with `grep`. A file in a language without a registered pack has no graph entries — use `search_codebase` or `grep` there.

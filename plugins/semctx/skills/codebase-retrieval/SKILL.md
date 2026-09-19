@@ -57,8 +57,8 @@ the last complete index.
 - Choose semctx for repository discovery, graph relationships, and broad indexed
   coverage. Batch independent exact lookups; avoid overlapping semantic queries.
 - Exact symbol, defined in this repo, in a graph language (Rust, C#, Go,
-  TypeScript/JS) → symbol-graph tools (`find_definition` / `find_references` /
-  `who_calls`), not search.
+  TypeScript/JS, and C++ with build context) → symbol-graph tools
+  (`find_definition` / `find_references` / `who_calls`), not search.
 - Semantic search responses share a server-enforced result-content budget.
   Start unexpanded, refine from ranked snippets, and expand only the relevant hit
   or small set. An expanded body normally replaces a follow-up file read.
@@ -73,8 +73,13 @@ the last complete index.
   hashes still match.
 - Cross-repository retrieval supplies evidence only. Modify another checkout or
   open a PR there only when it belongs to the user-requested edit scope.
-- Repo language outside the graph set (Python, Java, C++, …)? The symbol-graph
-  tools return nothing there — use `search_codebase` + `grep`.
+- Repo language without a registered language pack (Java, for example)? The
+  symbol-graph tools return nothing there — use `search_codebase` + `grep`.
+- C++ is on the graph, with limits: resolution needs build context in the
+  checkout (a CMakeLists.txt or a compile database), member declarations and
+  member calls can be missing, and inheritance appears through
+  `type_hierarchy` rather than `implementations_of`. Cross-check an empty C++
+  graph result with `grep` before concluding anything from it.
 - A prompt hook may already have injected likely-relevant hits. Treat them as
   leads when additional repository evidence is needed, and pull focused detail
   with `expand_chunk` / `file_outline` rather than issuing a fresh broad search.
