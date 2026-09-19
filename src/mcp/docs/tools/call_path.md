@@ -1,6 +1,6 @@
 Find a shortest call chain from one function to another — the sequence of definitions along one path of `calls` edges from `from` to `to`. Answers "how does X reach Y" / "is Y reachable from X through calls".
 
-Returns the chunks along the path in call order, or empty when no `calls`-edge path exists. Deterministic, exact-name on both ends. Symbol-graph coverage: Rust, C#, Go, TypeScript/JavaScript — files in other languages produce no call edges.
+Returns the chunks along the path in call order, or empty when no `calls`-edge path exists. Deterministic, exact-name on both ends. Coverage follows the server's registered language packs: Rust, C#, Go, TypeScript/JavaScript, and C++. C++ call edges need build context and can miss member calls; other languages produce no call edges.
 
 ## Use this when
 

@@ -62,7 +62,7 @@ freshness warnings.
    the matching edit action, which obtains the server plan internally and applies
    it after the host's normal approval.
 
-Prefer the symbol-graph tools over search whenever you have an exact name — they're cheaper and more precise. The symbol graph covers Rust, C#, Go, and TypeScript/JavaScript; for files in other languages the graph tools return nothing, so use `search_codebase` / `grep` there.
+Prefer the symbol-graph tools over search whenever you have an exact name — they're cheaper and more precise. Coverage follows the server's registered language packs: Rust, C#, Go, TypeScript/JavaScript, and C++. C++ needs build context in the checkout and can miss member declarations and calls, so confirm an empty C++ answer with `grep`. Other languages aren't on the graph — use `search_codebase` / `grep`.
 
 Expanded search bodies share the server's total result-content budget. `top_k` is
 an upper bound, not a guarantee that every full body fits. Use expanded bodies

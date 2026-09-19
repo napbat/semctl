@@ -4,7 +4,7 @@ This is a *neutral data-flow* surface — it tracks how values move across calls
 
 A **boundary** is an un-indexed callee the corpus crosses — a library/stdlib call (e.g. `env/var`, `fs/write`, a crate path). `to` matches a boundary moniker exactly or as a substring.
 
-Returns the list of source boundary monikers, or empty when nothing flows in. Flow coverage follows the symbol graph: Rust, C#, Go, TypeScript/JavaScript.
+Returns the list of source boundary monikers, or empty when nothing flows in. Flow coverage follows the resolved symbol graph: Rust, C#, Go, TypeScript/JavaScript. C++ flow needs build context and is not yet confirmed.
 
 ## Use this when
 

@@ -4,7 +4,7 @@ This is a *neutral data-flow* surface — it tracks how values move across funct
 
 A **boundary** is an un-indexed callee the corpus crosses — a library/stdlib call (e.g. `env/var`, `fs/write`, a crate path). `from` matches a boundary moniker exactly or as a substring.
 
-Returns the list of destination boundary monikers, or empty when the entering value doesn't reach any other boundary. Flow coverage follows the symbol graph: Rust, C#, Go, TypeScript/JavaScript.
+Returns the list of destination boundary monikers, or empty when the entering value doesn't reach any other boundary. Flow coverage follows the resolved symbol graph: Rust, C#, Go, TypeScript/JavaScript. C++ flow needs build context and is not yet confirmed.
 
 ## Use this when
 
