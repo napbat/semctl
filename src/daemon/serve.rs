@@ -42,7 +42,7 @@ use crate::session::PER_SESSION_VARS;
 const IDLE_SECS_VAR: &str = "SEMCTX_DAEMON_IDLE_SECS";
 
 /// Idle delay when `SEMCTX_DAEMON_IDLE_SECS` is unset or unreadable.
-const DEFAULT_IDLE: Duration = Duration::from_secs(600);
+const DEFAULT_IDLE: Duration = Duration::from_mins(10);
 
 /// Shortest time a daemon that has served no session stays alive.
 ///
@@ -710,7 +710,7 @@ mod tests {
 
         assert!(
             tokio::time::timeout(
-                Duration::from_secs(600),
+                Duration::from_mins(10),
                 sessions.wait_idle_for(Duration::from_secs(5))
             )
             .await
@@ -729,7 +729,7 @@ mod tests {
 
         let started = tokio::time::Instant::now();
         tokio::time::timeout(
-            Duration::from_secs(600),
+            Duration::from_mins(10),
             sessions.wait_idle_for(Duration::from_secs(5)),
         )
         .await
@@ -771,7 +771,7 @@ mod tests {
         let started = tokio::time::Instant::now();
 
         tokio::time::timeout(
-            STARTUP_GRACE + Duration::from_secs(60),
+            STARTUP_GRACE + Duration::from_mins(1),
             sessions.wait_idle_for(Duration::ZERO),
         )
         .await
@@ -793,7 +793,7 @@ mod tests {
         let started = tokio::time::Instant::now();
 
         tokio::time::timeout(
-            STARTUP_GRACE + Duration::from_secs(60),
+            STARTUP_GRACE + Duration::from_mins(1),
             sessions.wait_idle_for(Duration::ZERO),
         )
         .await
@@ -836,7 +836,7 @@ mod tests {
 
         assert!(
             tokio::time::timeout(
-                Duration::from_secs(60),
+                Duration::from_mins(1),
                 sessions.wait_idle_for(Duration::from_secs(1))
             )
             .await
@@ -846,7 +846,7 @@ mod tests {
 
         drop(connection);
         tokio::time::timeout(
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             sessions.wait_idle_for(Duration::from_secs(1)),
         )
         .await

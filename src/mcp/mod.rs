@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, OnceCell, RwLock};
 use tracing::{debug, info, warn};
 
 use crate::cli::Cli;
@@ -87,7 +87,12 @@ struct Shared {
     /// Launch working-copy root we resolve the current codebase against, derived
     /// from `context.cwd`. Registration occurs only through the explicit
     /// `index_codebase` tool.
-    dir: PathBuf,
+    ///
+    /// Resolved lazily by [`McpServer::dir`]: the resolution spawns a Git
+    /// process, and running it during construction held the daemon's attach
+    /// answer behind it, which pushed a burst of cold attaches past the
+    /// client's handshake deadline.
+    dir: OnceCell<PathBuf>,
     /// Codebase pinned up front (`--codebase` / `SEMCTX_CODEBASE` / config).
     /// The launch cwd is never synced into it; a separately cached local root can
     /// still be watched safely.
@@ -117,7 +122,7 @@ impl McpServer {
     /// `engine` is shared with every other session in this process. Everything
     /// else here belongs to this session: its client, its launch directory, and
     /// its codebase binding.
-    pub(crate) async fn new(context: SessionContext, engine: Arc<Engine>) -> Result<Self> {
+    pub(crate) fn new(context: SessionContext, engine: Arc<Engine>) -> Result<Self> {
         let base = client::from_context(
             &context,
             engine.transport(),
@@ -128,19 +133,37 @@ impl McpServer {
         // synced into the pinned id. A cached checkout root for that id can
         // still be watched safely.
         let pinned = base.codebase_raw().is_some();
-        // The launch directory: what we resolve against and, once indexed,
-        // auto-sync. The session context always carries one.
-        let launch = std::fs::canonicalize(&context.cwd).unwrap_or_else(|_| context.cwd.clone());
-        let dir = crate::codebase::working_copy_root(&launch).await;
-        Ok(Self::with_parts(context, base, dir, pinned, engine))
+        // The launch working-copy root is deliberately not resolved here. The
+        // daemon builds this server before it answers `attached`, so nothing
+        // that spawns a process or walks the filesystem may run yet; the
+        // first caller of [`Self::dir`] pays that cost instead.
+        Ok(Self::assemble(
+            context,
+            base,
+            OnceCell::new(),
+            pinned,
+            engine,
+        ))
     }
 
     /// The parts of one session, already resolved. Tests use it to serve a
     /// session without reading the configuration or the filesystem.
+    #[cfg(test)]
     fn with_parts(
         context: SessionContext,
         base: Client,
         dir: PathBuf,
+        pinned: bool,
+        engine: Arc<Engine>,
+    ) -> Self {
+        Self::assemble(context, base, OnceCell::new_with(Some(dir)), pinned, engine)
+    }
+
+    /// The one place a server is put together.
+    fn assemble(
+        context: SessionContext,
+        base: Client,
+        dir: OnceCell<PathBuf>,
         pinned: bool,
         engine: Arc<Engine>,
     ) -> Self {
@@ -157,6 +180,25 @@ impl McpServer {
             }),
             tool_router: tools::router(),
         }
+    }
+
+    /// This session's launch working-copy root: what the current codebase is
+    /// resolved against and, once indexed, auto-synced. Resolved once, on the
+    /// first use.
+    ///
+    /// The resolution canonicalizes the launch directory and asks Git for its
+    /// top level, which spawns a process. Deferring it keeps
+    /// [`McpServer::new`] cheap, so the daemon's attach answer never waits on
+    /// it. The session context always carries a launch directory.
+    async fn dir(&self) -> &PathBuf {
+        self.shared
+            .dir
+            .get_or_init(|| async {
+                let launch = std::fs::canonicalize(&self.shared.context.cwd)
+                    .unwrap_or_else(|_| self.shared.context.cwd.clone());
+                crate::codebase::working_copy_root(&launch).await
+            })
+            .await
     }
 
     /// Ask the engine for its one update check, on this session's behalf.
@@ -260,7 +302,7 @@ impl McpServer {
     /// unreachable" from "not indexed" — which the tool surfaces to the model
     /// verbatim. Self-healing: a later call retries from scratch.
     async fn bound(&self) -> std::result::Result<Client, String> {
-        self.await_initial_path(&self.shared.dir).await?;
+        self.await_initial_path(self.dir().await).await?;
         let client = self.bound_unchecked().await?;
         self.await_initial_client(&client).await?;
         Ok(client)
@@ -285,7 +327,7 @@ impl McpServer {
             return Ok(c);
         }
 
-        let dir = self.shared.dir.clone();
+        let dir = self.dir().await.clone();
 
         // Honest, local pre-check: an unauthenticated server can't resolve
         // anything, and that failure has nothing to do with the codebase — so
@@ -768,7 +810,7 @@ pub async fn run(cli: &Cli) -> Result<()> {
     // One engine per process. In standalone mode it serves exactly one session;
     // the type and the ownership are the same either way.
     let engine = Engine::new(EngineSettings::from_environment())?;
-    let server = McpServer::new(context, engine).await?;
+    let server = McpServer::new(context, engine)?;
 
     // Detached, best-effort check for a newer published CLI.
     server.start_update_check();

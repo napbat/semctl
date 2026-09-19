@@ -372,6 +372,28 @@ pub(crate) async fn connect(endpoint: &Endpoint, deadline: Instant) -> Result<St
     Ok(stream)
 }
 
+/// Whether a failed [`connect`] proves a live daemon serves the endpoint.
+///
+/// Windows reports a busy pipe when a daemon exists but every listening
+/// instance is taken: the daemon is alive and saturated, so starting another
+/// daemon would only add an election loser to an endpoint already under
+/// load. A Unix domain socket has no busy answer — its listener queues
+/// connections — so no failure there proves a daemon is alive.
+pub(crate) fn connect_found_a_busy_daemon(error: &anyhow::Error) -> bool {
+    #[cfg(windows)]
+    {
+        error
+            .chain()
+            .filter_map(|cause| cause.downcast_ref::<io::Error>())
+            .any(windows::is_busy)
+    }
+    #[cfg(unix)]
+    {
+        let _ = error;
+        false
+    }
+}
+
 /// Attach to the daemon and copy bytes until the connection ends.
 ///
 /// This is the transport half of the client role. It builds its own
@@ -445,7 +467,7 @@ where
         }
         return Err(error).context("send the attach request");
     }
-    let line = match handshake::read_line_async(&mut stream).await {
+    let line = match handshake::read_attach_answer_async(&mut stream).await {
         Ok(line) => line,
         Err(error) if connection_lost(&error) => return Ok(None),
         Err(error) => return Err(error).context("read the attach answer"),

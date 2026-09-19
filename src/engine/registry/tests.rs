@@ -25,7 +25,7 @@ fn root(name: &str) -> PathBuf {
 /// whole point of the registry: one watcher and one cache per checkout.
 #[tokio::test]
 async fn one_key_is_one_coordinator() {
-    let registry = registry(Duration::from_secs(300));
+    let registry = registry(Duration::from_mins(5));
     let client = Client::for_test("codebase", None);
 
     let first = registry
@@ -46,7 +46,7 @@ async fn one_key_is_one_coordinator() {
 /// may read and write what the other may not.
 #[tokio::test]
 async fn different_credential_scopes_do_not_share_a_checkout() {
-    let registry = registry(Duration::from_secs(300));
+    let registry = registry(Duration::from_mins(5));
     let stored = Client::for_test("codebase", None);
     let invocation = stored
         .clone()
@@ -68,7 +68,7 @@ async fn different_credential_scopes_do_not_share_a_checkout() {
 /// Different roots are different checkouts even under one codebase id.
 #[tokio::test]
 async fn different_roots_are_different_coordinators() {
-    let registry = registry(Duration::from_secs(300));
+    let registry = registry(Duration::from_mins(5));
     let client = Client::for_test("codebase", None);
 
     let first = registry
@@ -116,7 +116,7 @@ async fn an_unleased_coordinator_is_released_after_the_idle_grace() {
 /// host keeps the warm content cache and the existing watch.
 #[tokio::test]
 async fn an_attach_inside_the_grace_reuses_the_coordinator() {
-    let registry = registry(Duration::from_secs(300));
+    let registry = registry(Duration::from_mins(5));
     let client = Client::for_test("codebase", None);
     let first = registry
         .attach(client.clone(), root("warm"), Some(0))
@@ -138,7 +138,7 @@ async fn an_attach_inside_the_grace_reuses_the_coordinator() {
 /// registered, and two callers on one checkout share it.
 #[tokio::test]
 async fn a_first_index_gate_is_shared_while_it_is_pending() {
-    let registry = registry(Duration::from_secs(300));
+    let registry = registry(Duration::from_mins(5));
     let client = Client::for_test("codebase", None);
 
     let (first_lease, first_gate) = registry
@@ -165,7 +165,7 @@ async fn a_first_index_gate_is_shared_while_it_is_pending() {
 /// not the old failure.
 #[tokio::test]
 async fn a_failed_first_index_gate_is_replaced() {
-    let registry = registry(Duration::from_secs(300));
+    let registry = registry(Duration::from_mins(5));
     let client = Client::for_test("codebase", None);
     let (_lease, failed) = registry
         .attach_first_index(client.clone(), root("retry"), Some(0))
@@ -194,7 +194,7 @@ async fn a_failed_first_index_gate_is_replaced() {
 /// serves both and the gate stays with it.
 #[tokio::test]
 async fn a_plain_attach_and_a_first_index_share_one_coordinator() {
-    let registry = registry(Duration::from_secs(300));
+    let registry = registry(Duration::from_mins(5));
     let client = Client::for_test("codebase", None);
     let plain = registry
         .attach(client.clone(), root("both"), Some(0))
@@ -266,7 +266,7 @@ async fn a_checkout_key_names_the_root_and_hides_the_credential() {
 /// bookkeeping.
 #[tokio::test]
 async fn a_lease_reports_the_key_it_was_taken_for() {
-    let registry = registry(Duration::from_secs(300));
+    let registry = registry(Duration::from_mins(5));
     let client = Client::for_test("codebase", None);
     let lease = registry
         .attach(client.clone(), root("keyed"), Some(0))

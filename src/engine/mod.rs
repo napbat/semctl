@@ -32,7 +32,7 @@ pub(crate) use watch_hub::WatchHub;
 
 /// How long a coordinator with no lease stays alive. A session that reconnects
 /// within the grace reuses the watcher and the content cache it left behind.
-const DEFAULT_IDLE_GRACE: Duration = Duration::from_secs(300);
+const DEFAULT_IDLE_GRACE: Duration = Duration::from_mins(5);
 
 /// How often the registry looks for coordinators no session holds.
 const SWEEP_EVERY: Duration = Duration::from_secs(30);

@@ -586,10 +586,10 @@ impl McpServer {
 
     #[tool]
     async fn index_codebase(&self, Parameters(args): Parameters<IndexCodebaseArgs>) -> String {
-        let requested = args
-            .path
-            .as_deref()
-            .map_or_else(|| self.shared.dir.clone(), PathBuf::from);
+        let requested = match args.path.as_deref() {
+            Some(path) => PathBuf::from(path),
+            None => self.dir().await.clone(),
+        };
         let dir = match canonical_directory(&self.shared.context.cwd, &requested) {
             Ok(dir) => dir,
             Err(e) => return format!("index_codebase unavailable — {e}"),
@@ -628,7 +628,7 @@ impl McpServer {
                     .clone()
                     .with_codebase(resolved.id.clone())
                     .with_local_root(Some(dir.clone()));
-                if !self.shared.pinned && self.shared.dir == dir {
+                if !self.shared.pinned && self.dir().await == &dir {
                     *self.shared.bound.lock().await = Some(client.clone());
                 }
                 self.watch_once(client, dir.clone()).await;
@@ -683,7 +683,7 @@ impl McpServer {
             .clone()
             .with_codebase(id.clone())
             .with_local_root(Some(dir.clone()));
-        if !self.shared.pinned && self.shared.dir == dir {
+        if !self.shared.pinned && self.dir().await == &dir {
             *self.shared.bound.lock().await = Some(client.clone());
         }
         match gate.wait().await {

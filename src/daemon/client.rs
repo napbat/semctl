@@ -145,6 +145,30 @@ fn attach(cli: &Cli) -> Result<ipc::pump::Exit> {
 async fn connect_or_start(endpoint: &Endpoint) -> Result<Stream> {
     match ipc::connect(endpoint, Instant::now() + EXISTING_DEADLINE).await {
         Ok(stream) => return Ok(stream),
+        Err(error) if ipc::connect_found_a_busy_daemon(&error) => {
+            // A busy endpoint is a live daemon with no free instance right
+            // now, not a missing one. A burst of simultaneous sessions
+            // produces exactly this, and a daemon started here could only
+            // lose the election while adding load to the endpoint. Wait the
+            // longer deadline instead.
+            debug!(
+                endpoint = endpoint.id(),
+                "the daemon on this endpoint is busy; waiting instead of starting another"
+            );
+            match ipc::connect(endpoint, Instant::now() + SPAWNED_DEADLINE).await {
+                Ok(stream) => return Ok(stream),
+                Err(error) if ipc::connect_found_a_busy_daemon(&error) => {
+                    return Err(error).context("connect to the busy daemon on this endpoint");
+                }
+                // The busy daemon went away while this client waited. Fall
+                // through and start a daemon of its own.
+                Err(error) => debug!(
+                    error = format!("{error:#}"),
+                    endpoint = endpoint.id(),
+                    "the busy daemon went away; starting one"
+                ),
+            }
+        }
         Err(error) => debug!(
             error = format!("{error:#}"),
             endpoint = endpoint.id(),

@@ -308,9 +308,20 @@ mod tests {
         assert_eq!(context.resync_secs, Some(MAX_RESYNC_SECS));
     }
 
+    /// An absolute path on every platform. `/work` has no drive prefix, so
+    /// `Path::is_absolute` is false on Windows and the handshake would refuse
+    /// it before the behavior under test is reached.
+    fn abs(path: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!("C:{path}"))
+        } else {
+            PathBuf::from(path)
+        }
+    }
+
     fn request(cwd: &str, token: Option<&str>) -> SessionRequest {
         SessionRequest {
-            cwd: PathBuf::from(cwd),
+            cwd: abs(cwd),
             server: Some("https://example.invalid".to_string()),
             tenant: Some("acme".to_string()),
             codebase: Some("id".to_string()),
@@ -325,7 +336,7 @@ mod tests {
         let context = SessionContext::from_handshake(request("/work/checkout", Some("wire-token")))
             .expect("an absolute working directory is accepted");
 
-        assert_eq!(context.cwd, PathBuf::from("/work/checkout"));
+        assert_eq!(context.cwd, abs("/work/checkout"));
         assert_eq!(context.server.as_deref(), Some("https://example.invalid"));
         assert_eq!(context.tenant.as_deref(), Some("acme"));
         assert_eq!(context.codebase.as_deref(), Some("id"));
@@ -341,8 +352,11 @@ mod tests {
     /// never fall back to its own working directory.
     #[test]
     fn a_relative_working_directory_is_refused() {
-        let error = SessionContext::from_handshake(request("relative/path", None))
-            .expect_err("a relative working directory cannot resolve a selector");
+        let error = SessionContext::from_handshake(SessionRequest {
+            cwd: PathBuf::from("relative/path"),
+            ..request("/work", None)
+        })
+        .expect_err("a relative working directory cannot resolve a selector");
 
         assert!(error.to_string().contains("is not absolute"), "{error:#}");
     }
@@ -367,7 +381,7 @@ mod tests {
     #[test]
     fn a_context_round_trips_through_an_attach_body() {
         let context = SessionContext::build(
-            PathBuf::from("/work/checkout"),
+            abs("/work/checkout"),
             &cli(Some("https://example.invalid"), Some("acme"), Some("id")),
             Environment {
                 credentials: CredentialSource::from_test_token("round-trip-token"),

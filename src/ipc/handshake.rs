@@ -44,6 +44,17 @@ pub(crate) const MAX_ANSWER_BYTES: usize = 8 * 1024 * 1024;
 /// Longest time one handshake exchange may take.
 pub(crate) const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Longest time a client waits for the daemon's attach answer.
+///
+/// Deliberately longer than [`EXCHANGE_TIMEOUT`]. The answer comes from a
+/// daemon that may be absorbing a burst of simultaneous cold attaches, and a
+/// client that gives up early either fails the session (`require`) or falls
+/// back to a standalone server that forfeits the sharing the daemon exists
+/// for. The five-second bound stays on every daemon-side read: that is the
+/// protection against a silent connection, and a client writes its one
+/// request line immediately.
+pub(crate) const ATTACH_ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Message kinds a daemon accepts from a client.
 const REQUEST_KINDS: &[&str] = &["attach", "status", "stop"];
 
@@ -339,6 +350,25 @@ pub(crate) async fn read_answer_async<R: AsyncRead + Unpin + ?Sized>(
     read_bounded(reader, MAX_ANSWER_BYTES).await
 }
 
+/// Read the daemon's attach answer, inside [`ATTACH_ANSWER_TIMEOUT`].
+///
+/// Client-side only. The line bound is the handshake bound; the wait is the
+/// longer one, because the peer is a daemon that may be absorbing an attach
+/// burst rather than a silent stranger.
+pub(crate) async fn read_attach_answer_async<R: AsyncRead + Unpin + ?Sized>(
+    reader: &mut R,
+) -> Result<Vec<u8>, HandshakeError> {
+    match tokio::time::timeout(
+        ATTACH_ANSWER_TIMEOUT,
+        read_line_unbounded(reader, MAX_LINE_BYTES),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_elapsed) => Err(HandshakeError::TimedOut),
+    }
+}
+
 /// Read one line of at most `limit` bytes, inside [`EXCHANGE_TIMEOUT`].
 async fn read_bounded<R: AsyncRead + Unpin + ?Sized>(
     reader: &mut R,
@@ -410,7 +440,7 @@ mod tests {
     use super::{
         HandshakeError, MAX_ANSWER_BYTES, MAX_LINE_BYTES, PROTOCOL, Request, Response,
         SessionRequest, Token, decode, decode_request, decode_response, encode, read_answer_async,
-        read_line_async, write_answer_async, write_line_async,
+        read_attach_answer_async, read_line_async, write_answer_async, write_line_async,
     };
     use std::path::PathBuf;
 
@@ -504,6 +534,30 @@ mod tests {
             .await
             .expect_err("too long");
         assert!(matches!(error, HandshakeError::LineTooLong), "{error:?}");
+    }
+
+    /// The attach answer gets a longer wait, not a longer line: its bound is
+    /// still the handshake bound.
+    #[tokio::test]
+    async fn the_attach_answer_reader_keeps_the_handshake_line_bound() {
+        let mut oversized = vec![b'x'; MAX_LINE_BYTES + 16];
+        oversized.push(b'\n');
+        let error = read_attach_answer_async(&mut oversized.as_slice())
+            .await
+            .expect_err("too long");
+        assert!(matches!(error, HandshakeError::LineTooLong), "{error:?}");
+
+        let mut wire: Vec<u8> = Vec::new();
+        write_line_async(&mut wire, &Response::attached("0.2.0", "s"))
+            .await
+            .expect("write attached");
+        let line = read_attach_answer_async(&mut wire.as_slice())
+            .await
+            .expect("read the attach answer");
+        assert!(matches!(
+            decode_response(&line),
+            Ok(Response::Attached { .. })
+        ));
     }
 
     #[tokio::test]

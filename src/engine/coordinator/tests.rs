@@ -373,7 +373,7 @@ async fn an_impossible_resync_interval_disables_the_periodic_timer() {
 /// checkout always picks the same offset.
 #[test]
 fn the_periodic_offset_is_stable_and_inside_one_interval() {
-    let interval = Duration::from_secs(300);
+    let interval = Duration::from_mins(5);
     let first = jitter(std::path::Path::new("/work/first"), interval);
     let second = jitter(std::path::Path::new("/work/second"), interval);
 

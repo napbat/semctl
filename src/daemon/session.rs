@@ -43,7 +43,7 @@ pub(super) async fn serve(
         }
     };
     let cwd = context.cwd.clone();
-    let server = match McpServer::new(context, daemon.engine().clone()).await {
+    let server = match McpServer::new(context, daemon.engine().clone()) {
         Ok(server) => server,
         Err(error) => {
             refuse(&mut stream, &format!("cannot build the session: {error:#}")).await;

@@ -11,16 +11,12 @@
 //! current-thread runtime and uses the same code path as Unix.
 
 use std::io;
-use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 /// Copy buffer size for each direction.
 const BUFFER_BYTES: usize = 16 * 1024;
-
-/// Longest wait for the outbound task after the inbound task ends.
-const OUTBOUND_WAIT: Duration = Duration::from_secs(2);
 
 /// Process exit status of the client role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,8 +94,11 @@ enum Report {
 /// role. Both are parameters so a test can drive the pump with in-memory
 /// duplex pairs.
 ///
-/// The call returns when the connection ends. It waits at most
-/// [`OUTBOUND_WAIT`] for an outbound task that is still blocked on input.
+/// The call returns as soon as the connection ends. It does not wait for the
+/// outbound task, which is usually still blocked reading standard input: the
+/// caller ([`crate::ipc::run_client`]) shuts its runtime down in the
+/// background, which abandons that task without blocking, so lingering here
+/// would only delay the host's end of file after the daemon goes away.
 pub(crate) async fn run<C, I, O>(connection: C, half_close: HalfClose, input: I, output: O) -> Exit
 where
     C: AsyncRead + AsyncWrite + Send + 'static,
@@ -130,24 +129,24 @@ where
 
 /// Wait for the task reports and decide the exit status.
 async fn collect(inbox: &mut mpsc::Receiver<Report>) -> Exit {
-    let mut outbound_pending = true;
     loop {
         match inbox.recv().await {
-            Some(Report::Inbound(exit)) => {
-                if outbound_pending {
-                    // Best effort. The outbound task is usually still waiting
-                    // for standard input, and process exit ends it. Waiting
-                    // longer would delay the exit.
-                    let _ = tokio::time::timeout(OUTBOUND_WAIT, inbox.recv()).await;
-                }
-                return exit;
-            }
-            // A closed connection has nothing left to deliver, so the pump
-            // ends without waiting for the inbound task.
+            // The daemon closed the connection, or it broke. Either way the
+            // session is over, so the pump returns at once. The outbound task
+            // may still be blocked reading standard input; the caller's
+            // background runtime shutdown abandons it without waiting.
+            // Waiting for it here would only delay the host's end of file —
+            // and when the daemon died, that is exactly the signal the host
+            // needs promptly to reconnect. On a named pipe a peer that went
+            // away surfaces as end of file, so this arm is the crash path too.
+            Some(Report::Inbound(exit)) => return exit,
+            // A transport with no half-close ended the whole connection when
+            // standard input reached end of file. Nothing more will arrive.
             Some(Report::Outbound(OutboundEnd::Closed)) => return Exit::Clean,
-            Some(Report::Outbound(OutboundEnd::HalfClosed) | Report::OutboundFailed) => {
-                outbound_pending = false;
-            }
+            // The outbound direction ended but the connection stays readable
+            // (a half-close), or the outbound write failed. Keep draining the
+            // inbound direction until the daemon closes it.
+            Some(Report::Outbound(OutboundEnd::HalfClosed) | Report::OutboundFailed) => {}
             // Both tasks ended without a report. Treat that as a failure,
             // because no task observed a clean close.
             None => return Exit::TransportFailed,
@@ -218,10 +217,25 @@ mod tests {
     use std::io;
     use std::pin::Pin;
     use std::task::{Context, Poll};
+    use std::time::Duration;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 
     /// Capacity of every in-memory pair in this module's tests.
     const PAIR_BYTES: usize = 1024;
+
+    /// An input that never yields a byte and never ends, standing in for a
+    /// client whose host is holding standard input open with nothing to send.
+    struct StuckInput;
+
+    impl AsyncRead for StuckInput {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            _buffer: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
 
     /// A connection that always fails to read and accepts every write.
     struct BrokenConnection;
@@ -382,6 +396,30 @@ mod tests {
         )
         .await;
         assert_eq!(exit, Exit::TransportFailed);
+    }
+
+    /// When the connection ends — the daemon was killed, say — the pump must
+    /// not wait for the outbound task still blocked reading standard input.
+    /// Waiting would delay the host's end of file, which is how the host
+    /// learns the daemon is gone and reconnects. Paused time makes it
+    /// deterministic: had the pump kept the old two-second courtesy wait, the
+    /// clock would jump well past this bound.
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_end_does_not_wait_for_a_blocked_outbound_task() {
+        let (pump_output, _host_output) = tokio::io::duplex(PAIR_BYTES);
+        let start = tokio::time::Instant::now();
+        let exit = run(
+            BrokenConnection,
+            HalfClose::Unsupported,
+            StuckInput,
+            pump_output,
+        )
+        .await;
+        assert_eq!(exit, Exit::TransportFailed);
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "a connection that ended must not linger for a stuck outbound task"
+        );
     }
 
     #[test]

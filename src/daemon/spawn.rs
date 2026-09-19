@@ -23,6 +23,13 @@
 //! `semctl daemon stop` is the way to change that: the next client to run
 //! `semctl mcp` starts a daemon with its own environment.
 //!
+//! On Windows the daemon must inherit no handle to this client's standard
+//! streams. Process creation duplicates every inheritable handle, and an MCP
+//! host's pipes usually arrive inheritable, so an unshielded spawn left the
+//! daemon holding the write end of this client's stdout — and the host
+//! waiting for an end of file that came only when the daemon exited. See
+//! `shield_standard_handles`.
+//!
 //! The daemon's working directory is not inherited. A client is invoked inside
 //! a checkout, and a daemon that kept that directory would hold it open for
 //! its whole life and would resolve a relative path of one session against
@@ -64,6 +71,8 @@ pub(crate) fn spawn_daemon(endpoint: &Endpoint) -> Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
     detach(&mut command);
+    #[cfg(windows)]
+    shield_standard_handles();
     let pid = start(command)?;
     info!(
         pid,
@@ -119,6 +128,51 @@ fn detach(command: &mut Command) {
 /// The creation flags that always apply.
 #[cfg(windows)]
 const CREATION_FLAGS: u32 = CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+
+/// Keep this client's standard handles out of the daemon.
+///
+/// The daemon is created with handle inheritance enabled — that is how the
+/// three standard handles configured above reach it — and with it every
+/// *other* inheritable handle of this process is duplicated into the daemon
+/// too. An MCP host usually creates this client's standard pipes inheritable,
+/// so a cold-spawned daemon would hold the write end of this client's stdout
+/// for its whole life, and a host that waits for end of file on that pipe
+/// would wait long after this client exited.
+///
+/// Clearing the inherit flag on this process's own standard handles closes
+/// that path. The flag controls inheritance only: this process keeps using
+/// the handles, and the standard library duplicates a handle itself when a
+/// later child is asked to inherit a standard stream.
+///
+/// Best effort: a handle that cannot be adjusted leaves the old behavior for
+/// that one stream, and the daemon still starts.
+#[cfg(windows)]
+fn shield_standard_handles() {
+    use windows_sys::Win32::Foundation::{
+        HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+    };
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    for stream in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: the call takes one selector and returns a handle, a null
+        // handle, or `INVALID_HANDLE_VALUE`; it reads nothing else.
+        let handle = unsafe { GetStdHandle(stream) };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            continue;
+        }
+        // SAFETY: `handle` is a live standard handle of this process, and the
+        // call only clears its inherit flag.
+        if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
+            tracing::debug!(
+                stream,
+                error = %std::io::Error::last_os_error(),
+                "could not clear the inherit flag on a standard handle"
+            );
+        }
+    }
+}
 
 /// Start the daemon and report its process id.
 #[cfg(unix)]

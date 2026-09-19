@@ -472,6 +472,15 @@ fn is_absent(error: &io::Error) -> bool {
     }
 }
 
+/// Whether the failure proves a daemon serves this pipe right now.
+///
+/// A busy pipe has a server with every instance taken. That daemon is alive,
+/// so a client that sees this must keep connecting rather than start a
+/// competing daemon that can only lose the election.
+pub(super) fn is_busy(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(ERROR_PIPE_BUSY.cast_signed())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
