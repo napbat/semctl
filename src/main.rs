@@ -8,7 +8,8 @@
 //! typed request / response types in [`client::api`].
 //!
 //! Layout: [`cli`] parses the command line and dispatches into [`commands`];
-//! [`client`] is the shared HTTP layer; [`mcp`] runs the CLI as an MCP stdio
+//! [`client`] is the shared HTTP layer; [`ipc`] is the local endpoint of the
+//! shared daemon; [`mcp`] runs the CLI as an MCP stdio
 //! server; [`sync`] walks and uploads a codebase; [`config`]/[`auth`] own the
 //! on-disk config and credentials.
 
@@ -18,9 +19,13 @@ mod client;
 mod codebase;
 mod commands;
 mod config;
+mod daemon;
 mod editing;
+mod engine;
+mod ipc;
 mod mcp;
 mod query;
+mod session;
 mod sync;
 mod term;
 
@@ -29,11 +34,17 @@ use clap::Parser;
 
 use crate::cli::Command;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Parse the command line, install the log subscriber, then run the role this
+/// invocation asks for.
+///
+/// `main` builds no runtime. The three roles need different ones — the client
+/// needs one current thread, the daemon needs a bounded pool, and every other
+/// command needs the default pool — and the choice is made in
+/// [`daemon::run_role`] before any of them exists.
+fn main() -> Result<()> {
     let cli = cli::Cli::parse();
     init_tracing(&cli.command);
-    cli.run().await
+    daemon::run_role(cli)
 }
 
 /// Install the process-wide log subscriber. Everything goes to **stderr**:
@@ -57,6 +68,10 @@ fn init_tracing(command: &Command) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default));
     fmt()
         .with_env_filter(filter)
+        // A daemon's stderr is its log file, not a terminal. Colour escapes
+        // would make that file hard to read, so they are written only when a
+        // terminal is there to interpret them.
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .with_writer(std::io::stderr)
         .with_target(false)
         .without_time()

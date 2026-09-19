@@ -3,7 +3,7 @@
 //! every subcommand; [`Cli::run`] dispatches each command to the matching module
 //! under [`crate::commands`].
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use crate::commands;
@@ -99,6 +99,11 @@ pub enum Command {
     /// first). Speaks JSON-RPC over stdin/stdout — don't redirect them.
     Mcp,
 
+    /// The shared local daemon: `status`, `stop`. One daemon serves every
+    /// `semctl mcp` session of this user and configuration directory.
+    #[command(subcommand)]
+    Daemon(commands::daemon::DaemonCommand),
+
     /// Claude Code / Codex hook and OMP extension entry point: reads a hook event
     /// as JSON on stdin and emits prompt/session context when the repo is indexed.
     /// Invoked by the packaged integration, not run by hand.
@@ -121,13 +126,20 @@ impl Cli {
             Command::Edit(cmd) => commands::edit::run(cmd, &self).await,
             Command::Files(cmd) => commands::files::run(cmd, &self).await,
             Command::Inspect(cmd) => commands::inspect::run(cmd, &self).await,
-            Command::Install(args) => commands::install::run(&args),
+            Command::Install(args) => {
+                tokio::task::spawn_blocking(move || commands::install::run(&args))
+                    .await
+                    .context("installation task failed")?
+            }
             Command::Upgrade => commands::upgrade::run(&self).await,
             Command::Uninstall(args) => {
-                commands::install::run_uninstall(&args);
+                tokio::task::spawn_blocking(move || commands::install::run_uninstall(&args))
+                    .await
+                    .context("uninstallation task failed")?;
                 Ok(())
             }
             Command::Mcp => crate::mcp::run(&self).await,
+            Command::Daemon(cmd) => commands::daemon::run(cmd).await,
             Command::Hook(args) => commands::hook::run(args, &self).await,
         }
     }

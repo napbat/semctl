@@ -155,3 +155,28 @@ fn unit_test_modules_use_the_standard_name() {
         violations.join("\n")
     );
 }
+
+#[test]
+fn rust_source_does_not_use_decorative_separator_comments() {
+    let mut violations = Vec::new();
+    for path in rust_files() {
+        let source = read_source(&path);
+        if is_generated(&source) {
+            continue;
+        }
+        for (index, line) in source.lines().enumerate() {
+            let comment = line.trim_start().strip_prefix("//");
+            if comment.is_some_and(|comment| {
+                let comment = comment.trim_start_matches(['!', '/']).trim_start();
+                comment.starts_with("---") || comment.starts_with("===")
+            }) {
+                violations.push(format!("{}:{}", relative_path(&path), index + 1));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "Rust source must not use decorative separator comments:\n{}",
+        violations.join("\n")
+    );
+}

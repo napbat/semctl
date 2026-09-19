@@ -33,7 +33,7 @@ pub enum AuthCommand {
 pub async fn run(cmd: AuthCommand, cli: &Cli) -> Result<()> {
     match cmd {
         AuthCommand::Login(args) => login::run(args, cli).await,
-        AuthCommand::Logout => logout::run(),
+        AuthCommand::Logout => logout::run().await,
         AuthCommand::Whoami => whoami::run(cli).await,
         AuthCommand::Tenants(args) => tenants::run(args, cli).await,
     }

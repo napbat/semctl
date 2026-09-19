@@ -5,7 +5,9 @@ use clap::Args;
 
 use crate::auth;
 use crate::cli::Cli;
+use crate::client::HttpTransport;
 use crate::config;
+use crate::session::SessionContext;
 
 #[derive(Debug, Args)]
 pub struct TenantsArgs {
@@ -17,22 +19,21 @@ pub struct TenantsArgs {
 }
 
 pub async fn run(args: TenantsArgs, cli: &Cli) -> Result<()> {
+    let context = SessionContext::from_process(cli)?;
     let cfg = config::load()?;
-    let server_url = cfg.server_url(cli.server.as_deref());
+    let server_url = cfg.server_url(context.server.as_deref());
 
-    let http = reqwest::Client::new();
-    // Discover the authority from the server (same as login + refresh) — the CLI
-    // never caches where identity lives.
-    let identity_url = auth::discover_authority(&http, &server_url).await?;
-    let token = auth::get_valid_access_token(&http).await?;
-    let items = auth::fetch_tenants(&http, &identity_url, &token).await?;
+    let transport = HttpTransport::new()?;
+    let http = transport.http();
+    let session = auth::authenticated_session(http, &server_url, &context.credentials).await?;
+    let items = auth::fetch_tenants(http, &session.authority_url, &session.access_token).await?;
 
     if items.is_empty() {
         println!("(no tenant memberships)");
         return Ok(());
     }
 
-    let active = cfg.active_tenant(None);
+    let active = session.active_tenant.clone();
     let interactive = args.switch.is_none() && std::io::stdin().is_terminal() && items.len() > 1;
     if interactive {
         println!("{:<5}  {:<36}  {:<24}  NAME", "#", "ID", "SLUG");
@@ -77,9 +78,17 @@ pub async fn run(args: TenantsArgs, cli: &Cli) -> Result<()> {
     };
 
     if let Some(matched) = selected {
-        let mut cfg = config::load()?;
-        cfg.active_tenant = Some(matched.slug.clone());
-        config::save(&cfg)?;
+        if !auth::set_active_tenant(
+            &session.stamp,
+            session.active_tenant.clone(),
+            Some(matched.slug.clone()),
+        )
+        .await?
+        {
+            return Err(anyhow!(
+                "login or active tenant changed; retry tenant selection"
+            ));
+        }
         println!();
         println!("Active tenant -> {} ({})", matched.slug, matched.name);
     }

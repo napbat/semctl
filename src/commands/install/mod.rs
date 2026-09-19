@@ -179,23 +179,13 @@ fn snapshot_hosts(hosts: &[Box<dyn Host>]) -> Vec<(&dyn Host, HostStatus)> {
 
 pub fn run(args: &InstallArgs) -> Result<()> {
     let hosts = hosts();
+    validate_requested_hosts(args, &hosts)?;
 
     // Retire any previous `semctx` install first, so the snapshot below reflects
     // the post-migration state and reconcile re-adds from semctl's source.
-    migrate_legacy(&hosts);
+    migrate_legacy(&hosts)?;
 
     let snap = snapshot_hosts(&hosts);
-
-    // Reject unknown host names before doing anything.
-    if !args.hosts.is_empty() {
-        let known: HashSet<&str> = snap.iter().map(|(h, _)| h.id()).collect();
-        for want in &args.hosts {
-            if !known.contains(want.as_str()) {
-                let list = known.iter().copied().collect::<Vec<_>>().join(", ");
-                bail!("unknown host {want:?} (known: {list})");
-            }
-        }
-    }
 
     let Some(desired) = resolve_desired(args, &snap)? else {
         return Ok(()); // cancelled
@@ -213,30 +203,34 @@ pub fn run(args: &InstallArgs) -> Result<()> {
     Ok(())
 }
 
+fn validate_requested_hosts(args: &InstallArgs, hosts: &[Box<dyn Host>]) -> Result<()> {
+    let known: Vec<&str> = hosts.iter().map(|host| host.id()).collect();
+    for wanted in &args.hosts {
+        if !known.contains(&wanted.as_str()) {
+            bail!("unknown host {wanted:?} (known: {})", known.join(", "));
+        }
+    }
+    Ok(())
+}
+
 /// One-time retirement of a previous `semctx` install (the CLI's old name) so
 /// semctl fully supersedes it. Gated on legacy artifacts, so it's a no-op once
-/// nothing old remains. Best-effort: every step is reported, none is fatal.
-fn migrate_legacy(hosts: &[Box<dyn Host>]) {
+/// nothing old remains. A failed config copy stops all retirement steps.
+fn migrate_legacy(hosts: &[Box<dyn Host>]) -> Result<()> {
     let legacy = config::legacy_present()
         || selfpath::legacy_binary().is_some()
         || selfpath::legacy_path_block_present();
     if !legacy {
-        return;
+        return Ok(());
     }
     say("Retiring a previous semctx install…");
 
     // Carry ~/.config/semctx over to ~/.config/semctl once, then drop it.
-    match config::migrate_from_legacy() {
-        Ok(true) => ok("migrated config from ~/.config/semctx"),
-        Ok(false) => {}
-        Err(e) => warn(&format!("couldn't migrate config: {e:#}")),
+    if config::migrate_from_legacy()
+        .context("migrate config before retiring the legacy installation")?
+    {
+        ok("migrated config from ~/.config/semctx");
     }
-    match config::remove_legacy() {
-        Ok(true) => ok("removed ~/.config/semctx"),
-        Ok(false) => {}
-        Err(e) => warn(&format!("couldn't remove ~/.config/semctx: {e:#}")),
-    }
-
     // The old binary and the PATH entry it added.
     match selfpath::remove_legacy_binary() {
         Ok(Some(p)) => ok(&format!("removed legacy {}", p.display())),
@@ -261,6 +255,7 @@ fn migrate_legacy(hosts: &[Box<dyn Host>]) {
             p.display()
         ));
     }
+    Ok(())
 }
 
 #[derive(Debug, Args)]
@@ -659,5 +654,16 @@ mod tests {
         );
         assert_eq!(failing_calls.update.get(), 1);
         assert_eq!(working_calls.update.get(), 1);
+    }
+
+    #[test]
+    fn unknown_host_is_rejected_before_migration_or_host_probes() {
+        let args = InstallArgs {
+            hosts: vec!["unknown-test-host".into()],
+            all: false,
+            none: false,
+        };
+        let error = run(&args).unwrap_err();
+        assert!(error.to_string().starts_with("unknown host"));
     }
 }

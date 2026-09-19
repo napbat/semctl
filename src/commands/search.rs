@@ -56,12 +56,7 @@ pub async fn run(args: SearchArgs, cli: &Cli) -> Result<()> {
     {
         client = client.with_codebase(r.id);
     }
-    if let Some(id) = client.codebase_raw() {
-        let root = crate::config::load()
-            .ok()
-            .and_then(|cfg| cfg.codebase_root(id, std::env::current_dir().ok().as_deref()));
-        client = client.with_local_root(root);
-    }
+    client = client.with_cached_local_root(std::env::current_dir().ok().as_deref());
 
     let opts = query::SearchOpts {
         prefer: args.prefer.clone(),
