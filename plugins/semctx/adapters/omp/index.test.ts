@@ -113,7 +113,7 @@ describe("semctx OMP extension", () => {
 		});
 	});
 
-	test("injects prompt candidates and a one-shot namespaced tool nudge", async () => {
+	test("injects prompt candidates and returns passive tool context", async () => {
 		const responses: Record<string, string> = {
 			UserPromptSubmit: "candidate hits",
 			PreToolUse: "prefer `mcp__semctx_semctx_search_codebase`",
@@ -134,10 +134,13 @@ describe("semctx OMP extension", () => {
 		expect(promptCall.prompt).toBe("where is authentication handled?");
 		expect(promptCall.prompt_id).toBeString();
 
-		await harness.emit("tool_call", {
+		const toolResult = await harness.emit("tool_call", {
 			toolCallId: "tool-1",
 			toolName: "grep",
 			input: { pattern: "authenticate" },
+		});
+		expect(toolResult).toEqual({
+			additionalContext: "prefer `mcp__semctx_semctx_search_codebase`",
 		});
 		const toolCall = invoker.calls[1].input;
 		expect(toolCall).toMatchObject({
@@ -148,17 +151,19 @@ describe("semctx OMP extension", () => {
 			tool_input: { pattern: "authenticate" },
 		});
 
-		const contextResult = (await harness.emit("context", {
-			messages: [{ role: "user", content: "question", timestamp: 1 }],
-		})) as { messages: Array<Record<string, unknown>> };
-		expect(contextResult.messages.at(-1)).toMatchObject({
-			role: "custom",
-			customType: "ca.napbat.semctx.nudge",
-			content: "prefer `mcp__semctx_semctx_search_codebase`",
-			display: false,
-			attribution: "agent",
-		});
-		expect(await harness.emit("context", { messages: [] })).toBeUndefined();
+		expect(harness.handlers.has("context")).toBeFalse();
+	});
+
+	test("returns each tool call's passive context independently", async () => {
+		const invoker = new FakeInvoker(input => input.tool_name);
+		const harness = makeHarness(invoker);
+		const [grepResult, globResult] = await Promise.all([
+			harness.emit("tool_call", { toolName: "grep", input: { pattern: "needle" } }),
+			harness.emit("tool_call", { toolName: "glob", input: { pattern: "*.rs" } }),
+		]);
+		expect(grepResult).toEqual({ additionalContext: "Grep" });
+		expect(globResult).toEqual({ additionalContext: "Glob" });
+		expect(invoker.calls[0].input.prompt_id).toBe(invoker.calls[1].input.prompt_id);
 	});
 
 	test("maps OMP search and semctx tools without propagating hook failures", async () => {
@@ -199,7 +204,6 @@ describe("semctx OMP extension", () => {
 			input: { path: "src/main.rs" },
 		});
 		expect(invoker.calls).toHaveLength(callsBeforeRead);
-		expect(await harness.emit("context", { messages: [] })).toBeUndefined();
 	});
 
 	test("shuts down child work with the session", async () => {

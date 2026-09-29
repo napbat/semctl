@@ -19,6 +19,8 @@ To add another coding agent, point its marketplace at this plugin root and its
 adapter at `skills/` and the shared hooks wherever its plugin format allows. OMP
 instead loads `adapters/omp/index.ts`: its native events invoke `semctl hook` and
 inject the returned context without duplicating retrieval policy in TypeScript.
+The OMP `tool_call` event returns `PreToolUse` guidance as passive
+`additionalContext` for that tool call.
 Do not manually copy shared skills; when a host requires a projected format,
 generate it from the canonical skill and verify parity in CI.
 
