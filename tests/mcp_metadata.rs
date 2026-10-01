@@ -35,6 +35,9 @@ async fn mcp_metadata_exposes_tool_docs_without_shared_instructions() {
         ])
         .current_dir(directory.path())
         .env("XDG_CONFIG_HOME", directory.path())
+        // This test measures the server in this process. Pin the role so the
+        // default of `SEMCTX_MCP_DAEMON` cannot move it into a daemon.
+        .env("SEMCTX_MCP_DAEMON", "off")
         .env("SEMCTX_MCP_UPDATE_CHECK", "0")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

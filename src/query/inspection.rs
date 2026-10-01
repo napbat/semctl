@@ -124,7 +124,8 @@ pub async fn list_files(
         }
         matches.sort_by(|a, b| a.path.cmp(&b.path));
         let mut out = render_files(&matches, root);
-        writeln!(out, "({} of {total} files match `{raw}`)", matches.len()).unwrap();
+        writeln!(out, "({} of {total} files match `{raw}`)", matches.len())
+            .expect("writing to a String cannot fail");
         return out;
     }
 
@@ -153,9 +154,10 @@ pub async fn list_files(
     let start = pg as usize * page_size as usize; // 0-based index of the first row
     let end = start + files.len(); // exclusive
     let mut out = render_files(&files, root);
-    write!(out, "(rows {}–{end} of {total}", start + 1).unwrap();
+    write!(out, "(rows {}–{end} of {total}", start + 1).expect("writing to a String cannot fail");
     if end < total {
-        write!(out, "; pass page={} for the next {page_size}", pg + 1).unwrap();
+        write!(out, "; pass page={} for the next {page_size}", pg + 1)
+            .expect("writing to a String cannot fail");
     }
     out.push_str(")\n");
     out
@@ -199,14 +201,16 @@ pub async fn sync_status(
                 "\n  files: {files}\n  source bytes: {} ({bytes} bytes)",
                 human_bytes(bytes)
             )
-            .unwrap();
+            .expect("writing to a String cannot fail");
         }
-        Err(e) => write!(out, "\n  catalog totals unavailable: {e}").unwrap(),
+        Err(e) => write!(out, "\n  catalog totals unavailable: {e}")
+            .expect("writing to a String cannot fail"),
     }
     if let Some((_, Ok(status))) = &job
         && let Some(chunks) = status.chunk_count
     {
-        write!(out, "\n  chunks: {chunks} (post-sync total)").unwrap();
+        write!(out, "\n  chunks: {chunks} (post-sync total)")
+            .expect("writing to a String cannot fail");
     }
 
     match job {
@@ -215,7 +219,8 @@ pub async fn sync_status(
             out.push_str(&render_job(id, &status));
         }
         Some((id, Err(e))) => {
-            write!(out, "\n\nlast sync run {id}: status unavailable — {e}").unwrap();
+            write!(out, "\n\nlast sync run {id}: status unavailable — {e}")
+                .expect("writing to a String cannot fail");
         }
         None if local_watch_active => out.push_str(
             "\n\nlast sync run: no server job queued yet; the active local watcher may still \
@@ -313,7 +318,7 @@ pub async fn imports(client: &Client) -> String {
             local_path(root, &e.to),
             e.import_path
         )
-        .unwrap();
+        .expect("writing to a String cannot fail");
     }
     truncation_note(&mut out, edges.len(), total);
     out
@@ -345,7 +350,7 @@ pub async fn symbol_edges(client: &Client) -> String {
             local_path(root, &e.to_file),
             e.moniker
         )
-        .unwrap();
+        .expect("writing to a String cannot fail");
     }
     truncation_note(&mut out, edges.len(), total);
     out
@@ -385,7 +390,7 @@ pub async fn external_links(client: &Client) -> String {
             l.target_codebase_id,
             l.confidence,
         )
-        .unwrap();
+        .expect("writing to a String cannot fail");
     }
     truncation_note(&mut out, links.len(), total);
     out
@@ -408,7 +413,7 @@ pub async fn symbol_at_position(
         urlencode(path)
     );
     if let Some(col) = column {
-        write!(url, "&column={col}").unwrap();
+        write!(url, "&column={col}").expect("writing to a String cannot fail");
     }
     let at = match column {
         Some(col) => format!("{path}:{line}:{col}"),
@@ -445,10 +450,11 @@ pub async fn batch_lookup(client: &Client, symbols: &[String], references: bool)
     let mut out = String::new();
     for r in &results {
         if r.hits.is_empty() {
-            writeln!(out, "{} — no {kind}", r.symbol).unwrap();
+            writeln!(out, "{} — no {kind}", r.symbol).expect("writing to a String cannot fail");
             continue;
         }
-        writeln!(out, "{} ({} {kind}):", r.symbol, r.hits.len()).unwrap();
+        writeln!(out, "{} ({} {kind}):", r.symbol, r.hits.len())
+            .expect("writing to a String cannot fail");
         for h in &r.hits {
             let loc = h.path.as_deref().unwrap_or("?");
             writeln!(
@@ -458,7 +464,7 @@ pub async fn batch_lookup(client: &Client, symbols: &[String], references: bool)
                 h.line_start.unwrap_or(0),
                 h.line_end.unwrap_or(0)
             )
-            .unwrap();
+            .expect("writing to a String cannot fail");
         }
     }
     out
@@ -492,9 +498,11 @@ pub async fn list_domains(client: &Client) -> String {
         Ok(domains) => {
             let mut out = String::new();
             for d in &domains {
-                writeln!(out, "{}  ({})", d.id, d.display_name).unwrap();
+                writeln!(out, "{}  ({})", d.id, d.display_name)
+                    .expect("writing to a String cannot fail");
                 for t in &d.tag_schema {
-                    writeln!(out, "    {} [{}]: {}", t.name, t.data_type, t.description).unwrap();
+                    writeln!(out, "    {} [{}]: {}", t.name, t.data_type, t.description)
+                        .expect("writing to a String cannot fail");
                 }
             }
             out

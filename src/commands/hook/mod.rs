@@ -263,7 +263,8 @@ async fn user_prompt_context(cli: &Cli, input: &HookInput) -> Option<String> {
             .as_deref()
             .map(|l| format!("  ·  {l}"))
             .unwrap_or_default();
-        writeln!(out, "- {path}{loc}{sym}{lang}  ({:.3}){freshness}", h.score).unwrap();
+        writeln!(out, "- {path}{loc}{sym}{lang}  ({:.3}){freshness}", h.score)
+            .expect("writing to a String cannot fail");
     }
     Some(out)
 }
@@ -867,14 +868,14 @@ fn env_parse<T: FromStr>(key: &str) -> Option<T> {
 /// session. The enabled variant uses a non-panicking write so a broken stderr
 /// pipe can't break the session.
 #[cfg(feature = "hook-debug")]
-fn debug(args: std::fmt::Arguments) {
+fn debug(args: std::fmt::Arguments<'_>) {
     use std::io::Write;
     let _ = writeln!(std::io::stderr().lock(), "semctl hook: {args}");
 }
 
 #[cfg(not(feature = "hook-debug"))]
 #[inline(always)]
-fn debug(_args: std::fmt::Arguments) {}
+fn debug(_args: std::fmt::Arguments<'_>) {}
 
 #[cfg(test)]
 mod tests;

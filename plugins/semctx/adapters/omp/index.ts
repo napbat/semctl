@@ -9,7 +9,6 @@ const TOOL_TIMEOUT_MS = 6_000;
 
 const ORIENTATION_MESSAGE = "ca.napbat.semctx.orientation";
 const PROMPT_CONTEXT_MESSAGE = "ca.napbat.semctx.prompt-context";
-const NUDGE_MESSAGE = "ca.napbat.semctx.nudge";
 
 type SessionSource = "startup" | "resume" | "clear" | "compact";
 type HookEventName = "SessionStart" | "UserPromptSubmit" | "PreToolUse";
@@ -163,7 +162,6 @@ export function createSemctxExtension(invoker: HookInvoker = createSemctlHookInv
 		const instanceId = `${process.pid}-${Date.now().toString(36)}`;
 		let promptGeneration = 0;
 		let activePromptId = "";
-		let pendingNudge: string | undefined;
 
 		pi.setLabel("semctx");
 
@@ -180,7 +178,6 @@ export function createSemctxExtension(invoker: HookInvoker = createSemctlHookInv
 		};
 		const resetTurnState = () => {
 			activePromptId = "";
-			pendingNudge = undefined;
 		};
 		const sendOrientation = async (source: SessionSource, ctx: HookContext) => {
 			resetTurnState();
@@ -211,7 +208,6 @@ export function createSemctxExtension(invoker: HookInvoker = createSemctlHookInv
 		pi.on("session_compact", async (_event, ctx) => sendOrientation("compact", ctx));
 
 		pi.on("before_agent_start", async (event, ctx) => {
-			pendingNudge = undefined;
 			activePromptId = allocatePromptId(ctx);
 			const context = await safeInvoke(
 				{
@@ -247,28 +243,7 @@ export function createSemctxExtension(invoker: HookInvoker = createSemctlHookInv
 				ctx,
 				TOOL_TIMEOUT_MS,
 			);
-			if (context !== undefined) pendingNudge = context;
-			return undefined;
-		});
-
-		pi.on("context", event => {
-			const context = pendingNudge;
-			if (context === undefined) return undefined;
-			pendingNudge = undefined;
-			return {
-				messages: [
-					...event.messages,
-					{
-						role: "custom" as const,
-						...hiddenMessage(NUDGE_MESSAGE, context),
-						timestamp: Date.now(),
-					},
-				],
-			};
-		});
-
-		pi.on("agent_end", () => {
-			pendingNudge = undefined;
+			return context === undefined ? undefined : { additionalContext: context };
 		});
 		pi.on("session_shutdown", () => {
 			resetTurnState();

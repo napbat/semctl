@@ -14,10 +14,15 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Serialize, de::DeserializeOwned};
-use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, info, warn};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
+use tracing::{debug, warn};
 
 use crate::auth;
+use crate::session::{CredentialScope, CredentialSource, SessionContext};
+
+pub(crate) mod transport;
+
+pub(crate) use transport::HttpTransport;
 
 const TENANT_HEADER: &str = "X-Tenant-Id";
 /// The checkout a request is made from. The server prefers that copy of a
@@ -33,6 +38,9 @@ const LOADING_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
 #[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
+    /// How this client's session authorizes its requests. Carried explicitly so
+    /// two clients in one process can hold different credentials.
+    credentials: CredentialSource,
     base_url: String,
     /// Shared so an MCP server and every codebase-bound clone can recover from
     /// a persisted tenant that identity no longer lists for this principal.
@@ -59,21 +67,42 @@ pub struct Client {
     /// and asking again per call would put a round-trip in front of work
     /// that has nothing to do with it.
     capabilities: Arc<tokio::sync::OnceCell<Vec<String>>>,
+    /// The engine's bound on concurrent request attempts, when this client was
+    /// built by one. `None` for a one-shot command, which has nothing to bound.
+    /// The handle comes from the caller: this module never reads the
+    /// environment, so a session cannot raise a process-wide bound.
+    remote_permits: Option<Arc<Semaphore>>,
 }
 
 impl Client {
+    /// Build isolated client state for tests that do not send HTTP requests.
+    #[cfg(test)]
+    pub(crate) fn for_test(codebase: &str, local_root: Option<PathBuf>) -> Self {
+        let mut client = Self::new(
+            &HttpTransport::new().expect("build the test transport"),
+            CredentialSource::Stored,
+            "http://127.0.0.1:1",
+            None,
+            Some(codebase.into()),
+            false,
+            None,
+        );
+        client.local_root = local_root;
+        client
+    }
+
     fn new(
+        transport: &HttpTransport,
+        credentials: CredentialSource,
         base_url: &str,
         tenant: Option<String>,
         codebase: Option<String>,
         repair_configured_tenant: bool,
+        remote_permits: Option<Arc<Semaphore>>,
     ) -> Self {
-        let http = reqwest::Client::builder()
-            .user_agent(concat!("semctx-cli/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .expect("reqwest client build is infallible with default config");
         Self {
-            http,
+            http: transport.http().clone(),
+            credentials,
             base_url: base_url.trim_end_matches('/').to_string(),
             tenant: Arc::new(RwLock::new(tenant)),
             repair_configured_tenant,
@@ -82,6 +111,7 @@ impl Client {
             local_root: None,
             checkout_source_id: None,
             capabilities: Arc::new(tokio::sync::OnceCell::new()),
+            remote_permits,
         }
     }
 
@@ -111,17 +141,40 @@ impl Client {
         self
     }
 
-    /// Return a copy with the codebase's local checkout root set — used by
-    /// `semctl mcp` so hit paths can be absolutized for the host.
+    /// The same client with no codebase selected.
+    ///
+    /// A first index must not write into a codebase that was pinned for the
+    /// session: the checkout being indexed gets the codebase its own
+    /// registration names.
+    #[must_use]
+    pub(crate) fn without_codebase(mut self) -> Self {
+        self.codebase = None;
+        self
+    }
+
+    /// Attach a checkout only when its source identity can be derived. A failed
+    /// identity leaves both the request selector and local rendering unbound.
     pub fn with_local_root(mut self, root: Option<PathBuf>) -> Self {
+        let root = root.filter(|dir| dir.is_dir());
         // Derived here, once, rather than per request: it hashes the
         // installation id with the path, and every read would otherwise pay
         // for a file read it does not need.
         self.checkout_source_id = root
             .as_deref()
             .and_then(|dir| crate::codebase::checkout_source_id(dir).ok());
-        self.local_root = root;
+        self.local_root = root.filter(|_| self.checkout_source_id.is_some());
         self
+    }
+
+    /// Attach only a checkout recorded for this codebase. A missing cache leaves
+    /// the client unbound, so edit operations cannot select an unrelated directory.
+    pub fn with_cached_local_root(self, prefer: Option<&Path>) -> Self {
+        let root = self.codebase_raw().and_then(|id| {
+            crate::config::load()
+                .ok()
+                .and_then(|config| config.codebase_root(id, prefer))
+        });
+        self.with_local_root(root)
     }
 
     /// The same client, asking about the project rather than about the
@@ -134,6 +187,7 @@ impl Client {
     pub fn for_canonical(&self) -> Self {
         let mut client = self.clone();
         client.checkout_source_id = None;
+        client.local_root = None;
         client
     }
 
@@ -146,6 +200,20 @@ impl Client {
     /// Effective resource-server base URL. Contains no credentials.
     pub fn server_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// The same client, authorized differently. Tests use it to build the two
+    /// credential scopes one root can be attached under.
+    #[cfg(test)]
+    pub(crate) fn with_credentials(mut self, credentials: CredentialSource) -> Self {
+        self.credentials = credentials;
+        self
+    }
+
+    /// The comparable identity of this client's credentials. Shared state keyed
+    /// by it can never be reused across authorizations.
+    pub(crate) fn credential_scope(&self) -> CredentialScope {
+        self.credentials.scope()
     }
 
     /// Effective active tenant selector. Contains only the configured slug/id,
@@ -163,7 +231,8 @@ impl Client {
         method: reqwest::Method,
         path: &str,
     ) -> Result<(reqwest::RequestBuilder, String, Option<String>)> {
-        let token = auth::get_valid_access_token(&self.http).await?;
+        let token =
+            auth::get_valid_access_token(&self.http, &self.base_url, &self.credentials).await?;
         let url = self.url(path);
         let mut req = self.http.request(method, &url).bearer_auth(&token);
         let tenant = self.tenant.read().await.clone();
@@ -174,6 +243,19 @@ impl Client {
             req = req.header(CHECKOUT_HEADER, source);
         }
         Ok((req, url, tenant))
+    }
+
+    /// One in-flight request attempt, when this client is bound to an engine.
+    ///
+    /// The permit covers sending the request and receiving its response head.
+    /// It is released before the caller reads the body, so a slow reader does
+    /// not hold a permit, and it is released across a loading retry's sleep, so
+    /// a restoring server does not pin the process's permits.
+    async fn remote_permit(&self) -> Option<OwnedSemaphorePermit> {
+        match &self.remote_permits {
+            Some(permits) => crate::engine::scheduler::permit(permits).await,
+            None => None,
+        }
     }
 
     /// Send one request, repairing a stale persisted tenant once and honoring
@@ -188,10 +270,14 @@ impl Client {
         let mut tenant_retried = false;
         let loading_deadline = Instant::now() + LOADING_RETRY_BUDGET;
         loop {
+            // Acquired after the token fetch: that request is authorization, not
+            // an interactive read, and waiting for a permit while holding one
+            // would make the bound self-blocking.
             let (mut req, url, rejected_tenant) = self.authed(method.clone(), path).await?;
             if let Some(json) = &body {
                 req = req.json(json);
             }
+            let permit = self.remote_permit().await;
             let resp = req
                 .send()
                 .await
@@ -206,6 +292,7 @@ impl Client {
                     retry_after_ms = delay.as_millis(),
                     "server projection is restoring; retrying request"
                 );
+                drop(permit);
                 tokio::time::sleep(delay).await;
                 continue;
             }
@@ -219,6 +306,9 @@ impl Client {
                 .text()
                 .await
                 .with_context(|| format!("{method} {url}: read body"))?;
+            // Tenant repair queries identity and rewrites config. That is not
+            // this request attempt, so it must not hold this attempt's permit.
+            drop(permit);
             if !tenant_retried
                 && tenant_binding_denied(&response_body)
                 && self
@@ -256,60 +346,55 @@ impl Client {
             return current.is_some();
         }
 
-        let mut cfg = match crate::config::load() {
-            Ok(cfg) => cfg,
+        let session = match auth::authenticated_session(
+            &self.http,
+            &self.base_url,
+            &self.credentials,
+        )
+        .await
+        {
+            Ok(session) => session,
             Err(error) => {
-                warn!(%error, "couldn't load config while repairing stale tenant");
+                warn!(%error, "could not read the current login while repairing tenant selection");
                 return false;
             }
         };
-
-        // Honour a validated switch performed by another process while this MCP
-        // server was running before making another identity round-trip.
-        if let Some(configured) = cfg.active_tenant.clone()
+        if let Some(configured) = &session.active_tenant
             && configured != rejected
         {
             *self.tenant.write().await = Some(configured.clone());
-            info!(tenant = %configured, "adopted updated active tenant");
             return true;
         }
-
-        let token = match auth::get_valid_access_token(&self.http).await {
-            Ok(token) => token,
-            Err(error) => {
-                warn!(%error, "couldn't get token while repairing stale tenant");
-                return false;
-            }
-        };
-        let identity_url = match auth::discover_authority(&self.http, &self.base_url).await {
-            Ok(url) => url,
-            Err(error) => {
-                warn!(%error, "couldn't discover identity while repairing stale tenant");
-                return false;
-            }
-        };
-        let memberships = match auth::fetch_tenants(&self.http, &identity_url, &token).await {
-            Ok(memberships) => memberships,
-            Err(error) => {
-                warn!(%error, "couldn't list memberships while repairing stale tenant");
-                return false;
-            }
-        };
+        let memberships =
+            match auth::fetch_tenants(&self.http, &session.authority_url, &session.access_token)
+                .await
+            {
+                Ok(memberships) => memberships,
+                Err(error) => {
+                    warn!(%error, "could not list memberships while repairing tenant selection");
+                    return false;
+                }
+            };
         let [only] = memberships.as_slice() else {
             return false;
         };
-
-        cfg.active_tenant = Some(only.slug.clone());
-        if let Err(error) = crate::config::save(&cfg) {
-            warn!(%error, tenant = %only.slug, "repaired tenant for this session but couldn't save it");
+        match auth::set_active_tenant(
+            &session.stamp,
+            Some(rejected.to_string()),
+            Some(only.slug.clone()),
+        )
+        .await
+        {
+            Ok(true) => {
+                *self.tenant.write().await = Some(only.slug.clone());
+                true
+            }
+            Ok(false) => false,
+            Err(error) => {
+                warn!(%error, "could not persist repaired tenant selection");
+                false
+            }
         }
-        *self.tenant.write().await = Some(only.slug.clone());
-        info!(
-            rejected_tenant = %rejected,
-            tenant = %only.slug,
-            "repaired stale active tenant; retrying request"
-        );
-        true
     }
 
     /// Whether the server reports `capability`.
@@ -607,30 +692,58 @@ fn tenant_selection(configured: Option<String>, explicit: Option<&str>) -> (Opti
     }
 }
 
-/// Build an authenticated `Client` from the loaded config + the global CLI flags.
-pub fn from_cli(cli: &crate::cli::Cli) -> Result<Client> {
+/// Build an authenticated `Client` for one session.
+///
+/// This is the real constructor: every selection the client makes comes from
+/// `context` and the loaded config, never from the process. `transport` supplies
+/// the shared HTTP client, and `remote_permits` the engine's bound on
+/// concurrent request attempts. Both are supplied by the caller that owns them,
+/// so a session cannot create a second connection pool or raise a bound.
+pub(crate) fn from_context(
+    context: &SessionContext,
+    transport: &HttpTransport,
+    remote_permits: Option<Arc<Semaphore>>,
+) -> Result<Client> {
     let cfg = crate::config::load()?;
-    let server = cfg.server_url(cli.server.as_deref());
+    let server = auth::normalize_server_url(&cfg.server_url(context.server.as_deref()))?;
+    let configured_tenant = (auth::normalize_server_url(&cfg.persisted_server_url())? == server)
+        .then(|| cfg.active_tenant.clone())
+        .flatten();
     let (tenant, repair_configured_tenant) =
-        tenant_selection(cfg.active_tenant.clone(), cli.tenant.as_deref());
-    let codebase = cfg.active_codebase(cli.codebase.as_deref());
+        tenant_selection(configured_tenant, context.tenant.as_deref());
+    let codebase = cfg.active_codebase(context.codebase.as_deref());
     Ok(Client::new(
+        transport,
+        context.credentials.clone(),
         &server,
         tenant,
         codebase,
         repair_configured_tenant,
+        remote_permits,
     ))
 }
 
-/// Like [`from_cli`], but ensures a codebase is set — resolving the working
-/// directory's codebase when one wasn't configured explicitly. For the
+/// Convenience for a one-shot command: read this process as one session, give
+/// it its own transport, and build its client. Long-lived callers that serve
+/// several sessions build the context and the transport themselves and use
+/// [`from_context`].
+pub fn from_cli(cli: &crate::cli::Cli) -> Result<Client> {
+    let context = SessionContext::from_process(cli)?;
+    // A one-shot command sends one interactive request at a time, so it needs
+    // no remote bound. Its uploads are bounded by the sync limits it builds.
+    from_context(&context, &HttpTransport::new()?, None)
+}
+
+/// Like [`from_cli`], but ensures a codebase is set — resolving the session's
+/// working directory's codebase when one wasn't configured explicitly. For the
 /// codebase-scoped commands (`projects`, `graph …`) run inside a repo.
 pub async fn for_cwd(cli: &crate::cli::Cli) -> Result<Client> {
-    let client = from_cli(cli)?;
+    let context = SessionContext::from_process(cli)?;
+    let client = from_context(&context, &HttpTransport::new()?, None)?;
+    let dir = context.cwd;
     if client.codebase_raw().is_some() {
-        return Ok(client);
+        return Ok(client.with_cached_local_root(Some(&dir)));
     }
-    let dir = std::env::current_dir().context("read working directory")?;
     let id = crate::codebase::resolve(&client, &dir)
         .await?
         .map(|r| r.id)
@@ -640,7 +753,7 @@ pub async fn for_cwd(cli: &crate::cli::Cli) -> Result<Client> {
                 dir.display()
             )
         })?;
-    Ok(client.with_codebase(id))
+    Ok(client.with_codebase(id).with_cached_local_root(Some(&dir)))
 }
 
 #[cfg(test)]
@@ -650,9 +763,22 @@ mod tests {
     use serde::Deserialize;
 
     use super::{
-        Client, PageEnvelope, gateway_error, loading_retry_delay, tenant_binding_denied,
-        tenant_selection,
+        Client, CredentialSource, HttpTransport, PageEnvelope, gateway_error, loading_retry_delay,
+        tenant_binding_denied, tenant_selection,
     };
+
+    /// A client with no codebase and no checkout, for the pure selection tests.
+    fn test_client() -> Client {
+        Client::new(
+            &HttpTransport::new().expect("build the test transport"),
+            CredentialSource::Stored,
+            "https://example.invalid",
+            None,
+            None,
+            false,
+            None,
+        )
+    }
 
     #[derive(Debug, Deserialize, PartialEq, Eq)]
     struct Row {
@@ -773,23 +899,36 @@ mod tests {
     /// "tell me what the project publishes".
     #[test]
     fn asking_for_canonical_stops_claiming_a_checkout() {
-        let mut client = Client::new("https://example.invalid", None, None, false);
+        let mut client = test_client();
         client.checkout_source_id = Some("digest".into());
+        client.local_root = Some(std::path::PathBuf::from("checkout"));
 
         assert_eq!(client.for_canonical().checkout_source_id, None);
+        assert_eq!(client.for_canonical().local_root(), None);
 
         // A view, not a move: the checkout client stays usable, so one
         // canonical lookup cannot silently redirect the rest of a session to
         // the trunk.
         assert_eq!(client.checkout_source_id.as_deref(), Some("digest"));
+        assert_eq!(client.local_root(), Some(std::path::Path::new("checkout")));
     }
 
     /// Outside a checkout there is nothing to drop, and canonical is already
     /// what every read resolves to.
     #[test]
     fn canonical_is_a_no_op_when_no_checkout_is_claimed() {
-        let client = Client::new("https://example.invalid", None, None, false);
+        let client = test_client();
 
         assert_eq!(client.for_canonical().checkout_source_id, None);
+    }
+
+    #[test]
+    fn failed_checkout_identity_clears_local_binding() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut client = Client::for_test("codebase", Some(directory.path().to_path_buf()));
+        client.checkout_source_id = Some("old-checkout".into());
+        let client = client.with_local_root(Some(directory.path().join("missing")));
+        assert_eq!(client.checkout_source_id, None);
+        assert_eq!(client.local_root(), None);
     }
 }

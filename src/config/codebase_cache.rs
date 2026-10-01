@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 
 use super::Config;
+use crate::codebase::{path_from_key, path_key};
 
 impl Config {
     /// The codebase explicitly recorded for this exact canonical checkout root.
@@ -44,8 +45,9 @@ impl Config {
         if let Some((_, id)) = self
             .codebase_cache
             .iter()
-            .filter(|(k, _)| dir.starts_with(k) && self.is_umbrella_root(Path::new(k)))
-            .max_by_key(|(k, _)| k.len())
+            .filter_map(|(key, id)| path_from_key(key).map(|path| (path, id)))
+            .filter(|(path, _)| dir.starts_with(path) && self.is_umbrella_root(path))
+            .max_by_key(|(path, _)| path.components().count())
         {
             return Some((id.clone(), "cache (umbrella ancestor)"));
         }
@@ -58,12 +60,10 @@ impl Config {
     /// [`super::Config::umbrella_globs`] pattern. Empty config ⇒ always false, which is what
     /// makes plain per-folder scoping the default.
     fn is_umbrella_root(&self, ancestor: &Path) -> bool {
-        let s = ancestor.to_string_lossy().replace('\\', "/");
-        let s_trim = s.trim_end_matches('/');
         if self
             .umbrella_roots
             .iter()
-            .any(|r| r.replace('\\', "/").trim_end_matches('/') == s_trim)
+            .any(|root| canonical(Path::new(root)) == ancestor)
         {
             return true;
         }
@@ -76,7 +76,7 @@ impl Config {
         self.umbrella_globs
             .iter()
             .filter_map(|g| glob::Pattern::new(g).ok())
-            .any(|p| p.matches_with(&s, opts))
+            .any(|p| p.matches_path_with(ancestor, opts))
     }
 
     /// Reverse of the codebase cache: the local checkout root
@@ -94,12 +94,16 @@ impl Config {
             .codebase_cache
             .iter()
             .filter(|(_, id)| id.as_str() == codebase_id)
-            .map(|(dir, _)| PathBuf::from(dir));
+            .filter_map(|(key, _)| path_from_key(key));
         if let Some(p) = prefer {
             let p = canonical(p);
             // Re-collect so the preference scan doesn't consume the fallback.
             let all: Vec<PathBuf> = matches.collect();
-            if let Some(hit) = all.iter().find(|root| p.starts_with(root)) {
+            if let Some(hit) = all
+                .iter()
+                .filter(|root| p.starts_with(root))
+                .max_by_key(|root| root.components().count())
+            {
                 return Some(hit.clone());
             }
             return all.into_iter().next();
@@ -109,24 +113,26 @@ impl Config {
 }
 
 /// Record `dir → codebase_id` in the on-disk cache (load, update, save).
-pub fn cache_codebase(dir: &std::path::Path, codebase_id: &str) -> Result<()> {
-    let mut cfg = super::load()?;
-    cfg.codebase_cache
-        .insert(cache_key(dir), codebase_id.to_string());
-    super::save(&cfg)
+pub async fn cache_codebase(dir: &std::path::Path, codebase_id: &str) -> Result<()> {
+    let key = cache_key(dir);
+    let id = codebase_id.to_string();
+    super::update(move |cfg| {
+        cfg.codebase_cache.insert(key, id);
+    })
+    .await?;
+    Ok(())
 }
 
 /// Drop every `dir → codebase_id` mapping pointing at `codebase_id`. Called when
 /// the server reports the id gone (deleted/expired, or the cache predates a
 /// switch to a different server) — the cache isn't server-scoped, so a dead id
 /// is purged everywhere rather than clung to. A re-`index` then registers fresh.
-pub fn uncache_codebase_id(codebase_id: &str) -> Result<()> {
-    let mut cfg = super::load()?;
-    let before = cfg.codebase_cache.len();
-    cfg.codebase_cache.retain(|_, v| v != codebase_id);
-    if cfg.codebase_cache.len() != before {
-        super::save(&cfg)?;
-    }
+pub async fn uncache_codebase_id(codebase_id: &str) -> Result<()> {
+    let id = codebase_id.to_string();
+    super::update(move |cfg| {
+        cfg.codebase_cache.retain(|_, value| value != &id);
+    })
+    .await?;
     Ok(())
 }
 
@@ -136,9 +142,9 @@ fn canonical(p: &Path) -> PathBuf {
     fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
-/// Canonical, stable cache key for a directory (absolute path, lossy string).
+/// Canonical cache key with a reversible native encoding for non-UTF-8 paths.
 fn cache_key(dir: &Path) -> String {
-    canonical(dir).to_string_lossy().into_owned()
+    path_key(&canonical(dir))
 }
 
 #[cfg(test)]
@@ -220,5 +226,48 @@ mod tests {
         let mut c = cfg(&[("/x/repo", "id-repo")]);
         c.umbrella_roots = vec!["/x/repo".into()];
         assert_eq!(resolved(&c, "/x/repo-two"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_cache_roots_round_trip_without_aliasing() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let first = PathBuf::from(std::ffi::OsString::from_vec(b"/work/\xff".to_vec()));
+        let second = PathBuf::from(std::ffi::OsString::from_vec(b"/work/\xfe".to_vec()));
+        let mut config = Config::default();
+        config
+            .codebase_cache
+            .insert(cache_key(&first), "first".into());
+        config
+            .codebase_cache
+            .insert(cache_key(&second), "second".into());
+        assert_eq!(
+            config.cached_codebase_exact(&first).as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            config.cached_codebase_exact(&second).as_deref(),
+            Some("second")
+        );
+        assert_eq!(config.codebase_root("first", None), Some(first));
+        assert_eq!(config.codebase_root("second", None), Some(second));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn literal_backslashes_do_not_grant_umbrella_consent() {
+        let mut config = cfg(&[("/work/same/checkout", "other")]);
+        config.umbrella_roots = vec!["/work/same\\checkout".into()];
+        assert_eq!(resolved(&config, "/work/same/checkout/child"), None);
+    }
+
+    #[test]
+    fn lossy_legacy_cache_keys_cannot_authorize_a_different_checkout() {
+        let mut config = cfg(&[("/work/\u{fffd}", "legacy")]);
+        config.umbrella_roots = vec!["/work/\u{fffd}".into()];
+        assert_eq!(resolved(&config, "/work/\u{fffd}"), None);
+        assert_eq!(resolved(&config, "/work/\u{fffd}/child"), None);
+        assert_eq!(config.codebase_root("legacy", None), None);
     }
 }

@@ -54,6 +54,7 @@ semctl index        # register + sync the current repo for indexing
 | `semctl files …`                                      | File catalog (`tree` / filtered `list`) and revision-pinned line/byte source reads.                                    |
 | `semctl inspect …`                                    | Projects/domains plus visible codebases and the effective server/tenant/index/graph context.                          |
 | `semctl mcp`                                          | Run as an MCP stdio server (launched by the host, not by hand).                                                       |
+| `semctl daemon status` / `stop`                       | Report or end the shared local daemon that serves the MCP sessions.                                                   |
 | `semctl install`                                      | Add/remove the editor/agent integrations.                                                                             |
 | `semctl uninstall`                                    | Reverse `install`: unwire the tools, remove from PATH, delete the binary (`--purge` also drops config + credentials). |
 | `semctl upgrade`                                      | Update the binary and refresh each installed editor/agent integration.                                                |
@@ -72,17 +73,31 @@ semctl edit apply plan.json
 semctl edit undo <plan-id>
 ```
 
-`edit apply` is the only normal mutation boundary. Before touching the bound
-checkout it refreshes the server's checkout lease and graph generation,
-canonicalizes every planned path, verifies every preimage, edit range, and
-expected postimage, and stages the whole multi-file plan with rollback
-sidecars. Reapplying an unchanged completed plan is idempotent. Undo succeeds
-only while all current files still match the retained postimage hashes.
+Apply and undo use one local transaction engine. Apply checks the checkout
+identity and current server graph generation. It verifies every planned path,
+preimage, edit range, and expected postimage before staging the complete plan.
+Open directory handles keep mutations bound to the approved checkout.
+Reapplying an unchanged completed plan is idempotent. Undo requires all current
+files to match the retained postimage hashes.
 
-Private preimages live only under the local config directory's `edit-history/`
-folder and are never sent back to the server. A plan-supplied formatter is not
-run unless `--run-formatter` is explicit; formatter commands, arguments, and
-paths are bounded to the approved plan.
+Each replacement verifies the bytes it displaced. Installation and rollback
+never replace a target created during the swap. Edits require filesystem
+hard-link support; semctl checks this before changing source files. A conflict
+retains private `.semctl-*.edit` recovery directories next to affected files
+and reports their paths. Inspect retained files before retrying. Directory
+renames can change those reported locations. Multiple file replacements are
+not globally atomic. Semctl detects writes observed before cleanup, but a
+writer can still change a displaced inode through an old open descriptor after
+the final check. Stop such writers when full isolation is required.
+
+Undo history stays in the local config directory's `edit-history/` folder.
+A plan-supplied formatter runs only with explicit `--run-formatter` approval.
+Formatter commands, arguments, and paths are bounded to the approved plan.
+Each formatter receives only a planned
+postimage through standard input. Semctl captures the formatted output before
+it writes any file. Prettier runs without project configuration, EditorConfig
+settings, or configured plugins. These restrictions keep formatter writes
+within the approved plan.
 
 The MCP surface exposes edits as immediate actions. `rename_symbol`,
 `safe_delete_symbol`, `replace_symbol_body`, `insert_before_symbol`, and
@@ -103,6 +118,79 @@ and its PATH entry, and re-points the Claude Code / Codex plugin at semctl's
 source (the plugin itself stays the same). A `cargo install`'d `semctx` is left
 for you to remove with `cargo uninstall semctx-cli`.
 
+## Shared local daemon
+
+`semctl mcp` can serve its session from one shared local process instead of
+serving it in the process the host started. One daemon serves every MCP session
+of one operating-system user and one configuration directory. It keeps one
+filesystem watcher, one reconcile queue, one scan cache, and one HTTP connection
+pool per checkout, however many sessions use that checkout. Nothing changes at
+the MCP tool boundary: the host still launches `semctl mcp`, and that process
+becomes a byte pump between the host and the daemon.
+
+`SEMCTX_MCP_DAEMON` selects the role of a `semctl mcp` invocation:
+
+| Value | What it does |
+| ------------------ | ----------------------------------------------------------------------------------------------------------- |
+| `auto` (default) | Attach to the daemon, start one when none is running, and serve the session in this process when that fails. |
+| `off` | Serve the session in this process, as every earlier version did. |
+| `require` | Attach to the daemon, start one when none is running, and exit with status 1 when that fails. |
+
+Two commands inspect and end a running daemon:
+
+```sh
+semctl daemon status        # version, pid, uptime, sessions, permits, checkouts
+semctl daemon status --json # the same facts as one JSON object
+semctl daemon stop          # end every session and exit
+```
+
+Both exit with status 1 and report `no daemon is running for this
+configuration` when no daemon answers. A daemon also exits by itself after ten
+minutes with no session.
+
+| Env                            | What it sets                                                                                   |
+| ------------------------------ | ---------------------------------------------------------------------------------------------- |
+| `SEMCTX_DAEMON_IDLE_SECS`      | Seconds with no session before the daemon exits. Default 600; `0` exits with the last session.  |
+| `SEMCTX_DAEMON_SCAN_PERMITS`   | Concurrent checkout scans. Default: half the available CPUs, at least 2 and at most 8.          |
+| `SEMCTX_DAEMON_UPLOAD_PERMITS` | Concurrent upload requests across every checkout. Default 8.                                    |
+| `SEMCTX_DAEMON_REMOTE_PERMITS` | Concurrent remote requests from tool calls. Default 64.                                         |
+
+Each permit override is clamped to the range 1 to 1024.
+
+A daemon inherits the environment of the client that started it, minus the six
+per-session variables (`SEMCTX_TOKEN`, `SEMCTX_SERVER`, `SEMCTX_TENANT`,
+`SEMCTX_CODEBASE`, `SEMCTX_MCP_RESYNC_SECS`, `SEMCTX_MCP_UPDATE_CHECK`). Every
+later session of that daemon therefore runs with the first client's proxy
+settings, its `PATH`, which decides which formatter an edit runs, and its Git
+configuration variables, which decide which rules a source policy reads. Run
+`semctl daemon stop` to change any of them: the next `semctl mcp` client starts
+a daemon with its own environment. The daemon's working directory is not
+inherited; each session carries its own in its attach request.
+
+The endpoint and the daemon log live in the same place on each platform:
+
+| Platform | Endpoint                                                             | Log                                     |
+| -------- | -------------------------------------------------------------------- | --------------------------------------- |
+| Linux    | `$XDG_RUNTIME_DIR/semctl/<id>.sock`, else `/tmp/semctl-<uid>/<id>.sock` | `<same directory>/<id>.log`             |
+| macOS    | `$TMPDIR/semctl/<id>.sock`, else `/tmp/semctl-<uid>/<id>.sock`         | `<same directory>/<id>.log`             |
+| Windows  | `\\.\pipe\semctl-<id>`                                                 | `%LOCALAPPDATA%\semctl\daemon-<id>.log` |
+
+`<id>` is a hash of the configuration directory, the build version, and the
+user. A new version therefore starts its own daemon and never attaches to a
+daemon of another version.
+
+On Unix the runtime directory and the socket are owner-only, semctl refuses a
+runtime directory it does not own or one that carries group or other permission
+bits, and the daemon checks each peer's user id before it reads a handshake. On
+Windows the pipe carries a security descriptor that grants the current user's
+SID alone, the first instance of the pipe name is the election, and the client
+opens the pipe at identification level so the server cannot impersonate it.
+Secrets travel only inside the handshake body: no token appears in an endpoint
+name, a command argument, a log line, or status output.
+
+The daemon is exercised at runtime on Linux only. The Windows and macOS paths
+are compile-checked on every change and have no runtime measurements yet.
+
 ## Updating
 
 ```sh
@@ -118,6 +206,10 @@ re-run `cargo install … --force` instead of clobbering it. In both cases,
 The refresh also runs when the binary is already current. It does not install or
 remove an integration.
 
+Release maintainers must run an asset rebuild from the existing version tag.
+The workflow refuses a rebuild when the selected commit differs from that tag.
+Publication verifies the tag again before it uploads assets.
+
 ## Configuration
 
 Config lives at `~/.config/semctl/config.toml` (credentials in a sibling
@@ -125,14 +217,37 @@ Config lives at `~/.config/semctl/config.toml` (credentials in a sibling
 `installation-id` in the same directory lets the server distinguish concurrent
 local checkouts without receiving a host name or local path. Local codebases are
 mapped by canonical checkout path, not guessed from Git remote or folder name:
-two clones with the same display name therefore get separate UUIDs and opaque,
-collision-safe slugs. An older `~/.config/semctx/` install is read as a fallback
-so a rename doesn't force a re-login.
+servers without project-key support keep separate checkout slugs. Servers with
+project-key support decide project membership from complete remote identities.
+Ordinary checkout paths retain their existing source IDs. Native paths with
+invalid UTF-8, the Unicode replacement character, or a literal Unix backslash
+receive lossless source IDs and cache keys. Old ambiguous cache entries do not
+authorize a checkout or reuse its single-manifest codebase. These paths require
+indexing again because the old encoding could identify another checkout. An older
+`~/.config/semctx/` install remains readable.
+Legacy credentials migrate when their JWT issuer matches the configured server's
+advertised authority. Credentials without that evidence require a new login.
 
-`sync-cache/` stores non-secret per-checkout file stamps, hashes, and content-
-filter decisions so repeated `semctl index` runs do not reread unchanged files.
+Each stored login records its resource server, authentication authority, and
+generation. Requests refuse credentials from another server. A server override
+therefore needs a login for that server, or an explicit `SEMCTX_TOKEN` for the
+invocation. Refresh tokens remain bound to the authority that issued them.
+Login, logout, refresh, migration, and purge share one state lock. The non-secret
+`.semctl.state.lock` and `.semctl.state.generation` files remain in the config
+base after purge. They prevent pending operations from restoring cleared login
+state. Blank server flags and environment values fall through to the next
+configured source.
+
+`sync-cache/` stores non-secret per-checkout hashes and content-filter decisions.
+Every scan reads and hashes current file bytes. Matching hashes permit reuse of
+filter decisions. Equal file sizes and timestamps never prove unchanged content.
 Source contents are never written to this cache, and `semctl uninstall --purge`
 removes it with the rest of the semctl config directory.
+
+Use `.semctlignore` to exclude repository files from indexing. The legacy
+`.semctxignore` name remains supported. Both files use Git ignore syntax. A sync aborts when any effective exclusion
+source cannot be read or changes during the scan. This includes Git global
+exclusions, included configuration, and worktree `info/exclude` files.
 
 | Setting         | Flag         | Env               |
 | --------------- | ------------ | ----------------- |
@@ -140,8 +255,9 @@ removes it with the rest of the semctl config directory.
 | Active tenant   | `--tenant`   | `SEMCTX_TENANT`   |
 | Active codebase | `--codebase` | `SEMCTX_CODEBASE` |
 
-Login validates the saved active tenant against the new account's memberships
-and automatically selects a sole membership. If a saved tenant later becomes
+Login clears the previous account's tenant and automatically selects a sole
+membership. Tenant selection applies only while that login remains current.
+If a saved tenant later becomes
 invalid, an authenticated request repairs it the same way and retries once.
 Explicit `--tenant` / `SEMCTX_TENANT` overrides are never replaced; with
 multiple memberships, run `semctl auth tenants` in an interactive terminal to
@@ -171,8 +287,9 @@ cap: four successful nudges per clear/compact segment).
 
 ## Development
 
-Run `mise install` to install the repository's Rust and Bun toolchains. Run
-`prek install` once to install the pre-commit hook. The complete local and CI
+Run `mise install` to install the repository's Rust and Bun toolchains. Install
+Python 3, a POSIX shell, and PowerShell 7 for the bootstrap tests.
+Run `prek install` once to install the pre-commit hook. The complete local and CI
 gate is:
 
 ```sh
@@ -187,6 +304,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items --locked
 cargo test --workspace --locked
 mise exec -c "bun test plugins/semctx/adapters/omp/index.test.ts"
+python3 tests/bootstrap_installers.py
 ```
 
 `plugins/semctx/` is the shared plugin root for every supported coding agent.
@@ -210,8 +328,9 @@ warnings (including broken doc links) fail the build.
 Releases are cut by **bumping the version**: set a new `version` in `Cargo.toml`
 (e.g. `0.1.0` → `0.1.1`) and push to `main`. `.github/workflows/release.yml`
 detects the new version, builds the per-platform binaries, and publishes them as
-release `v<version>`; `semctl upgrade` then picks it up. Pushes that don't change
-the version are a no-op.
+release `v<version>` after the shared CI gate passes for the same commit. The
+release tag points to that commit. `semctl upgrade` then picks it up. Pushes that
+do not change the version are a no-op.
 
 ## License
 
