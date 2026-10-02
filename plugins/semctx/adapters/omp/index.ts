@@ -171,6 +171,18 @@ function pathEntries(value: unknown): string[] {
 }
 
 /**
+ * OMP content searches and the input field that holds each search pattern.
+ * `ast_grep` matches code structure and `find` is a natural-language discovery
+ * query; both are repository discovery that semctl serves, so each maps to the
+ * wire contract's `Grep`.
+ */
+const CONTENT_SEARCH_PATTERN: Record<string, string> = {
+	grep: "pattern",
+	ast_grep: "pat",
+	find: "query",
+};
+
+/**
  * Map an OMP tool call onto the wire contract. OMP input shapes differ from
  * Claude's: `glob` carries its pattern in `path`, `grep` accepts a line
  * selector on one file, and `bash` can run in its own `cwd`. A search of
@@ -178,13 +190,16 @@ function pathEntries(value: unknown): string[] {
  */
 function hookToolCall(toolName: string, input: Record<string, unknown>, cwd: string): HookToolCall | undefined {
 	if (toolName.startsWith(OMP_SEMCTX_TOOL_PREFIX)) return { tool_name: toolName, tool_input: input, cwd };
+	const patternField = CONTENT_SEARCH_PATTERN[toolName];
+	if (patternField !== undefined) {
+		const entries = pathEntries(input.path);
+		if (entries.some(entry => URL_PATH.test(entry))) return undefined;
+		const pattern = input[patternField];
+		if (entries.length === 0) return { tool_name: "Grep", tool_input: { pattern }, cwd };
+		const target = entries.length === 1 ? entries[0].replace(LINE_SELECTOR, "") : input.path;
+		return { tool_name: "Grep", tool_input: { pattern, path: target }, cwd };
+	}
 	switch (toolName) {
-		case "grep": {
-			const entries = pathEntries(input.path);
-			if (entries.some(entry => URL_PATH.test(entry))) return undefined;
-			if (entries.length !== 1) return { tool_name: "Grep", tool_input: input, cwd };
-			return { tool_name: "Grep", tool_input: { ...input, path: entries[0].replace(LINE_SELECTOR, "") }, cwd };
-		}
 		case "glob": {
 			// OMP `glob` carries its pattern in `path`. The wire contract follows
 			// Claude's `Glob`, which carries it in `pattern`.
@@ -209,6 +224,10 @@ export function createSemctxExtension(invoker: HookInvoker = createSemctlHookInv
 		const instanceId = `${process.pid}-${Date.now().toString(36)}`;
 		let promptGeneration = 0;
 		let activePromptId = "";
+		// The prompt of a submission that has not started a turn yet. OMP can run
+		// `before_agent_start` again for the same submission before its first
+		// turn. Reusing the prompt id keeps semctl's per-turn dedup intact.
+		let preparingPrompt: string | undefined;
 
 		pi.setLabel("semctx");
 
@@ -225,6 +244,7 @@ export function createSemctxExtension(invoker: HookInvoker = createSemctlHookInv
 		};
 		const resetTurnState = () => {
 			activePromptId = "";
+			preparingPrompt = undefined;
 		};
 		const sendOrientation = async (source: SessionSource, ctx: HookContext) => {
 			resetTurnState();
@@ -255,7 +275,10 @@ export function createSemctxExtension(invoker: HookInvoker = createSemctlHookInv
 		pi.on("session_compact", async (_event, ctx) => sendOrientation("compact", ctx));
 
 		pi.on("before_agent_start", async (event, ctx) => {
-			activePromptId = allocatePromptId(ctx);
+			if (activePromptId === "" || preparingPrompt !== event.prompt) {
+				activePromptId = allocatePromptId(ctx);
+			}
+			preparingPrompt = event.prompt;
 			const context = await safeInvoke(
 				{
 					host: HOST,
@@ -271,6 +294,9 @@ export function createSemctxExtension(invoker: HookInvoker = createSemctlHookInv
 			return context === undefined
 				? undefined
 				: { message: hiddenMessage(PROMPT_CONTEXT_MESSAGE, context) };
+		});
+		pi.on("turn_start", () => {
+			preparingPrompt = undefined;
 		});
 
 		pi.on("tool_call", async (event, ctx) => {

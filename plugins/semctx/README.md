@@ -23,7 +23,9 @@ The OMP `tool_call` event returns `PreToolUse` guidance as passive
 `additionalContext` for that tool call. The adapter maps OMP tool inputs to the
 Claude-shaped wire contract: the `glob` pattern moves from `path` to `pattern`,
 a single-file `grep` line selector (`src/lib.rs:10-20`) is removed, and a `bash`
-`cwd` becomes the hook `cwd`. A search of OMP internal URLs (`omp://`,
+`cwd` becomes the hook `cwd`. `ast_grep` (`pat`) and `find` (`query`) are
+repository content searches, so they map to `Grep` like `grep` does. A search
+of OMP internal URLs (`omp://`,
 `local://`, `skill://`) or web URLs is not repository discovery, so the adapter
 does not send it to `semctl hook`.
 Do not manually copy shared skills; when a host requires a projected format,

@@ -155,6 +155,24 @@ describe("semctx OMP extension", () => {
 		expect(harness.handlers.has("context")).toBeFalse();
 	});
 
+	test("keeps one prompt id when OMP retries a submission before its first turn", async () => {
+		const invoker = new FakeInvoker(() => undefined);
+		const harness = makeHarness(invoker);
+		const promptIds = async (prompt: string) => {
+			await harness.emit("before_agent_start", { prompt, systemPrompt: [] });
+			return invoker.calls.at(-1)?.input.prompt_id;
+		};
+
+		const first = await promptIds("find the parser");
+		expect(await promptIds("find the parser")).toBe(first);
+		const other = await promptIds("find the lexer");
+		expect(other).not.toBe(first);
+
+		// After a turn starts, the same text is a new submission.
+		await harness.emit("turn_start");
+		expect(await promptIds("find the lexer")).not.toBe(other);
+	});
+
 	test("returns each tool call's passive context independently", async () => {
 		const invoker = new FakeInvoker(input => input.tool_name);
 		const harness = makeHarness(invoker);
@@ -239,6 +257,16 @@ describe("semctx OMP extension", () => {
 			pattern: "x",
 			path: "src; tests",
 		});
+		expect(await sent("ast_grep", { pat: "foo($A)", path: "src", lang: "rust" })).toEqual({
+			tool_name: "Grep",
+			tool_input: { pattern: "foo($A)", path: "src" },
+			cwd: "/repo",
+		});
+		expect(await sent("find", { query: "where tokens refresh", grep_keywords: ["refresh"] })).toEqual({
+			tool_name: "Grep",
+			tool_input: { pattern: "where tokens refresh" },
+			cwd: "/repo",
+		});
 
 		expect(await sent("bash", { command: "rg needle", cwd: "crates/core" })).toEqual({
 			tool_name: "Bash",
@@ -258,6 +286,8 @@ describe("semctx OMP extension", () => {
 			["glob", { path: "skill://semctx/**" }],
 			["glob", { path: "omp:/tools" }],
 			["bash", { command: "rg needle", cwd: "local://scratch" }],
+			["ast_grep", { pat: "foo($A)", path: "omp://**/*.md" }],
+			["find", { query: "session lifecycle", grep_keywords: [], path: "omp://" }],
 		] as const) {
 			expect(await harness.emit("tool_call", { toolName, input })).toBeUndefined();
 		}

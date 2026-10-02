@@ -40,8 +40,8 @@ function toolDecisions(session: HostSession): string[] {
 
 for (const adapter of HOST_ADAPTERS) {
 	const selected = SELECTED === undefined ? true : SELECTED.includes(adapter.id);
-	const runnable = adapter.unsupported === undefined && Bun.which(hostCommand(adapter)[0]) !== null;
-	// Without SEMCTX_HOSTS, a host that cannot run here is skipped. With it, a
+	const runnable = Bun.which(hostCommand(adapter)[0]) !== null;
+	// Without SEMCTX_HOSTS, a host whose CLI is missing is skipped. With it, a
 	// selected host always runs, so a missing CLI fails loudly.
 	const skip = !ENABLED || !selected || (SELECTED === undefined && !runnable);
 

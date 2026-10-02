@@ -45,8 +45,6 @@ export interface HostAdapter {
 	hookHost: string;
 	wire: WireFormat;
 	defaultCommand: string[];
-	/** Why this platform cannot run the host's semctx integration, if it cannot. */
-	unsupported?: string;
 	/** One-time host configuration for a suite. */
 	setup(context: HostContext): void;
 	/** Arguments after the launch command for one print-mode session. */
@@ -183,10 +181,6 @@ const codex: HostAdapter = {
 	hookHost: "",
 	wire: "openai-responses",
 	defaultCommand: ["codex"],
-	unsupported:
-		process.platform === "win32"
-			? "Codex does not load plugin hooks on Windows (openai/codex#24453)"
-			: undefined,
 	setup({ command, env, home }) {
 		const codexEnv = { ...env, CODEX_HOME: home };
 		// A local marketplace installs a copy of this checkout's plugin.

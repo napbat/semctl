@@ -348,13 +348,10 @@ them locally:
 SEMCTX_HOST_INTEGRATION=1 mise exec -c "bun test tests/hosts"
 ```
 
-Without `SEMCTX_HOSTS`, the suite skips a host whose CLI is not on PATH or that
-cannot run on the current platform. `SEMCTX_HOSTS=omp,claude` selects hosts, and
-a selected host that cannot run fails. `SEMCTX_HOST_COMMAND_<ID>` replaces a
-host's launch command, for example
-`SEMCTX_HOST_COMMAND_CODEX="bun x @openai/codex"`. Codex does not load plugin
-hooks on Windows ([openai/codex#24453](https://github.com/openai/codex/issues/24453)),
-so run the Codex host on Linux or macOS.
+Without `SEMCTX_HOSTS`, the suite skips a host whose CLI is not on PATH.
+`SEMCTX_HOSTS=omp,claude` selects hosts, and a selected host whose CLI is
+missing fails. `SEMCTX_HOST_COMMAND_<ID>` replaces a host's launch command, for
+example `SEMCTX_HOST_COMMAND_CODEX="bun x @openai/codex"`.
 
 To add a host, add an adapter to `HOST_ADAPTERS` in `tests/hosts/hosts.ts`. If
 the host speaks a new model API, also add a wire format to

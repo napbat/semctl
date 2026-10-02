@@ -89,7 +89,6 @@ export class HostSuite {
 
 	/** Prepare a workspace, the scripted model, and the host configuration. */
 	static start(adapter: HostAdapter): HostSuite {
-		if (adapter.unsupported !== undefined) throw new Error(`${adapter.id}: ${adapter.unsupported}`);
 		const command = hostCommand(adapter);
 		if (Bun.which(command[0]) === null) throw new Error(`${adapter.id}: \`${command[0]}\` is not on PATH`);
 
