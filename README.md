@@ -148,6 +148,16 @@ Both exit with status 1 and report `no daemon is running for this
 configuration` when no daemon answers. A daemon also exits by itself after ten
 minutes with no session.
 
+A running daemon keeps its loaded executable after an on-disk binary update.
+Run `semctl daemon stop` and reconnect the host's MCP session to load the update.
+
+On Windows, the daemon and its Git probes use `CREATE_NO_WINDOW`: redirecting
+standard streams alone does not prevent Windows from allocating a console for
+each probe. Git source-policy checks skip the separate exclusion-path query when
+the complete resolved configuration proves `core.excludesFile` is absent.
+Explicit values still use Git's path expansion and participate in policy
+fingerprints; ignore-source identity and byte checks remain in place.
+
 | Env                            | What it sets                                                                                   |
 | ------------------------------ | ---------------------------------------------------------------------------------------------- |
 | `SEMCTX_DAEMON_IDLE_SECS`      | Seconds with no session before the daemon exits. Default 600; `0` exits with the last session.  |
@@ -188,8 +198,11 @@ opens the pipe at identification level so the server cannot impersonate it.
 Secrets travel only inside the handshake body: no token appears in an endpoint
 name, a command argument, a log line, or status output.
 
-The daemon is exercised at runtime on Linux only. The Windows and macOS paths
-are compile-checked on every change and have no runtime measurements yet.
+The full shared-daemon lifecycle suite is Unix-only. Native Windows regressions
+cover console-free Git probes and source-policy syncing. Windows named-pipe
+startup, MCP initialization, tool listing/calls, and client EOF have also been
+smoke-tested. The macOS daemon path remains compile-checked without runtime
+measurements.
 
 ## Updating
 
@@ -322,8 +335,10 @@ model-level golden prompts:
 python3 scripts/run_skill_evals.py --host all
 ```
 
-CI (`.github/workflows/ci.yml`) runs the same checks — clippy is `pedantic`, and
-warnings (including broken doc links) fail the build.
+CI (`.github/workflows/ci.yml`) installs the current stable Rust toolchain and
+runs these checks. Use the same Rust version for local checks. New stable
+releases can add Clippy lints. Clippy uses `pedantic`. Warnings, including broken
+doc links, fail the build.
 
 Releases are cut by **bumping the version**: set a new `version` in `Cargo.toml`
 (e.g. `0.1.0` → `0.1.1`) and push to `main`. `.github/workflows/release.yml`

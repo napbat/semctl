@@ -96,6 +96,9 @@ pub(super) async fn git_working_copy_root(dir: &Path) -> Option<PathBuf> {
 #[cfg(windows)]
 async fn git_output(command: &mut Command) -> std::io::Result<Output> {
     let mut stdout = tempfile::tempfile()?;
+    // The daemon has no console to inherit. Redirecting stdio alone still lets
+    // Windows allocate a new console for each Git probe.
+    command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     let child_stdout = stdout.try_clone()?;
     let status = command
         .stdin(Stdio::null())
@@ -189,5 +192,41 @@ mod tests {
             sanitized_remote("https://user:test-token@[invalid/repo.git"),
             None
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn git_child_has_no_console() {
+        if std::env::var_os("SEMCTL_TEST_GIT_CONSOLE").is_none() {
+            return;
+        }
+        // SAFETY: this query takes no pointers and only inspects this process.
+        let window = unsafe { windows_sys::Win32::System::Console::GetConsoleWindow() };
+        assert!(
+            window.is_null(),
+            "Git child has a console window: {window:?}"
+        );
+        println!("console-free Git probe");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn git_capture_does_not_allocate_a_console() {
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "codebase::git::tests::git_child_has_no_console",
+                "--nocapture",
+            ])
+            .env("SEMCTL_TEST_GIT_CONSOLE", "1")
+            .kill_on_drop(true);
+        let output = super::git_output(&mut command).await.unwrap();
+        assert!(
+            output.status.success(),
+            "Git probe allocated a console: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("console-free Git probe"));
     }
 }

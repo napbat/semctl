@@ -118,6 +118,19 @@ fn query(
         status == 0,
         "Git could not read source policy configuration (exit {status})"
     );
+    // The complete resolved listing already proves when this key is absent.
+    // Only an explicit value needs a second process for Git's path expansion;
+    // keep that expansion in the fingerprint when it exists.
+    let has_excludes = listed
+        .split(|byte| *byte == 0)
+        .enumerate()
+        .any(|(index, field)| {
+            index % 2 == 1
+                && (field == b"core.excludesfile" || field.starts_with(b"core.excludesfile\n"))
+        });
+    if !has_excludes {
+        return Ok(Some((listed, None)));
+    }
     let (_, excludes) = run_git(
         directory,
         &["config", "--null", "--path", "--get", "core.excludesfile"],
@@ -282,13 +295,25 @@ fn run_git(
     args: &[&str],
     cancellation: &Cancellation,
 ) -> Result<Option<(i32, Vec<u8>)>> {
+    let mut command = Command::new(OsStr::new("git"));
+    command.arg("-C").arg(directory).args(args);
+    run_git_command(command, cancellation)
+}
+
+fn run_git_command(
+    mut command: Command,
+    cancellation: &Cancellation,
+) -> Result<Option<(i32, Vec<u8>)>> {
     cancellation.check()?;
     let capture = Capture::new()?;
-    let mut command = Command::new(OsStr::new("git"));
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        // A console-less daemon must not allocate a console for each query.
+        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    }
     command
-        .arg("-C")
-        .arg(directory)
-        .args(args)
         .stdin(Stdio::null())
         // A disk handle avoids the Git for Windows anonymous-pipe startup hang.
         .stdout(capture.file.try_clone()?)
@@ -330,4 +355,31 @@ fn run_git(
         "Git source policy configuration exceeds 16 MiB"
     );
     Ok(Some((status, bytes)))
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::{Cancellation, Command, run_git_command};
+
+    #[test]
+    fn git_policy_query_does_not_allocate_a_console() {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "codebase::git::tests::git_child_has_no_console",
+                "--nocapture",
+            ])
+            .env("SEMCTL_TEST_GIT_CONSOLE", "1");
+        let (status, output) = run_git_command(command, &Cancellation::default())
+            .unwrap()
+            .expect("console probe is available");
+        assert_eq!(
+            status,
+            0,
+            "Git policy query allocated a console: {}",
+            String::from_utf8_lossy(&output)
+        );
+        assert!(String::from_utf8_lossy(&output).contains("console-free Git probe"));
+    }
 }
