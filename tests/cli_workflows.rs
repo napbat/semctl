@@ -848,14 +848,19 @@ async fn older_versioned_servers_keep_unrelated_remote_basenames_separate() {
 #[tokio::test]
 async fn native_checkout_paths_submit_distinct_stable_source_identities() {
     use std::os::unix::ffi::OsStringExt;
+    // APFS rejects a name that is not UTF-8 (EILSEQ), so macOS cannot hold the
+    // two non-UTF-8 checkouts this test also covers.
+    #[cfg(not(target_os = "macos"))]
+    const NAMES: &[&[u8]] = &[
+        b"same\\checkout",
+        b"same/checkout",
+        b"native-\xff",
+        b"native-\xfe",
+    ];
+    #[cfg(target_os = "macos")]
+    const NAMES: &[&[u8]] = &[b"same\\checkout", b"same/checkout"];
 
     let checkout = Checkout::new();
-    let names = [
-        b"same\\checkout".to_vec(),
-        b"same/checkout".to_vec(),
-        b"native-\xff".to_vec(),
-        b"native-\xfe".to_vec(),
-    ];
     let server = Server::start(|request| {
         let data = match request.path.as_str() {
             "/v1/whoami" => json!({"capabilities": []}),
@@ -864,8 +869,10 @@ async fn native_checkout_paths_submit_distinct_stable_source_identities() {
         };
         json!({"success": true, "data": data})
     });
-    for name in names {
-        let root = checkout.root.join(std::ffi::OsString::from_vec(name));
+    for name in NAMES {
+        let root = checkout
+            .root
+            .join(std::ffi::OsString::from_vec(name.to_vec()));
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
         for _ in 0..2 {
@@ -885,14 +892,14 @@ async fn native_checkout_paths_submit_distinct_stable_source_identities() {
         .filter(|r| r.path.ends_with("/sync"))
         .map(|r| r.body["sourceId"].as_str().unwrap())
         .collect();
-    assert_eq!(sources.len(), 8);
+    assert_eq!(sources.len(), 2 * NAMES.len());
     for pair in sources.as_chunks::<2>().0 {
         assert_eq!(pair[0], pair[1]);
     }
     let unique: std::collections::HashSet<_> = sources.into_iter().collect();
     assert_eq!(
         unique.len(),
-        4,
+        NAMES.len(),
         "each distinct checkout needs a distinct manifest identity"
     );
 }
