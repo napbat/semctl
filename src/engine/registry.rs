@@ -184,8 +184,8 @@ impl CheckoutRegistry {
             return Ok((lease, None));
         }
 
-        // Registering with the hub walks the tree to seed the watcher's file-id
-        // cache. It runs on the blocking pool, and the map lock is not held.
+        // Registering with the hub can walk the tree to add the platform watch.
+        // It runs on the blocking pool, and the map lock is not held.
         let (sender, batches) = mpsc::channel(BATCH_CAPACITY);
         let overflow = Arc::new(AtomicBool::new(false));
         let hub = self.hub.clone();
