@@ -43,7 +43,7 @@ use anyhow::{Context, Result};
 use tracing::info;
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
-    CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS,
+    CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
 };
 
 use crate::ipc::Endpoint;
@@ -114,10 +114,11 @@ fn detach(command: &mut Command) {
 
 /// Detach the daemon from this client's console and job object.
 ///
-/// `CREATE_NO_WINDOW` and `DETACHED_PROCESS` keep the daemon off this
-/// client's console, `CREATE_NEW_PROCESS_GROUP` keeps console control events
-/// from reaching it, and `CREATE_BREAKAWAY_FROM_JOB` keeps it out of a job
-/// object that would end it with this client.
+/// `CREATE_NO_WINDOW` starts the daemon without a console,
+/// `CREATE_NEW_PROCESS_GROUP` keeps console control events from reaching it,
+/// and `CREATE_BREAKAWAY_FROM_JOB` keeps it out of a job object that would end
+/// it with this client. Do not combine `CREATE_NO_WINDOW` with
+/// `DETACHED_PROCESS`: Windows ignores the former when the latter is set.
 #[cfg(windows)]
 fn detach(command: &mut Command) {
     use std::os::windows::process::CommandExt;
@@ -127,7 +128,7 @@ fn detach(command: &mut Command) {
 
 /// The creation flags that always apply.
 #[cfg(windows)]
-const CREATION_FLAGS: u32 = CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+const CREATION_FLAGS: u32 = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP;
 
 /// Keep this client's standard handles out of the daemon.
 ///

@@ -447,6 +447,32 @@ fn policy_changes_during_server_planning_abort_content_upload() {
     assert!(server.bodies("PUT").is_empty());
 }
 
+#[test]
+fn a_new_git_configuration_include_aborts_content_upload() {
+    let checkout = Checkout::new();
+    fs::write(checkout.root.join("private.txt"), "fixture content\n").unwrap();
+    fs::write(&checkout.global, "[include]\npath = late.config\n").unwrap();
+    let excludes = checkout.directory.path().join("late.ignore");
+    fs::write(&excludes, "private.txt\n").unwrap();
+    let included = checkout.directory.path().join("late.config");
+    let server = Server::start(move || {
+        fs::write(
+            &included,
+            format!(
+                "[core]\nexcludesFile = \"{}\"\n",
+                excludes.display().to_string().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+    });
+    let result = checkout.run(&server, &checkout.root);
+    assert!(!result.status.success());
+    let manifests = server.bodies("POST");
+    assert_eq!(manifests.len(), 1);
+    assert_eq!(manifests[0]["files"][0]["path"], "private.txt");
+    assert!(server.bodies("PUT").is_empty());
+}
+
 #[cfg(unix)]
 #[test]
 fn linked_worktree_policy_preserves_native_git_directory_paths() {
