@@ -18,12 +18,21 @@ env:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    name: check (${{ matrix.os }})
+    strategy:
+      # Report every platform. One platform failure must not hide another.
+      fail-fast: false
+      matrix:
+        # The release builds binaries for these three platforms. Each one runs
+        # its own `cfg` code paths and its own file-watcher backend.
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
       - uses: jdx/mise-action@v4
+        if: runner.os == 'Linux'
         with:
           install_args: bun
       # Deliberately floating. A new stable can turn a fresh lint into a build
@@ -34,7 +43,9 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      # Formatting does not depend on the platform.
       - name: fmt
+        if: runner.os == 'Linux'
         run: cargo fmt --check
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -44,11 +55,20 @@ jobs:
           RUSTDOCFLAGS: "-D warnings"
       - name: test
         run: cargo test --workspace --locked
+      # The remaining checks do not depend on the platform, except the
+      # PowerShell installer, which also runs on the platform it targets.
       - name: OMP extension test
+        if: runner.os == 'Linux'
         run: mise exec -c "bun test plugins/semctx/adapters/omp/index.test.ts"
       - name: Bootstrap installer test
+        if: runner.os == 'Linux'
         run: python3 tests/bootstrap_installers.py
+      - name: Bootstrap installer test (PowerShell)
+        if: runner.os == 'Windows'
+        run: python tests/bootstrap_installers.py --shell pwsh
       - name: Release source test
+        if: runner.os == 'Linux'
         run: python3 tests/release_source.py
       - name: Diff whitespace check
+        if: runner.os == 'Linux'
         run: git diff --check

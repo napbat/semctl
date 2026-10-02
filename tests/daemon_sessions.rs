@@ -55,7 +55,13 @@ struct Endpoint {
 
 impl Endpoint {
     fn new() -> Self {
-        let home = tempfile::tempdir().expect("create an isolated endpoint directory");
+        // The socket path must fit the 100-byte limit, or the endpoint moves
+        // to the shared `/tmp/semctl-<uid>` fallback and ignores this fixture's
+        // runtime directory. The default temporary directory on macOS is too
+        // long for that, so every endpoint lives under `/tmp`.
+        let home = tempfile::Builder::new()
+            .tempdir_in("/tmp")
+            .expect("create an isolated endpoint directory");
         let root = std::fs::canonicalize(home.path()).expect("canonicalize the endpoint directory");
         let config_home = root.join("config");
         // `semctl` reads `<XDG_CONFIG_HOME>/semctl`. Creating it up front keeps
@@ -126,8 +132,8 @@ impl Endpoint {
     fn start_client(&self, mode: &str, options: ClientOptions<'_>) -> McpClient {
         let ordinal = self.started.get() + 1;
         self.started.set(ordinal);
-        let log = std::fs::File::create(self.path().join(format!("client-{ordinal}.err")))
-            .expect("create the client log");
+        let log_path = self.path().join(format!("client-{ordinal}.err"));
+        let log = std::fs::File::create(&log_path).expect("create the client log");
         let mut command = self.command();
         command
             .args(["--server", DEAD_SERVER])
@@ -152,6 +158,7 @@ impl Endpoint {
             child,
             stdin: Some(stdin),
             stdout,
+            log_path,
         }
     }
 
@@ -307,6 +314,8 @@ struct McpClient {
     /// Taken when the test closes the client's input.
     stdin: Option<ChildStdin>,
     stdout: Lines<BufReader<ChildStdout>>,
+    /// The client's standard error, reported when it fails to exit.
+    log_path: PathBuf,
 }
 
 impl McpClient {
@@ -369,10 +378,11 @@ impl McpClient {
 
     /// Wait for the client to exit.
     async fn wait(&mut self) -> ExitStatus {
-        tokio::time::timeout(EXIT_TIMEOUT, self.child.wait())
-            .await
-            .expect("the client did not exit in time")
-            .expect("wait for the client")
+        let Ok(exit) = tokio::time::timeout(EXIT_TIMEOUT, self.child.wait()).await else {
+            let log = std::fs::read_to_string(&self.log_path).unwrap_or_default();
+            panic!("the client did not exit in time; its log:\n{log}");
+        };
+        exit.expect("wait for the client")
     }
 }
 

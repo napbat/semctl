@@ -300,9 +300,17 @@ mod tests {
     #[tokio::test]
     async fn git_root_preserves_native_bytes_and_trailing_whitespace() {
         use std::os::unix::ffi::OsStringExt;
+        // APFS rejects a name that is not UTF-8 (EILSEQ), so macOS cannot hold
+        // the non-UTF-8 checkout this test also covers.
+        #[cfg(not(target_os = "macos"))]
+        const NAMES: &[&[u8]] = &[b"repo \n", b"repo-\xff"];
+        #[cfg(target_os = "macos")]
+        const NAMES: &[&[u8]] = &[b"repo \n"];
         let temp = tempfile::tempdir().unwrap();
-        for name in [b"repo \n".to_vec(), b"repo-\xff".to_vec()] {
-            let root = temp.path().join(std::ffi::OsString::from_vec(name));
+        for name in NAMES {
+            let root = temp
+                .path()
+                .join(std::ffi::OsString::from_vec(name.to_vec()));
             std::fs::create_dir(&root).unwrap();
             assert!(
                 std::process::Command::new("git")

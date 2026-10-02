@@ -69,11 +69,43 @@ async fn open() -> Result<Stream> {
 }
 
 /// Send one control request and read its one answer line.
+///
+/// A connection that closes before the answer means the daemon was exiting,
+/// which is the same fact as no daemon at all.
 async fn exchange(stream: &mut Stream, request: &Request, name: &str) -> Result<Vec<u8>> {
+    let no_daemon = |error: handshake::HandshakeError, context: String| {
+        if ipc::connection_lost(&error) {
+            debug!(%error, "the daemon closed the connection before it answered");
+            anyhow!(NO_DAEMON)
+        } else {
+            anyhow::Error::new(error).context(context)
+        }
+    };
     handshake::write_line_async(stream, request)
         .await
-        .with_context(|| format!("send the {name} request"))?;
+        .map_err(|error| no_daemon(error, format!("send the {name} request")))?;
     handshake::read_answer_async(stream)
         .await
-        .with_context(|| format!("read the {name} answer"))
+        .map_err(|error| no_daemon(error, format!("read the {name} answer")))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::{NO_DAEMON, exchange};
+    use crate::ipc::Stream;
+    use crate::ipc::handshake::Request;
+
+    /// A daemon that is exiting can accept from its listen queue and then
+    /// close. The request write then fails with a broken pipe or the answer
+    /// read sees end of file, depending on the platform. Both mean no daemon.
+    #[tokio::test]
+    async fn a_daemon_that_closes_before_it_answers_is_no_daemon() {
+        let (client, daemon) = tokio::net::UnixStream::pair().expect("a socket pair");
+        drop(daemon);
+        let mut client = Stream::Socket(client);
+        let error = exchange(&mut client, &Request::status(), "status")
+            .await
+            .expect_err("a closed daemon answers nothing");
+        assert_eq!(format!("{error:#}"), NO_DAEMON);
+    }
 }

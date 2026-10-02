@@ -472,11 +472,17 @@ fn a_new_git_configuration_include_aborts_content_upload() {
 #[test]
 fn linked_worktree_policy_preserves_native_git_directory_paths() {
     use std::os::unix::ffi::OsStringExt;
+    // APFS rejects a name that is not UTF-8 (EILSEQ). The trailing space still
+    // tests that the Git directory path is not trimmed.
+    #[cfg(not(target_os = "macos"))]
+    const NAME: &[u8] = b"repo\xff ";
+    #[cfg(target_os = "macos")]
+    const NAME: &[u8] = b"repo ";
     let mut checkout = Checkout::new();
     let native = checkout
         .directory
         .path()
-        .join(std::ffi::OsString::from_vec(b"repo\xff ".to_vec()));
+        .join(std::ffi::OsString::from_vec(NAME.to_vec()));
     fs::rename(&checkout.root, &native).unwrap();
     checkout.root = native;
     checkout.git(&["init", "--quiet"]);

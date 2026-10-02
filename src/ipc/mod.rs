@@ -477,7 +477,11 @@ where
 }
 
 /// Whether the daemon went away before it answered.
-fn connection_lost(error: &handshake::HandshakeError) -> bool {
+///
+/// A daemon that is exiting can still accept a connection from its listen
+/// queue and then close it. The peer sees a reset, a broken pipe, or an end of
+/// file, depending on the platform and the timing.
+pub(crate) fn connection_lost(error: &handshake::HandshakeError) -> bool {
     match error {
         handshake::HandshakeError::Closed => true,
         handshake::HandshakeError::Transport(error) => matches!(
