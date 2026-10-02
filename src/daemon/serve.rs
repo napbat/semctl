@@ -2,8 +2,9 @@
 //! exit when nothing needs this process any more.
 //!
 //! The loop is deliberately small. It accepts, it reaps finished session
-//! tasks, and it watches three reasons to stop: an operating-system signal, a
-//! `stop` control request, and an idle period. Everything a connection does
+//! tasks, and it watches four reasons to stop: an operating-system signal, a
+//! `stop` control request, an idle period, and a replaced executable with no
+//! session attached (see [`rollover`]). Everything a connection does
 //! happens in its own task, so one slow session cannot hold up the accept
 //! loop or another session.
 //!
@@ -18,6 +19,8 @@
 //! - The drain aborts every task, which closes every connection. A connected
 //!   client observes end of file, which is the same event as a daemon that
 //!   went away, and its host reconnects if it wants another session.
+
+mod rollover;
 
 use std::io;
 use std::ops::RangeInclusive;
@@ -122,16 +125,18 @@ pub(crate) async fn serve() -> Result<()> {
         started: Instant::now(),
         pid: std::process::id(),
     });
+    let rollover = rollover::Rollover::from_environment().await;
     info!(
         endpoint = endpoint.id(),
         pid = daemon.pid,
         version = VERSION,
         idle_secs = idle_after.as_secs(),
+        auto_update = rollover.is_some(),
         "semctl daemon serves the local endpoint"
     );
 
     let mut tasks = JoinSet::new();
-    let reason = accept_loop(&listener, &daemon, &mut tasks, idle_after).await;
+    let reason = accept_loop(&listener, &daemon, &mut tasks, idle_after, rollover).await;
     drain(listener, tasks, daemon, reason).await;
     Ok(())
 }
@@ -206,6 +211,8 @@ enum DrainReason {
     Stop,
     /// No session was served for the idle delay.
     Idle,
+    /// The executable was replaced and no session was attached.
+    Superseded,
 }
 
 /// Accept connections until something asks this daemon to stop.
@@ -215,19 +222,23 @@ enum DrainReason {
 /// connection could not be accepted would turn a momentary resource shortage
 /// into a lost session for every other client. The loop waits with a backoff
 /// instead, which also keeps a repeating failure from spinning a worker. The
-/// wait delays the other three stop reasons by at most
-/// [`LAST_ACCEPT_BACKOFF`]: a signal stays pending, and a `stop` request holds
-/// its notification.
+/// wait delays the other stop reasons by at most [`LAST_ACCEPT_BACKOFF`]: a
+/// signal stays pending, a `stop` request holds its notification, and the idle
+/// and replacement checks read state that the wait does not change.
 async fn accept_loop(
     listener: &Listener,
     daemon: &Arc<Daemon>,
     tasks: &mut JoinSet<()>,
     idle_after: Duration,
+    rollover: Option<rollover::Rollover>,
 ) -> DrainReason {
     // Built once and polled across every iteration: the signal handler must be
     // installed before the first connection, and a signal that arrives while
     // another branch is running must not be lost.
     let mut shutdown = std::pin::pin!(shutdown_signal());
+    // Built once for the same reason: a replacement it has seen must survive
+    // every accepted connection.
+    let mut superseded = std::pin::pin!(rollover::superseded(rollover, &daemon.sessions));
     let mut backoff = FIRST_ACCEPT_BACKOFF;
     loop {
         tokio::select! {
@@ -265,6 +276,7 @@ async fn accept_loop(
             () = shutdown.as_mut() => return DrainReason::Signal,
             () = daemon.stop.notified() => return DrainReason::Stop,
             () = daemon.sessions.wait_idle_for(idle_after) => return DrainReason::Idle,
+            () = superseded.as_mut() => return DrainReason::Superseded,
         }
     }
 }

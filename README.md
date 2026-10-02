@@ -148,8 +148,12 @@ Both exit with status 1 and report `no daemon is running for this
 configuration` when no daemon answers. A daemon also exits by itself after ten
 minutes with no session.
 
-A running daemon keeps its loaded executable after an on-disk binary update.
-Run `semctl daemon stop` and reconnect the host's MCP session to load the update.
+A running daemon keeps its loaded executable while it serves a session. It
+checks its executable file every 30 seconds. After an on-disk update, such as
+`semctl upgrade`, it exits as soon as its last session ends, and the next
+`semctl mcp` starts a daemon from the new executable. Existing sessions keep the
+old version until the host reconnects them. To switch at once, run
+`semctl daemon stop` and reconnect the host's MCP sessions.
 
 On Windows, the daemon and its Git probes use `CREATE_NO_WINDOW`: redirecting
 standard streams alone does not prevent Windows from allocating a console for
@@ -161,6 +165,7 @@ fingerprints; ignore-source identity and byte checks remain in place.
 | Env                            | What it sets                                                                                   |
 | ------------------------------ | ---------------------------------------------------------------------------------------------- |
 | `SEMCTX_DAEMON_IDLE_SECS`      | Seconds with no session before the daemon exits. Default 600; `0` exits with the last session.  |
+| `SEMCTX_DAEMON_AUTO_UPDATE`    | `0` keeps an idle daemon running after its executable is updated on disk. Default on.          |
 | `SEMCTX_DAEMON_SCAN_PERMITS`   | Concurrent checkout scans. Default: half the available CPUs, at least 2 and at most 8.          |
 | `SEMCTX_DAEMON_UPLOAD_PERMITS` | Concurrent upload requests across every checkout. Default 8.                                    |
 | `SEMCTX_DAEMON_REMOTE_PERMITS` | Concurrent remote requests from tool calls. Default 64.                                         |
