@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import * as path from "node:path";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import {
 	createSemctxExtension,
@@ -159,7 +160,7 @@ describe("semctx OMP extension", () => {
 		const harness = makeHarness(invoker);
 		const [grepResult, globResult] = await Promise.all([
 			harness.emit("tool_call", { toolName: "grep", input: { pattern: "needle" } }),
-			harness.emit("tool_call", { toolName: "glob", input: { pattern: "*.rs" } }),
+			harness.emit("tool_call", { toolName: "glob", input: { path: "*.rs" } }),
 		]);
 		expect(grepResult).toEqual({ additionalContext: "Grep" });
 		expect(globResult).toEqual({ additionalContext: "Glob" });
@@ -180,7 +181,7 @@ describe("semctx OMP extension", () => {
 				await harness.emit("tool_call", {
 					toolCallId: toolName,
 					toolName,
-					input: toolName === "bash" ? { command: "rg needle" } : { pattern: "**/*.rs" },
+					input: toolName === "bash" ? { command: "rg needle" } : { path: "**/*.rs" },
 				}),
 			).toBeUndefined();
 			expect(invoker.calls.at(-1)?.input.tool_name).toBe(expected);
@@ -204,6 +205,66 @@ describe("semctx OMP extension", () => {
 			input: { path: "src/main.rs" },
 		});
 		expect(invoker.calls).toHaveLength(callsBeforeRead);
+	});
+
+	test("translates OMP tool inputs to the hook wire shape", async () => {
+		const invoker = new FakeInvoker(() => undefined);
+		const harness = makeHarness(invoker);
+		const sent = async (toolName: string, input: Record<string, unknown>) => {
+			await harness.emit("tool_call", { toolName, input });
+			const { tool_name, tool_input, cwd } = invoker.calls.at(-1)?.input ?? {};
+			return { tool_name, tool_input, cwd };
+		};
+
+		expect(await sent("glob", { path: "src/**/*.rs", limit: 5 })).toEqual({
+			tool_name: "Glob",
+			tool_input: { pattern: "src/**/*.rs" },
+			cwd: "/repo",
+		});
+		expect((await sent("glob", {})).tool_input).toEqual({ pattern: "**/*" });
+		expect((await sent("glob", { path: "/" })).tool_input).toEqual({ pattern: "**/*" });
+		expect((await sent("glob", { path: "src/**/*.rs; tests/*.rs" })).tool_input).toEqual({
+			pattern: "src/**/*.rs;tests/*.rs",
+		});
+
+		expect((await sent("grep", { pattern: "fn main", path: "src/main.rs:10-20" })).tool_input).toEqual({
+			pattern: "fn main",
+			path: "src/main.rs",
+		});
+		expect((await sent("grep", { pattern: "x", path: "C:\\repo\\lib.rs:5-9,40+3" })).tool_input).toEqual({
+			pattern: "x",
+			path: "C:\\repo\\lib.rs",
+		});
+		expect((await sent("grep", { pattern: "x", path: "src; tests" })).tool_input).toEqual({
+			pattern: "x",
+			path: "src; tests",
+		});
+
+		expect(await sent("bash", { command: "rg needle", cwd: "crates/core" })).toEqual({
+			tool_name: "Bash",
+			tool_input: { command: "rg needle", cwd: "crates/core" },
+			cwd: path.resolve("/repo", "crates/core"),
+		});
+		expect((await sent("bash", { command: "rg needle" })).cwd).toBe("/repo");
+	});
+
+	test("skips searches of OMP internal and web URLs", async () => {
+		const invoker = new FakeInvoker(() => "nudge");
+		const harness = makeHarness(invoker);
+		for (const [toolName, input] of [
+			["grep", { pattern: "session", path: "omp://**/*.md" }],
+			["grep", { pattern: "x", path: "src; local://notes" }],
+			["grep", { pattern: "x", path: "https://example.com/doc" }],
+			["glob", { path: "skill://semctx/**" }],
+			["glob", { path: "omp:/tools" }],
+			["bash", { command: "rg needle", cwd: "local://scratch" }],
+		] as const) {
+			expect(await harness.emit("tool_call", { toolName, input })).toBeUndefined();
+		}
+		expect(invoker.calls).toHaveLength(0);
+
+		await harness.emit("tool_call", { toolName: "glob", input: { path: "C:/repo/src/*.rs" } });
+		expect(invoker.calls).toHaveLength(1);
 	});
 
 	test("shuts down child work with the session", async () => {

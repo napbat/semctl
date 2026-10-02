@@ -1,3 +1,4 @@
+import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
 const HOST = "omp";
@@ -9,6 +10,16 @@ const TOOL_TIMEOUT_MS = 6_000;
 
 const ORIENTATION_MESSAGE = "ca.napbat.semctx.orientation";
 const PROMPT_CONTEXT_MESSAGE = "ca.napbat.semctx.prompt-context";
+
+// OMP internal URLs (`omp://`, `local://`, `skill://`, `artifact://`, ...) and
+// web URLs name harness or remote resources, not repository files. OMP also
+// accepts the single-slash alias (`omp:/tools`). The scheme has two or more
+// characters, so a Windows drive path (`C:/repo`) never matches.
+const URL_PATH = /^[a-z][a-z0-9+.-]+:\//i;
+// OMP accepts a trailing line selector on one file (`src/lib.rs:10-20`).
+const LINE_SELECTOR = /:(?=[^:]*\d)[\d,+-]+$/;
+// OMP `glob` treats a slash-only path as the session cwd.
+const ROOT_ALIAS = /^[\\/]+$/;
 
 type SessionSource = "startup" | "resume" | "clear" | "compact";
 type HookEventName = "SessionStart" | "UserPromptSubmit" | "PreToolUse";
@@ -143,15 +154,51 @@ function hiddenMessage(customType: string, content: string) {
 	};
 }
 
-function hookToolName(toolName: string): SemctlHookInput["tool_name"] {
-	if (toolName.startsWith(OMP_SEMCTX_TOOL_PREFIX)) return toolName;
+/** A `PreToolUse` call in the Claude-shaped wire contract that `semctl hook` reads. */
+interface HookToolCall {
+	tool_name: string;
+	tool_input: Record<string, unknown>;
+	cwd: string;
+}
+
+/** The non-empty entries of an OMP semicolon-delimited `path` list. */
+function pathEntries(value: unknown): string[] {
+	if (typeof value !== "string") return [];
+	return value
+		.split(";")
+		.map(entry => entry.trim())
+		.filter(entry => entry.length > 0);
+}
+
+/**
+ * Map an OMP tool call onto the wire contract. OMP input shapes differ from
+ * Claude's: `glob` carries its pattern in `path`, `grep` accepts a line
+ * selector on one file, and `bash` can run in its own `cwd`. A search of
+ * internal or web URLs is not repository discovery, so it is not sent.
+ */
+function hookToolCall(toolName: string, input: Record<string, unknown>, cwd: string): HookToolCall | undefined {
+	if (toolName.startsWith(OMP_SEMCTX_TOOL_PREFIX)) return { tool_name: toolName, tool_input: input, cwd };
 	switch (toolName) {
-		case "grep":
-			return "Grep";
-		case "glob":
-			return "Glob";
-		case "bash":
-			return "Bash";
+		case "grep": {
+			const entries = pathEntries(input.path);
+			if (entries.some(entry => URL_PATH.test(entry))) return undefined;
+			if (entries.length !== 1) return { tool_name: "Grep", tool_input: input, cwd };
+			return { tool_name: "Grep", tool_input: { ...input, path: entries[0].replace(LINE_SELECTOR, "") }, cwd };
+		}
+		case "glob": {
+			// OMP `glob` carries its pattern in `path`. The wire contract follows
+			// Claude's `Glob`, which carries it in `pattern`.
+			const entries = pathEntries(input.path);
+			if (entries.some(entry => URL_PATH.test(entry))) return undefined;
+			const wholeTree = entries.length === 0 || (entries.length === 1 && ROOT_ALIAS.test(entries[0]));
+			return { tool_name: "Glob", tool_input: { pattern: wholeTree ? "**/*" : entries.join(";") }, cwd };
+		}
+		case "bash": {
+			const shellCwd = typeof input.cwd === "string" ? input.cwd.trim() : "";
+			if (URL_PATH.test(shellCwd)) return undefined;
+			const commandCwd = shellCwd.length === 0 ? cwd : path.resolve(cwd, shellCwd);
+			return { tool_name: "Bash", tool_input: input, cwd: commandCwd };
+		}
 		default:
 			return undefined;
 	}
@@ -227,18 +274,16 @@ export function createSemctxExtension(invoker: HookInvoker = createSemctlHookInv
 		});
 
 		pi.on("tool_call", async (event, ctx) => {
-			const toolName = hookToolName(event.toolName);
-			if (toolName === undefined) return undefined;
+			const call = hookToolCall(event.toolName, event.input, ctx.cwd);
+			if (call === undefined) return undefined;
 			activePromptId ||= allocatePromptId(ctx);
 			const context = await safeInvoke(
 				{
 					host: HOST,
 					hook_event_name: "PreToolUse",
-					cwd: ctx.cwd,
 					session_id: ctx.sessionManager.getSessionId(),
 					prompt_id: activePromptId,
-					tool_name: toolName,
-					tool_input: event.input,
+					...call,
 				},
 				ctx,
 				TOOL_TIMEOUT_MS,

@@ -20,7 +20,12 @@ adapter at `skills/` and the shared hooks wherever its plugin format allows. OMP
 instead loads `adapters/omp/index.ts`: its native events invoke `semctl hook` and
 inject the returned context without duplicating retrieval policy in TypeScript.
 The OMP `tool_call` event returns `PreToolUse` guidance as passive
-`additionalContext` for that tool call.
+`additionalContext` for that tool call. The adapter maps OMP tool inputs to the
+Claude-shaped wire contract: the `glob` pattern moves from `path` to `pattern`,
+a single-file `grep` line selector (`src/lib.rs:10-20`) is removed, and a `bash`
+`cwd` becomes the hook `cwd`. A search of OMP internal URLs (`omp://`,
+`local://`, `skill://`) or web URLs is not repository discovery, so the adapter
+does not send it to `semctl hook`.
 Do not manually copy shared skills; when a host requires a projected format,
 generate it from the canonical skill and verify parity in CI.
 
