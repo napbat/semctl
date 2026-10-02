@@ -13,29 +13,24 @@ use tokio::sync::{Notify, mpsc};
 struct Fixture {
     _directory: tempfile::TempDir,
     root: PathBuf,
-    binary: PathBuf,
 }
 
 impl Fixture {
     fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().to_path_buf();
-        let binary = root.join(if cfg!(windows) {
-            "semctl.exe"
-        } else {
-            "semctl"
-        });
-        std::fs::copy(env!("CARGO_BIN_EXE_semctl"), &binary).unwrap();
         std::fs::create_dir(root.join("home")).unwrap();
         Self {
             _directory: directory,
             root,
-            binary,
         }
     }
 
+    // Run the Cargo-built binary in place. A per-test copy races with sibling
+    // tests on Linux: a child forked while the copy is open for writing keeps
+    // that descriptor until exec, so exec of the copy fails with ETXTBSY.
     fn command(&self, server: Option<&str>, args: &[&str]) -> Command {
-        let mut command = Command::new(&self.binary);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_semctl"));
         command
             .env_clear()
             .env("HOME", self.root.join("home"))

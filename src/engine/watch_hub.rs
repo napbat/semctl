@@ -25,7 +25,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use notify::event::{AccessKind, AccessMode};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode};
-use notify_debouncer_full::{DebouncedEvent, Debouncer, RecommendedCache, new_debouncer};
+use notify_debouncer_full::{DebouncedEvent, Debouncer, NoCache, new_debouncer_opt};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -129,7 +129,7 @@ type Routes = HashMap<u64, Route>;
 
 /// The platform watcher and the watches it holds.
 struct WatcherState {
-    debouncer: Debouncer<RecommendedWatcher, RecommendedCache>,
+    debouncer: Debouncer<RecommendedWatcher, NoCache>,
     /// How many registrations depend on each recursive root watch. Two
     /// registrations share one root when two sessions attach the same checkout
     /// at the same time, and when two credential scopes need two coordinators
@@ -161,9 +161,10 @@ impl WatchHub {
 
     /// Watch `root` recursively and send its events to `sink`.
     ///
-    /// **Blocking.** The debouncer walks the tree to seed its file-id cache, so
-    /// this can take seconds on a large checkout. Callers must run it on the
-    /// blocking pool, never on a runtime worker.
+    /// **Blocking.** The platform watcher can walk the tree to add its watch
+    /// (inotify adds one watch per directory), so this can take seconds on a
+    /// large checkout. Callers must run it on the blocking pool, never on a
+    /// runtime worker.
     ///
     /// An error means this root has no watcher. The caller keeps serving and
     /// falls back to its periodic re-sync; the reason belongs in its status.
@@ -231,9 +232,17 @@ impl WatchHub {
     /// The debouncer callback owns a handle to the route table and nothing
     /// else. It must stay free of filesystem access: it runs on the notify
     /// thread, which every watched checkout in the process shares.
-    fn new_debouncer(&self) -> Result<Debouncer<RecommendedWatcher, RecommendedCache>> {
+    ///
+    /// The debouncer runs without a file-id cache on every platform. The
+    /// cache only pairs the two halves of a rename, and a registration needs
+    /// the changed paths, not the pairing. On Windows and macOS the default
+    /// cache opens every entry under each watched directory while it holds the
+    /// debouncer lock, which stalls event delivery. An external watch on a
+    /// large directory such as the temporary directory then delayed every
+    /// watch change, and process exit, by tens of seconds.
+    fn new_debouncer(&self) -> Result<Debouncer<RecommendedWatcher, NoCache>> {
         let routes = self.routes.clone();
-        new_debouncer(
+        new_debouncer_opt(
             DEBOUNCE,
             None,
             move |result: Result<Vec<DebouncedEvent>, Vec<notify::Error>>| {
@@ -256,6 +265,8 @@ impl WatchHub {
                     }
                 }
             },
+            NoCache::new(),
+            notify::Config::default(),
         )
         .context("start the filesystem watcher")
     }
