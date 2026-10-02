@@ -15,6 +15,10 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # CI never attaches a debugger. Line tables keep file:line in panic
+  # backtraces and cut test compile time by about a fifth and `target/` (the
+  # cached directory) by about a third. Local builds keep full debug info.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   check:

@@ -8,10 +8,10 @@
 //! All three steps are implemented CLI-side:
 //! - **Resolve URL from server ([`resolve_download`]).** Anonymous GET of
 //!   `/v1/cli/latest?target={triple}` → `{ version, url, sha256 }`.
-//! - **Download + verify + extract ([`download_binary`]).** Plain public GET (no
-//!   auth), SHA-256 checked against the downloaded artifact, then the bare
-//!   executable is staged — the URL may serve a raw binary or a release archive
-//!   (`.tar.gz` / `.zip`) and both are handled.
+//! - **Download + verify ([`download_binary`]).** Plain public GET (no auth),
+//!   SHA-256 checked against the downloaded bytes, then the executable is
+//!   staged. Release assets are raw executables: the server maps only
+//!   `semctl-<platform>[.exe]` asset names to a platform.
 //! - **Swap ([`self_replace`]).** Cross-platform: rename-the-live-image on
 //!   Windows, replace-by-inode on Unix.
 //!
@@ -252,9 +252,8 @@ fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
 
 /// Download from a public URL into `dir`, verifying its SHA-256 if one is given,
 /// and return the staged path. No auth — the URL is public (presigned or plain),
-/// exactly what [`resolve_download`] hands back. The URL may serve a raw binary
-/// or a release archive (`.tar.gz` / `.zip`); either way the staged file is the
-/// bare executable.
+/// exactly what [`resolve_download`] hands back. The URL serves the raw
+/// executable.
 async fn download_binary(url: &str, dir: &Path, expected_sha256: Option<&str>) -> Result<PathBuf> {
     let resp = reqwest::Client::new()
         .get(url)
@@ -265,9 +264,8 @@ async fn download_binary(url: &str, dir: &Path, expected_sha256: Option<&str>) -
         .with_context(|| format!("download {url}"))?;
     let bytes = resp.bytes().await.context("read download body")?;
 
-    // Verify the checksum against the downloaded artifact as-is — the release
-    // publishes `sha256sum` over whatever the URL serves (archive or raw binary),
-    // so this must run before any extraction.
+    // The release publishes `sha256sum` over each asset, so the check covers
+    // exactly the bytes staged below.
     if let Some(want) = expected_sha256 {
         let got = sha256_hex(&bytes);
         if !got.eq_ignore_ascii_case(want) {
@@ -277,63 +275,15 @@ async fn download_binary(url: &str, dir: &Path, expected_sha256: Option<&str>) -
     }
 
     let staged = dir.join(format!("{}.new", bin_name()));
-    extract_binary(&bytes, &staged).with_context(|| format!("extract semctl binary from {url}"))?;
+    std::fs::write(&staged, &bytes).with_context(|| format!("write {}", staged.display()))?;
     Ok(staged)
 }
 
-/// Write the bare `semctl` executable to `staged` from downloaded bytes, which
-/// may be the raw binary or a release archive. Format is detected by magic bytes;
-/// for archives we stream out just the `semctl` entry (never extract to disk).
-fn extract_binary(bytes: &[u8], staged: &Path) -> Result<()> {
-    if bytes.starts_with(&[0x1f, 0x8b]) {
-        // gzip → the unix release `.tar.gz`.
-        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(bytes));
-        for entry in archive.entries().context("read tar")? {
-            let mut entry = entry.context("read tar entry")?;
-            let name = entry.path().context("tar entry path")?.into_owned();
-            if is_semctl_entry(name.file_name().and_then(|n| n.to_str())) {
-                let mut out = std::fs::File::create(staged)
-                    .with_context(|| format!("create {}", staged.display()))?;
-                std::io::copy(&mut entry, &mut out).context("unpack binary from tar.gz")?;
-                return Ok(());
-            }
-        }
-        bail!("no `{}` entry inside the downloaded .tar.gz", bin_name());
-    } else if bytes.starts_with(b"PK\x03\x04") {
-        // zip → the Windows release `.zip`.
-        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).context("open zip")?;
-        for i in 0..zip.len() {
-            let mut file = zip.by_index(i).context("read zip entry")?;
-            let base = file
-                .name()
-                .rsplit(['/', '\\'])
-                .next()
-                .unwrap_or(file.name());
-            if is_semctl_entry(Some(base)) {
-                let mut out = std::fs::File::create(staged)
-                    .with_context(|| format!("create {}", staged.display()))?;
-                std::io::copy(&mut file, &mut out).context("unpack binary from zip")?;
-                return Ok(());
-            }
-        }
-        bail!("no `{}` entry inside the downloaded .zip", bin_name());
-    }
-    // Raw executable.
-    std::fs::write(staged, bytes).with_context(|| format!("write {}", staged.display()))?;
-    Ok(())
-}
-
-/// Does this archive entry's file name look like the semctl binary? Accepts the
-/// platform's expected name and the bare `semctl`/`semctl.exe` either way.
-fn is_semctl_entry(base: Option<&str>) -> bool {
-    matches!(base, Some("semctl" | "semctl.exe"))
-}
-
+/// SHA-256 through `ring`, which rustls already compiles in.
 fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(bytes);
-    let mut hex = String::with_capacity(digest.len() * 2);
-    for b in digest {
+    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
+    let mut hex = String::with_capacity(digest.as_ref().len() * 2);
+    for b in digest.as_ref() {
         use std::fmt::Write;
         write!(hex, "{b:02x}").expect("writing to a String cannot fail");
     }
@@ -378,7 +328,7 @@ fn ensure_executable(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{VersionCmp, compare_versions, is_upgrade, parse_version};
+    use super::{VersionCmp, compare_versions, is_upgrade, parse_version, sha256_hex};
 
     #[test]
     fn parses_plain_semver() {
@@ -429,5 +379,14 @@ mod tests {
     fn is_upgrade_falls_back_to_inequality_when_unparseable() {
         assert!(is_upgrade("custom-a", "custom-b"));
         assert!(!is_upgrade("custom", "custom"));
+    }
+
+    #[test]
+    fn sha256_matches_the_published_checksum_format() {
+        // `sha256sum` of "abc", the FIPS 180-2 test vector.
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 }
