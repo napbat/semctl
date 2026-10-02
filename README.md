@@ -333,8 +333,40 @@ lifecycle events onto the same `semctl hook` wire contract. See
 agent integration. Do not copy or symlink shared skills.
 
 The deterministic hook and OMP-extension cases run under the normal Rust and Bun
-test commands. To record fresh Codex, Claude, and OMP tool-event traces for the
-model-level golden prompts:
+test commands.
+
+`tests/hosts/` runs each supported coding agent (OMP, Claude Code, and Codex)
+with the plugin from this checkout and the `semctl` that Cargo builds from it.
+Each host talks to a local scripted model, so a session is deterministic and
+offline. `semctl` runs logged out against an unreachable server. The tests read
+its decisions from the `SEMCTX_HOOK_TRACE` file. One scenario list runs on every
+host. Each host adapter in `tests/hosts/hosts.ts` maps the scenarios to that
+host's native tool calls. These tests are slow, so CI does not run them. Run
+them locally:
+
+```sh
+SEMCTX_HOST_INTEGRATION=1 mise exec -c "bun test tests/hosts"
+```
+
+Without `SEMCTX_HOSTS`, the suite skips a host whose CLI is not on PATH or that
+cannot run on the current platform. `SEMCTX_HOSTS=omp,claude` selects hosts, and
+a selected host that cannot run fails. `SEMCTX_HOST_COMMAND_<ID>` replaces a
+host's launch command, for example
+`SEMCTX_HOST_COMMAND_CODEX="bun x @openai/codex"`. Codex does not load plugin
+hooks on Windows ([openai/codex#24453](https://github.com/openai/codex/issues/24453)),
+so run the Codex host on Linux or macOS.
+
+To add a host, add an adapter to `HOST_ADAPTERS` in `tests/hosts/hosts.ts`. If
+the host speaks a new model API, also add a wire format to
+`tests/hosts/model_server.ts`.
+
+`SEMCTX_HOOK_TRACE=<file>` also helps with host debugging. Each `semctl hook`
+run appends one JSON line with the event, host, tool name, `PreToolUse`
+decision, and whether the hook emitted context. A trace line never contains
+prompt text, tool input, or context text.
+
+To record fresh Codex, Claude, and OMP tool-event traces for the model-level
+golden prompts:
 
 ```sh
 python3 scripts/run_skill_evals.py --host all

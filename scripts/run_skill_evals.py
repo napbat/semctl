@@ -100,6 +100,10 @@ def omp_command(query: str) -> list[str]:
         "read,grep,glob,lsp",
         "--plugin-dir",
         str(PLUGIN_ROOT),
+        # `--plugin-dir` does not load `package.json` `omp.extensions`; the
+        # package path does, so the lifecycle hooks run as in an install.
+        "--extension",
+        str(PLUGIN_ROOT),
         query,
     ]
 

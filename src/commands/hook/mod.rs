@@ -51,6 +51,7 @@ pub(crate) mod message;
 mod scope;
 mod sniffer;
 mod state;
+mod trace;
 
 use scope::{SearchScope, search_scope};
 
@@ -151,21 +152,28 @@ pub async fn run(_args: HookArgs, cli: &Cli) -> Result<()> {
     let Some(input) = read_input() else {
         return Ok(());
     };
+    let mut tool_outcome = None;
     let context = match input.hook_event_name.as_str() {
         "UserPromptSubmit" => user_prompt_context(cli, &input).await,
         "SessionStart" => {
             let store = state::Store::default_store();
             session_start_context(cli, &input, &store).await
         }
-        "PreToolUse" => pretooluse_nudge(cli, &input).await,
+        "PreToolUse" => {
+            let (context, outcome) = pretooluse_nudge(cli, &input).await;
+            tool_outcome = Some(outcome);
+            context
+        }
         _ => None,
     };
     // Claim delivery after network work. Tool events cannot claim the manual.
     // PostCompact only resets state because its output schema rejects context.
     let shared = instructions::context(&input).await;
-    if let Some(text) = combine_context(shared, context) {
-        emit(&input, &text);
+    let text = combine_context(shared, context);
+    if let Some(text) = &text {
+        emit(&input, text);
     }
+    trace::record(&input, tool_outcome, text.is_some());
     Ok(())
 }
 
@@ -596,9 +604,11 @@ async fn connect(cli: &Cli, cwd: &str) -> Option<(Client, String)> {
 /// guidance when broad built-in searching resumes. Single-file and outside-repo
 /// searches stay silent; compliance cools immediate reminders and a bounded
 /// broad-search streak re-arms them. Emissions remain deduped and availability-gated.
-async fn pretooluse_nudge(cli: &Cli, input: &HookInput) -> Option<String> {
+async fn pretooluse_nudge(cli: &Cli, input: &HookInput) -> (Option<String>, trace::ToolOutcome) {
+    use trace::ToolOutcome;
+
     if std::env::var_os("SEMCTX_NUDGE_DISABLE").is_some() {
-        return None;
+        return (None, ToolOutcome::Disabled);
     }
     // Need both identity fields: `session_id` keys the per-session state, the
     // per-turn key (`turn_key`) keys the dedup — without it, parallel searches in
@@ -613,14 +623,14 @@ async fn pretooluse_nudge(cli: &Cli, input: &HookInput) -> Option<String> {
             !input.session_id.is_empty(),
             !turn.is_empty()
         ));
-        return None;
+        return (None, ToolOutcome::MissingIdentity);
     }
 
     // The compliance matcher has a state-only fast path: no availability probe,
     // message, or recursive nudge. A later broad-search streak re-arms guidance.
     if is_semctx_tool_name(&input.tool_name) {
         record_semctx_compliance(&input.session_id, turn);
-        return None;
+        return (None, ToolOutcome::SemctxUse);
     }
 
     // Eligibility — local, no network. Non-search calls bail here cheaply.
@@ -629,7 +639,7 @@ async fn pretooluse_nudge(cli: &Cli, input: &HookInput) -> Option<String> {
             "PreToolUse {}: not an eligible search",
             input.tool_name
         ));
-        return None;
+        return (None, ToolOutcome::NotSearch);
     };
     debug(format_args!(
         "PreToolUse {}: eligible search",
@@ -642,11 +652,11 @@ async fn pretooluse_nudge(cli: &Cli, input: &HookInput) -> Option<String> {
     match search_scope(&input.tool_name, &input.tool_input, &input.cwd) {
         SearchScope::SingleFile => {
             debug(format_args!("nudge: single-file target — silent"));
-            return None;
+            return (None, ToolOutcome::SingleFile);
         }
         SearchScope::OutsideRepo => {
             debug(format_args!("nudge: target outside repo — silent"));
-            return None;
+            return (None, ToolOutcome::OutsideRepo);
         }
         SearchScope::BroadOrUnknown => {}
     }
@@ -656,14 +666,16 @@ async fn pretooluse_nudge(cli: &Cli, input: &HookInput) -> Option<String> {
     let store = state::Store::default_store();
     let Some(_lock) = store.try_lock(&input.session_id) else {
         debug(format_args!("nudge: session lock contended — skip"));
-        return None;
+        return (None, ToolOutcome::LockContended);
     };
 
     if compliance_suppresses(&store, &input.session_id, turn, load_compliance_rearm()) {
-        return None;
+        return (None, ToolOutcome::ComplianceCooled);
     }
     // advance() logs its own specific silence reason (dedup / grace / cooldown / cap).
-    let (mut st, tier) = advance(&store, &input.session_id, turn, &load_thresholds())?;
+    let Some((mut st, tier)) = advance(&store, &input.session_id, turn, &load_thresholds()) else {
+        return (None, ToolOutcome::Counted);
+    };
     debug(format_args!(
         "nudge: {:?} at n={} — checking availability",
         tier, st.eligible_count
@@ -689,7 +701,12 @@ async fn pretooluse_nudge(cli: &Cli, input: &HookInput) -> Option<String> {
             "nudge: semctl unavailable (logged out / not indexed / down) — silent"
         )),
     }
-    message
+    let outcome = if message.is_some() {
+        ToolOutcome::Nudged
+    } else {
+        ToolOutcome::Unavailable
+    };
+    (message, outcome)
 }
 
 const SEMCTX_CODEX_TOOL_PREFIX: &str = "mcp__semctx__";

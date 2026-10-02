@@ -29,16 +29,20 @@ does not send it to `semctl hook`.
 Do not manually copy shared skills; when a host requires a projected format,
 generate it from the canonical skill and verify parity in CI.
 
-Then add the host in three registries:
+Then add the host in four registries:
 
 1. implement the Rust `Host` adapter and append it to `hosts()` in
    `src/commands/install/mod.rs`;
 2. add its command builder and optional preflight to `HOST_ADAPTERS` in
-   `scripts/run_skill_evals.py`; and
-3. add the host id to the skill's `evals.json`.
+   `scripts/run_skill_evals.py`;
+3. add the host id to the skill's `evals.json`; and
+4. add a host adapter to `HOST_ADAPTERS` in `tests/hosts/hosts.ts`. The adapter
+   loads this plugin from the checkout, isolates the host configuration, and
+   maps each search intent to a native tool call.
 
 A host is supported only when install, status, update, and uninstall behavior
-are implemented and its eval session passes. MCP-only agents should launch
+are implemented, its host integration tests pass, and its eval session passes.
+MCP-only agents should launch
 `semctl mcp`; agents that support the Agent Skills layout should consume the
 canonical skill directly. Host-native rules or instruction files are generated
 projections, not new sources of truth.
