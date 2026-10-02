@@ -55,7 +55,13 @@ struct Endpoint {
 
 impl Endpoint {
     fn new() -> Self {
-        let home = tempfile::tempdir().expect("create an isolated endpoint directory");
+        // The socket path must fit the 100-byte limit, or the endpoint moves
+        // to the shared `/tmp/semctl-<uid>` fallback and ignores this fixture's
+        // runtime directory. The default temporary directory on macOS is too
+        // long for that, so every endpoint lives under `/tmp`.
+        let home = tempfile::Builder::new()
+            .tempdir_in("/tmp")
+            .expect("create an isolated endpoint directory");
         let root = std::fs::canonicalize(home.path()).expect("canonicalize the endpoint directory");
         let config_home = root.join("config");
         // `semctl` reads `<XDG_CONFIG_HOME>/semctl`. Creating it up front keeps
