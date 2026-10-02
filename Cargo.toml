@@ -61,10 +61,8 @@ open = "5"
 toml = "0.8"
 inquire = { version = "0.9", default-features = false, features = ["crossterm"] }
 self-replace = "1"
-sha2 = "0.10"
-flate2 = "1"
-tar = "0.4"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+# SHA-256 for `semctl upgrade`. rustls already compiles `ring` in.
+ring = "0.17"
 rmcp = { version = "1.7", features = [
     "server",
     "transport-io",
@@ -80,6 +78,9 @@ blake3 = "1"
 cap-std = "4"
 same-file = "1"
 tracing = "0.1"
+# `url` (through reqwest) resolves IDNA through `idna_adapter`. 1.1 uses the
+# unicode-rs crates; 1.2 compiles the ICU4X data tables (21 more crates).
+idna_adapter = "=1.1.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(windows)'.dependencies]
