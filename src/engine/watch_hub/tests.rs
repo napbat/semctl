@@ -161,7 +161,7 @@ fn an_external_event_reaches_only_its_subscribers() {
         subscriber.paths(),
         vec![PathBuf::from("/home/user/.config/git/ignore")]
     );
-    assert!(plain.paths().is_empty());
+    assert_eq!(plain.paths(), Vec::<PathBuf>::new());
 }
 
 /// Only the events a registration observes are copied into its channel; a

@@ -335,8 +335,10 @@ model-level golden prompts:
 python3 scripts/run_skill_evals.py --host all
 ```
 
-CI (`.github/workflows/ci.yml`) runs the same checks — clippy is `pedantic`, and
-warnings (including broken doc links) fail the build.
+CI (`.github/workflows/ci.yml`) installs the current stable Rust toolchain and
+runs these checks. Use the same Rust version for local checks. New stable
+releases can add Clippy lints. Clippy uses `pedantic`. Warnings, including broken
+doc links, fail the build.
 
 Releases are cut by **bumping the version**: set a new `version` in `Cargo.toml`
 (e.g. `0.1.0` → `0.1.1`) and push to `main`. `.github/workflows/release.yml`

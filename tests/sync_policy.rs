@@ -259,12 +259,7 @@ fn cached_exclusions_require_the_current_content_hash() {
         fs::write(&file, before).unwrap();
         let server = Server::start(|| {});
         checkout.success(&server);
-        assert!(
-            server.bodies("POST")[0]["files"]
-                .as_array()
-                .unwrap()
-                .is_empty()
-        );
+        assert_eq!(server.bodies("POST")[0]["files"], json!([]));
         let modified = fs::metadata(&file).unwrap().modified().unwrap();
         fs::write(&file, after).unwrap();
         restore_mtime(&file, modified);
@@ -337,7 +332,7 @@ fn malformed_config_or_ignore_rules_abort_before_manifest_submission() {
         fs::write(checkout.root.join("private.txt"), "fixture content\n").unwrap();
         let server = Server::start(|| {});
         assert!(!checkout.run(&server, &checkout.root).status.success());
-        assert!(server.bodies("POST").is_empty());
+        assert_eq!(server.bodies("POST"), Vec::<Value>::new());
     }
 }
 
@@ -444,7 +439,7 @@ fn policy_changes_during_server_planning_abort_content_upload() {
     let result = checkout.run(&server, &checkout.root);
     assert!(!result.status.success());
     assert_eq!(server.bodies("POST").len(), 1);
-    assert!(server.bodies("PUT").is_empty());
+    assert_eq!(server.bodies("PUT"), Vec::<Value>::new());
 }
 
 #[test]
@@ -470,7 +465,7 @@ fn a_new_git_configuration_include_aborts_content_upload() {
     let manifests = server.bodies("POST");
     assert_eq!(manifests.len(), 1);
     assert_eq!(manifests[0]["files"][0]["path"], "private.txt");
-    assert!(server.bodies("PUT").is_empty());
+    assert_eq!(server.bodies("PUT"), Vec::<Value>::new());
 }
 
 #[cfg(unix)]

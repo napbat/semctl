@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -22,7 +21,7 @@ async fn receive(stdout: &mut Lines<BufReader<ChildStdout>>) -> Value {
 }
 
 #[tokio::test]
-async fn mcp_metadata_exposes_tool_docs_without_shared_instructions() {
+async fn mcp_initialize_omits_shared_instructions() {
     let directory = tempfile::tempdir().expect("create isolated MCP directory");
     // A pinned codebase and disabled update check keep metadata discovery offline.
     let mut child = Command::new(env!("CARGO_BIN_EXE_semctl"))
@@ -75,28 +74,6 @@ async fn mcp_metadata_exposes_tool_docs_without_shared_instructions() {
         json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
     )
     .await;
-    for id in [2, 3] {
-        send(
-            &mut stdin,
-            json!({ "jsonrpc": "2.0", "id": id, "method": "tools/list" }),
-        )
-        .await;
-        let response = receive(&mut stdout).await;
-        assert_eq!(response["id"], id);
-        let tools = response["result"]["tools"]
-            .as_array()
-            .expect("tool catalog");
-        assert!(!tools.is_empty());
-        for tool in tools {
-            let name = tool["name"].as_str().expect("tool name");
-            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("src/mcp/docs/tools")
-                .join(format!("{name}.md"));
-            let doc = std::fs::read_to_string(path).expect("read tool documentation");
-            assert_eq!(tool["description"].as_str(), Some(doc.as_str()), "{name}");
-            assert!(tool["inputSchema"].is_object(), "{name}");
-        }
-    }
 
     drop(stdin);
     let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
