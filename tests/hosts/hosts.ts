@@ -226,8 +226,9 @@ const codex: HostAdapter = {
 			case "non-search":
 				return { name: "exec_command", arguments: { cmd: "echo semctx" } };
 			// Codex 0.160 drops `exec_command.workdir` from the PreToolUse payload:
-			// `cwd` is the session root and `tool_input` holds only `command`. The
-			// hook cannot see the subdirectory, and Codex has no internal URLs.
+			// `cwd` is the session root and `tool_input` holds only `command`
+			// (openai/codex#33986, tracked in napbat/semctl#30). The hook cannot
+			// see the subdirectory, and Codex has no internal URLs.
 			case "subdirectory-shell-search":
 			case "internal-url-search":
 				return undefined;
