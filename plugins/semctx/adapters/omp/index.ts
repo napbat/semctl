@@ -1,3 +1,4 @@
+import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
 const HOST = "omp";
@@ -9,6 +10,16 @@ const TOOL_TIMEOUT_MS = 6_000;
 
 const ORIENTATION_MESSAGE = "ca.napbat.semctx.orientation";
 const PROMPT_CONTEXT_MESSAGE = "ca.napbat.semctx.prompt-context";
+
+// OMP internal URLs (`omp://`, `local://`, `skill://`, `artifact://`, ...) and
+// web URLs name harness or remote resources, not repository files. OMP also
+// accepts the single-slash alias (`omp:/tools`). The scheme has two or more
+// characters, so a Windows drive path (`C:/repo`) never matches.
+const URL_PATH = /^[a-z][a-z0-9+.-]+:\//i;
+// OMP accepts a trailing line selector on one file (`src/lib.rs:10-20`).
+const LINE_SELECTOR = /:(?=[^:]*\d)[\d,+-]+$/;
+// OMP `glob` treats a slash-only path as the session cwd.
+const ROOT_ALIAS = /^[\\/]+$/;
 
 type SessionSource = "startup" | "resume" | "clear" | "compact";
 type HookEventName = "SessionStart" | "UserPromptSubmit" | "PreToolUse";
@@ -143,15 +154,66 @@ function hiddenMessage(customType: string, content: string) {
 	};
 }
 
-function hookToolName(toolName: string): SemctlHookInput["tool_name"] {
-	if (toolName.startsWith(OMP_SEMCTX_TOOL_PREFIX)) return toolName;
+/** A `PreToolUse` call in the Claude-shaped wire contract that `semctl hook` reads. */
+interface HookToolCall {
+	tool_name: string;
+	tool_input: Record<string, unknown>;
+	cwd: string;
+}
+
+/** The non-empty entries of an OMP semicolon-delimited `path` list. */
+function pathEntries(value: unknown): string[] {
+	if (typeof value !== "string") return [];
+	return value
+		.split(";")
+		.map(entry => entry.trim())
+		.filter(entry => entry.length > 0);
+}
+
+/**
+ * OMP content searches and the input field that holds each search pattern.
+ * `ast_grep` matches code structure and `find` is a natural-language discovery
+ * query; both are repository discovery that semctl serves, so each maps to the
+ * wire contract's `Grep`.
+ */
+const CONTENT_SEARCH_PATTERN: Record<string, string> = {
+	grep: "pattern",
+	ast_grep: "pat",
+	find: "query",
+};
+
+/**
+ * Map an OMP tool call onto the wire contract. OMP input shapes differ from
+ * Claude's: `glob` carries its pattern in `path`, `grep` accepts a line
+ * selector on one file, and `bash` can run in its own `cwd`. A search of
+ * internal or web URLs is not repository discovery, so it is not sent.
+ */
+function hookToolCall(toolName: string, input: Record<string, unknown>, cwd: string): HookToolCall | undefined {
+	if (toolName.startsWith(OMP_SEMCTX_TOOL_PREFIX)) return { tool_name: toolName, tool_input: input, cwd };
+	const patternField = CONTENT_SEARCH_PATTERN[toolName];
+	if (patternField !== undefined) {
+		const entries = pathEntries(input.path);
+		if (entries.some(entry => URL_PATH.test(entry))) return undefined;
+		const pattern = input[patternField];
+		if (entries.length === 0) return { tool_name: "Grep", tool_input: { pattern }, cwd };
+		const target = entries.length === 1 ? entries[0].replace(LINE_SELECTOR, "") : input.path;
+		return { tool_name: "Grep", tool_input: { pattern, path: target }, cwd };
+	}
 	switch (toolName) {
-		case "grep":
-			return "Grep";
-		case "glob":
-			return "Glob";
-		case "bash":
-			return "Bash";
+		case "glob": {
+			// OMP `glob` carries its pattern in `path`. The wire contract follows
+			// Claude's `Glob`, which carries it in `pattern`.
+			const entries = pathEntries(input.path);
+			if (entries.some(entry => URL_PATH.test(entry))) return undefined;
+			const wholeTree = entries.length === 0 || (entries.length === 1 && ROOT_ALIAS.test(entries[0]));
+			return { tool_name: "Glob", tool_input: { pattern: wholeTree ? "**/*" : entries.join(";") }, cwd };
+		}
+		case "bash": {
+			const shellCwd = typeof input.cwd === "string" ? input.cwd.trim() : "";
+			if (URL_PATH.test(shellCwd)) return undefined;
+			const commandCwd = shellCwd.length === 0 ? cwd : path.resolve(cwd, shellCwd);
+			return { tool_name: "Bash", tool_input: input, cwd: commandCwd };
+		}
 		default:
 			return undefined;
 	}
@@ -162,6 +224,10 @@ export function createSemctxExtension(invoker: HookInvoker = createSemctlHookInv
 		const instanceId = `${process.pid}-${Date.now().toString(36)}`;
 		let promptGeneration = 0;
 		let activePromptId = "";
+		// The prompt of a submission that has not started a turn yet. OMP can run
+		// `before_agent_start` again for the same submission before its first
+		// turn. Reusing the prompt id keeps semctl's per-turn dedup intact.
+		let preparingPrompt: string | undefined;
 
 		pi.setLabel("semctx");
 
@@ -178,6 +244,7 @@ export function createSemctxExtension(invoker: HookInvoker = createSemctlHookInv
 		};
 		const resetTurnState = () => {
 			activePromptId = "";
+			preparingPrompt = undefined;
 		};
 		const sendOrientation = async (source: SessionSource, ctx: HookContext) => {
 			resetTurnState();
@@ -208,7 +275,10 @@ export function createSemctxExtension(invoker: HookInvoker = createSemctlHookInv
 		pi.on("session_compact", async (_event, ctx) => sendOrientation("compact", ctx));
 
 		pi.on("before_agent_start", async (event, ctx) => {
-			activePromptId = allocatePromptId(ctx);
+			if (activePromptId === "" || preparingPrompt !== event.prompt) {
+				activePromptId = allocatePromptId(ctx);
+			}
+			preparingPrompt = event.prompt;
 			const context = await safeInvoke(
 				{
 					host: HOST,
@@ -225,20 +295,21 @@ export function createSemctxExtension(invoker: HookInvoker = createSemctlHookInv
 				? undefined
 				: { message: hiddenMessage(PROMPT_CONTEXT_MESSAGE, context) };
 		});
+		pi.on("turn_start", () => {
+			preparingPrompt = undefined;
+		});
 
 		pi.on("tool_call", async (event, ctx) => {
-			const toolName = hookToolName(event.toolName);
-			if (toolName === undefined) return undefined;
+			const call = hookToolCall(event.toolName, event.input, ctx.cwd);
+			if (call === undefined) return undefined;
 			activePromptId ||= allocatePromptId(ctx);
 			const context = await safeInvoke(
 				{
 					host: HOST,
 					hook_event_name: "PreToolUse",
-					cwd: ctx.cwd,
 					session_id: ctx.sessionManager.getSessionId(),
 					prompt_id: activePromptId,
-					tool_name: toolName,
-					tool_input: event.input,
+					...call,
 				},
 				ctx,
 				TOOL_TIMEOUT_MS,
