@@ -13,7 +13,11 @@ pub enum DaemonCommand {
     /// Serve MCP sessions over this user's local endpoint. Started by a
     /// `semctl mcp` client, not run by hand.
     #[command(hide = true)]
-    Run,
+    Run {
+        /// Reject automatic startup if a Windows job still owns this process.
+        #[arg(long, hide = true)]
+        require_detached: bool,
+    },
 
     /// Report the running daemon: its version, uptime, sessions, checkouts,
     /// and scheduler permits. Exits with status 1 when no daemon is running.
@@ -38,7 +42,7 @@ pub struct StatusArgs {
 /// behavior is the same, and only the runtime's worker bounds differ.
 pub(crate) async fn run(command: DaemonCommand) -> Result<()> {
     match command {
-        DaemonCommand::Run => daemon::serve::serve().await,
+        DaemonCommand::Run { require_detached } => daemon::serve::serve(require_detached).await,
         DaemonCommand::Status(args) => daemon::control::status(args.json).await,
         DaemonCommand::Stop => daemon::control::stop().await,
     }

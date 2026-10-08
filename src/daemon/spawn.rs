@@ -5,10 +5,9 @@
 //! Several clients may therefore start several daemons for one endpoint; all
 //! but one exit immediately.
 //!
-//! Nothing here waits on the child. A losing daemon exits right away and stays
-//! a zombie until this client exits, which is at most one short-lived entry per
-//! spawn; a winning daemon outlives the client that started it and must not be
-//! waited for at all.
+//! The client retains the child while it connects, so rejected startup can
+//! reach the standalone fallback promptly. A winning daemon outlives the
+//! client that started it and must not be waited for after connection.
 //!
 //! # What the daemon inherits
 //!
@@ -37,7 +36,7 @@
 //! in its attach body, so the daemon needs none of its own.
 
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 
 use anyhow::{Context, Result};
 use tracing::info;
@@ -62,7 +61,7 @@ const DAEMON_ARGS: [&str; 2] = ["daemon", "run"];
 ///
 /// The working directory is the endpoint's own, which
 /// [`Endpoint::open_log`] has just created, and never this client's checkout.
-pub(crate) fn spawn_daemon(endpoint: &Endpoint) -> Result<()> {
+pub(crate) fn spawn_daemon(endpoint: &Endpoint) -> Result<Child> {
     let program = std::env::current_exe().context("locate this executable")?;
     let log = endpoint.open_log()?;
     let mut command = command_for(&program, endpoint.daemon_dir());
@@ -73,14 +72,14 @@ pub(crate) fn spawn_daemon(endpoint: &Endpoint) -> Result<()> {
     detach(&mut command);
     #[cfg(windows)]
     shield_standard_handles();
-    let pid = start(command)?;
+    let child = command.spawn().context("start a detached semctl daemon")?;
     info!(
-        pid,
+        pid = child.id(),
         endpoint = endpoint.id(),
         log = %endpoint.log_path().display(),
         "started a semctl daemon for this endpoint"
     );
-    Ok(())
+    Ok(child)
 }
 
 /// The command that runs a daemon, without its platform detachment.
@@ -91,6 +90,8 @@ pub(crate) fn spawn_daemon(endpoint: &Endpoint) -> Result<()> {
 fn command_for(program: &Path, working_dir: Option<&Path>) -> Command {
     let mut command = Command::new(program);
     command.args(DAEMON_ARGS);
+    #[cfg(windows)]
+    command.arg("--require-detached");
     for name in PER_SESSION_VARS {
         command.env_remove(name);
     }
@@ -116,8 +117,10 @@ fn detach(command: &mut Command) {
 ///
 /// `CREATE_NO_WINDOW` starts the daemon without a console,
 /// `CREATE_NEW_PROCESS_GROUP` keeps console control events from reaching it,
-/// and `CREATE_BREAKAWAY_FROM_JOB` keeps it out of a job object that would end
-/// it with this client. Do not combine `CREATE_NO_WINDOW` with
+/// and `CREATE_BREAKAWAY_FROM_JOB` requests release from the client's jobs.
+/// A restrictive ancestor can retain a child even when creation succeeds.
+/// The child therefore verifies detachment before it binds its endpoint.
+/// Do not combine `CREATE_NO_WINDOW` with
 /// `DETACHED_PROCESS`: Windows ignores the former when the latter is set.
 #[cfg(windows)]
 fn detach(command: &mut Command) {
@@ -175,38 +178,27 @@ fn shield_standard_handles() {
     }
 }
 
-/// Start the daemon and report its process id.
-#[cfg(unix)]
-fn start(mut command: Command) -> Result<u32> {
-    let child = command.spawn().context("start a semctl daemon")?;
-    Ok(child.id())
-}
-
-/// Start the daemon and report its process id.
+/// Reject an automatically started daemon that still belongs to a Windows job.
 ///
-/// A job object may forbid breakaway, and a process that asks for it anyway
-/// cannot be created. The retry then accepts the job's lifetime: a daemon
-/// inside the client's job is better than no daemon at all.
+/// A successful breakaway can leave a process in a restrictive ancestor job.
+/// Run this check in the child before endpoint publication, not in the parent
+/// after spawning: another client could attach before a parent-side check.
 #[cfg(windows)]
-fn start(mut command: Command) -> Result<u32> {
-    use std::os::windows::process::CommandExt;
+pub(crate) fn ensure_detached() -> Result<()> {
+    use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
-    use tracing::debug;
-
-    match command.spawn() {
-        Ok(child) => Ok(child.id()),
-        Err(error) => {
-            debug!(
-                %error,
-                "retrying the daemon start without CREATE_BREAKAWAY_FROM_JOB"
-            );
-            command.creation_flags(CREATION_FLAGS);
-            let child = command
-                .spawn()
-                .context("start a semctl daemon inside this job object")?;
-            Ok(child.id())
-        }
+    let mut in_job = 0;
+    // SAFETY: the pseudo-handle names this process. A null job tests all
+    // job membership, and the output points to a live BOOL-sized value.
+    if unsafe { IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &raw mut in_job) } == 0 {
+        return Err(std::io::Error::last_os_error()).context("check daemon job membership");
     }
+    anyhow::ensure!(
+        in_job == 0,
+        "cannot serve a shared daemon inside a Windows job"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -223,7 +215,11 @@ mod tests {
 
         assert_eq!(command.get_program(), OsStr::new("/opt/semctl/bin/semctl"));
         let args: Vec<&OsStr> = command.get_args().collect();
-        assert_eq!(args, DAEMON_ARGS.map(OsStr::new).to_vec());
+        let mut expected = DAEMON_ARGS.map(OsStr::new).to_vec();
+        if cfg!(windows) {
+            expected.push(OsStr::new("--require-detached"));
+        }
+        assert_eq!(args, expected);
         assert_eq!(command.get_current_dir(), None);
     }
 

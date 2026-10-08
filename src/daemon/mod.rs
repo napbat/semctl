@@ -44,7 +44,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Which role this invocation takes.
 enum Role {
     /// Serve the local endpoint.
-    Daemon,
+    Daemon(bool),
     /// Attach to the daemon, with this mode's failure policy.
     Client(DaemonMode),
     /// Run the command in this process, as every earlier version did.
@@ -54,7 +54,7 @@ enum Role {
 /// Choose the role, reading the daemon mode at most once.
 fn select(command: &Command) -> Role {
     match command {
-        Command::Daemon(DaemonCommand::Run) => Role::Daemon,
+        Command::Daemon(DaemonCommand::Run { require_detached }) => Role::Daemon(*require_detached),
         Command::Mcp => match DaemonMode::from_environment() {
             DaemonMode::Off => Role::Standalone,
             mode => Role::Client(mode),
@@ -69,7 +69,7 @@ fn select(command: &Command) -> Role {
 /// installs the log subscriber.
 pub(crate) fn run_role(cli: Cli) -> Result<()> {
     match select(&cli.command) {
-        Role::Daemon => serve::run(),
+        Role::Daemon(require_detached) => serve::run(require_detached),
         Role::Client(mode) => match client::run_client_role(&cli, mode) {
             ClientOutcome::Exited(0) => Ok(()),
             // The pump is finished and the runtime is already shut down in

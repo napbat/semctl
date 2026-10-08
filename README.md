@@ -136,6 +136,13 @@ becomes a byte pump between the host and the daemon.
 | `off` | Serve the session in this process, as every earlier version did. |
 | `require` | Attach to the daemon, start one when none is running, and exit with status 1 when that fails. |
 
+On Windows, automatic startup must detach the daemon from every job object
+before it opens the shared endpoint. A restrictive host job or ancestor job
+can prevent detachment. In that case, `auto` serves this session in its own
+process and `require` reports the startup failure. Clients in a restrictive
+job can still attach to an existing daemon. Closing one client's job must not
+end other clients' sessions.
+
 Two commands inspect and end a running daemon:
 
 ```sh
@@ -204,9 +211,10 @@ Secrets travel only inside the handshake body: no token appears in an endpoint
 name, a command argument, a log line, or status output.
 
 The full shared-daemon lifecycle suite is Unix-only. Native Windows regressions
-cover console-free Git probes and source-policy syncing. Windows named-pipe
-startup, MCP initialization, tool listing/calls, and client EOF have also been
-smoke-tested. The macOS daemon path remains compile-checked without runtime
+cover restrictive and nested job startup, standalone fallback, attachment to
+an existing daemon, console-free Git probes, and source-policy syncing.
+Windows named-pipe startup, MCP initialization, tool listing/calls, and client
+EOF have also been smoke-tested. The macOS daemon path remains compile-checked without runtime
 measurements.
 
 ## Updating

@@ -77,14 +77,14 @@ const MAX_BLOCKING_THREADS: usize = 64;
 /// `main` calls this before it builds any other runtime: this runtime is
 /// bounded on purpose, because one daemon serves every session of this user
 /// and must not size itself as if it served one.
-pub(crate) fn run() -> Result<()> {
+pub(crate) fn run(require_detached: bool) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads(std::thread::available_parallelism().ok()))
         .max_blocking_threads(MAX_BLOCKING_THREADS)
         .enable_all()
         .build()
         .context("build the daemon runtime")?;
-    runtime.block_on(serve())
+    runtime.block_on(serve(require_detached))
 }
 
 /// How many worker threads the daemon runtime gets.
@@ -103,7 +103,15 @@ fn worker_threads(parallelism: Option<std::num::NonZero<usize>>) -> usize {
 /// Call this inside a Tokio runtime. [`run`] builds the daemon's own; the
 /// command dispatcher in [`crate::commands::daemon`] reaches this function
 /// when a runtime already exists.
-pub(crate) async fn serve() -> Result<()> {
+pub(crate) async fn serve(require_detached: bool) -> Result<()> {
+    #[cfg(windows)]
+    if require_detached {
+        // Check before binding: no other client may attach to a daemon whose
+        // lifetime still belongs to its launching host's Windows job.
+        super::spawn::ensure_detached()?;
+    }
+    #[cfg(not(windows))]
+    let _ = require_detached;
     let endpoint = Endpoint::current().context("locate the local daemon endpoint")?;
     let listener = match Listener::bind(&endpoint).context("bind the local daemon endpoint")? {
         Election::Lost => {
