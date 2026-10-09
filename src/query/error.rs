@@ -22,7 +22,6 @@ pub enum FailureKind {
     /// The call named something that does not exist or is not valid.
     InvalidArgument,
     /// The first index of the codebase is still running.
-    #[allow(dead_code)] // The first-index wait of the next change constructs it.
     IndexPending,
     /// The first index of the codebase failed.
     IndexFailed,

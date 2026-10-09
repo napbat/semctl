@@ -9,23 +9,31 @@
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Serialize, de::DeserializeOwned};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
-use tracing::{debug, warn};
+use tokio::{
+    sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore},
+    time::Instant,
+};
+use tracing::warn;
 
 use crate::auth;
 use crate::session::{CredentialScope, CredentialSource, SessionContext};
 
 mod failure;
+mod retry;
+#[cfg(test)]
+pub(crate) mod stub;
 pub(crate) mod transport;
 
-use failure::{gateway_error, response_body_error};
+use failure::gateway_error;
+use retry::Idempotency;
 
 pub(crate) use failure::ApiFailure;
+pub(crate) use retry::DEADLINE_MARGIN;
 pub(crate) use transport::HttpTransport;
 
 const TENANT_HEADER: &str = "X-Tenant-Id";
@@ -33,7 +41,6 @@ const TENANT_HEADER: &str = "X-Tenant-Id";
 /// codebase for any read that is about one, so an agent working in a checkout
 /// is answered about the tree it is looking at.
 const CHECKOUT_HEADER: &str = "X-Semctx-Source-Id";
-const LOADING_RETRY_BUDGET: Duration = Duration::from_mins(1);
 const LOADING_RETRY_MIN_DELAY: Duration = Duration::from_secs(1);
 const LOADING_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
 
@@ -77,6 +84,14 @@ pub struct Client {
     /// The handle comes from the caller: this module never reads the
     /// environment, so a session cannot raise a process-wide bound.
     remote_permits: Option<Arc<Semaphore>>,
+    /// The moment by which every request of this client must have an answer,
+    /// when the caller bounds its call. `None` for a CLI command and for the
+    /// daemon's sync, which have no caller waiting on a clock.
+    ///
+    /// Only a per-call clone carries a deadline. A client that a long-lived
+    /// owner keeps, such as a coordinator, never does: see
+    /// [`Self::with_deadline`].
+    deadline: Option<Instant>,
 }
 
 impl Client {
@@ -94,6 +109,21 @@ impl Client {
         );
         client.local_root = local_root;
         client
+    }
+
+    /// A client with no codebase for a stub server at `base_url`. A fixed
+    /// token authorizes it, so a test never reads the credential store.
+    #[cfg(test)]
+    pub(crate) fn for_test_server(base_url: &str) -> Self {
+        Self::new(
+            &HttpTransport::new().expect("build the test transport"),
+            CredentialSource::from_test_token("stub-token"),
+            base_url,
+            None,
+            None,
+            false,
+            None,
+        )
     }
 
     fn new(
@@ -117,6 +147,7 @@ impl Client {
             checkout_source_id: None,
             capabilities: Arc::new(tokio::sync::OnceCell::new()),
             remote_permits,
+            deadline: None,
         }
     }
 
@@ -155,6 +186,25 @@ impl Client {
     pub(crate) fn without_codebase(mut self) -> Self {
         self.codebase = None;
         self
+    }
+
+    /// The same client, with every request bounded by `deadline`.
+    ///
+    /// This is for one call. Each attempt, each retry wait, and each retry is
+    /// kept inside the deadline, and a request that cannot finish in time
+    /// fails with an error that names the deadline. Never give a client with
+    /// a deadline to an owner that outlives the call: its later requests
+    /// would fail at once.
+    #[must_use]
+    pub(crate) fn with_deadline(mut self, deadline: Option<Instant>) -> Self {
+        self.deadline = deadline;
+        self
+    }
+
+    /// The deadline of this client, for tests that check which clients carry one.
+    #[cfg(test)]
+    pub(crate) fn deadline(&self) -> Option<Instant> {
+        self.deadline
     }
 
     /// Attach a checkout only when its source identity can be derived. A failed
@@ -263,75 +313,6 @@ impl Client {
         }
     }
 
-    /// Send one request, repairing a stale persisted tenant once and honoring
-    /// the server's bounded `Retry-After` contract for transient graph/file
-    /// projection restores.
-    async fn send(
-        &self,
-        method: reqwest::Method,
-        path: &str,
-        body: Option<serde_json::Value>,
-    ) -> Result<(reqwest::Response, String)> {
-        let mut tenant_retried = false;
-        let loading_deadline = Instant::now() + LOADING_RETRY_BUDGET;
-        loop {
-            // Acquired after the token fetch: that request is authorization, not
-            // an interactive read, and waiting for a permit while holding one
-            // would make the bound self-blocking.
-            let (mut req, url, rejected_tenant) = self.authed(method.clone(), path).await?;
-            if let Some(json) = &body {
-                req = req.json(json);
-            }
-            let permit = self.remote_permit().await;
-            let resp = req
-                .send()
-                .await
-                .with_context(|| format!("{method} {url}"))?;
-
-            if let Some(delay) = loading_retry_delay(resp.status(), resp.headers()) {
-                if delay > loading_deadline.saturating_duration_since(Instant::now()) {
-                    return Ok((resp, url));
-                }
-                debug!(
-                    status = %resp.status(),
-                    retry_after_ms = delay.as_millis(),
-                    "server projection is restoring; retrying request"
-                );
-                drop(permit);
-                tokio::time::sleep(delay).await;
-                continue;
-            }
-
-            if resp.status() != reqwest::StatusCode::FORBIDDEN {
-                return Ok((resp, url));
-            }
-
-            let status = resp.status();
-            let response_body = resp
-                .text()
-                .await
-                .with_context(|| format!("{method} {url}: read body"))?;
-            // Tenant repair queries identity and rewrites config. That is not
-            // this request attempt, so it must not hold this attempt's permit.
-            drop(permit);
-            if !tenant_retried
-                && tenant_binding_denied(&response_body)
-                && self
-                    .repair_tenant_after_denial(rejected_tenant.as_deref())
-                    .await
-            {
-                tenant_retried = true;
-                continue;
-            }
-            return Err(response_body_error(
-                method.as_str(),
-                &url,
-                status,
-                &response_body,
-            ));
-        }
-    }
-
     /// Replace a rejected persisted tenant when identity has exactly one
     /// membership. Best-effort: any discovery/config error leaves the original
     /// denial as the user-facing result.
@@ -425,7 +406,9 @@ impl Client {
     /// GET `path`, parse the JSON response as `T`. The path is appended
     /// to the base URL — pass it WITH leading slash (`/v1/domains`).
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        let (resp, url) = self.send(reqwest::Method::GET, path, None).await?;
+        let (resp, url) = self
+            .send(reqwest::Method::GET, path, None, Idempotency::Idempotent)
+            .await?;
         unwrap_envelope(resp, "GET", &url).await
     }
 
@@ -433,7 +416,9 @@ impl Client {
     /// for "does this still exist?" probes (e.g. validating a cached codebase id
     /// before trusting it against the current server).
     pub async fn get_opt<T: DeserializeOwned>(&self, path: &str) -> Result<Option<T>> {
-        let (resp, url) = self.send(reqwest::Method::GET, path, None).await?;
+        let (resp, url) = self
+            .send(reqwest::Method::GET, path, None, Idempotency::Idempotent)
+            .await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -444,7 +429,9 @@ impl Client {
     /// `Ok(None)` instead of erroring. For endpoints that 200 with no payload to
     /// mean "nothing here" (e.g. hover at a position with no symbol).
     pub async fn get_maybe<T: DeserializeOwned>(&self, path: &str) -> Result<Option<T>> {
-        let (resp, url) = self.send(reqwest::Method::GET, path, None).await?;
+        let (resp, url) = self
+            .send(reqwest::Method::GET, path, None, Idempotency::Idempotent)
+            .await?;
         let (_, envelope) = read_envelope::<T>(resp, "GET", &url).await?;
         Ok(envelope.data)
     }
@@ -454,15 +441,43 @@ impl Client {
     /// paginated list endpoints put their rows (`data`, or legacy `items`) and
     /// page metadata beside `success` (see [`unwrap_page`]).
     pub async fn get_page<T: DeserializeOwned>(&self, path: &str) -> Result<api::Page<T>> {
-        let (resp, url) = self.send(reqwest::Method::GET, path, None).await?;
+        let (resp, url) = self
+            .send(reqwest::Method::GET, path, None, Idempotency::Idempotent)
+            .await?;
         unwrap_page(resp, "GET", &url).await
     }
 
     /// POST `path` with `body` serialised as JSON, parse the response
     /// as `T`. Same path semantics as [`Self::get`].
+    ///
+    /// The request can write, so a gateway or connection failure is not
+    /// retried. Use [`Self::post_read`] for a request that only reads.
     pub async fn post<B: Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> Result<T> {
+        self.post_with(path, body, Idempotency::NotIdempotent).await
+    }
+
+    /// POST `path` for a request that only reads, such as a search. The server
+    /// holds the same state after it answers the request twice, so a gateway
+    /// or connection failure is retried once, as for a GET. Parsed like
+    /// [`Self::post`].
+    pub async fn post_read<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        self.post_with(path, body, Idempotency::Idempotent).await
+    }
+
+    async fn post_with<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+        idempotency: Idempotency,
+    ) -> Result<T> {
         let body = serde_json::to_value(body).context("serialize POST body")?;
-        let (resp, url) = self.send(reqwest::Method::POST, path, Some(body)).await?;
+        let (resp, url) = self
+            .send(reqwest::Method::POST, path, Some(body), idempotency)
+            .await?;
         unwrap_envelope(resp, "POST", &url).await
     }
 
@@ -470,7 +485,14 @@ impl Client {
     /// Same path / envelope semantics as [`Self::post`].
     pub async fn put<B: Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> Result<T> {
         let body = serde_json::to_value(body).context("serialize PUT body")?;
-        let (resp, url) = self.send(reqwest::Method::PUT, path, Some(body)).await?;
+        let (resp, url) = self
+            .send(
+                reqwest::Method::PUT,
+                path,
+                Some(body),
+                Idempotency::NotIdempotent,
+            )
+            .await?;
         unwrap_envelope(resp, "PUT", &url).await
     }
 

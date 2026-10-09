@@ -401,7 +401,7 @@ pub async fn batch_lookup(
     let url = format!("/v1/codebases/{cb}/graph/batch");
     let body = serde_json::json!({ "symbols": symbols, "references": references });
     let results = client
-        .post::<_, Vec<api::SymbolHits>>(&url, &body)
+        .post_read::<_, Vec<api::SymbolHits>>(&url, &body)
         .await
         .map_err(|e| ToolError::from_client("batch_lookup", &e))?;
     let kind = if references {

@@ -19,7 +19,7 @@ use super::tool_types::{
     UndoEditArgs, render_edit_action_outcome,
 };
 use super::{
-    DIRECT_EDIT_TOOLS, InitialIndexGate, McpServer, client, initial_gate_for_path,
+    CallBudget, DIRECT_EDIT_TOOLS, InitialIndexGate, McpServer, client, initial_gate_for_path,
     ready_for_codebases, selector_is_path_like,
 };
 use crate::engine::Engine;
@@ -32,7 +32,7 @@ use crate::session::SessionContext;
 /// not exist serves as the launch root. The engine counts reconciles instead of
 /// performing them, and a root that does not exist also leaves every coordinator
 /// without a platform watcher, so no test touches the filesystem watcher.
-fn server(base: client::Client, dir: impl Into<PathBuf>, pinned: bool) -> McpServer {
+pub(super) fn server(base: client::Client, dir: impl Into<PathBuf>, pinned: bool) -> McpServer {
     session(
         base,
         dir,
@@ -53,7 +53,11 @@ fn session(
 
 /// Claim `root` for a first index on this session's behalf, as
 /// `index_codebase` does, and return the gate retrieval waits on.
-async fn first_index(server: &McpServer, codebase: &str, root: &Path) -> Arc<InitialIndexGate> {
+pub(super) async fn first_index(
+    server: &McpServer,
+    codebase: &str,
+    root: &Path,
+) -> Arc<InitialIndexGate> {
     let client = client::Client::for_test(codebase, Some(root.to_path_buf()));
     server
         .watch_first_once(client, root.to_path_buf())
@@ -146,7 +150,7 @@ async fn scoped_readiness_allows_registration_and_holds_new_indexes_out() {
     let gate = first_index(&server, "codebase", Path::new("checkout")).await;
     let leases = &server.shared.leases;
     let searching = async {
-        let guard = ready_for_codebases(leases, &["A".into()])
+        let guard = ready_for_codebases(leases, &["A".into()], &CallBudget::unbounded())
             .await
             .expect("the gate completes");
         assert!(
@@ -198,9 +202,12 @@ async fn a_second_sessions_startup_bind_does_not_wait_for_another_first_index() 
         .expect("the startup bind must not wait for another session's first index");
 
     assert!(
-        tokio::time::timeout(Duration::from_millis(50), second.bound("find_definition"))
-            .await
-            .is_err(),
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            second.bound("find_definition", &CallBudget::unbounded()),
+        )
+        .await
+        .is_err(),
         "a retrieval call still waits for the first index"
     );
 }
@@ -219,7 +226,7 @@ async fn a_failed_first_index_reports_how_to_retry() {
     gate.finish(Err("embedding job 7 failed".into())).await;
 
     let message = server
-        .await_initial_path("search_codebase", &root)
+        .await_initial_path("search_codebase", &root, &CallBudget::unbounded())
         .await
         .unwrap_err()
         .to_string();
@@ -262,7 +269,7 @@ fn a_relative_selector_is_a_path_under_the_session_directory() {
 async fn explicit_ids_ignore_unrelated_pending_and_failed_indexes_after_registration() {
     let gate = Arc::new(InitialIndexGate::pending());
     let gates = vec![gate.clone()];
-    let waiting = async { wait_for_gates(&gates, &["B".into()]).await };
+    let waiting = async { wait_for_gates(&gates, &["B".into()], None).await };
     let registering = async { gate.register_codebase("A".into()).await };
     let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
         tokio::join!(biased; waiting, registering)
@@ -272,10 +279,10 @@ async fn explicit_ids_ignore_unrelated_pending_and_failed_indexes_after_registra
     assert_eq!(result, Ok(()));
 
     gate.finish(Err("embedding failed".into())).await;
-    assert_eq!(wait_for_gates(&gates, &["B".into()]).await, Ok(()));
-    assert!(wait_for_gates(&gates, &["A".into()]).await.is_err());
+    assert_eq!(wait_for_gates(&gates, &["B".into()], None).await, Ok(()));
+    assert!(wait_for_gates(&gates, &["A".into()], None).await.is_err());
     assert!(
-        wait_for_gates(&gates, &[]).await.is_err(),
+        wait_for_gates(&gates, &[], None).await.is_err(),
         "a server-defined scope can include it, so its failure counts"
     );
 }
@@ -288,7 +295,8 @@ async fn scoped_readiness_rechecks_indexes_registered_while_it_waits() {
     let first = first_index(&server, "A", Path::new("first")).await;
     first.register_codebase("A".into()).await;
 
-    let search = ready_for_codebases(&server.shared.leases, &[]);
+    let unbounded = CallBudget::unbounded();
+    let search = ready_for_codebases(&server.shared.leases, &[], &unbounded);
     tokio::pin!(search);
     assert!(
         tokio::time::timeout(Duration::from_millis(5), &mut search)
@@ -361,7 +369,7 @@ async fn an_empty_selector_waits_only_on_this_sessions_gates() {
 
     let guard = tokio::time::timeout(
         Duration::from_secs(1),
-        ready_for_codebases(&mine.shared.leases, &[]),
+        ready_for_codebases(&mine.shared.leases, &[], &CallBudget::unbounded()),
     )
     .await
     .expect("a gate this session does not hold must not block it")
@@ -421,10 +429,17 @@ async fn canonical_search_omits_cached_checkout_freshness() {
         Some(("job".into(), Some("checkout sync failed".into())));
 
     assert_eq!(
-        server.index_freshness(&base).await,
+        server
+            .index_freshness(&base, &CallBudget::unbounded())
+            .await,
         Some("checkout sync failed".into())
     );
-    assert_eq!(server.index_freshness(&base.for_canonical()).await, None);
+    assert_eq!(
+        server
+            .index_freshness(&base.for_canonical(), &CallBudget::unbounded())
+            .await,
+        None
+    );
 }
 
 /// Two checkouts can share one codebase id. A bound checkout waits for its own
@@ -447,7 +462,7 @@ async fn checkout_readiness_does_not_use_another_checkouts_codebase_gate() {
     assert!(
         tokio::time::timeout(
             Duration::from_millis(5),
-            server.await_initial_client("find_definition", &first)
+            server.await_initial_client("find_definition", &first, &CallBudget::unbounded())
         )
         .await
         .is_err(),
@@ -456,14 +471,14 @@ async fn checkout_readiness_does_not_use_another_checkouts_codebase_gate() {
     first_gate.finish(Ok(())).await;
     assert!(
         server
-            .await_initial_client("find_definition", &first)
+            .await_initial_client("find_definition", &first, &CallBudget::unbounded())
             .await
             .is_ok()
     );
 
     let rootless = client::Client::for_test("shared-codebase", None);
     let message = server
-        .await_initial_client("find_definition", &rootless)
+        .await_initial_client("find_definition", &rootless, &CallBudget::unbounded())
         .await
         .unwrap_err()
         .to_string();

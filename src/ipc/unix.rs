@@ -361,6 +361,7 @@ mod tests {
                 codebase: None,
                 token: Some(Token::new("super-secret-value")),
                 resync_secs: None,
+                tool_deadline_secs: None,
                 update_check: true,
             },
         )

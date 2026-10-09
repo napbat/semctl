@@ -126,7 +126,7 @@ pub async fn search(
         granularity: opts.expand.then(|| "Symbol".to_string()),
     };
     let hits = client
-        .post::<_, Vec<api::SearchHit>>("/v1/search", &body)
+        .post_read::<_, Vec<api::SearchHit>>("/v1/search", &body)
         .await
         .map_err(|e| ToolError::from_client("search_codebase", &e))?;
     if hits.is_empty() {
@@ -599,7 +599,7 @@ async fn near_miss(client: &Client, symbol: &str, what: &str) -> String {
         granularity: None,
     };
     let Ok(hits) = client
-        .post::<_, Vec<api::SearchHit>>("/v1/search", &body)
+        .post_read::<_, Vec<api::SearchHit>>("/v1/search", &body)
         .await
     else {
         return miss;

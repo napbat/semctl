@@ -1,16 +1,21 @@
 //! MCP tool-router definitions.
 
-use std::path::PathBuf;
-
 use anyhow::Result;
 use rmcp::{
     ErrorData, RoleServer, ServerHandler,
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{ListToolsResult, ServerCapabilities, ServerInfo, Tool},
+    handler::server::{
+        common::Extension, router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters,
+    },
+    model::{
+        CallToolRequestParams, CallToolResult, ListToolsResult, ServerCapabilities, ServerInfo,
+        Tool,
+    },
     service::RequestContext,
     tool, tool_handler, tool_router,
 };
+use tokio::time::Instant;
 
+use super::budget::{call_budget, deadline_result, tool_op};
 use super::tool_types::{
     AnalysisPageArgs, BatchArgs, CallGraphArgs, CallPathArgs, EmptyArgs, ExpandArgs,
     FlowBetweenArgs, FlowFromArgs, FlowToArgs, GrepArgs, IndexCodebaseArgs, InsertSymbolArgs,
@@ -19,10 +24,7 @@ use super::tool_types::{
     SymbolSearchArgs, TraceArgs, TypeHierarchyArgs, UndoEditArgs, applied_edit_text,
     pattern_needs_regex,
 };
-use super::{
-    FailureKind, McpServer, ToolError, canonical_directory, client, initial_gate_for_path, query,
-    ready_for_codebases,
-};
+use super::{CallBudget, FailureKind, McpServer, ToolError, client, query, ready_for_codebases};
 
 // Tool descriptions come entirely from `docs/tools/<name>.md`: the `#[tool]`
 // macro's `description` is a string literal (darling FromMeta) that can't take
@@ -34,6 +36,7 @@ impl McpServer {
     async fn search_codebase(
         &self,
         Parameters(args): Parameters<SearchArgs>,
+        Extension(budget): Extension<CallBudget>,
     ) -> Result<String, ToolError> {
         let opts = query::SearchOpts {
             prefer: args.prefer,
@@ -50,13 +53,7 @@ impl McpServer {
         let client = if independent {
             // An explicit search scope does not require the launch directory to
             // be indexed. A known binding can still identify its own local hits.
-            let client = self
-                .shared
-                .bound
-                .lock()
-                .await
-                .clone()
-                .unwrap_or_else(|| self.shared.base.clone());
+            let client = self.bound_or_base(&budget).await;
             if args
                 .copy
                 .as_deref()
@@ -71,6 +68,7 @@ impl McpServer {
                 "search_codebase",
                 args.codebase.as_deref(),
                 args.copy.as_deref(),
+                &budget,
             )
             .await?
         };
@@ -78,16 +76,11 @@ impl McpServer {
         // Reserve checked registry membership only for the query. A new
         // codebase cannot appear between readiness and scope evaluation.
         let indexes = if opts.scope.is_some() || !opts.codebase_ids.is_empty() {
-            match ready_for_codebases(&self.shared.leases, &opts.codebase_ids).await {
-                Ok(indexes) => Some(indexes),
-                Err(detail) => {
-                    return Err(ToolError::new(
-                        "search_codebase",
-                        FailureKind::IndexFailed,
-                        detail,
-                    ));
-                }
-            }
+            Some(
+                ready_for_codebases(&self.shared.leases, &opts.codebase_ids, &budget)
+                    .await
+                    .map_err(|not_ready| not_ready.into_tool_error("search_codebase"))?,
+            )
         } else {
             None
         };
@@ -103,7 +96,7 @@ impl McpServer {
         // The launch checkout's watcher does not describe a broader search.
         if opts.scope.is_none()
             && opts.codebase_ids.is_empty()
-            && let Some(footer) = self.index_freshness(&client).await
+            && let Some(footer) = self.index_freshness(&client, &budget).await
         {
             out.push_str("\n\n");
             out.push_str(&footer);
@@ -122,12 +115,14 @@ impl McpServer {
     async fn find_definition(
         &self,
         Parameters(args): Parameters<SymbolArgs>,
+        Extension(budget): Extension<CallBudget>,
     ) -> Result<String, ToolError> {
         let client = self
             .client_for_copy(
                 "find_definition",
                 args.codebase.as_deref(),
                 args.copy.as_deref(),
+                &budget,
             )
             .await?;
         query::find_definition(&client, &args.symbol).await
@@ -137,9 +132,10 @@ impl McpServer {
     async fn find_references(
         &self,
         Parameters(args): Parameters<ReferenceArgs>,
+        Extension(budget): Extension<CallBudget>,
     ) -> Result<String, ToolError> {
         let client = self
-            .client_for("find_references", args.codebase.as_deref())
+            .client_for("find_references", args.codebase.as_deref(), &budget)
             .await?;
         query::find_references(&client, &args.symbol, args.namespace.as_deref()).await
     }
@@ -148,9 +144,15 @@ impl McpServer {
     async fn who_calls(
         &self,
         Parameters(args): Parameters<SymbolArgs>,
+        Extension(budget): Extension<CallBudget>,
     ) -> Result<String, ToolError> {
         let client = self
-            .client_for_copy("who_calls", args.codebase.as_deref(), args.copy.as_deref())
+            .client_for_copy(
+                "who_calls",
+                args.codebase.as_deref(),
+                args.copy.as_deref(),
+                &budget,
+            )
             .await?;
         query::who_calls(&client, &args.symbol).await
     }
@@ -159,12 +161,14 @@ impl McpServer {
     async fn implementations_of(
         &self,
         Parameters(args): Parameters<SymbolArgs>,
+        Extension(budget): Extension<CallBudget>,
     ) -> Result<String, ToolError> {
         let client = self
             .client_for_copy(
                 "implementations_of",
                 args.codebase.as_deref(),
                 args.copy.as_deref(),
+                &budget,
             )
             .await?;
         query::implementations_of(&client, &args.symbol).await
@@ -174,9 +178,10 @@ impl McpServer {
     async fn call_path(
         &self,
         Parameters(args): Parameters<CallPathArgs>,
+        Extension(budget): Extension<CallBudget>,
     ) -> Result<String, ToolError> {
         let client = self
-            .client_for("call_path", args.codebase.as_deref())
+            .client_for("call_path", args.codebase.as_deref(), &budget)
             .await?;
         query::call_path(&client, &args.from, &args.to).await
     }
@@ -185,8 +190,11 @@ impl McpServer {
     async fn reaches(
         &self,
         Parameters(args): Parameters<FlowFromArgs>,
+        Extension(budget): Extension<CallBudget>,
     ) -> Result<String, ToolError> {
-        let client = self.client_for("reaches", args.codebase.as_deref()).await?;
+        let client = self
+            .client_for("reaches", args.codebase.as_deref(), &budget)
+            .await?;
         query::reaches(&client, &args.from).await
     }
 
@@ -194,9 +202,10 @@ impl McpServer {
     async fn flows_into(
         &self,
         Parameters(args): Parameters<FlowToArgs>,
+        Extension(budget): Extension<CallBudget>,
     ) -> Result<String, ToolError> {
         let client = self
-            .client_for("flows_into", args.codebase.as_deref())
+            .client_for("flows_into", args.codebase.as_deref(), &budget)
             .await?;
         query::flows_into(&client, &args.to).await
     }
@@ -205,25 +214,44 @@ impl McpServer {
     async fn flows_between(
         &self,
         Parameters(args): Parameters<FlowBetweenArgs>,
+        Extension(budget): Extension<CallBudget>,
     ) -> Result<String, ToolError> {
         let client = self
-            .client_for("flows_between", args.codebase.as_deref())
+            .client_for("flows_between", args.codebase.as_deref(), &budget)
             .await?;
         query::flows_between(&client, &args.from, &args.to).await
     }
 
     #[tool]
-    async fn trace(&self, Parameters(args): Parameters<TraceArgs>) -> Result<String, ToolError> {
+    async fn trace(
+        &self,
+        Parameters(args): Parameters<TraceArgs>,
+        Extension(budget): Extension<CallBudget>,
+    ) -> Result<String, ToolError> {
         let client = self
-            .client_for_copy("trace", args.codebase.as_deref(), args.copy.as_deref())
+            .client_for_copy(
+                "trace",
+                args.codebase.as_deref(),
+                args.copy.as_deref(),
+                &budget,
+            )
             .await?;
         query::trace(&client, &args.symbol, args.depth.unwrap_or(1)).await
     }
 
     #[tool]
-    async fn grep(&self, Parameters(args): Parameters<GrepArgs>) -> Result<String, ToolError> {
+    async fn grep(
+        &self,
+        Parameters(args): Parameters<GrepArgs>,
+        Extension(budget): Extension<CallBudget>,
+    ) -> Result<String, ToolError> {
         let client = self
-            .client_for_copy("grep", args.codebase.as_deref(), args.copy.as_deref())
+            .client_for_copy(
+                "grep",
+                args.codebase.as_deref(),
+                args.copy.as_deref(),
+                &budget,
+            )
             .await?;
         query::grep(
             &client,
@@ -240,12 +268,14 @@ impl McpServer {
     async fn file_outline(
         &self,
         Parameters(args): Parameters<OutlineArgs>,
+        Extension(budget): Extension<CallBudget>,
     ) -> Result<String, ToolError> {
         let client = self
             .client_for_copy(
                 "file_outline",
                 args.codebase.as_deref(),
                 args.copy.as_deref(),
+                &budget,
             )
             .await?;
         query::file_outline(
@@ -262,9 +292,10 @@ impl McpServer {
     async fn expand_chunk(
         &self,
         Parameters(args): Parameters<ExpandArgs>,
+        Extension(budget): Extension<CallBudget>,
     ) -> Result<String, ToolError> {
         let client = self
-            .client_for("expand_chunk", args.codebase.as_deref())
+            .client_for("expand_chunk", args.codebase.as_deref(), &budget)
             .await?;
         query::expand_chunk(&client, &args.path, args.line_start, args.line_end).await
     }
@@ -273,9 +304,10 @@ impl McpServer {
     async fn symbol_at_position(
         &self,
         Parameters(args): Parameters<SymbolAtPositionArgs>,
+        Extension(budget): Extension<CallBudget>,
     ) -> Result<String, ToolError> {
         let client = self
-            .client_for("symbol_at_position", args.codebase.as_deref())
+            .client_for("symbol_at_position", args.codebase.as_deref(), &budget)
             .await?;
         query::symbol_at_position(&client, &args.path, args.line, args.column).await
     }
@@ -284,17 +316,22 @@ impl McpServer {
     async fn batch_lookup(
         &self,
         Parameters(args): Parameters<BatchArgs>,
+        Extension(budget): Extension<CallBudget>,
     ) -> Result<String, ToolError> {
         let client = self
-            .client_for("batch_lookup", args.codebase.as_deref())
+            .client_for("batch_lookup", args.codebase.as_deref(), &budget)
             .await?;
         query::batch_lookup(&client, &args.symbols, args.references.unwrap_or(false)).await
     }
 
     #[tool]
-    async fn file_tree(&self, Parameters(args): Parameters<NoArgs>) -> Result<String, ToolError> {
+    async fn file_tree(
+        &self,
+        Parameters(args): Parameters<NoArgs>,
+        Extension(budget): Extension<CallBudget>,
+    ) -> Result<String, ToolError> {
         let client = self
-            .client_for("file_tree", args.codebase.as_deref())
+            .client_for("file_tree", args.codebase.as_deref(), &budget)
             .await?;
         query::file_tree(&client).await
     }
@@ -303,9 +340,15 @@ impl McpServer {
     async fn list_files(
         &self,
         Parameters(args): Parameters<ListFilesArgs>,
+        Extension(budget): Extension<CallBudget>,
     ) -> Result<String, ToolError> {
         let client = self
-            .client_for_copy("list_files", args.codebase.as_deref(), args.copy.as_deref())
+            .client_for_copy(
+                "list_files",
+                args.codebase.as_deref(),
+                args.copy.as_deref(),
+                &budget,
+            )
             .await?;
         query::list_files(&client, args.path.as_deref(), args.page, args.page_size).await
     }
@@ -314,16 +357,23 @@ impl McpServer {
     async fn list_projects(
         &self,
         Parameters(args): Parameters<NoArgs>,
+        Extension(budget): Extension<CallBudget>,
     ) -> Result<String, ToolError> {
         let client = self
-            .client_for("list_projects", args.codebase.as_deref())
+            .client_for("list_projects", args.codebase.as_deref(), &budget)
             .await?;
         query::list_projects(&client).await
     }
 
     #[tool]
-    async fn imports(&self, Parameters(args): Parameters<NoArgs>) -> Result<String, ToolError> {
-        let client = self.client_for("imports", args.codebase.as_deref()).await?;
+    async fn imports(
+        &self,
+        Parameters(args): Parameters<NoArgs>,
+        Extension(budget): Extension<CallBudget>,
+    ) -> Result<String, ToolError> {
+        let client = self
+            .client_for("imports", args.codebase.as_deref(), &budget)
+            .await?;
         query::imports(&client).await
     }
 
@@ -331,9 +381,10 @@ impl McpServer {
     async fn symbol_edges(
         &self,
         Parameters(args): Parameters<NoArgs>,
+        Extension(budget): Extension<CallBudget>,
     ) -> Result<String, ToolError> {
         let client = self
-            .client_for("symbol_edges", args.codebase.as_deref())
+            .client_for("symbol_edges", args.codebase.as_deref(), &budget)
             .await?;
         query::symbol_edges(&client).await
     }
@@ -342,9 +393,10 @@ impl McpServer {
     async fn external_links(
         &self,
         Parameters(args): Parameters<NoArgs>,
+        Extension(budget): Extension<CallBudget>,
     ) -> Result<String, ToolError> {
         let client = self
-            .client_for("external_links", args.codebase.as_deref())
+            .client_for("external_links", args.codebase.as_deref(), &budget)
             .await?;
         query::external_links(&client).await
     }
@@ -353,24 +405,20 @@ impl McpServer {
     async fn list_domains(
         &self,
         Parameters(_): Parameters<EmptyArgs>,
+        Extension(budget): Extension<CallBudget>,
     ) -> Result<String, ToolError> {
         // Domains aren't codebase-scoped, and listing them is the natural probe
         // when nothing else works — so always use the plain client.
-        query::list_domains(&self.shared.base).await
+        query::list_domains(&self.base_for(&budget)).await
     }
 
     #[tool]
     async fn list_codebases(
         &self,
         Parameters(_): Parameters<EmptyArgs>,
+        Extension(budget): Extension<CallBudget>,
     ) -> Result<String, ToolError> {
-        let client = self
-            .shared
-            .bound
-            .lock()
-            .await
-            .clone()
-            .unwrap_or_else(|| self.shared.base.clone());
+        let client = self.bound_or_base(&budget).await;
         query::list_codebases(&client).await
     }
 
@@ -378,9 +426,10 @@ impl McpServer {
     async fn current_context(
         &self,
         Parameters(args): Parameters<NoArgs>,
+        Extension(budget): Extension<CallBudget>,
     ) -> Result<String, ToolError> {
         let client = self
-            .client_for_unchecked("current_context", args.codebase.as_deref())
+            .client_for_unchecked("current_context", args.codebase.as_deref(), &budget)
             .await?;
         let status = self.checkout_status(&client).await;
         let watching = status.is_some();
@@ -398,12 +447,14 @@ impl McpServer {
     async fn read_source(
         &self,
         Parameters(args): Parameters<ReadSourceArgs>,
+        Extension(budget): Extension<CallBudget>,
     ) -> Result<String, ToolError> {
         let client = self
             .client_for_copy(
                 "read_source",
                 args.codebase.as_deref(),
                 args.copy.as_deref(),
+                &budget,
             )
             .await?;
         let byte_range = match (args.byte_start, args.byte_end) {
@@ -449,12 +500,14 @@ impl McpServer {
     async fn search_symbols(
         &self,
         Parameters(args): Parameters<SymbolSearchArgs>,
+        Extension(budget): Extension<CallBudget>,
     ) -> Result<String, ToolError> {
         let client = self
             .client_for_copy(
                 "search_symbols",
                 args.codebase.as_deref(),
                 args.copy.as_deref(),
+                &budget,
             )
             .await?;
         query::search_symbols(
@@ -476,9 +529,10 @@ impl McpServer {
     async fn type_hierarchy(
         &self,
         Parameters(args): Parameters<TypeHierarchyArgs>,
+        Extension(budget): Extension<CallBudget>,
     ) -> Result<String, ToolError> {
         let client = self
-            .client_for("type_hierarchy", args.codebase.as_deref())
+            .client_for("type_hierarchy", args.codebase.as_deref(), &budget)
             .await?;
         query::type_hierarchy(
             &client,
@@ -493,9 +547,10 @@ impl McpServer {
     async fn call_graph(
         &self,
         Parameters(args): Parameters<CallGraphArgs>,
+        Extension(budget): Extension<CallBudget>,
     ) -> Result<String, ToolError> {
         let client = self
-            .client_for("call_graph", args.codebase.as_deref())
+            .client_for("call_graph", args.codebase.as_deref(), &budget)
             .await?;
         query::call_graph(
             &client,
@@ -507,8 +562,14 @@ impl McpServer {
     }
 
     #[tool]
-    async fn cycles(&self, Parameters(args): Parameters<NoArgs>) -> Result<String, ToolError> {
-        let client = self.client_for("cycles", args.codebase.as_deref()).await?;
+    async fn cycles(
+        &self,
+        Parameters(args): Parameters<NoArgs>,
+        Extension(budget): Extension<CallBudget>,
+    ) -> Result<String, ToolError> {
+        let client = self
+            .client_for("cycles", args.codebase.as_deref(), &budget)
+            .await?;
         query::cycles(&client).await
     }
 
@@ -516,8 +577,11 @@ impl McpServer {
     async fn unused(
         &self,
         Parameters(args): Parameters<AnalysisPageArgs>,
+        Extension(budget): Extension<CallBudget>,
     ) -> Result<String, ToolError> {
-        let client = self.client_for("unused", args.codebase.as_deref()).await?;
+        let client = self
+            .client_for("unused", args.codebase.as_deref(), &budget)
+            .await?;
         query::unused(
             &client,
             args.page.unwrap_or(0),
@@ -527,9 +591,13 @@ impl McpServer {
     }
 
     #[tool]
-    async fn duplicates(&self, Parameters(args): Parameters<NoArgs>) -> Result<String, ToolError> {
+    async fn duplicates(
+        &self,
+        Parameters(args): Parameters<NoArgs>,
+        Extension(budget): Extension<CallBudget>,
+    ) -> Result<String, ToolError> {
         let client = self
-            .client_for("duplicates", args.codebase.as_deref())
+            .client_for("duplicates", args.codebase.as_deref(), &budget)
             .await?;
         query::duplicates(&client).await
     }
@@ -538,9 +606,10 @@ impl McpServer {
     async fn rename_symbol(
         &self,
         Parameters(args): Parameters<RenameSymbolArgs>,
+        Extension(budget): Extension<CallBudget>,
     ) -> Result<String, ToolError> {
         let client = self
-            .client_for("rename_symbol", args.codebase.as_deref())
+            .client_for("rename_symbol", args.codebase.as_deref(), &budget)
             .await?;
         let run_formatter = args.run_formatter.unwrap_or(false);
         let request = client::api::RenameSymbolRequest {
@@ -567,9 +636,10 @@ impl McpServer {
     async fn safe_delete_symbol(
         &self,
         Parameters(args): Parameters<SafeDeleteSymbolArgs>,
+        Extension(budget): Extension<CallBudget>,
     ) -> Result<String, ToolError> {
         let client = self
-            .client_for("safe_delete_symbol", args.codebase.as_deref())
+            .client_for("safe_delete_symbol", args.codebase.as_deref(), &budget)
             .await?;
         let run_formatter = args.run_formatter.unwrap_or(false);
         let request = client::api::SafeDeleteSymbolRequest {
@@ -596,9 +666,10 @@ impl McpServer {
     async fn replace_symbol_body(
         &self,
         Parameters(args): Parameters<ReplaceBodyArgs>,
+        Extension(budget): Extension<CallBudget>,
     ) -> Result<String, ToolError> {
         let client = self
-            .client_for("replace_symbol_body", args.codebase.as_deref())
+            .client_for("replace_symbol_body", args.codebase.as_deref(), &budget)
             .await?;
         let run_formatter = args.run_formatter.unwrap_or(false);
         let request = client::api::ReplaceSymbolBodyRequest {
@@ -621,25 +692,28 @@ impl McpServer {
     async fn insert_before_symbol(
         &self,
         Parameters(args): Parameters<InsertSymbolArgs>,
+        Extension(budget): Extension<CallBudget>,
     ) -> Result<String, ToolError> {
-        self.execute_insert(args, true).await
+        self.execute_insert(args, true, &budget).await
     }
 
     #[tool]
     async fn insert_after_symbol(
         &self,
         Parameters(args): Parameters<InsertSymbolArgs>,
+        Extension(budget): Extension<CallBudget>,
     ) -> Result<String, ToolError> {
-        self.execute_insert(args, false).await
+        self.execute_insert(args, false, &budget).await
     }
 
     #[tool]
     async fn undo_edit(
         &self,
         Parameters(args): Parameters<UndoEditArgs>,
+        Extension(budget): Extension<CallBudget>,
     ) -> Result<String, ToolError> {
         let client = self
-            .client_for("undo_edit", args.codebase.as_deref())
+            .client_for("undo_edit", args.codebase.as_deref(), &budget)
             .await?;
         let watching = self.watcher_active(&client).await;
         match crate::editing::undo(&client, &args.edit_id, watching).await {
@@ -661,146 +735,19 @@ impl McpServer {
     async fn index_codebase(
         &self,
         Parameters(args): Parameters<IndexCodebaseArgs>,
+        Extension(budget): Extension<CallBudget>,
     ) -> Result<String, ToolError> {
-        let requested = match args.path.as_deref() {
-            Some(path) => PathBuf::from(path),
-            None => self.dir().await.clone(),
-        };
-        let dir = canonical_directory("index_codebase", &self.shared.context.cwd, &requested)?;
-        // The sync manifest represents the complete Git working copy. Use that
-        // same root for consent/cache lookup, readiness gates, checkout headers,
-        // and watching; otherwise indexing from `repo/src` records one path but
-        // later launches from `repo` incorrectly look unindexed.
-        let dir = crate::codebase::working_copy_root(&dir).await;
-
-        // A concurrent or recent first-index call owns the gate. Await it
-        // rather than queueing another full upload. A gate that FAILED is not
-        // awaited: it falls through below, where the engine replaces it with a
-        // fresh one, so a failed first index stays retryable while a partial
-        // one can never be reported as ready.
-        if let Some(gate) = initial_gate_for_path(&self.shared.leases, &dir).await
-            && !matches!(gate.outcome().await, Some(Err(_)))
-        {
-            return match gate.wait().await {
-                Ok(()) => Ok(format!(
-                    "initial indexing complete\npath {}\nretrieval tools are now available",
-                    dir.display()
-                )),
-                Err(e) => Err(ToolError::new(
-                    "index_codebase",
-                    FailureKind::IndexFailed,
-                    format!("initial indexing failed for {}: {e}", dir.display()),
-                )),
-            };
-        }
-
-        // Only this exact path's recorded index is prior permission. An umbrella
-        // ancestor may serve read requests, but explicitly indexing the child is
-        // a request for an independently writable codebase.
-        match crate::codebase::resolve_exact(&self.shared.base, &dir).await {
-            Ok(Some(resolved)) => {
-                let client = self
-                    .shared
-                    .base
-                    .clone()
-                    .with_codebase(resolved.id.clone())
-                    .with_local_root(Some(dir.clone()));
-                if !self.shared.pinned && self.dir().await == &dir {
-                    *self.shared.bound.lock().await = Some(client.clone());
-                }
-                self.watch_once(client, dir.clone()).await;
-                return Ok(format!(
-                    "codebase {} was already indexed; background sync and watching started\npath {}",
-                    resolved.id,
-                    dir.display()
-                ));
-            }
-            Ok(None) => {}
-            Err(e) => {
-                return Err(ToolError::from_client(
-                    "index_codebase",
-                    &e.context(dir.display().to_string()),
-                ));
-            }
-        }
-
-        // Claim the checkout and its gate before anything is registered on the
-        // server. The coordinator waits for the codebase this call registers
-        // instead of registering one of its own, so one first index creates one
-        // codebase. The gate is published for this session's readiness checks
-        // at the same time, so a concurrent path-scoped retrieval call already
-        // has something to wait on.
-        let first_index_client = self
-            .shared
-            .base
-            .clone()
-            .without_codebase()
-            .with_local_root(Some(dir.clone()));
-        let gate = match self.watch_first_once(first_index_client, dir.clone()).await {
-            Ok(gate) => gate,
-            Err(e) => {
-                return Err(ToolError::new(
-                    "index_codebase",
-                    FailureKind::Unavailable,
-                    format!("{}: {e}", dir.display()),
-                ));
-            }
-        };
-        if !gate.claim_registration().await {
-            return match gate.wait().await {
-                Ok(()) => Ok(format!(
-                    "initial indexing complete\npath {}\nretrieval tools are now available",
-                    dir.display()
-                )),
-                Err(e) => Err(ToolError::new(
-                    "index_codebase",
-                    FailureKind::IndexFailed,
-                    format!("initial indexing failed for {}: {e}", dir.display()),
-                )),
-            };
-        }
-
-        let id = match crate::codebase::ensure(&self.shared.base, &dir).await {
-            Ok(id) => id,
-            Err(e) => {
-                let reason = format!("{e:#}");
-                gate.finish(Err(reason)).await;
-                return Err(ToolError::from_client(
-                    "index_codebase",
-                    &e.context(dir.display().to_string()),
-                ));
-            }
-        };
-        gate.register_codebase(id.clone()).await;
-        let client = self
-            .shared
-            .base
-            .clone()
-            .with_codebase(id.clone())
-            .with_local_root(Some(dir.clone()));
-        if !self.shared.pinned && self.dir().await == &dir {
-            *self.shared.bound.lock().await = Some(client.clone());
-        }
-        match gate.wait().await {
-            Ok(()) => Ok(format!(
-                "initial indexing complete\ncodebase {id}\npath {}\nretrieval tools are now available",
-                dir.display()
-            )),
-            Err(e) => Err(ToolError::new(
-                "index_codebase",
-                FailureKind::IndexFailed,
-                format!(
-                    "initial indexing failed for {} (codebase {id}): {e}",
-                    dir.display()
-                ),
-            )),
-        }
+        self.index_checkout(args, &budget).await
     }
 
     #[tool]
-    async fn sync_status(&self, Parameters(args): Parameters<NoArgs>) -> Result<String, ToolError> {
+    async fn sync_status(
+        &self,
+        Parameters(args): Parameters<NoArgs>,
+        Extension(budget): Extension<CallBudget>,
+    ) -> Result<String, ToolError> {
         let client = self
-            .client_for_unchecked("sync_status", args.codebase.as_deref())
+            .client_for_unchecked("sync_status", args.codebase.as_deref(), &budget)
             .await?;
         if let Err(e) = client.codebase() {
             return Err(ToolError::from_client("sync_status", &e));
@@ -822,10 +769,34 @@ impl McpServer {
 
 #[tool_handler]
 impl ServerHandler for McpServer {
-    // Defining these here makes `#[tool_handler]` skip its generated
-    // versions (it checks `has_method`), so the Markdown descriptions
-    // reach the host. `call_tool` is still generated — it ignores
-    // descriptions, so the default delegation is correct.
+    // Defining `list_tools` and `get_tool` here makes `#[tool_handler]` skip its
+    // generated versions (it checks `has_method`), so the Markdown descriptions
+    // reach the host. `call_tool` is defined here for the same reason: it gives
+    // every call its time budget.
+    //
+    // The budget goes to the tool through its `Extension<CallBudget>`
+    // parameter, and the tool passes it on explicitly. The timeout here is the
+    // backstop for work that no client request bounds, such as a wait for a
+    // gate. A client request fails earlier and says why. Edit tools have an
+    // unbounded budget and are never cut off.
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        mut context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let tool_deadline = self.shared.context.tool_deadline;
+        let budget = call_budget(&request.name, Instant::now(), tool_deadline);
+        let op = tool_op(&self.tool_router, &request.name);
+        context.extensions.insert(budget);
+        let call = self
+            .tool_router
+            .call(ToolCallContext::new(self, request, context));
+        budget
+            .run(call)
+            .await
+            .unwrap_or_else(|_| Ok(deadline_result(op, tool_deadline)))
+    }
+
     // Not `async`: there is nothing to await, and the trait accepts any
     // `Future`. Written as async it is a future that never yields, which newer
     // clippy calls out rather than letting it read as if it might.

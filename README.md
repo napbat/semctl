@@ -118,6 +118,18 @@ reversed with the hash-guarded `undo_edit` action. Read-only additions include
 reference/search/outline tools expose the richer occurrence, scope, and nesting
 options instead of gaining aliases.
 
+Every read-only MCP tool call ends within one deadline. The default is 25
+seconds, below the 30 seconds after which Oh My Pi ends an MCP request. Set
+`SEMCTX_TOOL_DEADLINE_SECS` to change it. A value from 5 to 600 applies as
+given, a smaller or larger value is held to that range, and `0` or an
+unreadable value means the default. Inside the deadline, a request that meets a
+gateway failure or a refused connection is sent once more after one second, and
+only when it only reads. A call that has no answer in time returns an error
+result that names the cause and the next step. A retrieval call also waits at
+most 5 seconds for a first index before it reports that the index is still
+running. The edit actions have no deadline: a limit that fired after the files
+changed would report a failed edit that was applied.
+
 ### Coming from the old `semctx` CLI
 
 The first `semctl install` automatically retires a previous `semctx` install: it
@@ -196,9 +208,10 @@ fingerprints; ignore-source identity and byte checks remain in place.
 
 Each permit override is clamped to the range 1 to 1024.
 
-A daemon inherits the environment of the client that started it, minus the six
-per-session variables (`SEMCTX_TOKEN`, `SEMCTX_SERVER`, `SEMCTX_TENANT`,
-`SEMCTX_CODEBASE`, `SEMCTX_MCP_RESYNC_SECS`, `SEMCTX_MCP_UPDATE_CHECK`). Every
+A daemon inherits the environment of the client that started it, minus the
+seven per-session variables (`SEMCTX_TOKEN`, `SEMCTX_SERVER`, `SEMCTX_TENANT`,
+`SEMCTX_CODEBASE`, `SEMCTX_MCP_RESYNC_SECS`, `SEMCTX_TOOL_DEADLINE_SECS`,
+`SEMCTX_MCP_UPDATE_CHECK`). Every
 later session of that daemon therefore runs with the first client's proxy
 settings, its `PATH`, which decides which formatter an edit runs, and its Git
 configuration variables, which decide which rules a source policy reads. Run

@@ -110,6 +110,10 @@ pub(crate) struct SessionRequest {
     /// Resync interval override, from `SEMCTX_MCP_RESYNC_SECS`.
     #[serde(default)]
     pub(crate) resync_secs: Option<u64>,
+    /// Call deadline in seconds, from `SEMCTX_TOOL_DEADLINE_SECS`. A client
+    /// that predates the field omits it, which means the default deadline.
+    #[serde(default)]
+    pub(crate) tool_deadline_secs: Option<u64>,
     /// Whether this session wants the update note.
     pub(crate) update_check: bool,
 }
@@ -452,6 +456,7 @@ mod tests {
             codebase: None,
             token: Some(Token::new("super-secret-value")),
             resync_secs: Some(30),
+            tool_deadline_secs: Some(45),
             update_check: true,
         }
     }
@@ -477,7 +482,19 @@ mod tests {
             Some("super-secret-value")
         );
         assert_eq!(session.resync_secs, Some(30));
+        assert_eq!(session.tool_deadline_secs, Some(45));
         assert!(session.update_check);
+    }
+
+    /// A client that predates `tool_deadline_secs` must still attach, and the
+    /// daemon reads its silence as "use the default".
+    #[test]
+    fn an_attach_body_without_a_tool_deadline_decodes_to_none() {
+        let line = br#"{"kind":"attach","protocol":1,"version":"0.2.0","session":{"cwd":"/abs/path","update_check":true}}"#;
+        let Ok(Request::Attach { session, .. }) = decode_request(line) else {
+            panic!("an older client's attach body must decode");
+        };
+        assert_eq!(session.tool_deadline_secs, None);
     }
 
     #[test]

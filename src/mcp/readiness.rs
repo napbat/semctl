@@ -8,10 +8,43 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::{Mutex, Notify, RwLock, RwLockReadGuard};
+use tokio::time::Instant;
 
+use super::CallBudget;
 use crate::engine::{CheckoutKey, CoordinatorLease};
+use crate::query::{FailureKind, ToolError};
+
+/// The longest a bounded call waits for a first index. A small codebase
+/// finishes inside it. A larger one is reported as pending, so the caller can
+/// use its own tools instead of waiting out the whole call deadline.
+const FIRST_INDEX_WAIT: Duration = Duration::from_secs(5);
+
+/// Why a wait for a first index ended without a usable index.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum NotReady {
+    /// The first index still runs after the longest wait that the call may
+    /// spend. A partial first index is never served.
+    Pending,
+    /// The first index failed. The text says why.
+    Failed(String),
+}
+
+impl NotReady {
+    /// The failure that the tool `op` reports for this cause.
+    pub(super) fn into_tool_error(self, op: &'static str) -> ToolError {
+        match self {
+            Self::Pending => ToolError::new(
+                op,
+                FailureKind::IndexPending,
+                "the first index of this codebase is still running",
+            ),
+            Self::Failed(detail) => ToolError::new(op, FailureKind::IndexFailed, detail),
+        }
+    }
+}
 
 /// The coordinators one session holds, keyed by checkout.
 pub(super) type SessionLeases = RwLock<HashMap<CheckoutKey, CoordinatorLease>>;
@@ -29,6 +62,21 @@ async fn session_gates(
     gates
 }
 
+/// Wait for `wait`, which reports one or more first indexes. `until` ends the
+/// wait. `None` waits for as long as the first index takes.
+async fn until_ready(
+    until: Option<Instant>,
+    wait: impl Future<Output = Result<(), String>>,
+) -> Result<(), NotReady> {
+    let outcome = match until {
+        Some(until) => tokio::time::timeout_at(until, wait)
+            .await
+            .map_err(|_| NotReady::Pending)?,
+        None => wait.await,
+    };
+    outcome.map_err(|error| NotReady::Failed(initial_index_failed(&error)))
+}
+
 /// Wait for every gate that the query's scope can include.
 ///
 /// Empty ids mean a server-defined scope. Its membership is unknown here, so
@@ -36,20 +84,30 @@ async fn session_gates(
 pub(super) async fn wait_for_gates(
     gates: &[Arc<InitialIndexGate>],
     ids: &[String],
-) -> Result<(), String> {
-    for gate in gates {
-        gate.wait_for_codebases(ids)
-            .await
-            .map_err(|error| initial_index_failed(&error))?;
-    }
-    Ok(())
+    until: Option<Instant>,
+) -> Result<(), NotReady> {
+    until_ready(until, async {
+        for gate in gates {
+            gate.wait_for_codebases(ids).await?;
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// Wait for the first index of one checkout, for as long as `budget` allows.
+pub(super) async fn wait_for_gate(
+    gate: &InitialIndexGate,
+    budget: &CallBudget,
+) -> Result<(), NotReady> {
+    until_ready(budget.wait_until(FIRST_INDEX_WAIT), gate.wait()).await
 }
 
 /// The reason a retrieval call reports when a first index failed.
 ///
 /// A failed gate stays failed until something asks for that index again. The
 /// `IndexFailed` error names that recovery on its `next:` line.
-pub(super) fn initial_index_failed(error: &str) -> String {
+fn initial_index_failed(error: &str) -> String {
     format!("initial index failed — {error}")
 }
 
@@ -57,16 +115,21 @@ pub(super) fn initial_index_failed(error: &str) -> String {
 /// the query. A tool call can attach a checkout while embedding runs. If it
 /// does, repeat the readiness check before allowing the query to include the
 /// new codebase.
+///
+/// A bounded `budget` allows one short wait for all passes together. If a first
+/// index still runs after it, the call is [`NotReady::Pending`].
 pub(super) async fn ready_for_codebases<'a>(
     leases: &'a SessionLeases,
     ids: &[String],
-) -> Result<RwLockReadGuard<'a, HashMap<CheckoutKey, CoordinatorLease>>, String> {
+    budget: &CallBudget,
+) -> Result<RwLockReadGuard<'a, HashMap<CheckoutKey, CoordinatorLease>>, NotReady> {
+    let until = budget.wait_until(FIRST_INDEX_WAIT);
     loop {
         let checked = {
             let held = leases.read().await;
             Membership::of(&held).await
         };
-        wait_for_gates(&checked.gates, ids).await?;
+        wait_for_gates(&checked.gates, ids, until).await?;
         let current = leases.read().await;
         if Membership::of(&current).await.counts() == checked.counts() {
             return Ok(current);
@@ -240,3 +303,6 @@ impl InitialIndexGate {
         self.changed.notify_waiters();
     }
 }
+
+#[cfg(test)]
+mod tests;

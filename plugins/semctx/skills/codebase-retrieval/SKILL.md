@@ -46,9 +46,10 @@ for retrieval and watcher activation, so use it without asking again; that conse
 does not authorize edits outside the user's requested repository set. Only when a
 repo has never been indexed should you tell the user and call `index_codebase`
 after explicit opt-in. That first-ever index is gated:
-retrieval/catalog/graph tools wait until embedding finishes successfully, while
-`sync_status` remains available for progress. Later re-syncs do not block use of
-the last complete index.
+retrieval/catalog/graph tools never serve a partial index. They wait at most 5
+seconds, then fail with a "still running" error. Use `sync_status` to follow
+progress and local Read/Grep until the index completes. Later re-syncs do not
+block use of the last complete index.
 
 ## Rules
 

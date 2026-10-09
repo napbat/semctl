@@ -39,10 +39,11 @@ requested repository set. Ask only when a directory has never been indexed and
 would need `index_codebase`.
 
 The first-ever `index_codebase` call is a readiness boundary: retrieval, catalog,
-and graph tools for that codebase wait until server embedding completes
-successfully. `sync_status` remains callable while they wait. Later re-syncs do
-not block retrieval and continue to expose the last complete snapshot with
-freshness warnings.
+and graph tools never serve a partial first index. They wait at most 5 seconds
+for it to complete. If it still runs, they fail with a "still running" error:
+call `sync_status` to follow progress, and use local Read/Grep until it
+completes. `sync_status` stays callable. Later re-syncs do not block retrieval
+and continue to expose the last complete snapshot with freshness warnings.
 
 ## Workflow
 
