@@ -22,7 +22,12 @@ class ReleaseSourceTests(unittest.TestCase):
         for key in list(self.env):
             if key.startswith("GIT_CONFIG_KEY_") or key.startswith("GIT_CONFIG_VALUE_"):
                 del self.env[key]
-        for key in ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_CONFIG_COUNT"]:
+        # A Git hook exports repository variables such as GIT_INDEX_FILE. Git
+        # lists every such variable, so the fixture inherits none of them.
+        local = subprocess.run(
+            ["git", "rev-parse", "--local-env-vars"], check=True, capture_output=True, text=True,
+        ).stdout.split()
+        for key in local:
             self.env.pop(key, None)
         self.git("init", "--bare", str(self.remote), cwd=self.root)
         self.git("init", str(self.checkout), cwd=self.root)
