@@ -8,7 +8,9 @@ use std::time::Duration;
 use serde::Deserialize;
 use tokio::time::Instant;
 
-use super::{DEADLINE_MARGIN, GATEWAY_RETRY_DELAY, allows_wait, is_gateway_status, usable_until};
+use super::{
+    DEADLINE_MARGIN, GATEWAY_RETRY_DELAY, Idempotency, allows_wait, is_gateway_status, usable_until,
+};
 use crate::client::stub::{Reply, Stub};
 use crate::client::{ApiFailure, Client};
 use crate::query::ToolError;
@@ -291,31 +293,23 @@ async fn a_refused_connection_on_a_get_is_retried_once_after_a_pause() {
     assert_eq!(late.await.expect("the stub task").requests(), 1);
 }
 
-#[tokio::test]
-async fn a_refused_connection_is_retried_only_for_a_request_that_reads() {
-    let (_socket, address) = refusing_port();
-    let client = Client::for_test_server(&format!("http://{address}"));
+/// The connect-error branch of `send` and the gateway-status branch both ask
+/// `take_gateway_retry`. A refused connect is not used here: how long the
+/// operating system takes to refuse differs between Linux, macOS, and Windows.
+#[test]
+fn only_a_request_that_reads_gets_the_one_gateway_retry() {
+    let client = Client::for_test_server("http://127.0.0.1:1");
 
-    let started_write = Instant::now();
-    let write_error = client
-        .put::<_, Probe>("/v1/upload", &serde_json::json!({}))
-        .await
-        .expect_err("nothing listens");
-    let write = started_write.elapsed();
-    let started_read = Instant::now();
-    let read_error = client
-        .get::<Probe>("/v1/probe")
-        .await
-        .expect_err("nothing listens");
-    let read = started_read.elapsed();
+    let mut write_used = false;
+    assert!(!client.take_gateway_retry(Idempotency::NotIdempotent, &mut write_used));
+    assert!(!write_used, "a refused write claims no retry");
 
+    let mut read_used = false;
+    assert!(client.take_gateway_retry(Idempotency::Idempotent, &mut read_used));
+    assert!(read_used);
     assert!(
-        write < GATEWAY_RETRY_DELAY,
-        "a write fails at once: {write:?}: {write_error:#}"
-    );
-    assert!(
-        read >= GATEWAY_RETRY_DELAY,
-        "a read pauses once and tries again: {read:?}: {read_error:#}"
+        !client.take_gateway_retry(Idempotency::Idempotent, &mut read_used),
+        "a read gets one retry, not two"
     );
 }
 
