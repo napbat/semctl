@@ -2,12 +2,13 @@
 //! Reads a hook event as JSON on stdin and emits shared instructions plus
 //! available repository context through `additionalContext`.
 //!
-//! Both hosts send the same `snake_case` payload and accept
-//! `hookSpecificOutput.additionalContext`; Codex additionally documents
-//! `systemMessage` for `PreToolUse`, so that event emits both there. The main
-//! input difference is the per-turn id: Codex uses `turn_id`, while Claude uses
-//! `prompt_id`. The parser also accepts `PostCompact` for compatibility, while
-//! the packaged hooks use `SessionStart(source=compact)` as the shared boundary.
+//! Both hosts send the same `snake_case` payload. Every event's guidance goes
+//! only through `hookSpecificOutput.additionalContext`, the field each host adds
+//! to the model's context. Codex shows `systemMessage` to the user as a warning,
+//! so the hook never emits it. The main input difference is the per-turn id:
+//! Codex uses `turn_id`, while Claude uses `prompt_id`. The parser also accepts
+//! `PostCompact` for compatibility, while the packaged hooks use
+//! `SessionStart(source=compact)` as the shared boundary.
 //!
 //! - **`SessionStart`** — the server manual once per context segment, plus an
 //!   orientation: semctx is available, how to
@@ -128,10 +129,9 @@ impl HookInput {
     }
 }
 
+/// The hook's stdout. Its only field is the model-visible context.
 #[derive(Serialize)]
 struct HookOutput {
-    #[serde(rename = "systemMessage", skip_serializing_if = "Option::is_none")]
-    system_message: Option<String>,
     #[serde(rename = "hookSpecificOutput", skip_serializing_if = "Option::is_none")]
     hook_specific_output: Option<HookSpecific>,
 }
@@ -858,12 +858,7 @@ fn emit(input: &HookInput, context: &str) {
 }
 
 fn hook_output(input: &HookInput, context: &str) -> HookOutput {
-    // Codex documents `systemMessage` for PreToolUse. Keep the additional-context
-    // payload too because current Codex releases surface it to the model and
-    // Claude uses it; host-specific contract tests pin both shapes.
-    let codex_pretooluse = input.hook_event_name == "PreToolUse" && input.is_codex();
     HookOutput {
-        system_message: codex_pretooluse.then(|| context.to_string()),
         hook_specific_output: Some(HookSpecific {
             hook_event_name: input.hook_event_name.clone(),
             additional_context: context.to_string(),

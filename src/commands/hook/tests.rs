@@ -578,7 +578,6 @@ fn search_scope_distinguishes_broad_single_file_and_outside_targets() {
 #[test]
 fn hook_output_never_carries_permission_decision() {
     let out = HookOutput {
-        system_message: Some("prefer semctl".into()),
         hook_specific_output: Some(HookSpecific {
             hook_event_name: "PreToolUse".into(),
             additional_context: "prefer semctl".into(),
@@ -590,7 +589,6 @@ fn hook_output_never_carries_permission_decision() {
         "unexpected permissionDecision: {json}"
     );
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(v["systemMessage"], "prefer semctl");
     let inner = v["hookSpecificOutput"]
         .as_object()
         .expect("hookSpecificOutput object");
@@ -599,34 +597,42 @@ fn hook_output_never_carries_permission_decision() {
     assert!(inner.contains_key("additionalContext"));
 }
 
+// Codex shows `systemMessage` to the user as a warning; only
+// `additionalContext` reaches the model. Every host and event gets the same
+// shape, so no nudge can surface as a user-facing warning.
 #[test]
-fn pretooluse_output_preserves_each_hosts_contract() {
-    let codex = HookInput {
-        hook_event_name: "PreToolUse".into(),
-        turn_id: "turn-1".into(),
-        ..Default::default()
-    };
-    let claude = HookInput {
-        hook_event_name: "PreToolUse".into(),
-        prompt_id: "prompt-1".into(),
-        ..Default::default()
-    };
-    let codex = serde_json::to_value(hook_output(&codex, "prefer semctl")).unwrap();
-    let claude = serde_json::to_value(hook_output(&claude, "prefer semctl")).unwrap();
+fn every_host_and_event_gets_guidance_only_as_additional_context() {
+    // (turn_id, prompt_id, host) for Codex, Claude, and OMP.
+    let hosts = [
+        ("turn-1", "", ""),
+        ("", "prompt-1", ""),
+        ("", "prompt-1", "omp"),
+    ];
+    for (turn_id, prompt_id, host) in hosts {
+        for event in ["SessionStart", "UserPromptSubmit", "PreToolUse"] {
+            let input = HookInput {
+                hook_event_name: event.into(),
+                turn_id: turn_id.into(),
+                prompt_id: prompt_id.into(),
+                host: host.into(),
+                ..Default::default()
+            };
+            let out = serde_json::to_value(hook_output(&input, "prefer semctl")).unwrap();
 
-    assert_eq!(codex["systemMessage"], "prefer semctl");
-    assert_eq!(
-        codex["hookSpecificOutput"]["additionalContext"],
-        "prefer semctl"
-    );
-    assert!(
-        claude.get("systemMessage").is_none(),
-        "Claude keeps its existing additional-context-only output"
-    );
-    assert_eq!(
-        claude["hookSpecificOutput"]["additionalContext"],
-        "prefer semctl"
-    );
+            let top = out.as_object().expect("hook output object");
+            assert_eq!(
+                top.keys().collect::<Vec<_>>(),
+                ["hookSpecificOutput"],
+                "{event} for {:?}: {out}",
+                input.tool_name_style()
+            );
+            assert_eq!(out["hookSpecificOutput"]["hookEventName"], event);
+            assert_eq!(
+                out["hookSpecificOutput"]["additionalContext"],
+                "prefer semctl"
+            );
+        }
+    }
 }
 
 #[test]
