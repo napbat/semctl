@@ -60,6 +60,14 @@ semctl index        # register + sync the current repo for indexing
 | `semctl upgrade`                                      | Update the binary and refresh each installed editor/agent integration.                                                |
 | `semctl auth login` / `logout` / `whoami` / `tenants` | Account & session.                                                                                                    |
 
+`semctl index` uploads the requested files in batches. A failed batch does not
+stop the other batches. A batch that failed because of a connection, gateway, or
+server error is sent once more, alone, after the other batches. Then the command
+completes the sync for the files that the server received. It exits with an
+error that names the files that the server did not receive. Run `semctl index`
+again to upload them. The MCP auto-index logs the same files, and
+`semctl daemon status` shows them for each checkout.
+
 ## Grammar-native editing
 
 The server's edit operations are planners: they resolve one qualified or

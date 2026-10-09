@@ -122,6 +122,7 @@ impl Reconciler for CountingReconciler {
                 job_id: "job".to_string(),
                 uploaded: 0,
                 to_delete: 0,
+                failed: Vec::new(),
             })
         })
     }

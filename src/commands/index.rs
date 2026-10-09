@@ -9,10 +9,10 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Args;
 use tokio::sync::Mutex;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::cli::Cli;
 use crate::client::{self, Client, api};
@@ -97,6 +97,7 @@ pub async fn run(args: IndexArgs, cli: &Cli) -> Result<()> {
     let outcome =
         crate::sync::sync_with_progress(&client, &dir, &cache, &limits, report_sync_progress)
             .await?;
+    let upload_failures = outcome.upload_failures();
     if outcome.uploaded == 0 && outcome.to_delete == 0 {
         info!(codebase = %outcome.codebase_id, "up to date — nothing to upload");
     } else {
@@ -107,12 +108,29 @@ pub async fn run(args: IndexArgs, cli: &Cli) -> Result<()> {
             "queued sync",
         );
     }
-
-    if args.no_wait {
-        info!(job = %outcome.job_id, "queued; not waiting for embed");
-        return Ok(());
+    if upload_failures.is_some() {
+        warn!(
+            failed = outcome.failed.len(),
+            "some requested files were not uploaded; the server indexes the other files"
+        );
     }
-    wait_for_job(&client, &outcome.job_id).await
+
+    let waited = if args.no_wait {
+        info!(job = %outcome.job_id, "queued; not waiting for embed");
+        Ok(())
+    } else {
+        wait_for_job(&client, &outcome.job_id).await
+    };
+    let Some(failures) = upload_failures else {
+        return waited;
+    };
+    // The job closes without the missing files, so its own error restates the
+    // shortfall. The upload failure is the cause the user can act on.
+    let retry = "run `semctl index` again to upload them";
+    Err(match waited {
+        Ok(()) => anyhow!("{failures}; {retry}"),
+        Err(job) => job.context(format!("{failures}; {retry}")),
+    })
 }
 
 fn report_sync_progress(progress: &SyncProgress) {
