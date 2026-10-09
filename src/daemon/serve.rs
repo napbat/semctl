@@ -72,19 +72,42 @@ const WORKER_RANGE: RangeInclusive<usize> = 2..=8;
 /// watch registration runs on one of these.
 const MAX_BLOCKING_THREADS: usize = 64;
 
+/// How this daemon process was started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Launch {
+    /// A `semctl mcp` client started this daemon. The daemon must not share a
+    /// Windows job with that client, so it checks job membership before it
+    /// binds the endpoint.
+    Automatic,
+    /// A user ran `semctl daemon run`. The user owns this daemon's lifetime,
+    /// so no job check applies.
+    Manual,
+}
+
+impl Launch {
+    /// Map the hidden `--require-detached` flag, which only a client passes.
+    pub(crate) fn from_require_detached(require_detached: bool) -> Self {
+        if require_detached {
+            Self::Automatic
+        } else {
+            Self::Manual
+        }
+    }
+}
+
 /// Run the daemon role, including its own runtime.
 ///
 /// `main` calls this before it builds any other runtime: this runtime is
 /// bounded on purpose, because one daemon serves every session of this user
 /// and must not size itself as if it served one.
-pub(crate) fn run() -> Result<()> {
+pub(crate) fn run(launch: Launch) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads(std::thread::available_parallelism().ok()))
         .max_blocking_threads(MAX_BLOCKING_THREADS)
         .enable_all()
         .build()
         .context("build the daemon runtime")?;
-    runtime.block_on(serve())
+    runtime.block_on(serve(launch))
 }
 
 /// How many worker threads the daemon runtime gets.
@@ -103,7 +126,12 @@ fn worker_threads(parallelism: Option<std::num::NonZero<usize>>) -> usize {
 /// Call this inside a Tokio runtime. [`run`] builds the daemon's own; the
 /// command dispatcher in [`crate::commands::daemon`] reaches this function
 /// when a runtime already exists.
-pub(crate) async fn serve() -> Result<()> {
+pub(crate) async fn serve(launch: Launch) -> Result<()> {
+    if launch == Launch::Automatic {
+        // Check before binding: no other client may attach to a daemon whose
+        // lifetime still belongs to its launching host's Windows job.
+        super::spawn::ensure_detached()?;
+    }
     let endpoint = Endpoint::current().context("locate the local daemon endpoint")?;
     let listener = match Listener::bind(&endpoint).context("bind the local daemon endpoint")? {
         Election::Lost => {
