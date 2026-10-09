@@ -345,6 +345,10 @@ mise exec -c "bun test plugins/semctx/adapters/omp/index.test.ts"
 python3 tests/bootstrap_installers.py
 ```
 
+The installer test runs the `sh` and `pwsh` installer cases for each shell that
+is installed. It skips a missing shell and reports the skip. CI runs `sh` on
+Linux and `pwsh` on Windows. Use `--shell all` to require both shells.
+
 `plugins/semctx/` is the shared plugin root for every supported coding agent.
 Its `skills/codebase-retrieval/` has one physical source. Claude/Codex consume
 the shared hook manifest; OMP loads `adapters/omp/index.ts`, which maps native
