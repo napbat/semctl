@@ -8,6 +8,7 @@ use super::render::{
 };
 use super::{Client, ToolError, api, bound_codebase, urlencode};
 use crate::mcp::readiness::FirstIndexPhase;
+use crate::sync::SyncProgress;
 
 pub(super) const FILES_PAGE_MAX: u32 = 1000;
 
@@ -160,11 +161,16 @@ pub async fn list_files(
 ///
 /// `first_index` is the phase of the checkout's first index. No tool call waits
 /// for a first index, so this line is how an agent follows it.
+///
+/// `sync_progress` is the latest milestone of the reconcile that runs now. Its
+/// line follows the first-index line, so an agent reads how far a first index
+/// has come. There is no line when no reconcile runs.
 pub async fn sync_status(
     client: &Client,
     job_id: Option<&str>,
     local_watch_active: bool,
     first_index: Option<&FirstIndexPhase>,
+    sync_progress: Option<&SyncProgress>,
 ) -> Result<String, ToolError> {
     let codebase_id = bound_codebase(client, "sync_status")?;
     let totals = catalog_totals(client, codebase_id).await;
@@ -186,6 +192,9 @@ pub async fn sync_status(
     let mut out = format!("codebase {codebase_id}");
     if let Some(phase) = first_index {
         write!(out, "\n{}", first_index_line(phase)).expect("writing to a String cannot fail");
+    }
+    if let Some(progress) = sync_progress {
+        write!(out, "\n{}", current_sync_line(progress)).expect("writing to a String cannot fail");
     }
     write!(out, "\nlocal checkout watch: {watch}\ntotal indexed state:")
         .expect("writing to a String cannot fail");
@@ -239,6 +248,12 @@ fn first_index_line(phase: &FirstIndexPhase) -> String {
         }
         _ => format!("first index: {phase}"),
     }
+}
+
+/// The `current sync:` line of `sync_status`. The milestone text is the one
+/// `semctl index` shows, so both commands use the same words.
+fn current_sync_line(progress: &SyncProgress) -> String {
+    format!("current sync: {progress}")
 }
 
 async fn catalog_totals(client: &Client, codebase_id: &str) -> anyhow::Result<(u32, i64)> {

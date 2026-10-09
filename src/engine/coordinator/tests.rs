@@ -19,7 +19,7 @@ use super::{
 use crate::client::{Client, api};
 use crate::engine::registry::CheckoutKey;
 use crate::mcp::readiness::{FirstIndexPhase, InitialIndexGate};
-use crate::sync::policy;
+use crate::sync::{SyncProgress, policy};
 
 /// Somewhere no test writes, so a coordinator that starts reading the
 /// filesystem fails instead of touching a real checkout.
@@ -36,10 +36,24 @@ struct CountingReconciler {
     release: Arc<Semaphore>,
     /// Each job poll takes one permit, so a test can hold a first index open.
     finish_polls: Arc<Semaphore>,
+    /// The milestone each run publishes before it waits for its release.
+    milestone: Option<SyncProgress>,
+    /// How each run ends: `None` succeeds, and `Some` fails with the reason.
+    failure: Option<String>,
 }
 
 impl CountingReconciler {
     fn new() -> (Arc<Self>, Runs) {
+        Self::build(None, None)
+    }
+
+    /// A reconcile that reports `milestone` when it starts, and fails with
+    /// `failure` instead of succeeding when the test releases it.
+    fn reporting(milestone: SyncProgress, failure: Option<&str>) -> (Arc<Self>, Runs) {
+        Self::build(Some(milestone), failure.map(str::to_string))
+    }
+
+    fn build(milestone: Option<SyncProgress>, failure: Option<String>) -> (Arc<Self>, Runs) {
         let (started, starts) = mpsc::unbounded_channel();
         let release = Arc::new(Semaphore::new(0));
         let finish_polls = Arc::new(Semaphore::new(0));
@@ -49,6 +63,8 @@ impl CountingReconciler {
             started,
             release: release.clone(),
             finish_polls: finish_polls.clone(),
+            milestone,
+            failure,
         });
         (
             reconciler.clone(),
@@ -107,15 +123,23 @@ impl Runs {
 }
 
 impl Reconciler for CountingReconciler {
-    fn reconcile(&self, _run: super::ReconcileRun) -> Reconciled {
+    fn reconcile(&self, run: super::ReconcileRun) -> Reconciled {
         self.runs.fetch_add(1, Ordering::AcqRel);
         let _ = self.started.send(());
         let release = self.release.clone();
+        let milestone = self.milestone.clone();
+        let failure = self.failure.clone();
         Box::pin(async move {
+            if let Some(milestone) = &milestone {
+                run.progress.publish(milestone);
+            }
             let permit = release.acquire().await;
             // Only a closed semaphore fails, and no test closes one.
             if let Ok(permit) = permit {
                 permit.forget();
+            }
+            if let Some(reason) = failure {
+                return Err(reason);
             }
             Ok(SyncOutcome {
                 codebase_id: "codebase".to_string(),
@@ -348,10 +372,106 @@ async fn status_has_no_first_index_phase_without_a_gate() {
     assert!(status.to_string().contains("first index (none)"));
 }
 
+fn uploading(uploaded_files: usize, total_files: usize) -> SyncProgress {
+    SyncProgress::Uploading {
+        uploaded_files,
+        total_files,
+    }
+}
+
+/// Poll the coordinator's status until its sync progress is `expected`.
+async fn wait_for_progress(coordinator: &CheckoutCoordinator, expected: Option<SyncProgress>) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while coordinator.status().await.sync_progress != expected {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the sync progress must become {expected:?}"));
+}
+
+/// `sync_status` and `semctl daemon status` report how far the running
+/// reconcile has come. The milestone must be visible while the reconcile runs
+/// and gone when it ends.
+#[tokio::test]
+async fn status_shows_the_running_reconciles_progress_until_it_ends() {
+    let (reconciler, mut runs) = CountingReconciler::reporting(uploading(3, 10), None);
+    let (coordinator, task) = coordinator(reconciler).await;
+    assert_eq!(coordinator.status().await.sync_progress, None);
+    task.spawn();
+
+    coordinator.trigger(Trigger::Explicit);
+    runs.next_start().await;
+    wait_for_progress(&coordinator, Some(uploading(3, 10))).await;
+    let running = coordinator.status().await;
+    assert!(running.running);
+    assert!(
+        running.to_string().contains("sync uploading 3/10 files"),
+        "{running}"
+    );
+
+    runs.release(1);
+    wait_for_progress(&coordinator, None).await;
+    assert!(
+        coordinator
+            .status()
+            .await
+            .to_string()
+            .contains("sync (none)")
+    );
+}
+
+/// A failed reconcile must not leave its last milestone behind. The status
+/// would otherwise show an upload that no longer runs.
+#[tokio::test]
+async fn a_failed_reconcile_clears_its_progress() {
+    let (reconciler, mut runs) = CountingReconciler::reporting(uploading(3, 10), Some("boom"));
+    let (coordinator, task) = coordinator(reconciler).await;
+    task.spawn();
+
+    coordinator.trigger(Trigger::Explicit);
+    runs.next_start().await;
+    wait_for_progress(&coordinator, Some(uploading(3, 10))).await;
+    runs.release(1);
+
+    // The error is recorded after the progress is cleared, so the status that
+    // shows the error must show no progress.
+    let status = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = coordinator.status().await;
+            if status.last_error.is_some() {
+                return status;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a failed run records its error");
+    assert_eq!(status.last_error.as_deref(), Some("boom"));
+    assert_eq!(status.sync_progress, None);
+}
+
+/// Cancelling the coordinator drops the run in progress. Its milestone must go
+/// with it.
+#[tokio::test]
+async fn a_cancelled_reconcile_clears_its_progress() {
+    let (reconciler, mut runs) = CountingReconciler::reporting(uploading(3, 10), None);
+    let (coordinator, task) = coordinator(reconciler).await;
+    task.spawn();
+    coordinator.trigger(Trigger::Explicit);
+    runs.next_start().await;
+    wait_for_progress(&coordinator, Some(uploading(3, 10))).await;
+
+    coordinator.cancel();
+
+    wait_for_progress(&coordinator, None).await;
+}
+
 /// The daemon status crosses the process boundary. A daemon that predates the
-/// first-index field sends none, and the reader must still decode its status.
+/// first-index and sync-progress fields sends neither, and the reader must
+/// still decode its status.
 #[test]
-fn a_status_without_a_first_index_field_decodes_as_none() {
+fn a_status_from_an_older_daemon_decodes_without_the_newer_fields() {
     let old = serde_json::json!({
         "root": "/work/checkout", "codebase_id": "codebase", "leases": 1,
         "watcher": "active", "last_job_id": null, "running": false,
@@ -363,6 +483,28 @@ fn a_status_without_a_first_index_field_decodes_as_none() {
         serde_json::from_value(old).expect("decode a status from an older daemon");
 
     assert_eq!(status.first_index, None);
+    assert_eq!(status.sync_progress, None);
+}
+
+#[test]
+fn a_status_carries_its_sync_progress_across_the_wire() {
+    let current = serde_json::json!({
+        "root": "/work/checkout", "codebase_id": "codebase", "leases": 1,
+        "watcher": "active", "last_job_id": null, "running": true,
+        "pending_triggers": 0, "trigger_overflow": false,
+        "last_outcome": null, "last_error": null,
+        "sync_progress": {"uploading": {"uploaded_files": 3, "total_files": 10}},
+    });
+
+    let status: super::CoordinatorStatus =
+        serde_json::from_value(current).expect("decode a status with progress");
+    let encoded = serde_json::to_value(&status).expect("encode the status");
+
+    assert_eq!(status.sync_progress, Some(uploading(3, 10)));
+    assert_eq!(
+        encoded["sync_progress"],
+        serde_json::json!({"uploading": {"uploaded_files": 3, "total_files": 10}})
+    );
 }
 
 /// A second reconcile during embedding sees the same pending gate. It must not

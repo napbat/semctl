@@ -43,7 +43,9 @@ It never waits for embedding. Retrieval, catalog, and graph tools never serve a
 partial first index. They wait at most 5 seconds for it to complete. If it still
 runs, they fail with a "still running" error. `sync_status` stays callable. It
 reports the first-index phase: registering, syncing, embedding, ready, or failed.
-Call it every 10 to 15 seconds, and use local Read/Grep until the phase is ready.
+While the phase is syncing, its `current sync:` line shows how many files the
+upload has sent. Call it every 10 to 15 seconds, and use local Read/Grep until
+the phase is ready.
 If the phase is failed, call `index_codebase` for the same path to retry. Later
 re-syncs do not block retrieval and continue to expose the last complete
 snapshot with freshness warnings.

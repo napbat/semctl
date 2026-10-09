@@ -103,6 +103,7 @@ mod tests {
     use crate::engine::coordinator::WatcherState;
     use crate::engine::scheduler::{PermitUsage, SchedulerUsage};
     use crate::mcp::readiness::FirstIndexPhase;
+    use crate::sync::SyncProgress;
 
     fn status() -> DaemonStatus {
         DaemonStatus {
@@ -137,6 +138,10 @@ mod tests {
                 last_error: None,
                 first_index: Some(FirstIndexPhase::Embedding {
                     job_id: Some("job-1".to_string()),
+                }),
+                sync_progress: Some(SyncProgress::Uploading {
+                    uploaded_files: 3,
+                    total_files: 10,
                 }),
             }],
         }
@@ -174,6 +179,13 @@ mod tests {
                 job_id: Some("job-1".to_string())
             })
         );
+        assert_eq!(
+            coordinator.sync_progress,
+            Some(SyncProgress::Uploading {
+                uploaded_files: 3,
+                total_files: 10
+            })
+        );
     }
 
     /// A reader that is not this build must find the documented field names.
@@ -197,6 +209,10 @@ mod tests {
         assert_eq!(
             value["coordinators"][0]["first_index"],
             serde_json::json!({"embedding": {"job_id": "job-1"}})
+        );
+        assert_eq!(
+            value["coordinators"][0]["sync_progress"],
+            serde_json::json!({"uploading": {"uploaded_files": 3, "total_files": 10}})
         );
     }
 
@@ -223,6 +239,7 @@ mod tests {
             lines[8].contains("first index embedding (job job-1)"),
             "{rendered}"
         );
+        assert!(lines[8].contains("sync uploading 3/10 files"), "{rendered}");
     }
 
     #[test]

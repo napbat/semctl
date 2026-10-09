@@ -252,8 +252,9 @@ async fn catalog_hashes(client: &Client) -> anyhow::Result<HashMap<String, Optio
 }
 
 /// Blake3 hex of a local file's UTF-8 content — matching exactly what the sync
-/// manifest hashes (see `crate::sync::sync`), so the digest is comparable to
-/// the catalog's `content_hash`. `None` if the file can't be read as UTF-8.
+/// manifest hashes (see `crate::sync::sync_with_progress`), so the digest is
+/// comparable to the catalog's `content_hash`. `None` if the file can't be read
+/// as UTF-8.
 fn local_blake3(path: &Path) -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
     Some(blake3::hash(content.as_bytes()).to_hex().to_string())
@@ -717,7 +718,8 @@ mod tests {
         let p = dir.path().join("f.rs");
         std::fs::write(&p, "fn main() {}\n").unwrap();
 
-        // Must equal exactly what `crate::sync::sync` writes to the manifest.
+        // Must equal exactly what `crate::sync::sync_with_progress` writes to
+        // the manifest.
         let want = blake3::hash("fn main() {}\n".as_bytes())
             .to_hex()
             .to_string();

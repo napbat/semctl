@@ -765,6 +765,9 @@ impl McpServer {
             status
                 .as_ref()
                 .and_then(|status| status.first_index.as_ref()),
+            status
+                .as_ref()
+                .and_then(|status| status.sync_progress.as_ref()),
         )
         .await
     }

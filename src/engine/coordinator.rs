@@ -48,9 +48,15 @@ use super::registry::CheckoutKey;
 use super::scheduler;
 use super::watch_hub::{WatchBatch, WatchRegistration, can_change_tree};
 use crate::client::{self, Client};
-use crate::mcp::readiness::{FirstIndexPhase, InitialIndexGate};
+use crate::mcp::readiness::InitialIndexGate;
 use crate::sync::policy::{SourcePolicy, event_may_affect_policy};
 use crate::sync::{self, LastJob, SyncCache, SyncLimits, SyncOutcome, blocking};
+
+mod progress;
+mod status;
+
+use progress::ProgressSlot;
+pub(crate) use status::CoordinatorStatus;
 
 /// Reasons a reconcile can be due, before any coalescing.
 const TRIGGER_CAPACITY: usize = 64;
@@ -100,6 +106,8 @@ pub(crate) struct ReconcileRun {
     pub(crate) root: PathBuf,
     pub(crate) cache: Arc<Mutex<SyncCache>>,
     pub(crate) limits: SyncLimits,
+    /// Where the reconcile reports its milestones for status callers.
+    pub(crate) progress: Arc<ProgressSlot>,
 }
 
 /// A reconcile in progress. Boxed and `'static`, so an implementation must own
@@ -128,9 +136,15 @@ pub(crate) struct SyncReconciler;
 impl Reconciler for SyncReconciler {
     fn reconcile(&self, run: ReconcileRun) -> Reconciled {
         Box::pin(async move {
-            sync::sync(&run.client, &run.root, &run.cache, &run.limits)
-                .await
-                .map_err(|error| format!("{error:#}"))
+            sync::sync_with_progress(
+                &run.client,
+                &run.root,
+                &run.cache,
+                &run.limits,
+                |progress| run.progress.publish(progress),
+            )
+            .await
+            .map_err(|error| format!("{error:#}"))
         })
     }
 
@@ -183,57 +197,6 @@ struct RunState {
     last_error: Option<String>,
 }
 
-/// One checkout, as `sync_status` and the daemon status see it.
-///
-/// `semctl daemon status` reports one of these per checkout, so this is the
-/// single source of truth for that part of the status line as well.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct CoordinatorStatus {
-    pub(crate) root: PathBuf,
-    pub(crate) codebase_id: Option<String>,
-    pub(crate) leases: usize,
-    pub(crate) watcher: WatcherState,
-    pub(crate) last_job_id: Option<String>,
-    pub(crate) running: bool,
-    pub(crate) pending_triggers: usize,
-    pub(crate) trigger_overflow: bool,
-    pub(crate) last_outcome: Option<String>,
-    pub(crate) last_error: Option<String>,
-    /// The phase of this checkout's first index. `None` when the checkout has
-    /// no first-index gate, and for a daemon that predates the field.
-    #[serde(default)]
-    pub(crate) first_index: Option<FirstIndexPhase>,
-}
-
-impl std::fmt::Display for CoordinatorStatus {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "root {} codebase {} leases {} watcher {} job {} running {} first index {} pending {}{} outcome {} error {}",
-            self.root.display(),
-            self.codebase_id.as_deref().unwrap_or("(unbound)"),
-            self.leases,
-            match &self.watcher {
-                WatcherState::Active => "active",
-                WatcherState::Unavailable(reason) => reason,
-            },
-            self.last_job_id.as_deref().unwrap_or("(none)"),
-            self.running,
-            self.first_index
-                .as_ref()
-                .map_or_else(|| "(none)".to_string(), ToString::to_string),
-            self.pending_triggers,
-            if self.trigger_overflow {
-                " (overflowed)"
-            } else {
-                ""
-            },
-            self.last_outcome.as_deref().unwrap_or("(none)"),
-            self.last_error.as_deref().unwrap_or("(none)"),
-        )
-    }
-}
-
 /// Everything one coordinator needs to exist. The registry fills it; the watch
 /// registration is already decided, because registering is blocking work that
 /// must not happen under the registry's lock.
@@ -270,6 +233,8 @@ pub(crate) struct CheckoutCoordinator {
     /// unconditional, because what was dropped cannot be judged.
     overflow: Arc<AtomicBool>,
     run: Mutex<RunState>,
+    /// The latest milestone of the reconcile that is running.
+    progress: Arc<ProgressSlot>,
     leases: AtomicUsize,
     /// When the lease count last reached zero, for the registry's sweeper.
     released_at: StdMutex<Option<Instant>>,
@@ -309,6 +274,7 @@ impl CheckoutCoordinator {
             triggers,
             overflow: setup.overflow,
             run: Mutex::new(RunState::default()),
+            progress: Arc::new(ProgressSlot::new()),
             leases: AtomicUsize::new(0),
             released_at: StdMutex::new(None),
             task: StdMutex::new(None),
@@ -415,6 +381,7 @@ impl CheckoutCoordinator {
             last_job_id,
             running: run.running,
             first_index,
+            sync_progress: self.progress.latest(),
             pending_triggers: self.triggers.max_capacity() - self.triggers.capacity(),
             trigger_overflow: self.overflow.load(Ordering::Acquire),
             last_outcome: run.last_outcome.clone(),
@@ -558,14 +525,20 @@ impl CheckoutCoordinator {
         // process. It is held for the whole reconcile, including its uploads,
         // because the scan's retained content is what the bound protects.
         let permit = scheduler::permit(scan_permits).await;
-        let result = reconciler
-            .reconcile(ReconcileRun {
-                client: client.clone(),
-                root: self.root.clone(),
-                cache: self.cache.clone(),
-                limits: limits.clone(),
-            })
-            .await;
+        let result = {
+            // The scope clears the milestone when the reconcile ends, fails,
+            // or is cancelled by dropping this future.
+            let _progress = self.progress.scope();
+            reconciler
+                .reconcile(ReconcileRun {
+                    client: client.clone(),
+                    root: self.root.clone(),
+                    cache: self.cache.clone(),
+                    limits: limits.clone(),
+                    progress: self.progress.clone(),
+                })
+                .await
+        };
         drop(permit);
         self.record(trigger, &result).await;
         // Any run can report a first index, because a run only starts once the

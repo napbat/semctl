@@ -133,8 +133,10 @@ changed would report a failed edit that was applied.
 The `index_codebase` tool does not wait for the first index. It registers the
 codebase, starts the scan and upload in the background, and returns at once with
 the codebase id and the path. The `sync_status` tool then reports the first-index
-phase: registering, syncing, embedding, ready, or failed. `semctl daemon status`
-reports the same phase for each checkout.
+phase: registering, syncing, embedding, ready, or failed. While a sync runs, it
+also reports a `current sync:` line with the latest step, such as the number of
+uploaded files. `semctl daemon status` reports the same phase and step for each
+checkout.
 
 ### Coming from the old `semctx` CLI
 
@@ -181,7 +183,7 @@ A daemon started by hand skips the job check, and clients attach to it.
 Two commands inspect and end a running daemon:
 
 ```sh
-semctl daemon status        # version, pid, uptime, sessions, permits, checkouts and their first-index phase
+semctl daemon status        # version, pid, uptime, sessions, permits, checkouts, their first-index phase, and the progress of a running sync
 semctl daemon status --json # the same facts as one JSON object
 semctl daemon stop          # end every session and exit
 ```
