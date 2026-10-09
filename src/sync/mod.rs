@@ -30,6 +30,7 @@ use tracing::{debug, warn};
 
 use crate::client::{Client, api};
 use scan::ScanResult;
+use upload::UploadFailure;
 
 /// The process-wide bounds one sync must respect.
 ///
@@ -59,6 +60,17 @@ pub struct SyncOutcome {
     pub job_id: String,
     pub uploaded: usize,
     pub to_delete: usize,
+    /// Requested files that the server did not receive. The job closes
+    /// without them, and the next sync offers them again.
+    pub(crate) failed: Vec<UploadFailure>,
+}
+
+impl SyncOutcome {
+    /// Describe the requested files that the server did not receive. `None`
+    /// means that the server received every requested file.
+    pub(crate) fn upload_failures(&self) -> Option<String> {
+        upload::failure_summary(self.uploaded, &self.failed)
+    }
 }
 
 /// A user-visible milestone from a one-shot sync. Background indexing uses the
@@ -180,7 +192,7 @@ where
     };
 
     let files = upload::Files::new(dir, &plan.need_content, request.files, changed, policy)?;
-    let uploaded = upload::run(
+    let delivery = upload::run(
         client,
         &codebase_id,
         &plan.job_id,
@@ -193,7 +205,8 @@ where
     Ok(SyncOutcome {
         codebase_id,
         job_id: plan.job_id,
-        uploaded,
+        uploaded: delivery.uploaded,
         to_delete: plan.to_delete.len(),
+        failed: delivery.failed,
     })
 }

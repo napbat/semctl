@@ -611,7 +611,12 @@ impl CheckoutCoordinator {
                     outcome.uploaded,
                     outcome.to_delete
                 ));
-                state.last_error = None;
+                // A partial upload still queued its job, so the run counts. The
+                // missing files stay visible until a later sync delivers them.
+                state.last_error = outcome.upload_failures();
+                if let Some(failures) = &state.last_error {
+                    warn!(error = %failures, trigger = trigger.as_str(), "auto-index uploaded part of the sync");
+                }
                 drop(state);
                 *self.codebase_id.lock().await = Some(outcome.codebase_id.clone());
                 if trigger == Trigger::Startup || changed {
