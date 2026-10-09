@@ -371,6 +371,19 @@ pub(super) fn render_edit_action_outcome(
     })
 }
 
+/// The text of an edit that is already on disk. A summary that cannot be
+/// rendered is not a failure of the edit, so the text says that the edit was
+/// applied and names the edit id that undoes it.
+pub(super) fn applied_edit_text(operation: &str, outcome: &crate::editing::ApplyOutcome) -> String {
+    render_edit_action_outcome(outcome).unwrap_or_else(|error| {
+        format!(
+            "{operation} applied the edit, but the summary could not be rendered: {error}\n\
+             edit_id: {}",
+            outcome.plan_id
+        )
+    })
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ExpandArgs {
     /// Codebase id or indexed local directory path. Omit for the current codebase.

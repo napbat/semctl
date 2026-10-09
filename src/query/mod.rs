@@ -1,7 +1,7 @@
 //! Tool bodies. Each function takes the shared [`Client`] + typed args,
 //! hits one REST endpoint, and renders the response as the text an MCP
-//! host shows the model. Errors are formatted inline (not raised as
-//! protocol errors) so the model sees *why* a call failed and can adjust.
+//! host shows the model. A failed call returns a [`ToolError`], not text, so
+//! every MCP tool and CLI command shares one typed failure surface.
 //!
 //! The code/graph endpoints are codebase-scoped: the MCP server is launched
 //! for one codebase (`SEMCTX_CODEBASE`), and these build
@@ -15,8 +15,11 @@ use std::path::Path;
 use crate::client::{Client, api};
 
 mod advanced;
+mod error;
 mod inspection;
 mod render;
+
+pub use error::{FailureKind, ToolError};
 
 #[cfg(test)]
 use inspection::human_bytes;
@@ -33,29 +36,6 @@ use render::{
     HitContext, hit_location, local_path, render_boundaries, render_compact, render_hits,
     render_hits_inner,
 };
-
-/// Turn the MCP renderer's inline failure convention into a real CLI error.
-///
-/// MCP tools deliberately return failures as text so a model receives the
-/// server's explanation instead of an opaque protocol error. The human CLI
-/// shares those renderers, but must not report exit status zero after printing
-/// the same failure. Every hard renderer failure starts its first line with the
-/// stable `<operation> failed:` form; successful output never does.
-pub fn cli_result(output: String) -> anyhow::Result<String> {
-    let first_line = output.lines().next().unwrap_or_default();
-    let hard_failure = first_line
-        .split_once(" failed:")
-        .is_some_and(|(operation, _)| {
-            !operation.is_empty()
-                && operation
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
-        });
-    if hard_failure {
-        anyhow::bail!(output);
-    }
-    Ok(output)
-}
 
 /// Map the user's `--prefer` value to the server's `SearchPreference` enum name
 /// (`"Code"` / `"Docs"`). `None` for an unrecognised value — a typo means "no
@@ -87,17 +67,26 @@ pub struct SearchOpts {
 }
 
 impl SearchOpts {
-    pub(crate) fn normalized_scope(&self) -> Result<Option<&'static str>, &'static str> {
+    pub(crate) fn normalized_scope(&self) -> Result<Option<&'static str>, ToolError> {
         let scope = self
             .scope
             .as_deref()
             .map(|scope| {
-                normalize_scope(scope)
-                    .ok_or("search failed: scope must be local, personal, organization, or global")
+                normalize_scope(scope).ok_or_else(|| {
+                    ToolError::new(
+                        "search_codebase",
+                        FailureKind::InvalidArgument,
+                        "scope must be local, personal, organization, or global",
+                    )
+                })
             })
             .transpose()?;
         if scope.is_some() && !self.codebase_ids.is_empty() {
-            return Err("search failed: scope and codebase_ids are mutually exclusive");
+            return Err(ToolError::new(
+                "search_codebase",
+                FailureKind::InvalidArgument,
+                "scope and codebase_ids are mutually exclusive",
+            ));
         }
         Ok(scope)
     }
@@ -112,11 +101,8 @@ pub async fn search(
     top_k: u32,
     domains: &[String],
     opts: &SearchOpts,
-) -> String {
-    let scope = match opts.normalized_scope() {
-        Ok(scope) => scope,
-        Err(error) => return error.to_string(),
-    };
+) -> Result<String, ToolError> {
+    let scope = opts.normalized_scope()?;
     let body = api::SearchRequestBody {
         query,
         top_k,
@@ -139,15 +125,12 @@ pub async fn search(
             .map(str::to_string),
         granularity: opts.expand.then(|| "Symbol".to_string()),
     };
-    let hits = match client
+    let hits = client
         .post::<_, Vec<api::SearchHit>>("/v1/search", &body)
         .await
-    {
-        Ok(h) => h,
-        Err(e) => return format!("search failed: {e}"),
-    };
+        .map_err(|e| ToolError::from_client("search_codebase", &e))?;
     if hits.is_empty() {
-        return "no results".to_string();
+        return Ok("no results".to_string());
     }
 
     // Staleness is the one shaping the client owns — only it has the local bytes.
@@ -157,7 +140,14 @@ pub async fn search(
         opts.scope.is_none() && opts.codebase_ids.is_empty() && client.codebase_raw().is_some(),
     );
     let stale = stale_paths_in_context(client, &hits, context).await;
-    render_hits_inner(&hits, "no results", context, true, &stale, opts.expand)
+    Ok(render_hits_inner(
+        &hits,
+        "no results",
+        context,
+        true,
+        &stale,
+        opts.expand,
+    ))
 }
 
 fn normalize_scope(scope: &str) -> Option<&'static str> {
@@ -243,10 +233,8 @@ const STALENESS_MAX_PAGES: u32 = 5;
 
 /// Build a `codebase-relative path -> indexed content hash` map from the file
 /// catalog. Best-effort and bounded by [`STALENESS_MAX_PAGES`].
-async fn catalog_hashes(
-    client: &Client,
-) -> std::result::Result<HashMap<String, Option<String>>, String> {
-    let cb = client.codebase().map_err(|e| e.to_string())?;
+async fn catalog_hashes(client: &Client) -> anyhow::Result<HashMap<String, Option<String>>> {
+    let cb = client.codebase()?;
     let mut map = HashMap::new();
     let mut page = 0u32;
     loop {
@@ -271,24 +259,28 @@ fn local_blake3(path: &Path) -> Option<String> {
     Some(blake3::hash(content.as_bytes()).to_hex().to_string())
 }
 
+/// The codebase of `client`, or the `op` failure that says why none is bound.
+fn bound_codebase<'a>(client: &'a Client, op: &'static str) -> Result<&'a str, ToolError> {
+    client
+        .codebase()
+        .map_err(|error| ToolError::from_client(op, &error))
+}
+
 /// One-shot symbol neighbourhood (#4): the definition of `symbol` plus its
 /// direct callers and callees. The server's `/graph/trace` endpoint composes and
 /// classifies the neighbourhood next to the graph; the client renders it.
-pub async fn trace(client: &Client, symbol: &str, depth: u32) -> String {
-    let cb = match client.codebase() {
-        Ok(c) => c.to_string(),
-        Err(e) => return format!("trace failed: {e}"),
-    };
+pub async fn trace(client: &Client, symbol: &str, depth: u32) -> Result<String, ToolError> {
+    let cb = bound_codebase(client, "trace")?;
     let url = format!(
         "/v1/codebases/{cb}/graph/trace?symbol={}&depth={depth}",
         urlencode(symbol)
     );
-    let t = match client.get::<api::TraceResult>(&url).await {
-        Ok(t) => t,
-        Err(e) => return format!("trace failed: {e}"),
-    };
+    let t = client
+        .get::<api::TraceResult>(&url)
+        .await
+        .map_err(|e| ToolError::from_client("trace", &e))?;
     if t.definition.is_empty() {
-        return near_miss(client, symbol, "definition").await;
+        return Ok(near_miss(client, symbol, "definition").await);
     }
     let root = client.local_root();
 
@@ -299,32 +291,33 @@ pub async fn trace(client: &Client, symbol: &str, depth: u32) -> String {
     out.push_str(&render_compact(&t.callers, "  (none)", root));
     write!(out, "\ncallees ({}):\n", t.callees.len()).expect("writing to a String cannot fail");
     out.push_str(&render_compact(&t.callees, "  (none)", root));
-    out
+    Ok(out)
 }
 
 /// Symbol-graph: definitions of `symbol` in the codebase.
-pub async fn find_definition(client: &Client, symbol: &str) -> String {
-    let cb = match client.codebase() {
-        Ok(c) => c,
-        Err(e) => return format!("find_definition failed: {e}"),
-    };
+pub async fn find_definition(client: &Client, symbol: &str) -> Result<String, ToolError> {
+    let cb = bound_codebase(client, "find_definition")?;
     let path = format!(
         "/v1/codebases/{cb}/graph/definitions?symbol={}",
         urlencode(symbol)
     );
-    match client.get::<Vec<api::SearchHit>>(&path).await {
-        Ok(hits) if hits.is_empty() => near_miss(client, symbol, "definition").await,
-        Ok(hits) => render_hits(&hits, "", client.local_root(), false),
-        Err(e) => format!("find_definition failed: {e}"),
+    let hits = client
+        .get::<Vec<api::SearchHit>>(&path)
+        .await
+        .map_err(|e| ToolError::from_client("find_definition", &e))?;
+    if hits.is_empty() {
+        return Ok(near_miss(client, symbol, "definition").await);
     }
+    Ok(render_hits(&hits, "", client.local_root(), false))
 }
 
 /// Symbol-graph: references to `symbol` in the codebase.
-pub async fn find_references(client: &Client, symbol: &str, namespace: Option<&str>) -> String {
-    let cb = match client.codebase() {
-        Ok(c) => c,
-        Err(e) => return format!("find_references failed: {e}"),
-    };
+pub async fn find_references(
+    client: &Client,
+    symbol: &str,
+    namespace: Option<&str>,
+) -> Result<String, ToolError> {
+    let cb = bound_codebase(client, "find_references")?;
     let mut path = format!(
         "/v1/codebases/{cb}/graph/references?symbol={}",
         urlencode(symbol)
@@ -333,136 +326,130 @@ pub async fn find_references(client: &Client, symbol: &str, namespace: Option<&s
         write!(path, "&referenceNamespace={}", urlencode(namespace))
             .expect("writing to a String cannot fail");
     }
-    match client.get::<Vec<api::SearchHit>>(&path).await {
-        Ok(hits) if hits.is_empty() => near_miss(client, symbol, "references").await,
-        Ok(hits) => render_hits(&hits, "", client.local_root(), false),
-        Err(e) => format!("find_references failed: {e}"),
+    let hits = client
+        .get::<Vec<api::SearchHit>>(&path)
+        .await
+        .map_err(|e| ToolError::from_client("find_references", &e))?;
+    if hits.is_empty() {
+        return Ok(near_miss(client, symbol, "references").await);
     }
+    Ok(render_hits(&hits, "", client.local_root(), false))
 }
 
 /// Graph: incoming callers of `symbol` — the definitions that call it (the
 /// inverse `calls` edge).
-pub async fn who_calls(client: &Client, symbol: &str) -> String {
-    let cb = match client.codebase() {
-        Ok(c) => c,
-        Err(e) => return format!("who_calls failed: {e}"),
-    };
+pub async fn who_calls(client: &Client, symbol: &str) -> Result<String, ToolError> {
+    let cb = bound_codebase(client, "who_calls")?;
     let path = format!(
         "/v1/codebases/{cb}/graph/who-calls?symbol={}",
         urlencode(symbol)
     );
-    match client.get::<Vec<api::SearchHit>>(&path).await {
-        Ok(hits) => render_hits(
-            &hits,
-            &format!("nothing calls `{symbol}`"),
-            client.local_root(),
-            false,
-        ),
-        Err(e) => format!("who_calls failed: {e}"),
-    }
+    let hits = client
+        .get::<Vec<api::SearchHit>>(&path)
+        .await
+        .map_err(|e| ToolError::from_client("who_calls", &e))?;
+    Ok(render_hits(
+        &hits,
+        &format!("nothing calls `{symbol}`"),
+        client.local_root(),
+        false,
+    ))
 }
 
 /// Graph: the types implementing `symbol` (a trait/interface) — the reverse
 /// `implements` edge.
-pub async fn implementations_of(client: &Client, symbol: &str) -> String {
-    let cb = match client.codebase() {
-        Ok(c) => c,
-        Err(e) => return format!("implementations_of failed: {e}"),
-    };
+pub async fn implementations_of(client: &Client, symbol: &str) -> Result<String, ToolError> {
+    let cb = bound_codebase(client, "implementations_of")?;
     let path = format!(
         "/v1/codebases/{cb}/graph/implementations?symbol={}",
         urlencode(symbol)
     );
-    match client.get::<Vec<api::SearchHit>>(&path).await {
-        Ok(hits) => render_hits(
-            &hits,
-            &format!("no implementations of `{symbol}`"),
-            client.local_root(),
-            false,
-        ),
-        Err(e) => format!("implementations_of failed: {e}"),
-    }
+    let hits = client
+        .get::<Vec<api::SearchHit>>(&path)
+        .await
+        .map_err(|e| ToolError::from_client("implementations_of", &e))?;
+    Ok(render_hits(
+        &hits,
+        &format!("no implementations of `{symbol}`"),
+        client.local_root(),
+        false,
+    ))
 }
 
 /// Graph: a shortest call chain from `from` to `to` — the chunks along one path
 /// of `calls` edges, in order.
-pub async fn call_path(client: &Client, from: &str, to: &str) -> String {
-    let cb = match client.codebase() {
-        Ok(c) => c,
-        Err(e) => return format!("call_path failed: {e}"),
-    };
+pub async fn call_path(client: &Client, from: &str, to: &str) -> Result<String, ToolError> {
+    let cb = bound_codebase(client, "call_path")?;
     let path = format!(
         "/v1/codebases/{cb}/graph/call-path?from={}&to={}",
         urlencode(from),
         urlencode(to)
     );
-    match client.get::<Vec<api::SearchHit>>(&path).await {
-        Ok(hits) => render_hits(
-            &hits,
-            &format!("no call path from `{from}` to `{to}`"),
-            client.local_root(),
-            false,
-        ),
-        Err(e) => format!("call_path failed: {e}"),
-    }
+    let hits = client
+        .get::<Vec<api::SearchHit>>(&path)
+        .await
+        .map_err(|e| ToolError::from_client("call_path", &e))?;
+    Ok(render_hits(
+        &hits,
+        &format!("no call path from `{from}` to `{to}`"),
+        client.local_root(),
+        false,
+    ))
 }
 
 /// Flow: the external boundaries a value entering from `from` flows out to
 /// (forward, inter-procedural value flow). Boundaries are the un-indexed callees
 /// the corpus crosses.
-pub async fn reaches(client: &Client, from: &str) -> String {
-    let cb = match client.codebase() {
-        Ok(c) => c,
-        Err(e) => return format!("reaches failed: {e}"),
-    };
+pub async fn reaches(client: &Client, from: &str) -> Result<String, ToolError> {
+    let cb = bound_codebase(client, "reaches")?;
     let path = format!(
         "/v1/codebases/{cb}/graph/flow/reaches?from={}",
         urlencode(from)
     );
-    match client.get::<Vec<String>>(&path).await {
-        Ok(boundaries) => render_boundaries(
-            &boundaries,
-            &format!("no boundary flow reached from `{from}`"),
-        ),
-        Err(e) => format!("reaches failed: {e}"),
-    }
+    let boundaries = client
+        .get::<Vec<String>>(&path)
+        .await
+        .map_err(|e| ToolError::from_client("reaches", &e))?;
+    Ok(render_boundaries(
+        &boundaries,
+        &format!("no boundary flow reached from `{from}`"),
+    ))
 }
 
 /// Flow: the external boundaries whose entering value reaches `to` (backward,
 /// inter-procedural value flow) — the dual of [`reaches`].
-pub async fn flows_into(client: &Client, to: &str) -> String {
-    let cb = match client.codebase() {
-        Ok(c) => c,
-        Err(e) => return format!("flows_into failed: {e}"),
-    };
+pub async fn flows_into(client: &Client, to: &str) -> Result<String, ToolError> {
+    let cb = bound_codebase(client, "flows_into")?;
     let path = format!("/v1/codebases/{cb}/graph/flow/into?to={}", urlencode(to));
-    match client.get::<Vec<String>>(&path).await {
-        Ok(boundaries) => render_boundaries(&boundaries, &format!("nothing flows into `{to}`")),
-        Err(e) => format!("flows_into failed: {e}"),
-    }
+    let boundaries = client
+        .get::<Vec<String>>(&path)
+        .await
+        .map_err(|e| ToolError::from_client("flows_into", &e))?;
+    Ok(render_boundaries(
+        &boundaries,
+        &format!("nothing flows into `{to}`"),
+    ))
 }
 
 /// Flow: the function chunks a value flows through from boundary `from` to
 /// boundary `to` — the inter-procedural flow witness.
-pub async fn flows_between(client: &Client, from: &str, to: &str) -> String {
-    let cb = match client.codebase() {
-        Ok(c) => c,
-        Err(e) => return format!("flows_between failed: {e}"),
-    };
+pub async fn flows_between(client: &Client, from: &str, to: &str) -> Result<String, ToolError> {
+    let cb = bound_codebase(client, "flows_between")?;
     let path = format!(
         "/v1/codebases/{cb}/graph/flow/between?from={}&to={}",
         urlencode(from),
         urlencode(to)
     );
-    match client.get::<Vec<api::SearchHit>>(&path).await {
-        Ok(hits) => render_hits(
-            &hits,
-            &format!("no value flow from `{from}` to `{to}`"),
-            client.local_root(),
-            false,
-        ),
-        Err(e) => format!("flows_between failed: {e}"),
-    }
+    let hits = client
+        .get::<Vec<api::SearchHit>>(&path)
+        .await
+        .map_err(|e| ToolError::from_client("flows_between", &e))?;
+    Ok(render_hits(
+        &hits,
+        &format!("no value flow from `{from}` to `{to}`"),
+        client.local_root(),
+        false,
+    ))
 }
 
 /// Literal / regex code search over the codebase's indexed file content — the
@@ -474,11 +461,8 @@ pub async fn grep(
     ignore_case: bool,
     path: Option<&str>,
     max: u32,
-) -> String {
-    let cb = match client.codebase() {
-        Ok(c) => c,
-        Err(e) => return format!("grep failed: {e}"),
-    };
+) -> Result<String, ToolError> {
+    let cb = bound_codebase(client, "grep")?;
     let mut url = format!(
         "/v1/codebases/{cb}/grep?pattern={}&regex={regex}&ignoreCase={ignore_case}&max={max}",
         urlencode(pattern)
@@ -486,32 +470,33 @@ pub async fn grep(
     if let Some(p) = path.filter(|p| !p.is_empty()) {
         write!(url, "&path={}", urlencode(p)).expect("writing to a String cannot fail");
     }
-    match client.get::<Vec<api::GrepMatch>>(&url).await {
-        Ok(matches) if matches.is_empty() => format!("no matches for `{pattern}`"),
-        Ok(matches) => {
-            let root = client.local_root();
-            let mut out = String::new();
-            for m in &matches {
-                writeln!(
-                    out,
-                    "{}:{}: {}",
-                    local_path(root, &m.path),
-                    m.line_number,
-                    m.line.trim_end()
-                )
-                .expect("writing to a String cannot fail");
-            }
-            writeln!(
-                out,
-                "({} match{})",
-                matches.len(),
-                if matches.len() == 1 { "" } else { "es" }
-            )
-            .expect("writing to a String cannot fail");
-            out
-        }
-        Err(e) => format!("grep failed: {e}"),
+    let matches = client
+        .get::<Vec<api::GrepMatch>>(&url)
+        .await
+        .map_err(|e| ToolError::from_client("grep", &e))?;
+    if matches.is_empty() {
+        return Ok(format!("no matches for `{pattern}`"));
     }
+    let root = client.local_root();
+    let mut out = String::new();
+    for m in &matches {
+        writeln!(
+            out,
+            "{}:{}: {}",
+            local_path(root, &m.path),
+            m.line_number,
+            m.line.trim_end()
+        )
+        .expect("writing to a String cannot fail");
+    }
+    writeln!(
+        out,
+        "({} match{})",
+        matches.len(),
+        if matches.len() == 1 { "" } else { "es" }
+    )
+    .expect("writing to a String cannot fail");
+    Ok(out)
 }
 
 /// A file's table of contents — every indexed chunk (kind, symbol, line range)
@@ -522,11 +507,8 @@ pub async fn file_outline(
     max_depth: Option<u32>,
     kinds: &[String],
     include_body: bool,
-) -> String {
-    let cb = match client.codebase() {
-        Ok(c) => c,
-        Err(e) => return format!("file_outline failed: {e}"),
-    };
+) -> Result<String, ToolError> {
+    let cb = bound_codebase(client, "file_outline")?;
     let mut url = format!(
         "/v1/codebases/{cb}/graph/outline?path={}&includeBody={include_body}",
         urlencode(path)
@@ -537,62 +519,64 @@ pub async fn file_outline(
     for kind in kinds {
         write!(url, "&kinds={}", urlencode(kind)).expect("writing to a String cannot fail");
     }
-    match client.get::<api::FileOutline>(&url).await {
-        Ok(outline) if outline.entries.is_empty() => {
-            format!("{path} is indexed but has no chunks")
-        }
-        Ok(outline) => {
-            let local = local_path(client.local_root(), &outline.path);
-            let mut out = format!("{local}\n");
-            for e in &outline.entries {
-                let sym = e
-                    .qualified_symbol
-                    .as_deref()
-                    .or(e.symbol.as_deref())
-                    .unwrap_or("-");
-                let symbol_kind = e.symbol_kind.as_deref().unwrap_or(&e.kind);
-                writeln!(
-                    out,
-                    "  {}{}-{}  {} {sym}",
-                    "  ".repeat(e.depth as usize),
-                    e.line_start,
-                    e.line_end,
-                    symbol_kind
-                )
-                .expect("writing to a String cannot fail");
-                if let Some(body) = &e.body {
-                    for line in body.lines() {
-                        writeln!(out, "      {line}").expect("writing to a String cannot fail");
-                    }
-                }
-            }
-            out
-        }
-        Err(e) => format!("file_outline failed: {e}"),
+    let outline = client
+        .get::<api::FileOutline>(&url)
+        .await
+        .map_err(|e| ToolError::from_client("file_outline", &e))?;
+    if outline.entries.is_empty() {
+        return Ok(format!("{path} is indexed but has no chunks"));
     }
+    let local = local_path(client.local_root(), &outline.path);
+    let mut out = format!("{local}\n");
+    for e in &outline.entries {
+        let sym = e
+            .qualified_symbol
+            .as_deref()
+            .or(e.symbol.as_deref())
+            .unwrap_or("-");
+        let symbol_kind = e.symbol_kind.as_deref().unwrap_or(&e.kind);
+        writeln!(
+            out,
+            "  {}{}-{}  {} {sym}",
+            "  ".repeat(e.depth as usize),
+            e.line_start,
+            e.line_end,
+            symbol_kind
+        )
+        .expect("writing to a String cannot fail");
+        if let Some(body) = &e.body {
+            for line in body.lines() {
+                writeln!(out, "      {line}").expect("writing to a String cannot fail");
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Chunks overlapping an inclusive line range in a file — "grow context around
 /// a hit". Pass a search/definition hit's line range (widened to taste) to pull
 /// the neighbouring chunks in source order.
-pub async fn expand_chunk(client: &Client, path: &str, line_start: u32, line_end: u32) -> String {
-    let cb = match client.codebase() {
-        Ok(c) => c,
-        Err(e) => return format!("expand_chunk failed: {e}"),
-    };
+pub async fn expand_chunk(
+    client: &Client,
+    path: &str,
+    line_start: u32,
+    line_end: u32,
+) -> Result<String, ToolError> {
+    let cb = bound_codebase(client, "expand_chunk")?;
     let url = format!(
         "/v1/codebases/{cb}/graph/expand?path={}&lineStart={line_start}&lineEnd={line_end}",
         urlencode(path)
     );
-    match client.get::<Vec<api::SearchHit>>(&url).await {
-        Ok(hits) => render_hits(
-            &hits,
-            &format!("no indexed chunks overlap {path}:{line_start}-{line_end}"),
-            client.local_root(),
-            false,
-        ),
-        Err(e) => format!("expand_chunk failed: {e}"),
-    }
+    let hits = client
+        .get::<Vec<api::SearchHit>>(&url)
+        .await
+        .map_err(|e| ToolError::from_client("expand_chunk", &e))?;
+    Ok(render_hits(
+        &hits,
+        &format!("no indexed chunks overlap {path}:{line_start}-{line_end}"),
+        client.local_root(),
+        false,
+    ))
 }
 
 /// On an exact symbol-lookup miss, suggest near matches by name so the caller
@@ -666,15 +650,42 @@ fn urlencode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{cli_result, human_bytes, is_stale, local_blake3, normalize_prefer};
+    use super::{
+        SearchOpts, bound_codebase, human_bytes, is_stale, local_blake3, normalize_prefer,
+    };
+    use crate::client::Client;
+
+    const CORRECT_THE_ARGUMENT: &str = "next: correct the argument and call again.";
 
     #[test]
-    fn cli_turns_inline_query_failures_into_process_errors() {
-        let error = cli_result("call_graph failed: 409 GraphLoading".into()).unwrap_err();
-        assert_eq!(error.to_string(), "call_graph failed: 409 GraphLoading");
+    fn an_unknown_search_scope_is_an_invalid_argument() {
+        let opts = SearchOpts {
+            scope: Some("typo".into()),
+            ..SearchOpts::default()
+        };
+        let message = opts.normalized_scope().unwrap_err().to_string();
+        assert!(message.starts_with("search_codebase failed: scope must be"));
+        assert!(message.ends_with(CORRECT_THE_ARGUMENT));
+    }
 
-        let success = "nodes (1)\nsource text mentioning call_graph failed: is still data";
-        assert_eq!(cli_result(success.into()).unwrap(), success);
+    #[test]
+    fn a_scope_with_explicit_codebase_ids_is_an_invalid_argument() {
+        let opts = SearchOpts {
+            scope: Some("local".into()),
+            codebase_ids: vec!["A".into()],
+            ..SearchOpts::default()
+        };
+        let message = opts.normalized_scope().unwrap_err().to_string();
+        assert!(message.contains("mutually exclusive"));
+        assert!(message.ends_with(CORRECT_THE_ARGUMENT));
+    }
+
+    #[test]
+    fn a_missing_codebase_binding_names_the_failed_operation() {
+        let client = Client::for_test("", None);
+        let message = bound_codebase(&client, "trace").unwrap_err().to_string();
+        assert!(message.starts_with("trace failed: no codebase for this directory"));
+        assert!(message.ends_with("next: use local Read/Grep for this request."));
     }
 
     #[test]

@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 use tracing::{debug, warn};
@@ -20,10 +20,12 @@ use tracing::{debug, warn};
 use crate::auth;
 use crate::session::{CredentialScope, CredentialSource, SessionContext};
 
-mod response_error;
+mod failure;
 pub(crate) mod transport;
 
-pub(crate) use response_error::ResponseError;
+use failure::{gateway_error, response_body_error};
+
+pub(crate) use failure::ApiFailure;
 pub(crate) use transport::HttpTransport;
 
 const TENANT_HEADER: &str = "X-Tenant-Id";
@@ -32,6 +34,7 @@ const TENANT_HEADER: &str = "X-Tenant-Id";
 /// is answered about the tree it is looking at.
 const CHECKOUT_HEADER: &str = "X-Semctx-Source-Id";
 const LOADING_RETRY_BUDGET: Duration = Duration::from_mins(1);
+const LOADING_RETRY_MIN_DELAY: Duration = Duration::from_secs(1);
 const LOADING_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
 
 /// Cheap to clone — `reqwest::Client` is internally `Arc`'d and the
@@ -442,18 +445,7 @@ impl Client {
     /// mean "nothing here" (e.g. hover at a position with no symbol).
     pub async fn get_maybe<T: DeserializeOwned>(&self, path: &str) -> Result<Option<T>> {
         let (resp, url) = self.send(reqwest::Method::GET, path, None).await?;
-        let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .with_context(|| format!("GET {url}: read body"))?;
-        let Ok(envelope) = serde_json::from_str::<ApiEnvelope<T>>(&body) else {
-            let message = gateway_message("GET", &url, status, &body);
-            return Err(ResponseError::new(status, None, message).into());
-        };
-        if !status.is_success() || !envelope.success {
-            bail!("GET {url} -> {status}: {}", envelope.error_summary());
-        }
+        let (_, envelope) = read_envelope::<T>(resp, "GET", &url).await?;
         Ok(envelope.data)
     }
 
@@ -502,12 +494,13 @@ fn loading_retry_delay(
     if status != reqwest::StatusCode::CONFLICT {
         return None;
     }
-    let delay = response_error::retry_after(headers)?;
-    Some(
-        delay
-            .max(Duration::from_secs(1))
-            .min(LOADING_RETRY_MAX_DELAY),
-    )
+    failure::retry_after(headers).map(bounded_loading_delay)
+}
+
+/// The one bound for a delay that a loading response advertises. The retry
+/// loop and the typed failure classification both use it.
+fn bounded_loading_delay(delay: Duration) -> Duration {
+    delay.clamp(LOADING_RETRY_MIN_DELAY, LOADING_RETRY_MAX_DELAY)
 }
 
 fn tenant_binding_denied(body: &str) -> bool {
@@ -528,48 +521,6 @@ fn tenant_binding_denied(body: &str) -> bool {
     serde_json::from_str(body).is_ok_and(|value| contains_code(&value))
 }
 
-/// Preserve a structured JSON denial even when it is not wrapped in the
-/// resource server's usual API envelope. Tenant binding failures can be emitted
-/// by middleware before controller envelope handling runs.
-fn response_body_error(
-    method: &str,
-    url: &str,
-    status: reqwest::StatusCode,
-    body: &str,
-) -> anyhow::Error {
-    let message = if serde_json::from_str::<serde_json::Value>(body).is_ok() {
-        format!("{method} {url} -> {status}: {body}")
-    } else {
-        gateway_message(method, url, status, body)
-    };
-    ResponseError::new(status, None, message).into()
-}
-
-/// The message for a response that is not the API's JSON envelope at all.
-///
-/// A gateway between the CLI and the server (ingress, proxy, load balancer)
-/// answers failures in ITS format, not the API's — typically an HTML error page.
-/// Parsing that as the envelope produces `expected value at line 1 column 1`,
-/// which names the CLI's own parser rather than the thing that actually went
-/// wrong, and buries the status code that IS the diagnosis.
-///
-/// Reported by status instead, because those statuses have specific meanings a
-/// user can act on: 502/503/504 come from the gateway, not the application, and
-/// mean the request never got a real answer.
-fn gateway_message(method: &str, url: &str, status: reqwest::StatusCode, body: &str) -> String {
-    let hint = match status.as_u16() {
-        504 => "the gateway timed out waiting for the server — the request may still be running",
-        502 => "the gateway could not reach the server, or the server closed the connection",
-        503 => "the server is unavailable behind the gateway (starting, draining, or overloaded)",
-        _ => "the response was not the API's JSON envelope",
-    };
-    // A short excerpt only: an HTML error page is pages long and none of it is
-    // the diagnosis, but a truncated peek still distinguishes "HTML page" from
-    // "empty body" when someone needs it.
-    let excerpt: String = body.trim().chars().take(120).collect();
-    format!("{method} {url} -> {status}: {hint} (response was not JSON: {excerpt:?})")
-}
-
 /// Every server response is an `ApiResponse<T>` envelope
 /// (`{ success, errors, httpStatusCode, data }`); unwrap it to the inner
 /// `data`, surfacing the typed errors on failure rather than a raw body.
@@ -578,29 +529,40 @@ async fn unwrap_envelope<T: DeserializeOwned>(
     method: &str,
     url: &str,
 ) -> Result<T> {
-    let status = resp.status();
-    let retry_after = response_error::retry_after(resp.headers());
-    let body = resp
-        .text()
-        .await
-        .with_context(|| format!("{method} {url}: read body"))?;
-    // Not the envelope: attribute it to whatever answered instead of blaming
-    // the parser. See `gateway_message`.
-    let Ok(envelope) = serde_json::from_str::<ApiEnvelope<T>>(&body) else {
-        let message = gateway_message(method, url, status, &body);
-        return Err(ResponseError::new(status, retry_after, message).into());
-    };
-    if !status.is_success() || !envelope.success {
-        let message = format!("{method} {url} -> {status}: {}", envelope.error_summary());
-        return Err(ResponseError::new(status, retry_after, message).into());
-    }
+    let (status, envelope) = read_envelope::<T>(resp, method, url).await?;
     envelope
         .data
         .ok_or_else(|| anyhow!("{method} {url} -> {status}: success but no data"))
 }
 
-/// The server's `ApiResponse<T>` envelope. `errors` is captured untyped — the
-/// CLI only renders it on failure, so its exact shape doesn't matter here.
+/// Read one envelope answer. A failure by status or by the envelope's own flag
+/// becomes an [`ApiFailure`] that carries the typed error code and the
+/// server's retry delay.
+async fn read_envelope<T: DeserializeOwned>(
+    resp: reqwest::Response,
+    method: &str,
+    url: &str,
+) -> Result<(reqwest::StatusCode, ApiEnvelope<T>)> {
+    let status = resp.status();
+    let retry_after = failure::retry_after(resp.headers());
+    let body = resp
+        .text()
+        .await
+        .with_context(|| format!("{method} {url}: read body"))?;
+    // Not the envelope: attribute it to whatever answered instead of blaming
+    // the parser. See `gateway_error`.
+    let Ok(envelope) = serde_json::from_str::<ApiEnvelope<T>>(&body) else {
+        return Err(gateway_error(method, url, status, retry_after, &body));
+    };
+    if !status.is_success() || !envelope.success {
+        let errors = envelope.errors.as_deref().unwrap_or_default();
+        return Err(ApiFailure::from_errors(method, url, status, retry_after, errors).into());
+    }
+    Ok((status, envelope))
+}
+
+/// The server's `ApiResponse<T>` envelope. `errors` is captured untyped — only
+/// a failure reads it, for the first typed code and the human text.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ApiEnvelope<T> {
@@ -608,23 +570,6 @@ struct ApiEnvelope<T> {
     data: Option<T>,
     #[serde(default)]
     errors: Option<Vec<serde_json::Value>>,
-}
-
-impl<T> ApiEnvelope<T> {
-    fn error_summary(&self) -> String {
-        summarize_errors(self.errors.as_deref().unwrap_or_default())
-    }
-}
-
-fn summarize_errors(errors: &[serde_json::Value]) -> String {
-    if errors.is_empty() {
-        return "request failed".to_string();
-    }
-    errors
-        .iter()
-        .map(std::string::ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("; ")
 }
 
 /// Unwrap a flat paginated envelope (`PaginatedApiResponse<T>` —
@@ -638,6 +583,7 @@ async fn unwrap_page<T: DeserializeOwned>(
     url: &str,
 ) -> Result<api::Page<T>> {
     let status = resp.status();
+    let retry_after = failure::retry_after(resp.headers());
     let body = resp
         .text()
         .await
@@ -646,10 +592,8 @@ async fn unwrap_page<T: DeserializeOwned>(
         format!("{method} {url} -> {status}: parse paginated envelope ({body})")
     })?;
     if !status.is_success() || !env.success {
-        bail!(
-            "{method} {url} -> {status}: {}",
-            summarize_errors(env.errors.as_deref().unwrap_or_default())
-        );
+        let errors = env.errors.as_deref().unwrap_or_default();
+        return Err(ApiFailure::from_errors(method, url, status, retry_after, errors).into());
     }
     Ok(env.page)
 }
@@ -762,8 +706,8 @@ mod tests {
     use serde::Deserialize;
 
     use super::{
-        Client, CredentialSource, HttpTransport, PageEnvelope, gateway_message,
-        loading_retry_delay, tenant_binding_denied, tenant_selection,
+        Client, CredentialSource, HttpTransport, PageEnvelope, gateway_error, loading_retry_delay,
+        tenant_binding_denied, tenant_selection,
     };
 
     /// A client with no codebase and no checkout, for the pure selection tests.
@@ -817,12 +761,14 @@ mod tests {
     /// actual diagnosis (the gateway timed out) appears nowhere.
     #[test]
     fn a_gateway_html_page_is_reported_as_the_gateway_failing() {
-        let msg = gateway_message(
+        let msg = gateway_error(
             "PUT",
             "https://example/v1/codebases/x/sync/y",
             reqwest::StatusCode::GATEWAY_TIMEOUT,
+            None,
             "<html><head><title>504 Gateway Time-out</title></head><body>...</body></html>",
-        );
+        )
+        .to_string();
 
         assert!(
             msg.contains("gateway timed out"),

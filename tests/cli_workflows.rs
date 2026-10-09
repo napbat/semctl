@@ -514,8 +514,36 @@ async fn invalid_search_scope_fails_before_sending_a_request() {
         )
         .await;
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("scope must be"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("search_codebase failed: scope must be"),
+        "{stderr}"
+    );
     assert!(server.requests().is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_server_answer_exits_non_zero_with_one_failure_line() {
+    let checkout = Checkout::new();
+    let server = Server::start(
+        |_| json!({"success": false, "errors": [{"code": "GraphLoading", "message": "loading"}]}),
+    );
+    let output = checkout
+        .run(
+            &server,
+            &checkout.root,
+            &["--codebase", "A", "graph", "who-calls", "remote"],
+        )
+        .await;
+    assert!(!output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("who_calls failed: GET "), "{stderr}");
+    assert!(stderr.contains("GraphLoading"), "{stderr}");
+    assert!(
+        !stderr.contains("next:"),
+        "the next step is guidance for a model, not for the CLI: {stderr}"
+    );
 }
 
 #[tokio::test]
@@ -604,8 +632,20 @@ async fn mcp_scoped_search_works_from_an_unindexed_directory() {
         if id == 1 {
             assert!(response["result"]["capabilities"]["tools"].is_object());
         } else if id == 4 {
-            assert!(response.to_string().contains("mutually exclusive"));
+            assert_eq!(response["result"]["isError"], true, "{response}");
+            let text = response["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(
+                text.starts_with(
+                    "search_codebase failed: scope and codebase_ids are mutually exclusive\n"
+                ),
+                "{text}"
+            );
+            assert!(
+                text.ends_with("next: correct the argument and call again."),
+                "{text}"
+            );
         } else {
+            assert_eq!(response["result"]["isError"], false, "{response}");
             let text = response["result"]["content"][0]["text"].as_str().unwrap();
             assert!(text.contains("[codebase B] src/lib.rs:1"), "{text}");
             assert!(!text.contains("checkout-a"), "{text}");
@@ -757,6 +797,7 @@ async fn scoped_mcp_search_waits_for_initial_embedding_and_propagates_failure() 
             let response: Value = serde_json::from_str(&line).unwrap();
             ids.push(response["id"].as_u64().unwrap());
             assert_eq!(line.contains("embedding failed"), failed, "{line}");
+            assert_eq!(response["result"]["isError"], failed, "{line}");
         }
         ids.sort_unstable();
         assert_eq!(ids, [2, 3, 4]);

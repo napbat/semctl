@@ -20,7 +20,7 @@ use super::tool_types::{
 };
 use super::{
     DIRECT_EDIT_TOOLS, InitialIndexGate, McpServer, client, initial_gate_for_path,
-    initial_index_failed, ready_for_codebases, selector_is_path_like,
+    ready_for_codebases, selector_is_path_like,
 };
 use crate::engine::Engine;
 use crate::engine::coordinator::{CheckoutCoordinator, IdleReconciler};
@@ -198,7 +198,7 @@ async fn a_second_sessions_startup_bind_does_not_wait_for_another_first_index() 
         .expect("the startup bind must not wait for another session's first index");
 
     assert!(
-        tokio::time::timeout(Duration::from_millis(50), second.bound())
+        tokio::time::timeout(Duration::from_millis(50), second.bound("find_definition"))
             .await
             .is_err(),
         "a retrieval call still waits for the first index"
@@ -206,14 +206,31 @@ async fn a_second_sessions_startup_bind_does_not_wait_for_another_first_index() 
 }
 
 /// A failed first index stays failed until something asks for that index
-/// again, so the message a retrieval call reports must name the recovery.
-#[test]
-fn a_failed_first_index_reports_how_to_retry() {
-    let message = initial_index_failed("embedding job 7 failed");
+/// again, so the error a retrieval call reports must name the recovery.
+#[tokio::test]
+async fn a_failed_first_index_reports_how_to_retry() {
+    let root = PathBuf::from("failed-checkout");
+    let server = server(
+        client::Client::for_test("codebase", Some(root.clone())),
+        "launch",
+        false,
+    );
+    let gate = first_index(&server, "codebase", &root).await;
+    gate.finish(Err("embedding job 7 failed".into())).await;
 
-    assert!(message.contains("embedding job 7 failed"), "{message}");
+    let message = server
+        .await_initial_path("search_codebase", &root)
+        .await
+        .unwrap_err()
+        .to_string();
+
     assert!(
-        message.contains("call `index_codebase` for this path to retry"),
+        message
+            .starts_with("search_codebase failed: initial index failed — embedding job 7 failed\n"),
+        "{message}"
+    );
+    assert!(
+        message.ends_with("next: call index_codebase for this path to retry the first index."),
         "{message}"
     );
 }
@@ -430,23 +447,28 @@ async fn checkout_readiness_does_not_use_another_checkouts_codebase_gate() {
     assert!(
         tokio::time::timeout(
             Duration::from_millis(5),
-            server.await_initial_client(&first)
+            server.await_initial_client("find_definition", &first)
         )
         .await
         .is_err(),
         "another checkout's first index must not answer for this one"
     );
     first_gate.finish(Ok(())).await;
-    assert_eq!(server.await_initial_client(&first).await, Ok(()));
-
-    let rootless = client::Client::for_test("shared-codebase", None);
     assert!(
         server
-            .await_initial_client(&rootless)
+            .await_initial_client("find_definition", &first)
             .await
-            .unwrap_err()
-            .contains("another checkout failed")
+            .is_ok()
     );
+
+    let rootless = client::Client::for_test("shared-codebase", None);
+    let message = server
+        .await_initial_client("find_definition", &rootless)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(message.starts_with("find_definition failed: "), "{message}");
+    assert!(message.contains("another checkout failed"), "{message}");
 }
 
 /// The bound checkout can be an umbrella root above the launch directory. The
@@ -892,4 +914,37 @@ fn nudge_copy_names_no_phantom_tools() {
             "PreToolUse nudge copy names unknown tool(s) {phantoms:?} for {names:?}"
         );
     }
+}
+
+/// A plan that cannot be applied is a tool failure, not a success whose text
+/// says "refused".
+#[tokio::test]
+async fn an_edit_plan_that_cannot_be_applied_is_a_refused_tool_error() {
+    let server = server(client::Client::for_test("codebase", None), "launch", false);
+    let bound = client::Client::for_test("codebase", None);
+    let plan: client::api::WorkspaceEditPlan = serde_json::from_value(serde_json::json!({
+        "schemaVersion": 0, "planId": "a".repeat(64), "operation": "rename_symbol",
+        "codebaseId": "codebase", "graphGeneration": 1, "sourceIdentity": "source",
+        "graphComplete": true, "providerGenerationsCurrent": true, "dependentCodebases": [],
+        "applicable": false, "confidence": "High", "files": [], "warnings": [],
+        "refusalReasons": ["name collision"], "unresolvedSites": [], "uncertainSites": [],
+        "formatter": null, "renderedDiff": ""
+    }))
+    .expect("plan fixture");
+
+    let message = server
+        .apply_server_plan(&bound, plan, false, "rename_symbol")
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        message.starts_with("rename_symbol failed: unsupported workspace edit plan schema 0\n"),
+        "{message}"
+    );
+    assert!(
+        message
+            .ends_with("next: read the reason above, and do not repeat the same call unchanged."),
+        "{message}"
+    );
 }
