@@ -714,10 +714,26 @@ fn readiness_server(
     })
 }
 
-#[tokio::test]
-async fn scoped_mcp_search_waits_for_initial_embedding_and_propagates_failure() {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+type ServerLines = tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>;
 
+/// The next message the server writes. A message that never comes fails the
+/// test after ten seconds instead of hanging it.
+async fn next_message(stdout: &mut ServerLines, what: &str) -> (String, Value) {
+    let next = tokio::time::timeout(Duration::from_secs(10), stdout.next_line());
+    let line = next.await.expect(what).unwrap().unwrap();
+    let message = serde_json::from_str(&line).unwrap();
+    (line, message)
+}
+
+async fn send(stdin: &mut tokio::process::ChildStdin, message: &Value) {
+    use tokio::io::AsyncWriteExt;
+    let line = format!("{message}\n");
+    stdin.write_all(line.as_bytes()).await.unwrap();
+}
+
+#[tokio::test]
+async fn index_codebase_returns_at_once_and_scoped_search_waits_for_the_first_embedding() {
+    use tokio::io::AsyncBufReadExt;
     for failed in [false, true] {
         let checkout = Checkout::new();
         fs::write(checkout.config.join("semctl/config.toml"), "").unwrap();
@@ -739,26 +755,23 @@ async fn scoped_mcp_search_waits_for_initial_embedding_and_propagates_failure() 
                 "capabilities": {}, "clientInfo": {"name": "readiness-test", "version": "1"}
             }
         });
-        stdin
-            .write_all(format!("{initialize}\n").as_bytes())
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(10), stdout.next_line())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        stdin
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
-            .await
-            .unwrap();
+        send(&mut stdin, &initialize).await;
+        next_message(&mut stdout, "initialize must answer").await;
+        send(
+            &mut stdin,
+            &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        )
+        .await;
         let index = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
             "name": "index_codebase", "arguments": {}
         }});
-        stdin
-            .write_all(format!("{index}\n").as_bytes())
-            .await
-            .unwrap();
+        send(&mut stdin, &index).await;
+        // The embedding job is still open here, so this answer cannot wait for it.
+        let (started, response) =
+            next_message(&mut stdout, "index_codebase must not wait for embedding").await;
+        assert_eq!(response["id"], 2, "{started}");
+        assert_eq!(response["result"]["isError"], false, "{started}");
+        assert!(started.contains("call sync_status"), "{started}");
         tokio::time::timeout(Duration::from_secs(10), polled.notified())
             .await
             .expect("initial job must start");
@@ -770,37 +783,23 @@ async fn scoped_mcp_search_waits_for_initial_embedding_and_propagates_failure() 
             let search = json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {
                 "name": "search_codebase", "arguments": arguments
             }});
-            stdin
-                .write_all(format!("{search}\n").as_bytes())
-                .await
-                .unwrap();
+            send(&mut stdin, &search).await;
         }
-        let unrelated = tokio::time::timeout(Duration::from_secs(10), stdout.next_line())
-            .await
-            .expect("unrelated search must remain available")
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            serde_json::from_str::<Value>(&unrelated).unwrap()["id"],
-            5,
-            "{unrelated}"
-        );
+        let (unrelated, response) =
+            next_message(&mut stdout, "unrelated search must remain available").await;
+        assert_eq!(response["id"], 5, "{unrelated}");
         assert_eq!(server.request_count("/v1/search"), 1);
         complete.store(true, Ordering::Release);
         let mut ids = Vec::new();
-        for _ in 0..3 {
-            let line = tokio::time::timeout(Duration::from_secs(10), stdout.next_line())
-                .await
-                .expect("initial index must release waiting tools")
-                .unwrap()
-                .unwrap();
-            let response: Value = serde_json::from_str(&line).unwrap();
+        for _ in 0..2 {
+            let (line, response) =
+                next_message(&mut stdout, "initial index must release waiting tools").await;
             ids.push(response["id"].as_u64().unwrap());
             assert_eq!(line.contains("embedding failed"), failed, "{line}");
             assert_eq!(response["result"]["isError"], failed, "{line}");
         }
         ids.sort_unstable();
-        assert_eq!(ids, [2, 3, 4]);
+        assert_eq!(ids, [3, 4]);
         drop(stdin);
         let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
             .await

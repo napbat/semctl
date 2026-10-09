@@ -6,10 +6,12 @@
 //! this session did bring in is waited for.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify, RwLock, RwLockReadGuard};
 use tokio::time::Instant;
 
@@ -191,6 +193,58 @@ struct InitialIndexState {
     result: Option<Result<(), String>>,
 }
 
+/// How far one first index has come. `sync_status` and the daemon status
+/// report it, so an agent can follow a first index that no tool call waits for.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FirstIndexPhase {
+    /// `index_codebase` has not yet registered a codebase for the checkout.
+    Registering,
+    /// The codebase exists. The scan and the upload run, or wait for a permit.
+    Syncing,
+    /// The upload is done and the server embeds the files. `job_id` names the
+    /// server job when the coordinator has recorded it.
+    Embedding { job_id: Option<String> },
+    /// The server embedded every file. Retrieval serves this index.
+    Ready,
+    /// The first index ended without a usable index. Another `index_codebase`
+    /// call retries it.
+    Failed { reason: String },
+}
+
+impl FirstIndexPhase {
+    /// The phase of a first index, from one snapshot of its gate.
+    ///
+    /// `last_job_id` is the coordinator's last recorded job. Once the upload is
+    /// done, that job is the embedding job of this first index.
+    fn of(state: &InitialIndexState, last_job_id: Option<&str>) -> Self {
+        match &state.result {
+            Some(Ok(())) => Self::Ready,
+            Some(Err(reason)) => Self::Failed {
+                reason: reason.clone(),
+            },
+            None if state.codebase_id.is_none() => Self::Registering,
+            None if !state.polling => Self::Syncing,
+            None => Self::Embedding {
+                job_id: last_job_id.map(str::to_string),
+            },
+        }
+    }
+}
+
+impl fmt::Display for FirstIndexPhase {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Registering => formatter.write_str("registering"),
+            Self::Syncing => formatter.write_str("syncing"),
+            Self::Embedding { job_id: Some(id) } => write!(formatter, "embedding (job {id})"),
+            Self::Embedding { job_id: None } => formatter.write_str("embedding"),
+            Self::Ready => formatter.write_str("ready"),
+            Self::Failed { reason } => write!(formatter, "failed — {reason}"),
+        }
+    }
+}
+
 impl InitialIndexGate {
     pub(crate) fn pending() -> Self {
         Self {
@@ -212,8 +266,9 @@ impl InitialIndexGate {
     /// Take responsibility for registering this first index's codebase.
     ///
     /// Exactly one caller is answered `true` for one gate. Every other caller
-    /// waits, so one explicit `index_codebase` on a checkout registers one
-    /// codebase however many callers ask at once.
+    /// reports the first index as already in progress, so one explicit
+    /// `index_codebase` on a checkout registers one codebase however many
+    /// callers ask at once.
     pub(crate) async fn claim_registration(&self) -> bool {
         let mut state = self.state.lock().await;
         if state.registering {
@@ -249,6 +304,18 @@ impl InitialIndexGate {
     /// caller already reported.
     pub(crate) async fn outcome(&self) -> Option<Result<(), String>> {
         self.state.lock().await.result.clone()
+    }
+
+    /// The phase of this first index now. Never waits.
+    pub(crate) async fn phase(&self, last_job_id: Option<&str>) -> FirstIndexPhase {
+        let state = self.state.lock().await;
+        FirstIndexPhase::of(&state, last_job_id)
+    }
+
+    /// The codebase that `index_codebase` registered for this first index, if
+    /// it has registered one. Never waits, unlike [`Self::registered_codebase`].
+    pub(crate) async fn codebase(&self) -> Option<String> {
+        self.state.lock().await.codebase_id.clone()
     }
 
     /// Wait until the first index has a codebase, or until it ends without one.

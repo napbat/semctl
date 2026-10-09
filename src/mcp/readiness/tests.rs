@@ -8,7 +8,10 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use super::{FIRST_INDEX_WAIT, NotReady, ready_for_codebases};
+use super::{
+    FIRST_INDEX_WAIT, FirstIndexPhase, InitialIndexGate, InitialIndexState, NotReady,
+    ready_for_codebases,
+};
 use crate::client::Client;
 use crate::mcp::CallBudget;
 use crate::mcp::tests::{first_index, server};
@@ -182,4 +185,117 @@ async fn a_scoped_wait_serves_a_finished_index_and_reports_a_failed_one() {
             "initial index failed — embedding failed".into()
         ))
     );
+}
+
+fn snapshot(
+    codebase: Option<&str>,
+    polling: bool,
+    result: Option<Result<(), String>>,
+) -> InitialIndexState {
+    InitialIndexState {
+        registering: true,
+        polling,
+        codebase_id: codebase.map(str::to_string),
+        result,
+    }
+}
+
+fn embedding(job: Option<&str>) -> FirstIndexPhase {
+    FirstIndexPhase::Embedding {
+        job_id: job.map(str::to_string),
+    }
+}
+
+fn failed(reason: &str) -> FirstIndexPhase {
+    FirstIndexPhase::Failed {
+        reason: reason.to_string(),
+    }
+}
+
+/// The phase is a pure function of one gate snapshot and the coordinator's
+/// last job, so each row below is one state that a first index can be in.
+#[test]
+fn each_gate_state_maps_to_one_phase() {
+    let cases = [
+        // No codebase yet, whether or not a caller claimed the registration.
+        (
+            InitialIndexState::default(),
+            None,
+            FirstIndexPhase::Registering,
+        ),
+        (
+            snapshot(None, false, None),
+            None,
+            FirstIndexPhase::Registering,
+        ),
+        // A codebase and no poll: the scan and the upload.
+        (
+            snapshot(Some("A"), false, None),
+            None,
+            FirstIndexPhase::Syncing,
+        ),
+        // A job of an earlier attempt is not the job of this upload.
+        (
+            snapshot(Some("A"), false, None),
+            Some("earlier-job"),
+            FirstIndexPhase::Syncing,
+        ),
+        // A poll claimed: the server embeds the files.
+        (
+            snapshot(Some("A"), true, None),
+            Some("job-1"),
+            embedding(Some("job-1")),
+        ),
+        (snapshot(Some("A"), true, None), None, embedding(None)),
+        // A result ends the first index, whatever the other fields say.
+        (
+            snapshot(Some("A"), true, Some(Ok(()))),
+            Some("job-1"),
+            FirstIndexPhase::Ready,
+        ),
+        (
+            snapshot(None, false, Some(Err("registration failed".into()))),
+            None,
+            failed("registration failed"),
+        ),
+        (
+            snapshot(Some("A"), true, Some(Err("embedding failed".into()))),
+            Some("job-1"),
+            failed("embedding failed"),
+        ),
+    ];
+
+    for (state, last_job_id, expected) in cases {
+        assert_eq!(FirstIndexPhase::of(&state, last_job_id), expected);
+    }
+}
+
+#[tokio::test]
+async fn a_gate_reports_each_phase_as_the_first_index_advances() {
+    let gate = InitialIndexGate::pending();
+    assert_eq!(gate.phase(None).await, FirstIndexPhase::Registering);
+    assert_eq!(gate.codebase().await, None);
+
+    gate.register_codebase("A".into()).await;
+    assert_eq!(gate.phase(None).await, FirstIndexPhase::Syncing);
+    assert_eq!(gate.codebase().await.as_deref(), Some("A"));
+
+    assert!(gate.claim_poll().await);
+    assert_eq!(gate.phase(Some("job-1")).await, embedding(Some("job-1")));
+
+    gate.finish(Ok(())).await;
+    assert_eq!(gate.phase(Some("job-1")).await, FirstIndexPhase::Ready);
+}
+
+/// The phase never waits. A tool call that asks for it while the first index
+/// runs must come back at once.
+#[tokio::test(start_paused = true)]
+async fn asking_for_the_phase_does_not_wait_for_the_first_index() {
+    let gate = InitialIndexGate::pending();
+
+    let phase = tokio::time::timeout(Duration::from_millis(1), gate.phase(None))
+        .await
+        .expect("the phase is read without waiting");
+
+    assert_eq!(phase, FirstIndexPhase::Registering);
 }

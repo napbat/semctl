@@ -1,18 +1,31 @@
 //! The explicit first index behind the `index_codebase` tool.
 //!
-//! The tool registers a checkout, hands it to the engine, and reports through
-//! the checkout's first-index gate. Retrieval tools wait on that same gate.
+//! The tool registers a checkout, hands it to the engine, and returns as soon
+//! as the codebase exists. The first index then runs in the checkout's
+//! coordinator, so no `index_codebase` call waits for it. Retrieval tools wait
+//! on the checkout's first-index gate, and `sync_status` reports its phase.
 
 use std::{
+    future::Future,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
+use super::readiness::FirstIndexPhase;
 use super::tool_types::IndexCodebaseArgs;
 use super::{
     CallBudget, FailureKind, InitialIndexGate, McpServer, ToolError, canonical_directory,
     initial_gate_for_path,
 };
+use crate::client::Client;
+
+/// What every report of a running first index ends with. The agent can follow
+/// the first index through `sync_status`, and it can use its own tools until
+/// retrieval serves the new index.
+const FOLLOW_PROGRESS: &str = "retrieval tools for this path report that the first index is \
+     still running until it completes\n\
+     call sync_status every 10 to 15 seconds to follow progress, and use local Read/Grep \
+     meanwhile";
 
 impl McpServer {
     /// Index the checkout that `args` names, or the launch checkout.
@@ -32,21 +45,34 @@ impl McpServer {
         // later launches from `repo` incorrectly look unindexed.
         let dir = crate::codebase::working_copy_root(&dir).await;
 
-        // A concurrent or recent first-index call owns the gate. Await it
-        // rather than queueing another full upload. A gate that FAILED is not
-        // awaited: it falls through below, where the engine replaces it with a
-        // fresh one, so a failed first index stays retryable while a partial
-        // one can never be reported as ready.
-        if let Some(gate) = initial_gate_for_path(&self.shared.leases, &dir).await
-            && !matches!(gate.outcome().await, Some(Err(_)))
-        {
-            return first_index_report(gate.wait().await, &dir, None);
+        if let Some(report) = self.earlier_first_index(&dir).await {
+            return report;
         }
-
         if let Some(started) = self.resume_recorded_index(&dir, budget).await? {
             return Ok(started);
         }
-        self.start_first_index(&dir).await
+        self.start_first_index(&dir, ensure_codebase).await
+    }
+
+    /// The report of a first index that an earlier call already owns on `dir`,
+    /// or `None` when this call must start one.
+    ///
+    /// A concurrent or recent first-index call owns the gate. Report it rather
+    /// than queue another full upload, and never wait for it. A gate that
+    /// FAILED is not reported: it falls through, where the engine replaces it
+    /// with a fresh one, so a failed first index stays retryable while a
+    /// partial one can never be reported as ready.
+    async fn earlier_first_index(&self, dir: &Path) -> Option<Result<String, ToolError>> {
+        let gate = initial_gate_for_path(&self.shared.leases, dir).await?;
+        let phase = gate.phase(None).await;
+        if matches!(phase, FirstIndexPhase::Failed { .. }) {
+            return None;
+        }
+        Some(first_index_report(
+            &phase,
+            dir,
+            gate.codebase().await.as_deref(),
+        ))
     }
 
     /// Start the background sync and the watcher for a checkout that already
@@ -84,8 +110,19 @@ impl McpServer {
         )))
     }
 
-    /// Register the checkout as a new codebase and wait for its first index.
-    async fn start_first_index(&self, dir: &Path) -> Result<String, ToolError> {
+    /// Register the checkout as a new codebase, and return once the codebase
+    /// exists. The first index continues in the checkout's coordinator.
+    ///
+    /// `ensure` finds or creates the codebase of the checkout. It is a
+    /// parameter so a test can register without a server.
+    async fn start_first_index<F>(
+        &self,
+        dir: &Path,
+        ensure: impl FnOnce(Client, PathBuf) -> F,
+    ) -> Result<String, ToolError>
+    where
+        F: Future<Output = anyhow::Result<String>> + Send + 'static,
+    {
         // Claim the checkout and its gate before anything is registered on the
         // server. The coordinator waits for the codebase this call registers
         // instead of registering one of its own, so one first index creates one
@@ -109,10 +146,16 @@ impl McpServer {
                 )
             })?;
         if !gate.claim_registration().await {
-            return first_index_report(gate.wait().await, dir, None);
+            // Another call registers this codebase and owns the first index.
+            return first_index_report(
+                &gate.phase(None).await,
+                dir,
+                gate.codebase().await.as_deref(),
+            );
         }
 
-        let id = register_codebase(&self.shared.base, &gate, dir).await?;
+        let registering = ensure(self.shared.base.clone(), dir.to_path_buf());
+        let id = register_codebase(&gate, dir, registering).await?;
         let client = self
             .shared
             .base
@@ -122,28 +165,31 @@ impl McpServer {
         if !self.shared.pinned && self.dir().await == dir {
             *self.shared.bound.lock().await = Some(client.clone());
         }
-        first_index_report(gate.wait().await, dir, Some(&id))
+        Ok(running_report("first index started", dir, Some(&id)))
     }
 }
 
-/// Register `dir` on the server and report the result to `gate`.
+/// Find or create the codebase of `dir`. `base` has no deadline, because the
+/// registration outlives the call that asked for it.
+async fn ensure_codebase(base: Client, dir: PathBuf) -> anyhow::Result<String> {
+    crate::codebase::ensure(&base, &dir).await
+}
+
+/// Run `ensure` and report its result to `gate`.
 ///
 /// The registration runs in a task of its own. The call deadline can drop the
 /// future of the tool while the request is in flight, and a gate that was
 /// claimed but never finished would hold every later call on this path. The
-/// task reports to the gate whatever happens to the call. It uses `base`
-/// without a deadline, because it outlives the call.
+/// task reports to the gate whatever happens to the call.
 async fn register_codebase(
-    base: &crate::client::Client,
     gate: &Arc<InitialIndexGate>,
     dir: &Path,
+    ensure: impl Future<Output = anyhow::Result<String>> + Send + 'static,
 ) -> Result<String, ToolError> {
     let registration = tokio::spawn({
-        let base = base.clone();
-        let dir = dir.to_path_buf();
         let gate = Arc::clone(gate);
         async move {
-            match crate::codebase::ensure(&base, &dir).await {
+            match ensure.await {
                 Ok(id) => {
                     gate.register_codebase(id.clone()).await;
                     Ok(id)
@@ -169,30 +215,54 @@ async fn register_codebase(
     }
 }
 
-/// The tool's answer for the result of a first index. `codebase` names the
-/// codebase when this call registered it.
+/// The `codebase <id>` line of a report, or nothing when the codebase is not
+/// known.
+fn codebase_line(codebase: Option<&str>) -> String {
+    codebase.map_or_else(String::new, |id| format!("codebase {id}\n"))
+}
+
+/// The report of a first index that is running. `headline` says whether this
+/// call started it or found it.
+fn running_report(headline: &str, dir: &Path, codebase: Option<&str>) -> String {
+    format!(
+        "{headline}\n{}path {}\n{FOLLOW_PROGRESS}",
+        codebase_line(codebase),
+        dir.display()
+    )
+}
+
+/// The tool's answer for a first index that another call owns. `codebase` names
+/// the codebase when the gate knows it.
 fn first_index_report(
-    outcome: Result<(), String>,
+    phase: &FirstIndexPhase,
     dir: &Path,
     codebase: Option<&str>,
 ) -> Result<String, ToolError> {
-    let path = dir.display();
-    match (outcome, codebase) {
-        (Ok(()), None) => Ok(format!(
-            "initial indexing complete\npath {path}\nretrieval tools are now available"
+    match phase {
+        FirstIndexPhase::Ready => Ok(format!(
+            "first index complete\n{}path {}\nretrieval tools are available",
+            codebase_line(codebase),
+            dir.display()
         )),
-        (Ok(()), Some(id)) => Ok(format!(
-            "initial indexing complete\ncodebase {id}\npath {path}\nretrieval tools are now available"
-        )),
-        (Err(e), None) => Err(ToolError::new(
-            "index_codebase",
-            FailureKind::IndexFailed,
-            format!("initial indexing failed for {path}: {e}"),
-        )),
-        (Err(e), Some(id)) => Err(ToolError::new(
-            "index_codebase",
-            FailureKind::IndexFailed,
-            format!("initial indexing failed for {path} (codebase {id}): {e}"),
+        FirstIndexPhase::Failed { reason } => {
+            let path = dir.display();
+            let detail = match codebase {
+                Some(id) => format!("first index failed for {path} (codebase {id}): {reason}"),
+                None => format!("first index failed for {path}: {reason}"),
+            };
+            Err(ToolError::new(
+                "index_codebase",
+                FailureKind::IndexFailed,
+                detail,
+            ))
+        }
+        running => Ok(running_report(
+            &format!("first index already in progress ({running})"),
+            dir,
+            codebase,
         )),
     }
 }
+
+#[cfg(test)]
+mod tests;

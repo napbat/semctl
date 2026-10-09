@@ -48,7 +48,7 @@ use super::registry::CheckoutKey;
 use super::scheduler;
 use super::watch_hub::{WatchBatch, WatchRegistration, can_change_tree};
 use crate::client::{self, Client};
-use crate::mcp::readiness::InitialIndexGate;
+use crate::mcp::readiness::{FirstIndexPhase, InitialIndexGate};
 use crate::sync::policy::{SourcePolicy, event_may_affect_policy};
 use crate::sync::{self, LastJob, SyncCache, SyncLimits, SyncOutcome, blocking};
 
@@ -199,13 +199,17 @@ pub(crate) struct CoordinatorStatus {
     pub(crate) trigger_overflow: bool,
     pub(crate) last_outcome: Option<String>,
     pub(crate) last_error: Option<String>,
+    /// The phase of this checkout's first index. `None` when the checkout has
+    /// no first-index gate, and for a daemon that predates the field.
+    #[serde(default)]
+    pub(crate) first_index: Option<FirstIndexPhase>,
 }
 
 impl std::fmt::Display for CoordinatorStatus {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "root {} codebase {} leases {} watcher {} job {} running {} pending {}{} outcome {} error {}",
+            "root {} codebase {} leases {} watcher {} job {} running {} first index {} pending {}{} outcome {} error {}",
             self.root.display(),
             self.codebase_id.as_deref().unwrap_or("(unbound)"),
             self.leases,
@@ -215,6 +219,9 @@ impl std::fmt::Display for CoordinatorStatus {
             },
             self.last_job_id.as_deref().unwrap_or("(none)"),
             self.running,
+            self.first_index
+                .as_ref()
+                .map_or_else(|| "(none)".to_string(), ToString::to_string),
             self.pending_triggers,
             if self.trigger_overflow {
                 " (overflowed)"
@@ -394,6 +401,11 @@ impl CheckoutCoordinator {
             .await
             .as_ref()
             .map(|job| job.job_id.clone());
+        let first_index = if let Some(gate) = self.gate().await {
+            Some(gate.phase(last_job_id.as_deref()).await)
+        } else {
+            None
+        };
         let run = self.run.lock().await;
         CoordinatorStatus {
             root: self.root.clone(),
@@ -402,6 +414,7 @@ impl CheckoutCoordinator {
             watcher: self.watcher_state(),
             last_job_id,
             running: run.running,
+            first_index,
             pending_triggers: self.triggers.max_capacity() - self.triggers.capacity(),
             trigger_overflow: self.overflow.load(Ordering::Acquire),
             last_outcome: run.last_outcome.clone(),

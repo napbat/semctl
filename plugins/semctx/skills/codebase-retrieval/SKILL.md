@@ -45,11 +45,14 @@ for the rest of the MCP session. A previously indexed repo already has consent
 for retrieval and watcher activation, so use it without asking again; that consent
 does not authorize edits outside the user's requested repository set. Only when a
 repo has never been indexed should you tell the user and call `index_codebase`
-after explicit opt-in. That first-ever index is gated:
-retrieval/catalog/graph tools never serve a partial index. They wait at most 5
-seconds, then fail with a "still running" error. Use `sync_status` to follow
-progress and local Read/Grep until the index completes. Later re-syncs do not
-block use of the last complete index.
+after explicit opt-in. That first-ever index runs in the background:
+`index_codebase` returns at once and never waits for embedding. Retrieval,
+catalog, and graph tools never serve a partial index. They wait at most 5
+seconds, then fail with a "still running" error. Call `sync_status` every 10 to
+15 seconds to follow the first-index phase (registering, syncing, embedding,
+ready, or failed), and use local Read/Grep meanwhile. If the phase is failed,
+call `index_codebase` for the same path to retry. Later re-syncs do not block
+use of the last complete index.
 
 ## Rules
 
@@ -85,9 +88,13 @@ block use of the last complete index.
 
 ## Degraded states — read the signals, don't guess
 
-- Empty results right after attach → `sync_status`: `queued` / `running`
-  means the index is still building; retry shortly instead of concluding the
-  repo isn't indexed.
+- Empty results right after attach → `sync_status`: a first-index phase of
+  registering, syncing, or embedding, or a job that is `queued` / `running`,
+  means the index is still building; check again in 10 to 15 seconds instead of
+  concluding the repo isn't indexed.
+- A tool fails → the error ends with a `next:` line. Follow it. Retry once only
+  when it says the call is retryable. Otherwise use local Read/Grep for that
+  request. Do not repeat the same failing call in a loop.
 - A hit flagged `⚠ stale (edited since indexed)`, or a freshness footer →
   `Read` that file for current bytes. The MCP server auto-syncs edits
   (filesystem watcher + periodic re-sync); do not tell the user to run

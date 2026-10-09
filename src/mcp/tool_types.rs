@@ -456,7 +456,7 @@ pub struct ListFilesArgs {
 pub struct IndexCodebaseArgs {
     /// Local directory to register and index. Omit for the launch/current
     /// directory. Calling this tool is the explicit indexing opt-in; agents must
-    /// ask the user before calling it. A first-ever index waits for embedding to
-    /// complete before retrieval tools are released.
+    /// ask the user before calling it. A first-ever index runs in the
+    /// background: the call returns at once, and `sync_status` reports progress.
     pub path: Option<String>,
 }

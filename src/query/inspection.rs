@@ -7,6 +7,7 @@ use super::render::{
     truncation_note,
 };
 use super::{Client, ToolError, api, bound_codebase, urlencode};
+use crate::mcp::readiness::FirstIndexPhase;
 
 pub(super) const FILES_PAGE_MAX: u32 = 1000;
 
@@ -156,10 +157,14 @@ pub async fn list_files(
 /// The catalog totals are deliberately independent of the latest job: a no-op
 /// sync has a 0-file plan even when the codebase already contains thousands of
 /// indexed files.
+///
+/// `first_index` is the phase of the checkout's first index. No tool call waits
+/// for a first index, so this line is how an agent follows it.
 pub async fn sync_status(
     client: &Client,
     job_id: Option<&str>,
     local_watch_active: bool,
+    first_index: Option<&FirstIndexPhase>,
 ) -> Result<String, ToolError> {
     let codebase_id = bound_codebase(client, "sync_status")?;
     let totals = catalog_totals(client, codebase_id).await;
@@ -178,8 +183,12 @@ pub async fn sync_status(
     } else {
         "not active (no local checkout selected)"
     };
-    let mut out =
-        format!("codebase {codebase_id}\nlocal checkout watch: {watch}\ntotal indexed state:");
+    let mut out = format!("codebase {codebase_id}");
+    if let Some(phase) = first_index {
+        write!(out, "\n{}", first_index_line(phase)).expect("writing to a String cannot fail");
+    }
+    write!(out, "\nlocal checkout watch: {watch}\ntotal indexed state:")
+        .expect("writing to a String cannot fail");
     match totals {
         Ok((files, bytes)) => {
             write!(
@@ -219,6 +228,17 @@ pub async fn sync_status(
         ),
     }
     Ok(out)
+}
+
+/// The `first index:` line of `sync_status`. A failed first index also names
+/// the call that retries it.
+fn first_index_line(phase: &FirstIndexPhase) -> String {
+    match phase {
+        FirstIndexPhase::Failed { .. } => {
+            format!("first index: {phase}; call index_codebase to retry")
+        }
+        _ => format!("first index: {phase}"),
+    }
 }
 
 async fn catalog_totals(client: &Client, codebase_id: &str) -> anyhow::Result<(u32, i64)> {
@@ -470,3 +490,6 @@ pub async fn list_domains(client: &Client) -> Result<String, ToolError> {
         Err(e) => Err(ToolError::from_client("list_domains", &e)),
     }
 }
+
+#[cfg(test)]
+mod tests;

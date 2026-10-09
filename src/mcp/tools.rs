@@ -762,6 +762,9 @@ impl McpServer {
                 .as_ref()
                 .and_then(|status| status.last_job_id.as_deref()),
             watching,
+            status
+                .as_ref()
+                .and_then(|status| status.first_index.as_ref()),
         )
         .await
     }

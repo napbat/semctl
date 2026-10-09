@@ -18,7 +18,7 @@ use super::{
 };
 use crate::client::{Client, api};
 use crate::engine::registry::CheckoutKey;
-use crate::mcp::readiness::InitialIndexGate;
+use crate::mcp::readiness::{FirstIndexPhase, InitialIndexGate};
 use crate::sync::policy;
 
 /// Somewhere no test writes, so a coordinator that starts reading the
@@ -287,6 +287,82 @@ async fn status_reports_the_last_job_and_the_watcher_state() {
     assert!(!status.running);
     assert!(status.last_error.is_none());
     assert!(status.to_string().contains("job job"));
+}
+
+/// Poll the coordinator's status until its first index reaches `expected`.
+async fn wait_for_phase(coordinator: &CheckoutCoordinator, expected: FirstIndexPhase) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while coordinator.status().await.first_index.as_ref() != Some(&expected) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the first index must reach {expected}"));
+}
+
+/// Nothing waits for a first index any more, so status is the only way to
+/// follow it. Each phase comes from the gate and from the last recorded job.
+#[tokio::test]
+async fn status_follows_a_first_index_through_its_phases() {
+    let (reconciler, mut runs) = CountingReconciler::new();
+    let gate = Arc::new(InitialIndexGate::pending());
+    let (coordinator, task) = build(reconciler, Some(gate.clone()), Some(0)).await;
+    assert_eq!(
+        coordinator.status().await.first_index,
+        Some(FirstIndexPhase::Registering)
+    );
+    task.spawn();
+    coordinator.trigger(Trigger::Startup);
+
+    gate.register_codebase("codebase".to_string()).await;
+    runs.next_start().await;
+    wait_for_phase(&coordinator, FirstIndexPhase::Syncing).await;
+
+    runs.release(1);
+    let embedding = FirstIndexPhase::Embedding {
+        job_id: Some("job".to_string()),
+    };
+    wait_for_phase(&coordinator, embedding.clone()).await;
+    assert!(
+        coordinator
+            .status()
+            .await
+            .to_string()
+            .contains("first index embedding (job job)")
+    );
+
+    runs.release_polls(1);
+    wait_for_phase(&coordinator, FirstIndexPhase::Ready).await;
+}
+
+/// A checkout that no `index_codebase` call claimed has no first index to
+/// report.
+#[tokio::test]
+async fn status_has_no_first_index_phase_without_a_gate() {
+    let (reconciler, _runs) = CountingReconciler::new();
+    let (coordinator, _task) = coordinator(reconciler).await;
+
+    let status = coordinator.status().await;
+
+    assert_eq!(status.first_index, None);
+    assert!(status.to_string().contains("first index (none)"));
+}
+
+/// The daemon status crosses the process boundary. A daemon that predates the
+/// first-index field sends none, and the reader must still decode its status.
+#[test]
+fn a_status_without_a_first_index_field_decodes_as_none() {
+    let old = serde_json::json!({
+        "root": "/work/checkout", "codebase_id": "codebase", "leases": 1,
+        "watcher": "active", "last_job_id": null, "running": false,
+        "pending_triggers": 0, "trigger_overflow": false,
+        "last_outcome": null, "last_error": null,
+    });
+
+    let status: super::CoordinatorStatus =
+        serde_json::from_value(old).expect("decode a status from an older daemon");
+
+    assert_eq!(status.first_index, None);
 }
 
 /// A second reconcile during embedding sees the same pending gate. It must not

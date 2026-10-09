@@ -130,6 +130,12 @@ most 5 seconds for a first index before it reports that the index is still
 running. The edit actions have no deadline: a limit that fired after the files
 changed would report a failed edit that was applied.
 
+The `index_codebase` tool does not wait for the first index. It registers the
+codebase, starts the scan and upload in the background, and returns at once with
+the codebase id and the path. The `sync_status` tool then reports the first-index
+phase: registering, syncing, embedding, ready, or failed. `semctl daemon status`
+reports the same phase for each checkout.
+
 ### Coming from the old `semctx` CLI
 
 The first `semctl install` automatically retires a previous `semctx` install: it
@@ -175,7 +181,7 @@ A daemon started by hand skips the job check, and clients attach to it.
 Two commands inspect and end a running daemon:
 
 ```sh
-semctl daemon status        # version, pid, uptime, sessions, permits, checkouts
+semctl daemon status        # version, pid, uptime, sessions, permits, checkouts and their first-index phase
 semctl daemon status --json # the same facts as one JSON object
 semctl daemon stop          # end every session and exit
 ```
