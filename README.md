@@ -136,12 +136,21 @@ becomes a byte pump between the host and the daemon.
 | `off` | Serve the session in this process, as every earlier version did. |
 | `require` | Attach to the daemon, start one when none is running, and exit with status 1 when that fails. |
 
-On Windows, automatic startup must detach the daemon from every job object
-before it opens the shared endpoint. A restrictive host job or ancestor job
-can prevent detachment. In that case, `auto` serves this session in its own
-process and `require` reports the startup failure. Clients in a restrictive
-job can still attach to an existing daemon. Closing one client's job must not
-end other clients' sessions.
+On Windows, a daemon that `semctl mcp` starts must belong to no job object
+before it opens the shared endpoint. The client asks Windows to release the
+daemon from the client's jobs. A job that forbids breakaway blocks that
+request, and an ancestor job can keep the daemon even when the request
+succeeds. The daemon rejects membership in any job, including a job that would
+not end the daemon, because Windows offers no simple way to read an ancestor
+job's limits. When the daemon still belongs to a job, `auto` serves this
+session in its own process and `require` reports the startup failure. Clients
+in a job can still attach to an existing daemon. Closing one client's job must
+not end other clients' sessions.
+
+Some hosts run every process in a job that forbids breakaway. To share one
+daemon there, run `semctl daemon run` yourself as the same user and with the
+same configuration as the clients, from a process whose lifetime you control.
+A daemon started by hand skips the job check, and clients attach to it.
 
 Two commands inspect and end a running daemon:
 
@@ -211,10 +220,13 @@ Secrets travel only inside the handshake body: no token appears in an endpoint
 name, a command argument, a log line, or status output.
 
 The full shared-daemon lifecycle suite is Unix-only. Native Windows regressions
-cover restrictive and nested job startup, standalone fallback, attachment to
-an existing daemon, console-free Git probes, and source-policy syncing.
-Windows named-pipe startup, MCP initialization, tool listing/calls, and client
-EOF have also been smoke-tested. The macOS daemon path remains compile-checked without runtime
+cover rejected startup in breakaway-denied and nested jobs, standalone
+fallback, attachment to an existing daemon, console-free Git probes, and
+source-policy syncing. Startup that survives its client's job needs a process
+outside Cargo's job, so that case runs only from the test binary directly (see
+`tests/daemon_windows_jobs.rs`). Windows named-pipe startup, MCP
+initialization, tool listing/calls, and client EOF have also been
+smoke-tested. The macOS daemon path remains compile-checked without runtime
 measurements.
 
 ## Updating

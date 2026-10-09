@@ -3,6 +3,20 @@
 //! Each test assigns only its helper subprocess to its own kill-on-close job.
 //! The helper waits for assignment before it starts any semctl process. Cargo
 //! and the integration-test parent never enter that job.
+//!
+//! Automatic startup can fail in two places, and each rejecting case asserts
+//! its own: `CreateProcess` refuses breakaway, or breakaway succeeds and the
+//! daemon refuses to serve inside an ancestor job.
+//!
+//! The successful startup case needs a test process outside every job that
+//! forbids breakaway. On Windows, Cargo runs every test inside such a job, so
+//! that case is ignored under `cargo test`. Run it locally from the test
+//! binary directly:
+//!
+//! ```text
+//! cargo test --locked --test daemon_windows_jobs --no-run
+//! target\debug\deps\daemon_windows_jobs-<hash>.exe --ignored --exact a_daemon_started_in_a_breakaway_job_outlives_that_job
+//! ```
 
 #![cfg(windows)]
 
@@ -17,9 +31,12 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+    AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JobObjectExtendedLimitInformation, SetInformationJobObject,
+};
+use windows_sys::Win32::System::Threading::{
+    CREATE_BREAKAWAY_FROM_JOB, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
 const DEAD_SERVER: &str = "http://127.0.0.1:9";
@@ -28,6 +45,12 @@ const POLL_STEP: Duration = Duration::from_millis(25);
 const HELPER_TEST: &str = "job_client_helper";
 const ROOT_VAR: &str = "SEMCTL_WINDOWS_JOB_TEST_ROOT";
 const CASE_VAR: &str = "SEMCTL_WINDOWS_JOB_TEST_CASE";
+/// The client error when `CreateProcess` refuses `CREATE_BREAKAWAY_FROM_JOB`.
+const SPAWN_REFUSED: &str = "start a detached semctl daemon";
+/// The client error when the spawned daemon exits before it serves.
+const DAEMON_EXITED: &str = "before accepting a connection";
+/// The daemon log line when the daemon refuses to serve inside a job.
+const DAEMON_IN_JOB: &str = "cannot serve a shared daemon inside a Windows job";
 
 /// This handle is not inheritable and has no name. Closing its sole handle
 /// terminates all assigned processes, including a daemon started by old code.
@@ -217,6 +240,9 @@ async fn run_case(case: &str) {
     } else {
         None
     };
+    // A daemon that a client starts in this case leaves the job on purpose.
+    let _stop = (case == "breakaway").then(|| StopDaemon(root));
+
     if let Some(daemon) = &external {
         let deadline = Instant::now() + TIMEOUT;
         loop {
@@ -232,7 +258,7 @@ async fn run_case(case: &str) {
         }
     }
 
-    let job = Job::new(false);
+    let job = Job::new(case == "breakaway");
     let inner = case.starts_with("nested-").then(|| Job::new(true));
     let mut command = Command::new(std::env::current_exe().expect("locate this test executable"));
     Endpoint::configure(&mut command, root);
@@ -254,21 +280,128 @@ async fn run_case(case: &str) {
     }
     std::fs::write(root.join("assigned"), b"assigned\n").expect("release the assigned helper");
     let status = helper.wait().await;
-    drop(inner);
-    drop(job);
     assert!(
         status.success(),
-        "job case {case} failed: {status}\n{}\n{}",
+        "job case {case} failed: {status}\n{}\n{}\nclient:\n{}",
         std::fs::read_to_string(root.join("helper.out")).unwrap_or_default(),
-        std::fs::read_to_string(root.join("helper.err")).unwrap_or_default()
+        std::fs::read_to_string(root.join("helper.err")).unwrap_or_default(),
+        std::fs::read_to_string(root.join("client.err")).unwrap_or_default()
     );
-    if let Some(daemon) = external.as_mut() {
-        let status = Endpoint::status(root)
-            .await
-            .expect("external daemon survives the client job");
+    // Query before the job closes: a daemon still in the job would die with it.
+    let started = if case == "breakaway" {
+        Some(daemon_outside(root, &job).await)
+    } else {
+        None
+    };
+    drop(inner);
+    drop(job);
+
+    if let Some(daemon) = &mut external {
+        let status = idle_status(root, "external daemon survives the client job").await;
         assert_eq!(status["pid"], daemon.0.id());
-        assert_eq!(status["sessions"], 0);
     }
+    if let Some(pid) = started {
+        let status = idle_status(root, "started daemon survives its client's job").await;
+        assert_eq!(status["pid"], pid);
+    }
+}
+
+/// Stop a daemon that a client started during a case. It left the test's
+/// job, so closing the job does not end it.
+struct StopDaemon<'a>(&'a Path);
+
+impl Drop for StopDaemon<'_> {
+    fn drop(&mut self) {
+        match Endpoint::command(self.0).args(["daemon", "stop"]).output() {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => eprintln!(
+                "started daemon cleanup: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(error) => eprintln!("started daemon cleanup: {error}"),
+        }
+    }
+}
+
+/// Return the pid of the daemon a client started, after proving that the
+/// daemon is outside that client's job.
+async fn daemon_outside(root: &Path, job: &Job) -> u64 {
+    let status = Endpoint::status(root)
+        .await
+        .expect("the started daemon answers while its client's job is open");
+    let pid = status["pid"]
+        .as_u64()
+        .expect("status reports the daemon pid");
+    let id = u32::try_from(pid).expect("a Windows process id fits a DWORD");
+    // SAFETY: plain query access to a process that just answered status.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, id) };
+    assert!(
+        !process.is_null(),
+        "open the started daemon: {}",
+        io::Error::last_os_error()
+    );
+    let mut in_job = 1;
+    // SAFETY: both handles are live, and the output points to a live BOOL.
+    let queried = unsafe { IsProcessInJob(process, job.0, &raw mut in_job) };
+    let error = io::Error::last_os_error();
+    // SAFETY: this function owns the handle it opened and closes it once.
+    unsafe { CloseHandle(process) };
+    assert_ne!(queried, 0, "query the started daemon's job: {error}");
+    assert_eq!(in_job, 0, "the started daemon is still in its client's job");
+    pid
+}
+
+/// Wait until the daemon answers with no session left.
+async fn idle_status(root: &Path, what: &str) -> Value {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let status = Endpoint::status(root).await.expect(what);
+        if status["sessions"] == 0 {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: sessions remain: {status}"
+        );
+        tokio::time::sleep(POLL_STEP).await;
+    }
+}
+
+/// Assert that a rejecting case failed in its own place and nowhere else.
+///
+/// `output` is the client's error text. A nested case must pass breakaway and
+/// then see its daemon refuse the ancestor job; any other case must see
+/// `CreateProcess` refuse breakaway, with no daemon started.
+fn assert_rejection(case: &str, output: &str) {
+    let spawn_refused = output.contains(SPAWN_REFUSED);
+    let daemon_exited = output.contains(DAEMON_EXITED);
+    if case.starts_with("nested-") {
+        assert!(
+            daemon_exited && !spawn_refused,
+            "breakaway must succeed and the daemon must exit: {output}"
+        );
+        let log = daemon_log(output);
+        assert!(
+            log.contains(DAEMON_IN_JOB),
+            "the daemon must report its job: {log}"
+        );
+    } else {
+        assert!(
+            spawn_refused && !daemon_exited,
+            "CreateProcess must refuse breakaway: {output}"
+        );
+    }
+}
+
+/// Read the daemon log that a startup failure names after `; see `.
+fn daemon_log(output: &str) -> String {
+    const SEE: &str = "; see ";
+    let start = output.find(SEE).expect("the failure names the daemon log") + SEE.len();
+    let length = output[start..]
+        .find(".log")
+        .expect("the daemon log path ends in .log")
+        + ".log".len();
+    std::fs::read_to_string(&output[start..start + length]).expect("read the daemon log")
 }
 
 async fn initialize(client: &mut tokio::process::Child) {
@@ -348,11 +481,55 @@ async fn require_reports_startup_failure_when_breakaway_leaves_a_restrictive_anc
 }
 
 #[tokio::test]
+#[ignore = "Cargo's job forbids breakaway; run the test binary directly"]
+async fn a_daemon_started_in_a_breakaway_job_outlives_that_job() {
+    assert_breakaway_possible();
+    run_case("breakaway").await;
+}
+
+/// Fail unless this test process can start a child outside every job.
+///
+/// Without this check, an environment that retains every child would make the
+/// success case fail for a reason unrelated to semctl.
+fn assert_breakaway_possible() {
+    use std::os::windows::process::CommandExt;
+
+    const HINT: &str = "this case needs a test process whose jobs allow breakaway; \
+                        Cargo's job does not, so run the test binary directly";
+    let child = Command::new("cmd.exe")
+        .args(["/d", "/q"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_BREAKAWAY_FROM_JOB)
+        .spawn()
+        .unwrap_or_else(|error| panic!("{HINT}: CreateProcess refused breakaway: {error}"));
+    // Dropping the fixture ends the probe even though it is outside any job.
+    let probe = OwnedProcess(child);
+    let mut in_job = 1;
+    // SAFETY: the child handle is live, a null job tests all job membership,
+    // and the output points to a live BOOL.
+    let queried =
+        unsafe { IsProcessInJob(probe.0.as_raw_handle(), ptr::null_mut(), &raw mut in_job) };
+    assert_ne!(
+        queried,
+        0,
+        "query the breakaway probe's job: {}",
+        io::Error::last_os_error()
+    );
+    assert_eq!(in_job, 0, "{HINT}: an ancestor job retained the probe");
+}
+
+#[tokio::test]
 #[ignore = "run only as the gated subprocess of an owning Windows job test"]
 async fn job_client_helper() {
-    let root =
-        PathBuf::from(std::env::var_os(ROOT_VAR).expect("the parent supplies an isolated root"));
-    let case = std::env::var(CASE_VAR).expect("the parent supplies the job-test case");
+    // `cargo test -- --include-ignored` also runs this helper. Without its
+    // parent it has no job and no isolated root, so it has nothing to test.
+    let (Some(root), Ok(case)) = (std::env::var_os(ROOT_VAR), std::env::var(CASE_VAR)) else {
+        eprintln!("skipped: {HELPER_TEST} runs only as the subprocess of a job test");
+        return;
+    };
+    let root = PathBuf::from(root);
     let deadline = Instant::now() + TIMEOUT;
     while !root.join("assigned").exists() {
         assert!(
@@ -393,13 +570,8 @@ async fn job_client_helper() {
             .expect("wait for require exit");
         assert_eq!(status.code(), Some(1));
         let error = std::fs::read_to_string(log_path).expect("read the require error");
-        assert!(
-            error.contains("requires the shared daemon")
-                && (error.contains("start a semctl daemon")
-                    || error.contains("detached")
-                    || error.contains("exited")),
-            "{error}"
-        );
+        assert!(error.contains("requires the shared daemon"), "{error}");
+        assert_rejection(&case, &error);
         assert!(
             Endpoint::status(&root).await.is_none(),
             "require must not publish a job-owned daemon"
@@ -417,11 +589,9 @@ async fn job_client_helper() {
                 log.contains("serving this session in this process"),
                 "{log}"
             );
+            assert_rejection(&case, &log);
         } else {
-            assert_eq!(
-                status.expect("the existing daemon still answers")["sessions"],
-                1
-            );
+            assert_eq!(status.expect("the shared daemon answers")["sessions"], 1);
         }
         drop(client.stdin.take());
         let status = tokio::time::timeout(TIMEOUT, client.wait())

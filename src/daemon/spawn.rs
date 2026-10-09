@@ -48,8 +48,8 @@ use windows_sys::Win32::System::Threading::{
 use crate::ipc::Endpoint;
 use crate::session::PER_SESSION_VARS;
 
-/// The subcommand that runs the daemon role.
-const DAEMON_ARGS: [&str; 2] = ["daemon", "run"];
+/// The subcommand that runs the daemon role, marked as started by a client.
+const DAEMON_ARGS: [&str; 3] = ["daemon", "run", "--require-detached"];
 
 /// Start a daemon for `endpoint`.
 ///
@@ -90,8 +90,6 @@ pub(crate) fn spawn_daemon(endpoint: &Endpoint) -> Result<Child> {
 fn command_for(program: &Path, working_dir: Option<&Path>) -> Command {
     let mut command = Command::new(program);
     command.args(DAEMON_ARGS);
-    #[cfg(windows)]
-    command.arg("--require-detached");
     for name in PER_SESSION_VARS {
         command.env_remove(name);
     }
@@ -178,9 +176,14 @@ fn shield_standard_handles() {
     }
 }
 
-/// Reject an automatically started daemon that still belongs to a Windows job.
+/// Reject an automatically started daemon that still belongs to any Windows job.
 ///
 /// A successful breakaway can leave a process in a restrictive ancestor job.
+/// The check covers every job, not only one that kills its processes on
+/// close: Windows offers no simple query for the limits of an ancestor job,
+/// so membership alone decides. A host that keeps every process in a job,
+/// such as a container, needs a daemon started by hand.
+///
 /// Run this check in the child before endpoint publication, not in the parent
 /// after spawning: another client could attach before a parent-side check.
 #[cfg(windows)]
@@ -196,8 +199,20 @@ pub(crate) fn ensure_detached() -> Result<()> {
     }
     anyhow::ensure!(
         in_job == 0,
-        "cannot serve a shared daemon inside a Windows job"
+        "cannot serve a shared daemon inside a Windows job; \
+         start `semctl daemon run` by hand to serve clients in this job"
     );
+    Ok(())
+}
+
+/// Unix has no job objects. [`detach`] already put the daemon in its own
+/// process group, so nothing else ties it to the client.
+#[cfg(unix)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "matches the fallible Windows check"
+)]
+pub(crate) fn ensure_detached() -> Result<()> {
     Ok(())
 }
 
@@ -215,11 +230,7 @@ mod tests {
 
         assert_eq!(command.get_program(), OsStr::new("/opt/semctl/bin/semctl"));
         let args: Vec<&OsStr> = command.get_args().collect();
-        let mut expected = DAEMON_ARGS.map(OsStr::new).to_vec();
-        if cfg!(windows) {
-            expected.push(OsStr::new("--require-detached"));
-        }
-        assert_eq!(args, expected);
+        assert_eq!(args, DAEMON_ARGS.map(OsStr::new).to_vec());
         assert_eq!(command.get_current_dir(), None);
     }
 
