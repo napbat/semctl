@@ -77,10 +77,12 @@ impl Host for ClaudeCode {
     }
 
     fn update(&self) -> Result<()> {
-        // Refresh the marketplace manifest from its git source first, so
-        // `plugin update` can see a new version / edited skill / hook / MCP
-        // config. Tolerate the marketplace refresh failing (offline, transient);
-        // `plugin update` then just no-ops on the cached manifest.
+        // `add` repairs a marketplace the user removed; it fails harmlessly
+        // when one is registered. Then refresh the manifest from its git source
+        // so `plugin update` can see a new version / edited skill / hook / MCP
+        // config. Tolerate the refresh failing (offline, transient); `plugin
+        // update` then just no-ops on the cached manifest.
+        let _ = claude(&["plugin", "marketplace", "add", MARKETPLACE_SLUG]);
         let _ = claude(&["plugin", "marketplace", "update", MARKETPLACE_NAME]);
         claude_checked(&["plugin", "update", PLUGIN, "--scope", "user"])
     }
@@ -226,7 +228,7 @@ impl Host for Codex {
     fn install(&self) -> Result<()> {
         // `marketplace add` errors if already registered; tolerate it, then force
         // a snapshot refresh with `upgrade` before installing the plugin.
-        let _ = codex(&["plugin", "marketplace", "add", CODEX_MARKETPLACE_SLUG]);
+        register_marketplace("codex", CODEX_MARKETPLACE_SLUG);
         let _ = codex(&["plugin", "marketplace", "upgrade"]);
         codex_checked(&["plugin", "add", CODEX_PLUGIN])?;
         codex_hook_trust_notice();
@@ -234,9 +236,11 @@ impl Host for Codex {
     }
 
     fn update(&self) -> Result<()> {
-        // Refresh the marketplace snapshot from git, then re-add to pick up a new
-        // version / edited skill / hook / MCP config (Codex has no `plugin
-        // update`; re-`add` reinstalls from the upgraded snapshot).
+        // Re-register a removed marketplace (tolerated when registered), refresh
+        // the snapshot from git, then re-add to pick up a new version / edited
+        // skill / hook / MCP config (Codex has no `plugin update`; re-`add`
+        // reinstalls from the upgraded snapshot).
+        register_marketplace("codex", CODEX_MARKETPLACE_SLUG);
         let _ = codex(&["plugin", "marketplace", "upgrade"]);
         codex_checked(&["plugin", "add", CODEX_PLUGIN])?;
         codex_hook_trust_notice();
@@ -338,12 +342,15 @@ impl Host for Omp {
     fn install(&self) -> Result<()> {
         // `marketplace add` rejects an existing source; tolerate it, then refresh
         // the catalog so a re-run always sees the current plugin version.
-        let _ = omp(&["plugin", "marketplace", "add", MARKETPLACE_SLUG]);
+        register_marketplace("omp", MARKETPLACE_SLUG);
         let _ = omp(&["plugin", "marketplace", "update", MARKETPLACE_NAME]);
         omp_checked(&["plugin", "install", PLUGIN, "--scope", "user"])
     }
 
     fn update(&self) -> Result<()> {
+        // A removed marketplace would fail the upgrade; `add` restores it and
+        // fails harmlessly when one is registered.
+        register_marketplace("omp", MARKETPLACE_SLUG);
         let _ = omp(&["plugin", "marketplace", "update", MARKETPLACE_NAME]);
         // OMP preserves a plugin's disabled state across upgrades. A checked
         // host is the desired active wiring, so repair that state first; the
@@ -362,6 +369,19 @@ impl Host for Omp {
              omp plugin install {PLUGIN} --scope user"
         ))
     }
+}
+
+/// Register the marketplace, best effort and without output. `add` fails when
+/// the marketplace is already registered, which is the normal case, so its
+/// error text would only alarm the user. A real problem shows in the next
+/// step, which is checked.
+fn register_marketplace(program: &str, slug: &str) {
+    let _ = tool_cmd(program)
+        .args(["plugin", "marketplace", "add", slug])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 fn omp(args: &[&str]) -> Result<std::process::ExitStatus> {
