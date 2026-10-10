@@ -57,7 +57,7 @@ semctl index        # register + sync the current repo for indexing
 | `semctl daemon status` / `stop`                       | Report or end the shared local daemon that serves the MCP sessions.                                                   |
 | `semctl install`                                      | Add/remove the editor/agent integrations.                                                                             |
 | `semctl uninstall`                                    | Reverse `install`: unwire the tools, remove from PATH, delete the binary (`--purge` also drops config + credentials). |
-| `semctl upgrade`                                      | Update the binary and refresh each installed editor/agent integration.                                                |
+| `semctl upgrade` / `update`                           | Update the binary and refresh each installed editor/agent integration.                                                |
 | `semctl auth login` / `logout` / `whoami` / `tenants` | Account & session.                                                                                                    |
 
 `semctl index` uploads the requested files in batches. A failed batch does not
