@@ -37,8 +37,14 @@ fn unindexed_startup_notice_requires_opt_in_and_names_the_tool() {
 fn indexed_orientation_keeps_discovery_signal_without_slugs() {
     let message = indexed_orientation();
     assert!(message.starts_with("This repository is indexed by semctl."));
-    assert!(message.contains("`search_codebase`"));
-    assert!(message.contains("repository discovery"));
+    for tool in [
+        "search_codebase",
+        "who_calls",
+        "call_path",
+        "implementations_of",
+    ] {
+        assert!(message.contains(&format!("`{tool}`")), "{tool}: {message}");
+    }
     assert!(message.contains("Omit `codebase` for this checkout"));
     assert!(message.contains("immutable codebase ID or local directory path"));
     assert!(!message.contains("indexed by semctl as"));

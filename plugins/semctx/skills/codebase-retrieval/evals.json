@@ -15,6 +15,22 @@
     },
     {
       "skills": ["codebase-retrieval"],
+      "query": "How does `query::search` reach `Client::send`?",
+      "expected_behavior": [
+        "Calls call_path from query::search to Client::send rather than grepping for call sites or reading files one by one",
+        "Reports the chain: query::search -> Client::post_read -> Client::send"
+      ]
+    },
+    {
+      "skills": ["codebase-retrieval"],
+      "query": "What implements the `Reconciler` trait?",
+      "expected_behavior": [
+        "Calls implementations_of for Reconciler rather than grepping for `impl Reconciler for`",
+        "Lists SyncReconciler, IdleReconciler, and the test CountingReconciler"
+      ]
+    },
+    {
+      "skills": ["codebase-retrieval"],
       "query": "Find every occurrence of `index_codebase` in this repo — all of them, including documentation, comments, tests, and string literals.",
       "expected_behavior": [
         "Uses the semctx grep tool, NOT find_references (which skips comments, strings, and repeat uses within a chunk)",

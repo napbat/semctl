@@ -61,9 +61,9 @@ re-syncs do not block use of the last complete index.
   missing evidence rather than reacquiring material already available.
 - Choose semctx for repository discovery, graph relationships, and broad indexed
   coverage. Batch independent exact lookups; avoid overlapping semantic queries.
-- Exact symbol, defined in this repo, in a graph language (Rust, C#, Go,
-  TypeScript/JS, C++) → symbol-graph tools (`find_definition` /
-  `find_references` / `who_calls`), not search.
+- A symbol defined in this repo, its callers, a call path, implementations, or
+  dependencies, in a graph language (Rust, C#, Go, TypeScript/JS, C++) → the
+  graph tool from the table above, not search or `grep`.
 - Use `grep` instead of `find_references` when you need EVERY occurrence:
   `find_references` returns every resolved code occurrence (including repeated
   same-line uses) but still skips strings, comments, markdown, and any symbol whose

@@ -414,14 +414,14 @@ async fn session_orientation_context(cli: &Cli, input: &HookInput) -> Option<Str
 }
 
 fn indexed_orientation() -> &'static str {
-    "This repository is indexed by semctl. Begin with relevant, fresh evidence \
-     already available in the conversation. Use the semctl MCP tools \
-     (`search_codebase`, `find_definition`, `find_references`, `who_calls`, `imports`) \
-     for repository discovery, unknown locations, cross-file relationships, symbol \
-     graphs, and broad indexed searches. Use local file tools for current bytes at a \
-     known path or range and for narrow, file-scoped checks. Omit `codebase` for this \
-     checkout; for another indexed checkout, pass its immutable codebase ID or local \
-     directory path — see the codebase-retrieval skill."
+    "This repository is indexed by semctl. Use fresh evidence already in the \
+     conversation first. For missing evidence: concept or unknown location → \
+     `search_codebase`; definition or uses → `find_definition` / `find_references`; \
+     callers → `who_calls`; how A reaches B → `call_path`; implementations → \
+     `implementations_of`; file dependencies → `imports`; repo-wide literal → `grep`. \
+     Local file tools fit current bytes at a known path. Omit `codebase` for this \
+     checkout; for another, pass its immutable codebase ID or local directory path. \
+     See the codebase-retrieval skill."
 }
 
 fn unindexed_notice(dir: &std::path::Path) -> String {
