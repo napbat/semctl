@@ -48,8 +48,8 @@ repo has never been indexed should you tell the user and call `index_codebase`
 after explicit opt-in. That first-ever index runs in the background:
 `index_codebase` returns at once and never waits for embedding. Retrieval,
 catalog, and graph tools never serve a partial index. They wait at most 5
-seconds, then fail with a "still running" error. Call `sync_status` every 10 to
-15 seconds to follow the first-index phase (registering, syncing, embedding,
+seconds, then fail with a "still running" error. Call `sync_status` every 60
+seconds to follow the first-index phase (registering, syncing, embedding,
 ready, or failed), and use local Read/Grep meanwhile. While the phase is
 syncing, the `current sync:` line shows how many files the upload has sent. If
 the phase is failed, call `index_codebase` for the same path to retry. Later
