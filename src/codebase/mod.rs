@@ -267,17 +267,26 @@ async fn find_by_slug(client: &Client, slug: &str) -> Result<Option<api::Codebas
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
+    use super::git::git_in;
     use super::working_copy_root;
+
+    /// `git init` in `dir`, isolated from the repository variables that a Git
+    /// hook exports to this test process.
+    async fn git_init(dir: &Path) {
+        let status = git_in(dir)
+            .args(["init", "--quiet"])
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success());
+    }
 
     #[tokio::test]
     async fn nested_git_directory_resolves_to_the_worktree_root() {
         let temp = tempfile::tempdir().unwrap();
-        let status = std::process::Command::new("git")
-            .args(["init", "--quiet"])
-            .current_dir(temp.path())
-            .status()
-            .unwrap();
-        assert!(status.success());
+        git_init(temp.path()).await;
         let nested = temp.path().join("src").join("nested");
         std::fs::create_dir_all(&nested).unwrap();
 
@@ -312,14 +321,7 @@ mod tests {
                 .path()
                 .join(std::ffi::OsString::from_vec(name.to_vec()));
             std::fs::create_dir(&root).unwrap();
-            assert!(
-                std::process::Command::new("git")
-                    .args(["init", "--quiet"])
-                    .current_dir(&root)
-                    .status()
-                    .unwrap()
-                    .success()
-            );
+            git_init(&root).await;
             let child = root.join("src");
             std::fs::create_dir(&child).unwrap();
             assert_eq!(
