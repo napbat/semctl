@@ -17,7 +17,7 @@ use tracing::{debug, info, warn};
 use super::blocking::Cancellation;
 use super::scan::PreparedFile;
 use super::{SyncLimits, SyncProgress, blocking, source, walker};
-use crate::client::{Client, ResponseError, api};
+use crate::client::{ApiFailure, Client, api};
 
 const UPLOAD_BATCH_BYTES: usize = 4 * 1024 * 1024;
 const UPLOAD_BATCH_FILES: usize = 256;
@@ -434,7 +434,7 @@ async fn put(
 fn disposition(error: &anyhow::Error) -> Disposition {
     if let Some(response) = error
         .chain()
-        .find_map(|cause| cause.downcast_ref::<ResponseError>())
+        .find_map(|cause| cause.downcast_ref::<ApiFailure>())
     {
         return match response.status().as_u16() {
             401 | 403 | 404 | 409 | 410 => Disposition::Abort,
@@ -454,8 +454,8 @@ fn disposition(error: &anyhow::Error) -> Disposition {
 fn response_delay(error: &anyhow::Error) -> Option<Duration> {
     error
         .chain()
-        .find_map(|cause| cause.downcast_ref::<ResponseError>())
-        .and_then(ResponseError::retry_after)
+        .find_map(|cause| cause.downcast_ref::<ApiFailure>())
+        .and_then(ApiFailure::retry_after)
 }
 
 fn retry_delay(requested: Option<Duration>) -> Duration {
@@ -694,8 +694,13 @@ mod tests {
 
     fn response_error(status: u16) -> anyhow::Error {
         let status = reqwest::StatusCode::from_u16(status).unwrap();
-        anyhow::Error::new(ResponseError::new(status, None, format!("PUT -> {status}")))
-            .context("upload 1 files")
+        anyhow::Error::new(ApiFailure::new(
+            status,
+            None,
+            None,
+            format!("PUT -> {status}"),
+        ))
+        .context("upload 1 files")
     }
 
     #[test]

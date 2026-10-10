@@ -9,21 +9,31 @@
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use serde::{Serialize, de::DeserializeOwned};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
-use tracing::{debug, warn};
+use tokio::{
+    sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore},
+    time::Instant,
+};
+use tracing::warn;
 
 use crate::auth;
 use crate::session::{CredentialScope, CredentialSource, SessionContext};
 
-mod response_error;
+mod failure;
+mod retry;
+#[cfg(test)]
+pub(crate) mod stub;
 pub(crate) mod transport;
 
-pub(crate) use response_error::ResponseError;
+use failure::gateway_error;
+use retry::Idempotency;
+
+pub(crate) use failure::ApiFailure;
+pub(crate) use retry::DEADLINE_MARGIN;
 pub(crate) use transport::HttpTransport;
 
 const TENANT_HEADER: &str = "X-Tenant-Id";
@@ -31,7 +41,7 @@ const TENANT_HEADER: &str = "X-Tenant-Id";
 /// codebase for any read that is about one, so an agent working in a checkout
 /// is answered about the tree it is looking at.
 const CHECKOUT_HEADER: &str = "X-Semctx-Source-Id";
-const LOADING_RETRY_BUDGET: Duration = Duration::from_mins(1);
+const LOADING_RETRY_MIN_DELAY: Duration = Duration::from_secs(1);
 const LOADING_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
 
 /// Cheap to clone — `reqwest::Client` is internally `Arc`'d and the
@@ -74,6 +84,14 @@ pub struct Client {
     /// The handle comes from the caller: this module never reads the
     /// environment, so a session cannot raise a process-wide bound.
     remote_permits: Option<Arc<Semaphore>>,
+    /// The moment by which every request of this client must have an answer,
+    /// when the caller bounds its call. `None` for a CLI command and for the
+    /// daemon's sync, which have no caller waiting on a clock.
+    ///
+    /// Only a per-call clone carries a deadline. A client that a long-lived
+    /// owner keeps, such as a coordinator, never does: see
+    /// [`Self::with_deadline`].
+    deadline: Option<Instant>,
 }
 
 impl Client {
@@ -91,6 +109,21 @@ impl Client {
         );
         client.local_root = local_root;
         client
+    }
+
+    /// A client with no codebase for a stub server at `base_url`. A fixed
+    /// token authorizes it, so a test never reads the credential store.
+    #[cfg(test)]
+    pub(crate) fn for_test_server(base_url: &str) -> Self {
+        Self::new(
+            &HttpTransport::new().expect("build the test transport"),
+            CredentialSource::from_test_token("stub-token"),
+            base_url,
+            None,
+            None,
+            false,
+            None,
+        )
     }
 
     fn new(
@@ -114,6 +147,7 @@ impl Client {
             checkout_source_id: None,
             capabilities: Arc::new(tokio::sync::OnceCell::new()),
             remote_permits,
+            deadline: None,
         }
     }
 
@@ -152,6 +186,25 @@ impl Client {
     pub(crate) fn without_codebase(mut self) -> Self {
         self.codebase = None;
         self
+    }
+
+    /// The same client, with every request bounded by `deadline`.
+    ///
+    /// This is for one call. Each attempt, each retry wait, and each retry is
+    /// kept inside the deadline, and a request that cannot finish in time
+    /// fails with an error that names the deadline. Never give a client with
+    /// a deadline to an owner that outlives the call: its later requests
+    /// would fail at once.
+    #[must_use]
+    pub(crate) fn with_deadline(mut self, deadline: Option<Instant>) -> Self {
+        self.deadline = deadline;
+        self
+    }
+
+    /// The deadline of this client, for tests that check which clients carry one.
+    #[cfg(test)]
+    pub(crate) fn deadline(&self) -> Option<Instant> {
+        self.deadline
     }
 
     /// Attach a checkout only when its source identity can be derived. A failed
@@ -260,75 +313,6 @@ impl Client {
         }
     }
 
-    /// Send one request, repairing a stale persisted tenant once and honoring
-    /// the server's bounded `Retry-After` contract for transient graph/file
-    /// projection restores.
-    async fn send(
-        &self,
-        method: reqwest::Method,
-        path: &str,
-        body: Option<serde_json::Value>,
-    ) -> Result<(reqwest::Response, String)> {
-        let mut tenant_retried = false;
-        let loading_deadline = Instant::now() + LOADING_RETRY_BUDGET;
-        loop {
-            // Acquired after the token fetch: that request is authorization, not
-            // an interactive read, and waiting for a permit while holding one
-            // would make the bound self-blocking.
-            let (mut req, url, rejected_tenant) = self.authed(method.clone(), path).await?;
-            if let Some(json) = &body {
-                req = req.json(json);
-            }
-            let permit = self.remote_permit().await;
-            let resp = req
-                .send()
-                .await
-                .with_context(|| format!("{method} {url}"))?;
-
-            if let Some(delay) = loading_retry_delay(resp.status(), resp.headers()) {
-                if delay > loading_deadline.saturating_duration_since(Instant::now()) {
-                    return Ok((resp, url));
-                }
-                debug!(
-                    status = %resp.status(),
-                    retry_after_ms = delay.as_millis(),
-                    "server projection is restoring; retrying request"
-                );
-                drop(permit);
-                tokio::time::sleep(delay).await;
-                continue;
-            }
-
-            if resp.status() != reqwest::StatusCode::FORBIDDEN {
-                return Ok((resp, url));
-            }
-
-            let status = resp.status();
-            let response_body = resp
-                .text()
-                .await
-                .with_context(|| format!("{method} {url}: read body"))?;
-            // Tenant repair queries identity and rewrites config. That is not
-            // this request attempt, so it must not hold this attempt's permit.
-            drop(permit);
-            if !tenant_retried
-                && tenant_binding_denied(&response_body)
-                && self
-                    .repair_tenant_after_denial(rejected_tenant.as_deref())
-                    .await
-            {
-                tenant_retried = true;
-                continue;
-            }
-            return Err(response_body_error(
-                method.as_str(),
-                &url,
-                status,
-                &response_body,
-            ));
-        }
-    }
-
     /// Replace a rejected persisted tenant when identity has exactly one
     /// membership. Best-effort: any discovery/config error leaves the original
     /// denial as the user-facing result.
@@ -422,7 +406,9 @@ impl Client {
     /// GET `path`, parse the JSON response as `T`. The path is appended
     /// to the base URL — pass it WITH leading slash (`/v1/domains`).
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        let (resp, url) = self.send(reqwest::Method::GET, path, None).await?;
+        let (resp, url) = self
+            .send(reqwest::Method::GET, path, None, Idempotency::Idempotent)
+            .await?;
         unwrap_envelope(resp, "GET", &url).await
     }
 
@@ -430,7 +416,9 @@ impl Client {
     /// for "does this still exist?" probes (e.g. validating a cached codebase id
     /// before trusting it against the current server).
     pub async fn get_opt<T: DeserializeOwned>(&self, path: &str) -> Result<Option<T>> {
-        let (resp, url) = self.send(reqwest::Method::GET, path, None).await?;
+        let (resp, url) = self
+            .send(reqwest::Method::GET, path, None, Idempotency::Idempotent)
+            .await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -441,19 +429,10 @@ impl Client {
     /// `Ok(None)` instead of erroring. For endpoints that 200 with no payload to
     /// mean "nothing here" (e.g. hover at a position with no symbol).
     pub async fn get_maybe<T: DeserializeOwned>(&self, path: &str) -> Result<Option<T>> {
-        let (resp, url) = self.send(reqwest::Method::GET, path, None).await?;
-        let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .with_context(|| format!("GET {url}: read body"))?;
-        let Ok(envelope) = serde_json::from_str::<ApiEnvelope<T>>(&body) else {
-            let message = gateway_message("GET", &url, status, &body);
-            return Err(ResponseError::new(status, None, message).into());
-        };
-        if !status.is_success() || !envelope.success {
-            bail!("GET {url} -> {status}: {}", envelope.error_summary());
-        }
+        let (resp, url) = self
+            .send(reqwest::Method::GET, path, None, Idempotency::Idempotent)
+            .await?;
+        let (_, envelope) = read_envelope::<T>(resp, "GET", &url).await?;
         Ok(envelope.data)
     }
 
@@ -462,15 +441,43 @@ impl Client {
     /// paginated list endpoints put their rows (`data`, or legacy `items`) and
     /// page metadata beside `success` (see [`unwrap_page`]).
     pub async fn get_page<T: DeserializeOwned>(&self, path: &str) -> Result<api::Page<T>> {
-        let (resp, url) = self.send(reqwest::Method::GET, path, None).await?;
+        let (resp, url) = self
+            .send(reqwest::Method::GET, path, None, Idempotency::Idempotent)
+            .await?;
         unwrap_page(resp, "GET", &url).await
     }
 
     /// POST `path` with `body` serialised as JSON, parse the response
     /// as `T`. Same path semantics as [`Self::get`].
+    ///
+    /// The request can write, so a gateway or connection failure is not
+    /// retried. Use [`Self::post_read`] for a request that only reads.
     pub async fn post<B: Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> Result<T> {
+        self.post_with(path, body, Idempotency::NotIdempotent).await
+    }
+
+    /// POST `path` for a request that only reads, such as a search. The server
+    /// holds the same state after it answers the request twice, so a gateway
+    /// or connection failure is retried once, as for a GET. Parsed like
+    /// [`Self::post`].
+    pub async fn post_read<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        self.post_with(path, body, Idempotency::Idempotent).await
+    }
+
+    async fn post_with<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+        idempotency: Idempotency,
+    ) -> Result<T> {
         let body = serde_json::to_value(body).context("serialize POST body")?;
-        let (resp, url) = self.send(reqwest::Method::POST, path, Some(body)).await?;
+        let (resp, url) = self
+            .send(reqwest::Method::POST, path, Some(body), idempotency)
+            .await?;
         unwrap_envelope(resp, "POST", &url).await
     }
 
@@ -478,7 +485,14 @@ impl Client {
     /// Same path / envelope semantics as [`Self::post`].
     pub async fn put<B: Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> Result<T> {
         let body = serde_json::to_value(body).context("serialize PUT body")?;
-        let (resp, url) = self.send(reqwest::Method::PUT, path, Some(body)).await?;
+        let (resp, url) = self
+            .send(
+                reqwest::Method::PUT,
+                path,
+                Some(body),
+                Idempotency::NotIdempotent,
+            )
+            .await?;
         unwrap_envelope(resp, "PUT", &url).await
     }
 
@@ -502,12 +516,13 @@ fn loading_retry_delay(
     if status != reqwest::StatusCode::CONFLICT {
         return None;
     }
-    let delay = response_error::retry_after(headers)?;
-    Some(
-        delay
-            .max(Duration::from_secs(1))
-            .min(LOADING_RETRY_MAX_DELAY),
-    )
+    failure::retry_after(headers).map(bounded_loading_delay)
+}
+
+/// The one bound for a delay that a loading response advertises. The retry
+/// loop and the typed failure classification both use it.
+fn bounded_loading_delay(delay: Duration) -> Duration {
+    delay.clamp(LOADING_RETRY_MIN_DELAY, LOADING_RETRY_MAX_DELAY)
 }
 
 fn tenant_binding_denied(body: &str) -> bool {
@@ -528,48 +543,6 @@ fn tenant_binding_denied(body: &str) -> bool {
     serde_json::from_str(body).is_ok_and(|value| contains_code(&value))
 }
 
-/// Preserve a structured JSON denial even when it is not wrapped in the
-/// resource server's usual API envelope. Tenant binding failures can be emitted
-/// by middleware before controller envelope handling runs.
-fn response_body_error(
-    method: &str,
-    url: &str,
-    status: reqwest::StatusCode,
-    body: &str,
-) -> anyhow::Error {
-    let message = if serde_json::from_str::<serde_json::Value>(body).is_ok() {
-        format!("{method} {url} -> {status}: {body}")
-    } else {
-        gateway_message(method, url, status, body)
-    };
-    ResponseError::new(status, None, message).into()
-}
-
-/// The message for a response that is not the API's JSON envelope at all.
-///
-/// A gateway between the CLI and the server (ingress, proxy, load balancer)
-/// answers failures in ITS format, not the API's — typically an HTML error page.
-/// Parsing that as the envelope produces `expected value at line 1 column 1`,
-/// which names the CLI's own parser rather than the thing that actually went
-/// wrong, and buries the status code that IS the diagnosis.
-///
-/// Reported by status instead, because those statuses have specific meanings a
-/// user can act on: 502/503/504 come from the gateway, not the application, and
-/// mean the request never got a real answer.
-fn gateway_message(method: &str, url: &str, status: reqwest::StatusCode, body: &str) -> String {
-    let hint = match status.as_u16() {
-        504 => "the gateway timed out waiting for the server — the request may still be running",
-        502 => "the gateway could not reach the server, or the server closed the connection",
-        503 => "the server is unavailable behind the gateway (starting, draining, or overloaded)",
-        _ => "the response was not the API's JSON envelope",
-    };
-    // A short excerpt only: an HTML error page is pages long and none of it is
-    // the diagnosis, but a truncated peek still distinguishes "HTML page" from
-    // "empty body" when someone needs it.
-    let excerpt: String = body.trim().chars().take(120).collect();
-    format!("{method} {url} -> {status}: {hint} (response was not JSON: {excerpt:?})")
-}
-
 /// Every server response is an `ApiResponse<T>` envelope
 /// (`{ success, errors, httpStatusCode, data }`); unwrap it to the inner
 /// `data`, surfacing the typed errors on failure rather than a raw body.
@@ -578,29 +551,40 @@ async fn unwrap_envelope<T: DeserializeOwned>(
     method: &str,
     url: &str,
 ) -> Result<T> {
-    let status = resp.status();
-    let retry_after = response_error::retry_after(resp.headers());
-    let body = resp
-        .text()
-        .await
-        .with_context(|| format!("{method} {url}: read body"))?;
-    // Not the envelope: attribute it to whatever answered instead of blaming
-    // the parser. See `gateway_message`.
-    let Ok(envelope) = serde_json::from_str::<ApiEnvelope<T>>(&body) else {
-        let message = gateway_message(method, url, status, &body);
-        return Err(ResponseError::new(status, retry_after, message).into());
-    };
-    if !status.is_success() || !envelope.success {
-        let message = format!("{method} {url} -> {status}: {}", envelope.error_summary());
-        return Err(ResponseError::new(status, retry_after, message).into());
-    }
+    let (status, envelope) = read_envelope::<T>(resp, method, url).await?;
     envelope
         .data
         .ok_or_else(|| anyhow!("{method} {url} -> {status}: success but no data"))
 }
 
-/// The server's `ApiResponse<T>` envelope. `errors` is captured untyped — the
-/// CLI only renders it on failure, so its exact shape doesn't matter here.
+/// Read one envelope answer. A failure by status or by the envelope's own flag
+/// becomes an [`ApiFailure`] that carries the typed error code and the
+/// server's retry delay.
+async fn read_envelope<T: DeserializeOwned>(
+    resp: reqwest::Response,
+    method: &str,
+    url: &str,
+) -> Result<(reqwest::StatusCode, ApiEnvelope<T>)> {
+    let status = resp.status();
+    let retry_after = failure::retry_after(resp.headers());
+    let body = resp
+        .text()
+        .await
+        .with_context(|| format!("{method} {url}: read body"))?;
+    // Not the envelope: attribute it to whatever answered instead of blaming
+    // the parser. See `gateway_error`.
+    let Ok(envelope) = serde_json::from_str::<ApiEnvelope<T>>(&body) else {
+        return Err(gateway_error(method, url, status, retry_after, &body));
+    };
+    if !status.is_success() || !envelope.success {
+        let errors = envelope.errors.as_deref().unwrap_or_default();
+        return Err(ApiFailure::from_errors(method, url, status, retry_after, errors).into());
+    }
+    Ok((status, envelope))
+}
+
+/// The server's `ApiResponse<T>` envelope. `errors` is captured untyped — only
+/// a failure reads it, for the first typed code and the human text.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ApiEnvelope<T> {
@@ -608,23 +592,6 @@ struct ApiEnvelope<T> {
     data: Option<T>,
     #[serde(default)]
     errors: Option<Vec<serde_json::Value>>,
-}
-
-impl<T> ApiEnvelope<T> {
-    fn error_summary(&self) -> String {
-        summarize_errors(self.errors.as_deref().unwrap_or_default())
-    }
-}
-
-fn summarize_errors(errors: &[serde_json::Value]) -> String {
-    if errors.is_empty() {
-        return "request failed".to_string();
-    }
-    errors
-        .iter()
-        .map(std::string::ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("; ")
 }
 
 /// Unwrap a flat paginated envelope (`PaginatedApiResponse<T>` —
@@ -638,6 +605,7 @@ async fn unwrap_page<T: DeserializeOwned>(
     url: &str,
 ) -> Result<api::Page<T>> {
     let status = resp.status();
+    let retry_after = failure::retry_after(resp.headers());
     let body = resp
         .text()
         .await
@@ -646,10 +614,8 @@ async fn unwrap_page<T: DeserializeOwned>(
         format!("{method} {url} -> {status}: parse paginated envelope ({body})")
     })?;
     if !status.is_success() || !env.success {
-        bail!(
-            "{method} {url} -> {status}: {}",
-            summarize_errors(env.errors.as_deref().unwrap_or_default())
-        );
+        let errors = env.errors.as_deref().unwrap_or_default();
+        return Err(ApiFailure::from_errors(method, url, status, retry_after, errors).into());
     }
     Ok(env.page)
 }
@@ -762,8 +728,8 @@ mod tests {
     use serde::Deserialize;
 
     use super::{
-        Client, CredentialSource, HttpTransport, PageEnvelope, gateway_message,
-        loading_retry_delay, tenant_binding_denied, tenant_selection,
+        Client, CredentialSource, HttpTransport, PageEnvelope, gateway_error, loading_retry_delay,
+        tenant_binding_denied, tenant_selection,
     };
 
     /// A client with no codebase and no checkout, for the pure selection tests.
@@ -817,12 +783,14 @@ mod tests {
     /// actual diagnosis (the gateway timed out) appears nowhere.
     #[test]
     fn a_gateway_html_page_is_reported_as_the_gateway_failing() {
-        let msg = gateway_message(
+        let msg = gateway_error(
             "PUT",
             "https://example/v1/codebases/x/sync/y",
             reqwest::StatusCode::GATEWAY_TIMEOUT,
+            None,
             "<html><head><title>504 Gateway Time-out</title></head><body>...</body></html>",
-        );
+        )
+        .to_string();
 
         assert!(
             msg.contains("gateway timed out"),

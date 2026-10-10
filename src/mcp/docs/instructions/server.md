@@ -25,8 +25,8 @@ Code retrieval and graph navigation over semctx-indexed codebases. Tools default
 - **external_links** — cross-repo "jump to definition": imports that leave this codebase, resolved into the public API of other codebases you can see.
 - **list_codebases / current_context** — discover visible codebases and diagnose the effective server/tenant/codebase/checkout/index/graph binding.
 - **list_domains** — discover what's searchable and which tags are available for filtering.
-- **sync_status** — check the background index job; if `list_files` / `search` are empty right after attaching, this tells you whether indexing is still in progress.
-- **index_codebase** — explicit opt-in indexing. If startup or a tool says the current repository is not indexed, tell the user and ask permission; call this only after they agree.
+- **sync_status** — check the background index job and the first-index phase; if `list_files` / `search` are empty right after attaching, this tells you whether indexing is still in progress.
+- **index_codebase** — explicit opt-in indexing. If startup or a tool says the current repository is not indexed, tell the user and ask permission; call this only after they agree. It returns as soon as the first index starts; follow the first index with `sync_status`.
 - **rename_symbol / safe_delete_symbol / replace_symbol_body / insert_before_symbol / insert_after_symbol** — immediate local edit actions. Each internally consumes the server's grammar-validated plan, verifies source identity, graph generation, paths, and hashes, and goes through the client's normal approval flow.
 - **undo_edit** — reverse a completed symbolic edit by its returned edit id while retained preimages and current postimage hashes still match.
 
@@ -38,11 +38,17 @@ without asking again; that consent does not authorize edits beyond the user's
 requested repository set. Ask only when a directory has never been indexed and
 would need `index_codebase`.
 
-The first-ever `index_codebase` call is a readiness boundary: retrieval, catalog,
-and graph tools for that codebase wait until server embedding completes
-successfully. `sync_status` remains callable while they wait. Later re-syncs do
-not block retrieval and continue to expose the last complete snapshot with
-freshness warnings.
+The first-ever `index_codebase` call starts the first index and returns at once.
+It never waits for embedding. Retrieval, catalog, and graph tools never serve a
+partial first index. They wait at most 5 seconds for it to complete. If it still
+runs, they fail with a "still running" error. `sync_status` stays callable. It
+reports the first-index phase: registering, syncing, embedding, ready, or failed.
+While the phase is syncing, its `current sync:` line shows how many files the
+upload has sent. Call it every 10 to 15 seconds, and use local Read/Grep until
+the phase is ready.
+If the phase is failed, call `index_codebase` for the same path to retry. Later
+re-syncs do not block retrieval and continue to expose the last complete
+snapshot with freshness warnings.
 
 ## Workflow
 
@@ -67,3 +73,9 @@ Prefer the symbol-graph tools over search whenever you have an exact name — th
 Expanded search bodies share the server's total result-content budget. `top_k` is
 an upper bound, not a guarantee that every full body fits. Use expanded bodies
 directly instead of fetching the same files again.
+
+## When a tool fails
+
+A tool failure arrives as an error result with a `next:` line. Follow that line.
+Retry once only when it says the call is retryable. Otherwise use local
+Read/Grep for that request. Do not repeat the same failing call in a loop.

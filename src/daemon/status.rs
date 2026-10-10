@@ -102,6 +102,8 @@ mod tests {
     use crate::engine::CoordinatorStatus;
     use crate::engine::coordinator::WatcherState;
     use crate::engine::scheduler::{PermitUsage, SchedulerUsage};
+    use crate::mcp::readiness::FirstIndexPhase;
+    use crate::sync::SyncProgress;
 
     fn status() -> DaemonStatus {
         DaemonStatus {
@@ -134,6 +136,13 @@ mod tests {
                 trigger_overflow: false,
                 last_outcome: Some("uploaded 3 files".to_string()),
                 last_error: None,
+                first_index: Some(FirstIndexPhase::Embedding {
+                    job_id: Some("job-1".to_string()),
+                }),
+                sync_progress: Some(SyncProgress::Uploading {
+                    uploaded_files: 3,
+                    total_files: 10,
+                }),
             }],
         }
     }
@@ -164,6 +173,19 @@ mod tests {
             Some("uploaded 3 files")
         );
         assert_eq!(coordinator.last_error, None);
+        assert_eq!(
+            coordinator.first_index,
+            Some(FirstIndexPhase::Embedding {
+                job_id: Some("job-1".to_string())
+            })
+        );
+        assert_eq!(
+            coordinator.sync_progress,
+            Some(SyncProgress::Uploading {
+                uploaded_files: 3,
+                total_files: 10
+            })
+        );
     }
 
     /// A reader that is not this build must find the documented field names.
@@ -184,6 +206,14 @@ mod tests {
         assert_eq!(value["permits"]["scan"]["total"], 8);
         assert_eq!(value["coordinators"][0]["leases"], 2);
         assert_eq!(value["coordinators"][0]["watcher"], "active");
+        assert_eq!(
+            value["coordinators"][0]["first_index"],
+            serde_json::json!({"embedding": {"job_id": "job-1"}})
+        );
+        assert_eq!(
+            value["coordinators"][0]["sync_progress"],
+            serde_json::json!({"uploading": {"uploaded_files": 3, "total_files": 10}})
+        );
     }
 
     #[test]
@@ -205,6 +235,11 @@ mod tests {
             ]
         );
         assert!(lines[8].starts_with("  root /work/checkout"), "{rendered}");
+        assert!(
+            lines[8].contains("first index embedding (job job-1)"),
+            "{rendered}"
+        );
+        assert!(lines[8].contains("sync uploading 3/10 files"), "{rendered}");
     }
 
     #[test]

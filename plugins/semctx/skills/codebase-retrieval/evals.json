@@ -37,7 +37,7 @@
       "expected_behavior": [
         "Uses search_codebase (prefer: docs) or semctx grep — does not skip semctx on the false premise that markdown is not indexed",
         "Falls back to host tools only on a reported degraded state",
-        "Identifies that retrieval/catalog/graph tools wait for the initial embed job while sync_status remains available"
+        "Identifies that index_codebase returns without waiting for embedding, that retrieval/catalog/graph tools wait at most 5 seconds and then report a still-running error, and that sync_status remains available to follow the first-index phase"
       ]
     },
     {
@@ -62,8 +62,9 @@
       "skills": ["codebase-retrieval"],
       "query": "I just opted a brand-new repository into indexing. Can I search it while its first embed job is still running?",
       "expected_behavior": [
-        "Explains that first-time retrieval/catalog/graph calls wait for successful embedding completion and cannot see a partial initial index",
-        "Uses sync_status to monitor first-index progress because status bypasses the readiness gate",
+        "Explains that index_codebase returned at once, and that first-time retrieval/catalog/graph calls cannot see a partial initial index: they wait at most 5 seconds, then fail with a still-running error",
+        "Calls sync_status about every 10 to 15 seconds to follow the first-index phase (registering, syncing, embedding, ready, or failed) because status bypasses the readiness gate",
+        "Uses local Read/Grep for the repository until the phase is ready instead of looping on a retrieval call that reports it is still running",
         "Distinguishes later background re-syncs, which do not block retrieval from the last complete snapshot"
       ]
     },
@@ -107,6 +108,15 @@
         "Omits codebase for the current checkout",
         "Uses an immutable codebase id or indexed local directory path for another checkout",
         "Does not present or reuse a friendly slug as a selector"
+      ]
+    },
+    {
+      "skills": ["codebase-retrieval"],
+      "query": "A semctx retrieval tool returned an error that ends with the line 'next: use local Read/Grep for this request.' What do you do next?",
+      "expected_behavior": [
+        "Follows the next: line and answers this request with local Read/Grep instead of calling the same semctx tool again",
+        "Does not loop on the failing call, and retries once only when the next: line says the call is retryable",
+        "Does not claim the repository is unindexed or tell the user to reindex because of one failed call"
       ]
     }
   ],

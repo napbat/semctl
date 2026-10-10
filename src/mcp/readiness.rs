@@ -6,12 +6,47 @@
 //! this session did bring in is waited for.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify, RwLock, RwLockReadGuard};
+use tokio::time::Instant;
 
+use super::CallBudget;
 use crate::engine::{CheckoutKey, CoordinatorLease};
+use crate::query::{FailureKind, ToolError};
+
+/// The longest a bounded call waits for a first index. A small codebase
+/// finishes inside it. A larger one is reported as pending, so the caller can
+/// use its own tools instead of waiting out the whole call deadline.
+const FIRST_INDEX_WAIT: Duration = Duration::from_secs(5);
+
+/// Why a wait for a first index ended without a usable index.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum NotReady {
+    /// The first index still runs after the longest wait that the call may
+    /// spend. A partial first index is never served.
+    Pending,
+    /// The first index failed. The text says why.
+    Failed(String),
+}
+
+impl NotReady {
+    /// The failure that the tool `op` reports for this cause.
+    pub(super) fn into_tool_error(self, op: &'static str) -> ToolError {
+        match self {
+            Self::Pending => ToolError::new(
+                op,
+                FailureKind::IndexPending,
+                "the first index of this codebase is still running",
+            ),
+            Self::Failed(detail) => ToolError::new(op, FailureKind::IndexFailed, detail),
+        }
+    }
+}
 
 /// The coordinators one session holds, keyed by checkout.
 pub(super) type SessionLeases = RwLock<HashMap<CheckoutKey, CoordinatorLease>>;
@@ -29,6 +64,21 @@ async fn session_gates(
     gates
 }
 
+/// Wait for `wait`, which reports one or more first indexes. `until` ends the
+/// wait. `None` waits for as long as the first index takes.
+async fn until_ready(
+    until: Option<Instant>,
+    wait: impl Future<Output = Result<(), String>>,
+) -> Result<(), NotReady> {
+    let outcome = match until {
+        Some(until) => tokio::time::timeout_at(until, wait)
+            .await
+            .map_err(|_| NotReady::Pending)?,
+        None => wait.await,
+    };
+    outcome.map_err(|error| NotReady::Failed(initial_index_failed(&error)))
+}
+
 /// Wait for every gate that the query's scope can include.
 ///
 /// Empty ids mean a server-defined scope. Its membership is unknown here, so
@@ -36,38 +86,52 @@ async fn session_gates(
 pub(super) async fn wait_for_gates(
     gates: &[Arc<InitialIndexGate>],
     ids: &[String],
-) -> Result<(), String> {
-    for gate in gates {
-        gate.wait_for_codebases(ids)
-            .await
-            .map_err(|error| initial_index_failed(&error))?;
-    }
-    Ok(())
+    until: Option<Instant>,
+) -> Result<(), NotReady> {
+    until_ready(until, async {
+        for gate in gates {
+            gate.wait_for_codebases(ids).await?;
+        }
+        Ok(())
+    })
+    .await
 }
 
-/// What a retrieval call reports when a first index failed.
+/// Wait for the first index of one checkout, for as long as `budget` allows.
+pub(super) async fn wait_for_gate(
+    gate: &InitialIndexGate,
+    budget: &CallBudget,
+) -> Result<(), NotReady> {
+    until_ready(budget.wait_until(FIRST_INDEX_WAIT), gate.wait()).await
+}
+
+/// The reason a retrieval call reports when a first index failed.
 ///
-/// A failed gate stays failed until something asks for that index again, so
-/// the message names the recovery. Without it the caller sees a permanent
-/// failure and no way out of it.
-pub(super) fn initial_index_failed(error: &str) -> String {
-    format!("initial index failed — {error}; call `index_codebase` for this path to retry")
+/// A failed gate stays failed until something asks for that index again. The
+/// `IndexFailed` error names that recovery on its `next:` line.
+fn initial_index_failed(error: &str) -> String {
+    format!("initial index failed — {error}")
 }
 
 /// Wait without holding the lease map, then reserve the checked membership for
 /// the query. A tool call can attach a checkout while embedding runs. If it
 /// does, repeat the readiness check before allowing the query to include the
 /// new codebase.
+///
+/// A bounded `budget` allows one short wait for all passes together. If a first
+/// index still runs after it, the call is [`NotReady::Pending`].
 pub(super) async fn ready_for_codebases<'a>(
     leases: &'a SessionLeases,
     ids: &[String],
-) -> Result<RwLockReadGuard<'a, HashMap<CheckoutKey, CoordinatorLease>>, String> {
+    budget: &CallBudget,
+) -> Result<RwLockReadGuard<'a, HashMap<CheckoutKey, CoordinatorLease>>, NotReady> {
+    let until = budget.wait_until(FIRST_INDEX_WAIT);
     loop {
         let checked = {
             let held = leases.read().await;
             Membership::of(&held).await
         };
-        wait_for_gates(&checked.gates, ids).await?;
+        wait_for_gates(&checked.gates, ids, until).await?;
         let current = leases.read().await;
         if Membership::of(&current).await.counts() == checked.counts() {
             return Ok(current);
@@ -129,6 +193,58 @@ struct InitialIndexState {
     result: Option<Result<(), String>>,
 }
 
+/// How far one first index has come. `sync_status` and the daemon status
+/// report it, so an agent can follow a first index that no tool call waits for.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FirstIndexPhase {
+    /// `index_codebase` has not yet registered a codebase for the checkout.
+    Registering,
+    /// The codebase exists. The scan and the upload run, or wait for a permit.
+    Syncing,
+    /// The upload is done and the server embeds the files. `job_id` names the
+    /// server job when the coordinator has recorded it.
+    Embedding { job_id: Option<String> },
+    /// The server embedded every file. Retrieval serves this index.
+    Ready,
+    /// The first index ended without a usable index. Another `index_codebase`
+    /// call retries it.
+    Failed { reason: String },
+}
+
+impl FirstIndexPhase {
+    /// The phase of a first index, from one snapshot of its gate.
+    ///
+    /// `last_job_id` is the coordinator's last recorded job. Once the upload is
+    /// done, that job is the embedding job of this first index.
+    fn of(state: &InitialIndexState, last_job_id: Option<&str>) -> Self {
+        match &state.result {
+            Some(Ok(())) => Self::Ready,
+            Some(Err(reason)) => Self::Failed {
+                reason: reason.clone(),
+            },
+            None if state.codebase_id.is_none() => Self::Registering,
+            None if !state.polling => Self::Syncing,
+            None => Self::Embedding {
+                job_id: last_job_id.map(str::to_string),
+            },
+        }
+    }
+}
+
+impl fmt::Display for FirstIndexPhase {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Registering => formatter.write_str("registering"),
+            Self::Syncing => formatter.write_str("syncing"),
+            Self::Embedding { job_id: Some(id) } => write!(formatter, "embedding (job {id})"),
+            Self::Embedding { job_id: None } => formatter.write_str("embedding"),
+            Self::Ready => formatter.write_str("ready"),
+            Self::Failed { reason } => write!(formatter, "failed — {reason}"),
+        }
+    }
+}
+
 impl InitialIndexGate {
     pub(crate) fn pending() -> Self {
         Self {
@@ -150,8 +266,9 @@ impl InitialIndexGate {
     /// Take responsibility for registering this first index's codebase.
     ///
     /// Exactly one caller is answered `true` for one gate. Every other caller
-    /// waits, so one explicit `index_codebase` on a checkout registers one
-    /// codebase however many callers ask at once.
+    /// reports the first index as already in progress, so one explicit
+    /// `index_codebase` on a checkout registers one codebase however many
+    /// callers ask at once.
     pub(crate) async fn claim_registration(&self) -> bool {
         let mut state = self.state.lock().await;
         if state.registering {
@@ -187,6 +304,18 @@ impl InitialIndexGate {
     /// caller already reported.
     pub(crate) async fn outcome(&self) -> Option<Result<(), String>> {
         self.state.lock().await.result.clone()
+    }
+
+    /// The phase of this first index now. Never waits.
+    pub(crate) async fn phase(&self, last_job_id: Option<&str>) -> FirstIndexPhase {
+        let state = self.state.lock().await;
+        FirstIndexPhase::of(&state, last_job_id)
+    }
+
+    /// The codebase that `index_codebase` registered for this first index, if
+    /// it has registered one. Never waits, unlike [`Self::registered_codebase`].
+    pub(crate) async fn codebase(&self) -> Option<String> {
+        self.state.lock().await.codebase_id.clone()
     }
 
     /// Wait until the first index has a codebase, or until it ends without one.
@@ -241,3 +370,6 @@ impl InitialIndexGate {
         self.changed.notify_waiters();
     }
 }
+
+#[cfg(test)]
+mod tests;

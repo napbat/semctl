@@ -134,25 +134,7 @@ pub async fn run(args: IndexArgs, cli: &Cli) -> Result<()> {
 }
 
 fn report_sync_progress(progress: &SyncProgress) {
-    info!("{}", sync_progress_message(progress));
-}
-
-fn sync_progress_message(progress: &SyncProgress) -> String {
-    match progress {
-        SyncProgress::Preparing => "preparing index".to_string(),
-        SyncProgress::Scanning { root } => format!("scanning files in {}", root.display()),
-        SyncProgress::Planning {
-            files,
-            cached_files,
-        } => format!(
-            "scanned {files} files ({cached_files} filter decisions reused) — checking for changes"
-        ),
-        SyncProgress::Uploading {
-            uploaded_files,
-            total_files,
-        } => format!("uploading: {uploaded_files}/{total_files} files"),
-        SyncProgress::Finalizing => "finalizing upload".to_string(),
-    }
+    info!("{progress}");
 }
 
 fn poll_interval(elapsed: std::time::Duration) -> std::time::Duration {
@@ -219,11 +201,7 @@ async fn wait_for_job(client: &Client, job_id: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
-    use super::{
-        JobProgress, SyncProgress, api, poll_interval, sync_progress_message, terminal_result,
-    };
+    use super::{JobProgress, api, poll_interval, terminal_result};
 
     #[test]
     fn polling_is_responsive_for_fast_jobs_then_backs_off() {
@@ -281,34 +259,5 @@ mod tests {
         let progress = JobProgress::from(&job(false, 3, None));
         assert_eq!(progress.processed, 12);
         assert_eq!(progress.total, 15);
-    }
-
-    #[test]
-    fn upload_progress_reports_completed_and_total_files() {
-        let message = sync_progress_message(&SyncProgress::Uploading {
-            uploaded_files: 3,
-            total_files: 8,
-        });
-        assert_eq!(message, "uploading: 3/8 files");
-    }
-
-    #[test]
-    fn scan_summary_reports_verified_filter_decisions() {
-        let message = sync_progress_message(&SyncProgress::Planning {
-            files: 80,
-            cached_files: 73,
-        });
-        assert_eq!(
-            message,
-            "scanned 80 files (73 filter decisions reused) — checking for changes"
-        );
-    }
-
-    #[test]
-    fn scan_progress_names_the_effective_root() {
-        let message = sync_progress_message(&SyncProgress::Scanning {
-            root: PathBuf::from("repo"),
-        });
-        assert_eq!(message, "scanning files in repo");
     }
 }

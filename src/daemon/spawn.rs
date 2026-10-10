@@ -12,7 +12,7 @@
 //! # What the daemon inherits
 //!
 //! The daemon inherits the environment of the client that started it, minus
-//! the six per-session variables in [`PER_SESSION_VARS`]. Every later session
+//! the seven per-session variables in [`PER_SESSION_VARS`]. Every later session
 //! of that daemon therefore runs with the first client's environment, not with
 //! its own. That applies to the proxy settings (`HTTP_PROXY`, `HTTPS_PROXY`,
 //! `NO_PROXY`), to `PATH`, which decides which formatter an edit runs, and to

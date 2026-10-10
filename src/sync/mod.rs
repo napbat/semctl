@@ -16,15 +16,19 @@ mod cache;
 pub(crate) mod policy;
 mod scan;
 mod source;
+#[cfg(test)]
+mod tests;
 mod upload;
 pub(crate) mod walker;
 
 pub(crate) use cache::SyncCache;
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, warn};
 
@@ -54,7 +58,7 @@ impl SyncLimits {
     }
 }
 
-/// What a [`sync`] queued, for the caller to report on.
+/// What [`sync_with_progress`] queued, for the caller to report on.
 pub struct SyncOutcome {
     pub codebase_id: String,
     pub job_id: String,
@@ -73,10 +77,13 @@ impl SyncOutcome {
     }
 }
 
-/// A user-visible milestone from a one-shot sync. Background indexing uses the
-/// quiet [`sync`] wrapper; interactive callers can use [`sync_with_progress`]
-/// to show what is happening before the server-side embed job is queued.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A user-visible milestone of a sync, from [`sync_with_progress`].
+///
+/// The coordinator keeps the latest milestone of the reconcile that is
+/// running, and the daemon status carries it, so this is also a wire type.
+/// [`Display`](fmt::Display) is the one source of its human text.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SyncProgress {
     Preparing,
     Scanning {
@@ -93,6 +100,27 @@ pub enum SyncProgress {
     Finalizing,
 }
 
+impl fmt::Display for SyncProgress {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Preparing => formatter.write_str("preparing index"),
+            Self::Scanning { root } => write!(formatter, "scanning files in {}", root.display()),
+            Self::Planning {
+                files,
+                cached_files,
+            } => write!(
+                formatter,
+                "scanned {files} files ({cached_files} filter decisions reused) — checking for changes"
+            ),
+            Self::Uploading {
+                uploaded_files,
+                total_files,
+            } => write!(formatter, "uploading {uploaded_files}/{total_files} files"),
+            Self::Finalizing => formatter.write_str("finalizing upload"),
+        }
+    }
+}
+
 /// Identifies the index job `sync_status` reports on. One coordinator keeps one
 /// of these, so status for one checkout never reports another checkout's sync.
 #[derive(Clone)]
@@ -105,21 +133,14 @@ pub(crate) struct LastJob {
 /// the caller decides whether to poll it. Shared by the `semctl index` command
 /// and the `semctl mcp` startup / watch / periodic auto-index.
 ///
+/// Reports each scan, plan, and completed upload-batch milestone through
+/// `on_progress`. A caller that does not show progress passes a closure that
+/// ignores it.
+///
 /// Holds the `cache` lock for the whole call: that gives exclusive cache access
 /// *and* serializes overlapping syncs to one codebase into one job at a time.
 /// Step-by-step progress is logged at `debug`; callers emit the `info`-level
 /// summary so a no-op periodic tick stays quiet.
-pub(crate) async fn sync(
-    client: &Client,
-    dir: &Path,
-    cache: &Mutex<SyncCache>,
-    limits: &SyncLimits,
-) -> Result<SyncOutcome> {
-    sync_with_progress(client, dir, cache, limits, |_| {}).await
-}
-
-/// The interactive form of [`sync`], reporting scan, plan, and completed
-/// upload-batch progress through `on_progress`.
 pub(crate) async fn sync_with_progress<F>(
     client: &Client,
     dir: &Path,

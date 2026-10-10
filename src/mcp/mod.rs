@@ -33,19 +33,21 @@ use tracing::{debug, info, warn};
 use crate::cli::Cli;
 use crate::client::{self, Client};
 use crate::engine::{CheckoutKey, CoordinatorStatus, Engine, EngineSettings, Trigger};
-use crate::query;
+use crate::query::{self, FailureKind, ToolError};
 use crate::session::SessionContext;
 
+mod budget;
+mod indexing;
 pub(crate) mod readiness;
 mod tool_types;
 mod tools;
 
+use budget::CallBudget;
 use readiness::{
-    InitialIndexGate, SessionLeases, initial_gate_for_path, initial_index_failed,
-    ready_for_codebases,
+    InitialIndexGate, SessionLeases, initial_gate_for_path, ready_for_codebases, wait_for_gate,
 };
 
-use tool_types::{InsertSymbolArgs, render_edit_action_outcome};
+use tool_types::{InsertSymbolArgs, applied_edit_text};
 
 #[cfg(test)]
 mod tests;
@@ -201,6 +203,24 @@ impl McpServer {
             .await
     }
 
+    /// The session's base client, bounded by `budget`.
+    ///
+    /// Use it for a request that this call makes and that nothing keeps. A
+    /// client that a watcher or the binding keeps is cloned from `base` itself,
+    /// without a deadline.
+    fn base_for(&self, budget: &CallBudget) -> Client {
+        self.shared.base.clone().with_deadline(budget.deadline())
+    }
+
+    /// The bound client when this session has one, else the base client, bounded
+    /// by `budget`. Tools that list or search without a codebase use it.
+    async fn bound_or_base(&self, budget: &CallBudget) -> Client {
+        let bound = self.shared.bound.lock().await.clone();
+        bound
+            .unwrap_or_else(|| self.shared.base.clone())
+            .with_deadline(budget.deadline())
+    }
+
     /// Ask the engine for its one update check, on this session's behalf.
     ///
     /// Every session does this, in both roles: the engine answers the first
@@ -229,12 +249,14 @@ impl McpServer {
     /// never waits for it. Best effort: on failure the session serves anyway
     /// and the code tools self-heal (see [`Self::bound`]).
     pub(crate) async fn bind_at_startup(&self) {
-        match self.bound_unchecked().await {
+        let unbounded = CallBudget::unbounded();
+        match self.bound_unchecked("bind_at_startup", &unbounded).await {
             Ok(_) if self.shared.pinned => info!(
                 "codebase pinned explicitly; launch directory will not be synced into the pinned id"
             ),
             Ok(_) => {}
-            Err(reason) => {
+            Err(error) => {
+                let reason = error.summary();
                 warn!(%reason, "codebase not bound at startup; code tools will retry on demand");
             }
         }
@@ -259,7 +281,7 @@ impl McpServer {
     /// `None` too when no sync ran this session: we don't fabricate a freshness
     /// claim for a codebase indexed earlier (that caveat lives in `sync_status`).
     /// Cached once the job is terminal, keyed by job id so a later sync recomputes.
-    async fn index_freshness(&self, client: &Client) -> Option<String> {
+    async fn index_freshness(&self, client: &Client, budget: &CallBudget) -> Option<String> {
         client.local_root()?;
         let job_id = self.checkout_status(client).await?.last_job_id?;
         if let Some((id, footer)) = self.shared.freshness.lock().await.as_ref()
@@ -268,8 +290,7 @@ impl McpServer {
             return footer.clone();
         }
         let status = self
-            .shared
-            .base
+            .base_for(budget)
             .get::<client::api::JobStatus>(&format!("/v1/jobs/{job_id}"))
             .await
             .ok()?;
@@ -298,22 +319,31 @@ impl McpServer {
     /// isn't bound yet. A previously indexed folder carries durable consent and
     /// is synced/watched immediately without asking again. A genuinely unindexed
     /// folder is reported and never auto-registered. On failure it returns a
-    /// human-readable reason — distinguishing "not logged in" from "server
-    /// unreachable" from "not indexed" — which the tool surfaces to the model
-    /// verbatim. Self-healing: a later call retries from scratch.
-    async fn bound(&self) -> std::result::Result<Client, String> {
-        self.await_initial_path(self.dir().await).await?;
-        let client = self.bound_unchecked().await?;
-        self.await_initial_client(&client).await?;
+    /// [`ToolError`] whose detail distinguishes "not logged in" from "server
+    /// unreachable" from "not indexed". The tool reports that error to the
+    /// model. Self-healing: a later call retries from scratch.
+    async fn bound(&self, op: &'static str, budget: &CallBudget) -> Result<Client, ToolError> {
+        self.await_initial_path(op, self.dir().await, budget)
+            .await?;
+        let client = self.bound_unchecked(op, budget).await?;
+        self.await_initial_client(op, &client, budget).await?;
         Ok(client)
     }
 
-    async fn bound_unchecked(&self) -> std::result::Result<Client, String> {
+    /// The bound client, without a first-index wait.
+    ///
+    /// The binding that this server keeps, and that it hands to a watcher, has
+    /// no deadline. Only the returned copy is bounded by `budget`.
+    async fn bound_unchecked(
+        &self,
+        op: &'static str,
+        budget: &CallBudget,
+    ) -> Result<Client, ToolError> {
         // Held across the network round-trips below so concurrent first calls
         // queue and reuse one bind instead of each registering a codebase.
         let mut guard = self.shared.bound.lock().await;
         if let Some(c) = guard.as_ref() {
-            return Ok(c.clone());
+            return Ok(c.clone().with_deadline(budget.deadline()));
         }
 
         // Pinned: the codebase is already on `base`. Never associate it with the
@@ -324,7 +354,7 @@ impl McpServer {
             *guard = Some(c.clone());
             drop(guard);
             self.watch_checkout_once(&c).await;
-            return Ok(c);
+            return Ok(c.with_deadline(budget.deadline()));
         }
 
         let dir = self.dir().await.clone();
@@ -334,18 +364,25 @@ impl McpServer {
         // say so, rather than the misleading "no codebase for this directory".
         match crate::auth::load_tokens(&self.shared.context.credentials) {
             Ok(None) => {
-                return Err(
-                    "not logged in — run `semctl auth login`, then just retry (no reconnect needed)"
-                        .into(),
-                );
+                return Err(ToolError::new(
+                    op,
+                    FailureKind::Unavailable,
+                    "not logged in — run `semctl auth login`, then just retry (no reconnect needed)",
+                ));
             }
-            Err(e) => return Err(format!("can't read stored credentials: {e:#}")),
+            Err(e) => {
+                return Err(ToolError::new(
+                    op,
+                    FailureKind::Unavailable,
+                    format!("can't read stored credentials: {e:#}"),
+                ));
+            }
             Ok(Some(_)) => {}
         }
 
         // Authenticated: resolve against the server without registering on a
         // clean miss. Registration is reserved for the explicit index tool.
-        let id = match crate::codebase::resolve(&self.shared.base, &dir).await {
+        let id = match crate::codebase::resolve(&self.base_for(budget), &dir).await {
             Ok(Some(r)) => {
                 info!(codebase = %r.id, matched_by = r.how, dir = %dir.display(), "resolved codebase");
                 r.id
@@ -354,17 +391,22 @@ impl McpServer {
             // is an explicit `semctl index`; a parent is used only when declared
             // an umbrella root (see `Config::cached_codebase_for`).
             Ok(None) => {
-                return Err(format!(
-                    "this folder isn't indexed as a semctl codebase. Do not index it \
+                return Err(ToolError::new(
+                    op,
+                    FailureKind::Unavailable,
+                    format!(
+                        "this folder isn't indexed as a semctl codebase. Do not index it \
                          automatically: ask the user to opt in, then call `index_codebase` \
                          (path `{}`). You can also pass an already-indexed directory path or \
                          codebase ID in any codebase-scoped tool's `codebase` argument",
-                    dir.display()
+                        dir.display()
+                    ),
                 ));
             }
             Err(e) => {
-                return Err(format!(
-                    "can't reach the semctx server, or it rejected the request: {e:#}"
+                return Err(ToolError::from_client(
+                    op,
+                    &e.context("can't reach the semctx server, or it rejected the request"),
                 ));
             }
         };
@@ -381,7 +423,7 @@ impl McpServer {
         // the bound checkout only after resolution succeeds, including after a
         // login performed while this MCP server was already running.
         self.watch_checkout_once(&client).await;
-        Ok(client)
+        Ok(client.with_deadline(budget.deadline()))
     }
 
     /// Resolve an optional per-call selector. Omitted means the launch/current
@@ -389,21 +431,27 @@ impl McpServer {
     /// prompting or registering, then watch it for the rest of the session.
     /// Anything else is treated as a codebase id; when that id has a cached local
     /// checkout, that checkout is watched too.
-    async fn client_for(&self, selector: Option<&str>) -> std::result::Result<Client, String> {
+    async fn client_for(
+        &self,
+        op: &'static str,
+        selector: Option<&str>,
+        budget: &CallBudget,
+    ) -> Result<Client, ToolError> {
         let Some(raw) = selector.map(str::trim).filter(|s| !s.is_empty()) else {
-            return self.bound().await;
+            return self.bound(op, budget).await;
         };
         let candidate = PathBuf::from(raw);
         let client = if selector_is_path_like(&self.shared.context.cwd, raw) {
-            let dir = canonical_directory(&self.shared.context.cwd, &candidate)?;
+            let dir = canonical_directory(op, &self.shared.context.cwd, &candidate)?;
             let dir = crate::codebase::working_copy_root(&dir).await;
-            self.await_initial_path(&dir).await?;
+            self.await_initial_path(op, &dir, budget).await?;
             let selector = dir.to_string_lossy().into_owned();
-            self.client_for_unchecked(Some(&selector)).await?
+            self.client_for_unchecked(op, Some(&selector), budget)
+                .await?
         } else {
-            self.client_for_unchecked(Some(raw)).await?
+            self.client_for_unchecked(op, Some(raw), budget).await?
         };
-        self.await_initial_client(&client).await?;
+        self.await_initial_client(op, &client, budget).await?;
         Ok(client)
     }
 
@@ -414,10 +462,12 @@ impl McpServer {
     /// which is the tree the caller is looking at.
     async fn client_for_copy(
         &self,
+        op: &'static str,
         selector: Option<&str>,
         copy: Option<&str>,
-    ) -> std::result::Result<Client, String> {
-        let client = self.client_for(selector).await?;
+        budget: &CallBudget,
+    ) -> Result<Client, ToolError> {
+        let client = self.client_for(op, selector, budget).await?;
 
         Ok(match copy.map(str::trim) {
             Some(value) if value.eq_ignore_ascii_case("canonical") => client.for_canonical(),
@@ -429,22 +479,33 @@ impl McpServer {
     /// calls use this; retrieval calls must go through [`Self::client_for`].
     async fn client_for_unchecked(
         &self,
+        op: &'static str,
         selector: Option<&str>,
-    ) -> std::result::Result<Client, String> {
+        budget: &CallBudget,
+    ) -> Result<Client, ToolError> {
         let Some(raw) = selector.map(str::trim).filter(|s| !s.is_empty()) else {
-            return self.bound_unchecked().await;
+            return self.bound_unchecked(op, budget).await;
         };
         let candidate = PathBuf::from(raw);
         if selector_is_path_like(&self.shared.context.cwd, raw) {
-            let dir = canonical_directory(&self.shared.context.cwd, &candidate)?;
-            let resolved = crate::codebase::resolve(&self.shared.base, &dir)
+            let dir = canonical_directory(op, &self.shared.context.cwd, &candidate)?;
+            let resolved = crate::codebase::resolve(&self.base_for(budget), &dir)
                 .await
-                .map_err(|e| format!("can't resolve codebase for {}: {e:#}", dir.display()))?
+                .map_err(|e| {
+                    ToolError::from_client(
+                        op,
+                        &e.context(format!("can't resolve codebase for {}", dir.display())),
+                    )
+                })?
                 .ok_or_else(|| {
-                    format!(
-                        "{} isn't indexed. Do not index it automatically: ask the user to opt \
-                         in, then call `index_codebase` with that path",
-                        dir.display()
+                    ToolError::new(
+                        op,
+                        FailureKind::Unavailable,
+                        format!(
+                            "{} isn't indexed. Do not index it automatically: ask the user to \
+                             opt in, then call `index_codebase` with that path",
+                            dir.display()
+                        ),
                     )
                 })?;
             // Prefer the cached root that contains the supplied path. This matters
@@ -461,12 +522,11 @@ impl McpServer {
                 .with_codebase(resolved.id)
                 .with_local_root(Some(watch_dir.clone()));
             self.watch_once(client.clone(), watch_dir).await;
-            return Ok(client);
+            return Ok(client.with_deadline(budget.deadline()));
         }
 
         match self
-            .shared
-            .base
+            .base_for(budget)
             .get_opt::<client::api::CodebaseSummary>(&format!("/v1/codebases/{raw}"))
             .await
         {
@@ -476,40 +536,69 @@ impl McpServer {
                     &self.shared.context.cwd,
                 );
                 self.watch_checkout_once(&client).await;
-                Ok(client)
+                Ok(client.with_deadline(budget.deadline()))
             }
-            Ok(None) => Err(format!(
-                "codebase id `{raw}` was not found or is not accessible"
+            Ok(None) => Err(ToolError::new(
+                op,
+                FailureKind::InvalidArgument,
+                format!(
+                    "codebase `{raw}` was not found or is not accessible. Pass an immutable \
+                     codebase ID or a local directory path; list_codebases shows the IDs you can use"
+                ),
             )),
-            Err(e) => Err(format!("can't resolve codebase id `{raw}`: {e:#}")),
+            Err(e) => Err(ToolError::from_client(
+                op,
+                &e.context(format!("can't resolve codebase id `{raw}`")),
+            )),
         }
     }
 
     /// Different checkouts can share a codebase id. A bound checkout waits for
     /// its own gate; a rootless request waits for all matching checkouts.
-    async fn await_initial_client(&self, client: &Client) -> std::result::Result<(), String> {
+    async fn await_initial_client(
+        &self,
+        op: &'static str,
+        client: &Client,
+        budget: &CallBudget,
+    ) -> Result<(), ToolError> {
         if let Some(root) = client.local_root() {
-            self.await_initial_path(root).await
+            self.await_initial_path(op, root, budget).await
         } else if let Some(id) = client.codebase_raw() {
-            self.await_initial_codebase(id).await
+            self.await_initial_codebase(op, id, budget).await
         } else {
             Ok(())
         }
     }
 
-    async fn await_initial_path(&self, dir: &Path) -> std::result::Result<(), String> {
+    /// Wait for the first index of the checkout at `dir`, when this session
+    /// holds one. Under a bounded `budget` the wait is short, and a first index
+    /// that is still running is an [`FailureKind::IndexPending`] error.
+    async fn await_initial_path(
+        &self,
+        op: &'static str,
+        dir: &Path,
+        budget: &CallBudget,
+    ) -> Result<(), ToolError> {
         let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
         let gate = initial_gate_for_path(&self.shared.leases, &dir).await;
         match gate {
-            Some(gate) => gate.wait().await.map_err(|e| initial_index_failed(&e)),
+            Some(gate) => wait_for_gate(&gate, budget)
+                .await
+                .map_err(|not_ready| not_ready.into_tool_error(op)),
             None => Ok(()),
         }
     }
 
-    async fn await_initial_codebase(&self, id: &str) -> std::result::Result<(), String> {
-        ready_for_codebases(&self.shared.leases, &[id.to_string()])
+    async fn await_initial_codebase(
+        &self,
+        op: &'static str,
+        id: &str,
+        budget: &CallBudget,
+    ) -> Result<(), ToolError> {
+        ready_for_codebases(&self.shared.leases, &[id.to_string()], budget)
             .await
             .map(|_| ())
+            .map_err(|not_ready| not_ready.into_tool_error(op))
     }
 
     /// Watch the checkout whose source identity the client sends with requests.
@@ -630,13 +719,15 @@ impl McpServer {
         }
     }
 
+    /// Apply a server plan to the checkout. A plan that cannot be applied is a
+    /// [`FailureKind::Refused`] error.
     async fn apply_server_plan(
         &self,
         client: &Client,
         plan: client::api::WorkspaceEditPlan,
         run_formatter: bool,
-        operation: &str,
-    ) -> String {
+        operation: &'static str,
+    ) -> Result<String, ToolError> {
         let watching = self.watcher_active(client).await;
         match crate::editing::apply(client, &plan, run_formatter, watching).await {
             Ok(outcome) => {
@@ -644,23 +735,30 @@ impl McpServer {
                 // for the watcher's debounce; a burst of edits still costs one
                 // reconcile, because the coordinator coalesces triggers.
                 self.trigger_sync(client).await;
-                render_edit_action_outcome(&outcome)
-                    .unwrap_or_else(|error| format!("{operation} result render failed: {error}"))
+                Ok(applied_edit_text(operation, &outcome))
             }
-            Err(error) => format!("{operation} refused: {error:#}"),
+            Err(error) => Err(ToolError::new(
+                operation,
+                FailureKind::Refused,
+                format!("{error:#}"),
+            )),
         }
     }
 
-    async fn execute_insert(&self, args: InsertSymbolArgs, before: bool) -> String {
+    async fn execute_insert(
+        &self,
+        args: InsertSymbolArgs,
+        before: bool,
+        budget: &CallBudget,
+    ) -> Result<String, ToolError> {
         let operation = if before {
             "insert_before_symbol"
         } else {
             "insert_after_symbol"
         };
-        let client = match self.client_for(args.codebase.as_deref()).await {
-            Ok(client) => client,
-            Err(error) => return format!("{operation} unavailable — {error}"),
-        };
+        let client = self
+            .client_for(operation, args.codebase.as_deref(), budget)
+            .await?;
         let run_formatter = args.run_formatter.unwrap_or(false);
         let request = client::api::InsertSymbolRequest {
             target: args.target,
@@ -671,7 +769,10 @@ impl McpServer {
                 self.apply_server_plan(&client, plan, run_formatter, operation)
                     .await
             }
-            Err(error) => format!("{operation} planning failed: {error:#}"),
+            Err(error) => Err(ToolError::from_client(
+                operation,
+                &error.context("planning"),
+            )),
         }
     }
 }
@@ -692,21 +793,23 @@ fn selector_is_path_like(cwd: &Path, raw: &str) -> bool {
         || cwd.join(candidate).is_dir()
 }
 
-/// Resolve a selector path to a canonical directory.
+/// Resolve a selector path to a canonical directory. A path that does not name
+/// a directory is an invalid argument of `op`.
 ///
 /// A relative selector resolves against the session's working directory, not
 /// against the process working directory. One process can serve sessions
 /// invoked from different directories, and it must never move its own.
-fn canonical_directory(cwd: &Path, path: &Path) -> std::result::Result<PathBuf, String> {
+fn canonical_directory(op: &'static str, cwd: &Path, path: &Path) -> Result<PathBuf, ToolError> {
+    let invalid = |detail: String| ToolError::new(op, FailureKind::InvalidArgument, detail);
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         cwd.join(path)
     };
     let dir = std::fs::canonicalize(&absolute)
-        .map_err(|e| format!("can't resolve directory {}: {e}", path.display()))?;
+        .map_err(|e| invalid(format!("can't resolve directory {}: {e}", path.display())))?;
     if !dir.is_dir() {
-        return Err(format!("{} is not a directory", dir.display()));
+        return Err(invalid(format!("{} is not a directory", dir.display())));
     }
     Ok(dir)
 }
