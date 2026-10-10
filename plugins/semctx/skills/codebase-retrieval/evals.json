@@ -63,7 +63,7 @@
       "query": "I just opted a brand-new repository into indexing. Can I search it while its first embed job is still running?",
       "expected_behavior": [
         "Explains that index_codebase returned at once, and that first-time retrieval/catalog/graph calls cannot see a partial initial index: they wait at most 5 seconds, then fail with a still-running error",
-        "Calls sync_status about every 10 to 15 seconds to follow the first-index phase (registering, syncing, embedding, ready, or failed) because status bypasses the readiness gate",
+        "Calls sync_status about every 60 seconds to follow the first-index phase (registering, syncing, embedding, ready, or failed) because status bypasses the readiness gate",
         "Uses local Read/Grep for the repository until the phase is ready instead of looping on a retrieval call that reports it is still running",
         "Distinguishes later background re-syncs, which do not block retrieval from the last complete snapshot"
       ]

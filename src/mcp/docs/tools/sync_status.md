@@ -12,7 +12,7 @@ While a first index is running, or after it ended, the answer has a `first index
 - ready: the first index is complete, and retrieval tools serve it.
 - failed: the first index ended without a usable index. The line gives the reason. Call `index_codebase` for the same path to retry.
 
-The line is absent when the MCP server has no first index for the checkout, such as a checkout that was indexed in an earlier session. Call this tool every 10 to 15 seconds while a first index runs.
+The line is absent when the MCP server has no first index for the checkout, such as a checkout that was indexed in an earlier session. Call this tool every 60 seconds while a first index runs.
 
 While a sync runs for the checkout, the answer has a `current sync:` line after the `first index:` line. This holds for a first index and for a later re-sync. When there is no `first index:` line, the `current sync:` line follows the codebase line. The line shows the latest step of the sync:
 

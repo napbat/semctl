@@ -57,10 +57,7 @@ async fn a_new_first_index_returns_once_the_codebase_is_registered() {
         text.starts_with("first index started\ncodebase codebase-1\npath "),
         "{text}"
     );
-    assert!(
-        text.contains("call sync_status every 10 to 15 seconds"),
-        "{text}"
-    );
+    assert!(text.contains("call sync_status every 60 seconds"), "{text}");
     assert!(text.contains("local Read/Grep"), "{text}");
     let gate = initial_gate_for_path(&server.shared.leases, &dir)
         .await
@@ -104,10 +101,7 @@ async fn a_second_call_reports_the_first_index_in_progress_without_waiting() {
         text.starts_with("first index already in progress (syncing)\ncodebase codebase-1\npath "),
         "{text}"
     );
-    assert!(
-        text.contains("call sync_status every 10 to 15 seconds"),
-        "{text}"
-    );
+    assert!(text.contains("call sync_status every 60 seconds"), "{text}");
 }
 
 /// Two calls race for one checkout. The one that does not win the claim must

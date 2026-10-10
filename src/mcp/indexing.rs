@@ -24,7 +24,7 @@ use crate::client::Client;
 /// retrieval serves the new index.
 const FOLLOW_PROGRESS: &str = "retrieval tools for this path report that the first index is \
      still running until it completes\n\
-     call sync_status every 10 to 15 seconds to follow progress, and use local Read/Grep \
+     call sync_status every 60 seconds to follow progress, and use local Read/Grep \
      meanwhile";
 
 impl McpServer {

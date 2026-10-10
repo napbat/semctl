@@ -91,7 +91,7 @@ re-syncs do not block use of the last complete index.
 
 - Empty results right after attach → `sync_status`: a first-index phase of
   registering, syncing, or embedding, or a job that is `queued` / `running`,
-  means the index is still building; check again in 10 to 15 seconds instead of
+  means the index is still building; check again in 60 seconds instead of
   concluding the repo isn't indexed.
 - A tool fails → the error ends with a `next:` line. Follow it. Retry once only
   when it says the call is retryable. Otherwise use local Read/Grep for that
