@@ -21,6 +21,36 @@ fn blank_server_overrides_fall_through_to_the_next_candidate() {
     assert_eq!(server_url_from(None, None), DEFAULT_SERVER_URL);
 }
 
+/// Two sessions of one daemon bind at the same moment on a fresh install. A
+/// reader that arrived while the winner was still writing used to fail, and
+/// its session silently skipped watching its checkout.
+#[test]
+fn concurrent_first_runs_agree_on_one_installation_id() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("installation-id");
+    let ready = Arc::new(Barrier::new(16));
+    let ids: Vec<String> = std::thread::scope(|scope| {
+        let threads: Vec<_> = (0..16)
+            .map(|_| {
+                let ready = ready.clone();
+                let path = &path;
+                scope.spawn(move || {
+                    ready.wait();
+                    installation_id_at(path).unwrap()
+                })
+            })
+            .collect();
+        threads.into_iter().map(|t| t.join().unwrap()).collect()
+    });
+    assert!(ids.iter().all(|id| id == &ids[0]), "{ids:?}");
+    assert_eq!(installation_id_at(&path).unwrap(), ids[0]);
+    assert_eq!(
+        std::fs::read_dir(directory.path()).unwrap().count(),
+        1,
+        "no staged sidecar is left behind"
+    );
+}
+
 #[test]
 fn concurrent_config_updates_preserve_each_change() {
     let directory = tempfile::tempdir().unwrap();
