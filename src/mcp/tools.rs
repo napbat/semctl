@@ -87,7 +87,7 @@ impl McpServer {
         let mut out = query::search(
             &client,
             &args.query,
-            args.top_k.unwrap_or(20),
+            args.top_k.unwrap_or(8),
             &args.domains.unwrap_or_default(),
             &opts,
         )

@@ -15,7 +15,7 @@ fit current bytes at a known path or a narrow file-scoped check.
 
 | You want | Call |
 | --- | --- |
-| fuzzy / conceptual — "how does X work" | `search_codebase` — start with snippets and a focused `top_k` (usually 5–8); the server bounds total result content; use `expand: true` only for the most relevant hit or small set, then reason from those bodies; `prefer: "docs"` or `"code"`; use `scope` or `codebase_ids` for an authorized multi-codebase lens |
+| fuzzy / conceptual — "how does X work" | `search_codebase` — start with snippets; `expand: true` only for the most relevant hits, then reason from those bodies; `prefer: "docs"` or `"code"`; `scope` / `codebase_ids` for a multi-codebase lens |
 | declaration-name discovery | `search_symbols` — exact/prefix/substring/glob/fuzzy qualified-name search with kind/path/project/language filters |
 | where is X defined / where is every resolved use | `find_definition` / `find_references` (exact, case-sensitive names; references include exact occurrences, read/write, namespace, kind, and resolved identity) |
 | who calls X / what implements Y | `who_calls` / `implementations_of` |
@@ -64,9 +64,6 @@ re-syncs do not block use of the last complete index.
 - Exact symbol, defined in this repo, in a graph language (Rust, C#, Go,
   TypeScript/JS, C++) → symbol-graph tools (`find_definition` /
   `find_references` / `who_calls`), not search.
-- Semantic search responses share a server-enforced result-content budget.
-  Start unexpanded, refine from ranked snippets, and expand only the relevant hit
-  or small set. An expanded body normally replaces a follow-up file read.
 - Use `grep` instead of `find_references` when you need EVERY occurrence:
   `find_references` returns every resolved code occurrence (including repeated
   same-line uses) but still skips strings, comments, markdown, and any symbol whose

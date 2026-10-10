@@ -269,6 +269,8 @@ pub(super) fn render_hits_inner(
 
     let mut out = String::new();
     let mut separated = false;
+    let mut expanded_chars = 0_usize;
+    let mut snipped = 0_usize;
     for h in hits {
         let root = context.root_for(h);
         if let Some(floor) = weak_below
@@ -326,21 +328,37 @@ pub(super) fn render_hits_inner(
         // Skip leading blank lines so the declaration/signature leads the snippet
         // rather than whitespace. `--expand` shows the whole body; otherwise the
         // first few lines, enough to judge relevance without flooding context.
-        let take = if full_body { usize::MAX } else { 4 };
-        for line in h
-            .snippet
-            .lines()
-            .skip_while(|l| l.trim().is_empty())
-            .take(take)
-        {
+        let lines = h.snippet.lines().skip_while(|l| l.trim().is_empty());
+        let expand = full_body
+            && (expanded_chars == 0 || expanded_chars + h.snippet.len() <= EXPANDED_BODY_CHARS);
+        if expand {
+            expanded_chars += h.snippet.len();
+        } else if full_body {
+            snipped += 1;
+        }
+        for line in lines.take(if expand { usize::MAX } else { 4 }) {
             out.push_str("    ");
             out.push_str(line);
             out.push('\n');
         }
         out.push('\n');
     }
+    if snipped > 0 {
+        writeln!(
+            out,
+            "{snipped} hit(s) shown as snippets: expanded bodies stop at \
+             {EXPANDED_BODY_CHARS} characters. Use expand_chunk for one of them."
+        )
+        .expect("writing to a String cannot fail");
+    }
     out
 }
+
+/// The total length of expanded bodies in one search answer. The first hit is
+/// always expanded; a later hit that does not fit is shown as a snippet. The
+/// server has no size limit of its own, and one expanded search with a broad
+/// `top_k` can otherwise return tens of thousands of characters.
+const EXPANDED_BODY_CHARS: usize = 30_000;
 
 /// A hit scoring below this fraction of the top hit's score is sorted under the
 /// "weaker matches" separator. Relative (not absolute) because raw hybrid
@@ -403,7 +421,9 @@ pub(super) fn hit_location(h: &api::SearchHit, root: Option<&Path>) -> String {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{HitContext, api, render_hits_inner, render_job, strip_verbatim_prefix};
+    use super::{
+        EXPANDED_BODY_CHARS, HitContext, api, render_hits_inner, render_job, strip_verbatim_prefix,
+    };
 
     /// A `SearchHit` with a chosen chunk id + path — for the render test that
     /// keys on those.
@@ -455,6 +475,52 @@ mod tests {
 
         assert!(dirty.contains("⚠ stale"), "edited file flagged");
         assert!(!clean.contains("⚠ stale"), "untouched file not flagged");
+    }
+
+    /// A hit whose expanded body has `lines` lines of 10 characters each.
+    fn body(id: &str, lines: usize) -> api::SearchHit {
+        let mut hit = node(id, &format!("{id}.rs"));
+        hit.snippet = format!("{id}-body-ln\n").repeat(lines);
+        hit
+    }
+
+    fn expanded(hits: &[api::SearchHit]) -> String {
+        render_hits_inner(
+            hits,
+            "none",
+            HitContext::local(None),
+            true,
+            &HashSet::new(),
+            true,
+        )
+    }
+
+    #[test]
+    fn expanded_bodies_stop_at_the_limit_and_later_hits_that_fit_still_expand() {
+        // 2,000 + 1,500 + 500 lines of 10 characters: the second body would pass
+        // 30,000 characters, the third still fits after it is skipped.
+        let out = expanded(&[body("a", 2_000), body("b", 1_500), body("c", 500)]);
+
+        assert_eq!(out.matches("a-body-ln").count(), 2_000);
+        assert_eq!(out.matches("b-body-ln").count(), 4, "shown as a snippet");
+        assert_eq!(out.matches("c-body-ln").count(), 500);
+        assert!(
+            out.ends_with(&format!(
+                "1 hit(s) shown as snippets: expanded bodies stop at {EXPANDED_BODY_CHARS} \
+                 characters. Use expand_chunk for one of them.\n"
+            )),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn the_first_expanded_body_is_never_cut_and_small_answers_have_no_note() {
+        let oversized = expanded(&[body("a", 4_000)]);
+        assert_eq!(oversized.matches("a-body-ln").count(), 4_000);
+        assert!(!oversized.contains("shown as snippets"), "{oversized}");
+
+        let small = expanded(&[body("a", 10), body("b", 10)]);
+        assert!(!small.contains("shown as snippets"), "{small}");
     }
 
     #[test]

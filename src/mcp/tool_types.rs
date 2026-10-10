@@ -23,8 +23,7 @@ pub struct SearchArgs {
     pub copy: Option<String>,
     /// Natural-language query.
     pub query: String,
-    /// Max hits to return. Defaults to 20; focused discovery usually needs 5–8.
-    /// The server's total result-content budget still bounds the response.
+    /// Max hits to return. Defaults to 8.
     pub top_k: Option<u32>,
     /// Restrict to these registered domain ids. Empty / omitted = all.
     pub domains: Option<Vec<String>>,
@@ -35,8 +34,8 @@ pub struct SearchArgs {
     /// Omit for every kind.
     pub kinds: Option<Vec<String>>,
     /// Return full enclosing-symbol bodies instead of 4-line snippets. Defaults
-    /// false. Expand only a focused hit set and use those bodies without rereading
-    /// the same files; the server result budget applies across expanded hits.
+    /// false. Bodies stop at 30,000 characters in total; later hits stay
+    /// snippets. Do not reread files whose bodies were returned.
     pub expand: Option<bool>,
     /// Server scope lens: `local`, `personal`, `organization`, or `global`.
     /// Mutually exclusive with `codebase_ids`.

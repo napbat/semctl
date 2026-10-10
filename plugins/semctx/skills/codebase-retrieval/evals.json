@@ -88,7 +88,7 @@
       "skills": ["codebase-retrieval"],
       "query": "I don't know where production readiness is implemented. Find the likely code and explain the relevant path without flooding the context.",
       "expected_behavior": [
-        "Starts with one focused search_codebase call using snippets rather than expand and a small top_k around 5-8",
+        "Starts with one focused search_codebase call using snippets rather than expand, with the default or a small top_k",
         "Refines or expands only the most relevant hit instead of issuing overlapping semantic searches",
         "Uses an expanded body directly rather than immediately rereading the same file"
       ]

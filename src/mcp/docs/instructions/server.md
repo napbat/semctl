@@ -3,7 +3,7 @@ Code retrieval and graph navigation over semctx-indexed codebases. Tools default
 ## Tool selection
 
 - **find_definition / find_references** — use these FIRST when you know an exact symbol name. Deterministic, fast, precise (no embedding round-trip).
-- **search_codebase** — use for fuzzy / conceptual queries when you don't know the symbol or file. Start with snippets and a focused result set; the server bounds total result content, so expand only the most relevant hit or small set.
+- **search_codebase** — use for fuzzy / conceptual queries when you don't know the symbol or file. Start with snippets; expand only the most relevant hit or small set.
 - **search_symbols** — declaration-name discovery by exact/prefix/substring/glob/fuzzy matching; use between exact `find_definition` and conceptual `search_codebase`.
 - **grep** — exact literal / regex search over file content ("find all occurrences of X"); the exhaustive counterpart to semantic search.
 - **who_calls** — every definition that calls a function (the inverse call edge); the "who calls X" tool.
@@ -52,9 +52,8 @@ snapshot with freshness warnings.
 
 ## Workflow
 
-1. Need to discover an unknown location → `search_codebase` with snippets and a
-   focused result set (usually 5–8); refine or expand one relevant hit rather than
-   issuing overlapping expanded searches.
+1. Need to discover an unknown location → `search_codebase`; refine or expand one
+   relevant hit rather than issuing overlapping searches.
 2. Know the symbol name → `find_definition` / `find_references`; callers →
    `who_calls`; the whole neighbourhood → `trace`; many symbols at once →
    `batch_lookup`.
@@ -69,10 +68,6 @@ snapshot with freshness warnings.
    it after the host's normal approval.
 
 Prefer the symbol-graph tools over search whenever you have an exact name — they're cheaper and more precise. Coverage follows the server's registered language packs: Rust, C#, Go, TypeScript/JavaScript, and C++. C++ needs build context in the checkout and can miss member declarations and calls, so confirm an empty C++ answer with `grep`. Other languages aren't on the graph — use `search_codebase` / `grep`.
-
-Expanded search bodies share the server's total result-content budget. `top_k` is
-an upper bound, not a guarantee that every full body fits. Use expanded bodies
-directly instead of fetching the same files again.
 
 ## When a tool fails
 
