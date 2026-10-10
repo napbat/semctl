@@ -480,6 +480,13 @@ pub async fn grep(
     }
     let root = client.local_root();
     let mut out = String::new();
+    if let Some(file) = single_file_target(path, &matches)
+        && root.is_some_and(|root| root.join(file).is_file())
+    {
+        out.push_str(
+            "note: for one local file, host Grep is current; this searched the indexed snapshot.\n",
+        );
+    }
     for m in &matches {
         writeln!(
             out,
@@ -498,6 +505,14 @@ pub async fn grep(
     )
     .expect("writing to a String cannot fail");
     Ok(out)
+}
+
+/// The one file a grep targeted: `path` names a file (not a directory), and
+/// every match is in one file whose path ends with it.
+fn single_file_target<'a>(path: Option<&str>, matches: &'a [api::GrepMatch]) -> Option<&'a str> {
+    let filter = path.filter(|p| !p.is_empty() && !p.ends_with('/'))?;
+    let file = matches.first()?.path.as_str();
+    (file.ends_with(filter) && matches.iter().all(|m| m.path == file)).then_some(file)
 }
 
 /// A file's table of contents — every indexed chunk (kind, symbol, line range)
@@ -653,8 +668,35 @@ fn urlencode(s: &str) -> String {
 mod tests {
     use super::{
         SearchOpts, bound_codebase, human_bytes, is_stale, local_blake3, normalize_prefer,
+        single_file_target,
     };
-    use crate::client::Client;
+    use crate::client::{Client, api};
+
+    fn at(path: &str) -> api::GrepMatch {
+        api::GrepMatch {
+            path: path.into(),
+            line_number: 1,
+            line: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_grep_is_single_file_only_when_its_path_names_the_one_matched_file() {
+        let one = [
+            at("crates/a/src/simplify.rs"),
+            at("crates/a/src/simplify.rs"),
+        ];
+        assert_eq!(
+            single_file_target(Some("a/src/simplify.rs"), &one),
+            Some("crates/a/src/simplify.rs")
+        );
+        // A directory filter, no filter, or matches in two files are broad.
+        assert_eq!(single_file_target(Some("crates/a/"), &one), None);
+        assert_eq!(single_file_target(Some("crates/a/src"), &one), None);
+        assert_eq!(single_file_target(None, &one), None);
+        let two = [at("x/simplify.rs"), at("y/simplify.rs")];
+        assert_eq!(single_file_target(Some("simplify.rs"), &two), None);
+    }
 
     const CORRECT_THE_ARGUMENT: &str = "next: correct the argument and call again.";
 

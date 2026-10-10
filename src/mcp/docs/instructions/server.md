@@ -5,7 +5,7 @@ Code retrieval and graph navigation over semctx-indexed codebases. Tools default
 - **find_definition / find_references** — use these FIRST when you know an exact symbol name. Deterministic, fast, precise (no embedding round-trip).
 - **search_codebase** — use for fuzzy / conceptual queries when you don't know the symbol or file. Start with snippets; expand only the most relevant hit or small set.
 - **search_symbols** — declaration-name discovery by exact/prefix/substring/glob/fuzzy matching; use between exact `find_definition` and conceptual `search_codebase`.
-- **grep** — exact literal / regex search over file content ("find all occurrences of X"); the exhaustive counterpart to semantic search.
+- **grep** — exact literal / regex search across indexed files ("find all occurrences of X"); for one known local file, use host Grep.
 - **who_calls** — every definition that calls a function (the inverse call edge); the "who calls X" tool.
 - **implementations_of** — the types implementing a trait/interface (the reverse implements edge).
 - **call_path** — a shortest call chain from one function to another.

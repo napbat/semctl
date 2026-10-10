@@ -23,7 +23,7 @@ fit current bytes at a known path or a narrow file-scoped check.
 | super/subtype relations | `type_hierarchy` — declared/structural origin, external targets, bounded direction/depth |
 | call cycles / unused definitions / exact duplicates | `cycles` / `unused` / `duplicates` (unused results include reason + completeness caveat; duplicates include hashes) |
 | where does a value flow | `reaches` (forward), `flows_into` (backward), `flows_between` (witness path) |
-| every literal occurrence, incl. strings/comments | `grep` — semctx's own, over indexed content (regex, ignore_case, path filter) |
+| every literal occurrence, incl. strings/comments | `grep` — repo-wide, over indexed content (regex, ignore_case, path filter) |
 | a file's nested shape / more context around a hit | `file_outline` (depth/kind/body controls) / `expand_chunk` |
 | exact source bytes from a remote-only or revision-pinned codebase | `read_source` — request a focused line/byte range; use host `Read` for current bytes at a known local path |
 | what is at path:line | `symbol_at_position` |
