@@ -5,8 +5,11 @@ use std::path::PathBuf;
 use anyhow::Result;
 use rmcp::{
     ErrorData, RoleServer, ServerHandler,
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{ListToolsResult, ServerCapabilities, ServerInfo, Tool},
+    handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
+    model::{
+        CallToolRequestParams, CallToolResult, Implementation, ListToolsResult, ServerCapabilities,
+        ServerInfo, Tool,
+    },
     service::RequestContext,
     tool, tool_handler, tool_router,
 };
@@ -726,8 +729,8 @@ impl McpServer {
 impl ServerHandler for McpServer {
     // Defining these here makes `#[tool_handler]` skip its generated
     // versions (it checks `has_method`), so the Markdown descriptions
-    // reach the host. `call_tool` is still generated — it ignores
-    // descriptions, so the default delegation is correct.
+    // reach the host. Calls retain the shared query text and report failures
+    // through MCP so hosts can display the correct tool status.
     // Not `async`: there is nothing to await, and the trait accepts any
     // `Future`. Written as async it is a future that never yields, which newer
     // clippy calls out rather than letting it read as if it might.
@@ -754,11 +757,27 @@ impl ServerHandler for McpServer {
         self.tool_router.get(name).cloned().map(Self::with_doc)
     }
 
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let name = request.name.clone();
+        let call = ToolCallContext::new(self, request, context);
+        let mut result = self.tool_router.call(call).await?;
+        super::presentation::mark_failure(&name, &mut result);
+        Ok(result)
+    }
+
     fn get_info(&self) -> ServerInfo {
         // ServerInfo is #[non_exhaustive] — start from default, then set
         // the fields we care about.
         let mut info = ServerInfo::default();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        info.server_info = Implementation::new("semctx", env!("CARGO_PKG_VERSION"))
+            .with_title("semctx code intelligence")
+            .with_description("Search, navigate, and edit indexed code with semctl.")
+            .with_website_url(env!("CARGO_PKG_REPOSITORY"));
         // Hosts can prepend server instructions to every tool description.
         // The session hook delivers server.md once per context segment instead.
         info

@@ -36,6 +36,7 @@ use crate::engine::{CheckoutKey, CoordinatorStatus, Engine, EngineSettings, Trig
 use crate::query;
 use crate::session::SessionContext;
 
+mod presentation;
 pub(crate) mod readiness;
 mod tool_types;
 mod tools;
@@ -781,6 +782,12 @@ impl McpServer {
         } else {
             ToolAnnotations::new().read_only(true).open_world(false)
         });
+        if let Some(title) = presentation::tool_title(&tool.name) {
+            tool.title = Some(title.into());
+            if let Some(annotations) = &mut tool.annotations {
+                annotations.title = Some(title.into());
+            }
+        }
         tool
     }
 }

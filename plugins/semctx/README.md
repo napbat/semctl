@@ -28,6 +28,19 @@ repository content searches, so they map to `Grep` like `grep` does. A search
 of OMP internal URLs (`omp://`,
 `local://`, `skill://`) or web URLs is not repository discovery, so the adapter
 does not send it to `semctl hook`.
+
+Tool presentation comes from the shared MCP server. Search and symbol results
+start with a match count and source location. Each hit separates metadata from
+the fenced source snippet. Local stale-file warnings remain next to the
+location. Tool names and argument schemas stay stable. Display titles are
+available to clients that support MCP titles. Failed operations set `isError`
+and retain their explanation.
+
+OMP uses its built-in MCP tool cards. Keep `mcp.renderMarkdownResults` enabled
+to render the headings and source fences. OMP controls the card title, colors,
+and collapsed preview length. Use its expand control to see more output.
+The lifecycle adapter does not register duplicate tools or replace result text.
+
 Do not manually copy shared skills; when a host requires a projected format,
 generate it from the canonical skill and verify parity in CI.
 

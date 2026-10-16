@@ -3,6 +3,7 @@
 //! model. No `Client`, no `async`, no network — just formatting, so this
 //! layer is cheap to unit-test in isolation.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt::Write;
 use std::path::Path;
@@ -220,9 +221,8 @@ pub(super) fn render_tree(nodes: &[api::FileTreeNode], depth: usize, out: &mut S
     }
 }
 
-/// Render a hit list as readable text. Each hit is a location line plus
-/// a few lines of snippet — enough for the model to decide whether to
-/// expand, without flooding the context.
+/// Render a hit list as Markdown. The count and first location lead the output.
+/// Each hit has a heading, metadata, and a fenced snippet.
 ///
 /// `show_score` gates the relevance score: it's meaningful for `search`
 /// (ranked by hybrid similarity) but a constant 0.000 for the symbol-graph
@@ -267,7 +267,11 @@ pub(super) fn render_hits_inner(
     let weak_below = show_score
         .then(|| hits.iter().map(|h| h.score).fold(f64::MIN, f64::max) * WEAK_HIT_FRACTION);
 
-    let mut out = String::new();
+    let mut out = format!(
+        "**{} {}**\n\n",
+        hits.len(),
+        if hits.len() == 1 { "match" } else { "matches" }
+    );
     let mut separated = false;
     for h in hits {
         let root = context.root_for(h);
@@ -275,71 +279,120 @@ pub(super) fn render_hits_inner(
             && !separated
             && h.score < floor
         {
-            out.push_str("--- weaker matches (below ");
-            write!(
-                out,
-                "{:.0}% of top score) ---\n\n",
-                WEAK_HIT_FRACTION * 100.0
-            )
-            .expect("writing to a String cannot fail");
+            out.push_str("### Weaker matches (below ");
+            write!(out, "{:.0}% of top score)\n\n", WEAK_HIT_FRACTION * 100.0)
+                .expect("writing to a String cannot fail");
             separated = true;
         }
-        let lang = h
-            .language
-            .as_deref()
-            .map(|l| format!(" {l}"))
-            .unwrap_or_default();
-        let score = if show_score {
-            format!("  (score {:.3})", h.score)
-        } else {
-            String::new()
-        };
-        let sym = hit_symbol(h);
-        // Kind (container/function/block) lets the reader tell a type/def chunk
-        // from a free block at a glance. Omitted when the server didn't send one.
-        let kind = if h.kind.is_empty() {
+        let marker = write_marker(h);
+        let classification = if marker.is_empty() {
             String::new()
         } else {
-            format!(" ({})", h.kind)
-        };
-        let stale_mark = if root.is_some() && h.path.as_deref().is_some_and(|p| stale.contains(p)) {
-            "  ⚠ stale (edited since indexed)"
-        } else {
-            ""
-        };
-        let codebase = if show_score {
-            h.codebase_id
-                .as_deref()
-                .map(|id| format!(" [codebase {id}]"))
-                .unwrap_or_default()
-        } else {
-            String::new()
+            format!(" {}", markdown_code(marker.trim()))
         };
         writeln!(
             out,
-            "[{}{lang}]{codebase} {}  {sym}{kind}{}{score}{stale_mark}",
-            h.domain_id,
-            hit_location(h, root),
-            write_marker(h)
+            "### {} — {}{classification}",
+            markdown_code(&hit_location(h, root)),
+            markdown_code(&hit_symbol(h))
         )
         .expect("writing to a String cannot fail");
-        // Skip leading blank lines so the declaration/signature leads the snippet
-        // rather than whitespace. `--expand` shows the whole body; otherwise the
-        // first few lines, enough to judge relevance without flooding context.
-        let take = if full_body { usize::MAX } else { 4 };
-        for line in h
-            .snippet
-            .lines()
-            .skip_while(|l| l.trim().is_empty())
-            .take(take)
-        {
-            out.push_str("    ");
-            out.push_str(line);
-            out.push('\n');
+        if root.is_some() && h.path.as_deref().is_some_and(|p| stale.contains(p)) {
+            // Put this warning before metadata so collapsed host views show it.
+            out.push_str("⚠ stale (edited since indexed)\n");
+        }
+        render_hit_metadata(&mut out, h, show_score);
+        // The preview starts at the first nonblank line. Expanded bodies retain
+        // all source bytes, including leading blank lines and indentation.
+        let snippet = if full_body {
+            Cow::Borrowed(h.snippet.as_str())
+        } else {
+            Cow::Owned(
+                h.snippet
+                    .lines()
+                    .skip_while(|line| line.trim().is_empty())
+                    .take(4)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+        };
+        if !snippet.is_empty() {
+            let fence = "`".repeat(longest_backtick_run(&snippet).saturating_add(1).max(3));
+            let language = fence_language(h.language.as_deref());
+            write!(out, "\n{fence}{language}\n{snippet}").expect("writing to a String cannot fail");
+            if !snippet.ends_with('\n') {
+                out.push('\n');
+            }
+            writeln!(out, "{fence}").expect("writing to a String cannot fail");
         }
         out.push('\n');
     }
     out
+}
+
+fn render_hit_metadata(out: &mut String, hit: &api::SearchHit, show_score: bool) {
+    write!(out, "Domain: {}", markdown_code(&hit.domain_id))
+        .expect("writing to a String cannot fail");
+    if let Some(language) = &hit.language {
+        write!(out, " · Language: {}", markdown_code(language))
+            .expect("writing to a String cannot fail");
+    }
+    if !hit.kind.is_empty() {
+        write!(out, " · Kind: {}", markdown_code(&hit.kind))
+            .expect("writing to a String cannot fail");
+    }
+    if show_score {
+        write!(out, " · Score: {:.3}", hit.score).expect("writing to a String cannot fail");
+    }
+    if let Some(codebase) = &hit.codebase_id {
+        write!(out, " · Codebase: {}", markdown_code(codebase))
+            .expect("writing to a String cannot fail");
+    }
+    out.push('\n');
+}
+
+/// Keep untrusted values on one line and outside Markdown syntax.
+fn markdown_code(value: &str) -> String {
+    if value.is_empty() {
+        return "(empty)".into();
+    }
+    let mut text = String::new();
+    for character in value.chars() {
+        if character.is_control() {
+            text.extend(character.escape_default());
+        } else {
+            text.push(character);
+        }
+    }
+    let fence = "`".repeat(longest_backtick_run(&text).saturating_add(1));
+    // Padding separates delimiter backticks and preserves surrounding spaces.
+    // CommonMark removes one padding space at each end of a code span.
+    let needs_padding = text.starts_with('`')
+        || text.ends_with('`')
+        || (text.starts_with(' ') && text.ends_with(' ') && !text.trim().is_empty());
+    let padding = if needs_padding { " " } else { "" };
+    format!("{fence}{padding}{text}{padding}{fence}")
+}
+
+fn longest_backtick_run(value: &str) -> usize {
+    value
+        .split(|character| character != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or(0)
+}
+
+/// A fence language must be a single token with no Markdown delimiters.
+fn fence_language(language: Option<&str>) -> String {
+    language
+        .filter(|value| {
+            value.chars().all(|character| {
+                character.is_ascii_alphanumeric()
+                    || matches!(character, '_' | '-' | '+' | '#' | '.')
+            })
+        })
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default()
 }
 
 /// A hit scoring below this fraction of the top hit's score is sorted under the
@@ -450,8 +503,14 @@ mod tests {
             &stale,
             false,
         );
-        let dirty = out.lines().find(|l| l.contains("dirty.rs")).unwrap();
-        let clean = out.lines().find(|l| l.contains("clean.rs")).unwrap();
+        let dirty = out
+            .split("\n### ")
+            .find(|hit| hit.contains("dirty.rs"))
+            .unwrap();
+        let clean = out
+            .split("\n### ")
+            .find(|hit| hit.contains("clean.rs"))
+            .unwrap();
 
         assert!(dirty.contains("⚠ stale"), "edited file flagged");
         assert!(!clean.contains("⚠ stale"), "untouched file not flagged");
@@ -475,18 +534,17 @@ mod tests {
             &stale,
             false,
         );
-        let lines: Vec<_> = output
-            .lines()
-            .filter(|line| line.starts_with('['))
-            .collect();
-        assert!(lines[0].contains("[codebase a]"));
-        assert!(lines[0].contains(&root.join("src/lib.rs").display().to_string()));
-        assert!(lines[0].contains("stale"));
-        assert!(lines[1].contains("[codebase b] src/lib.rs"));
-        assert!(!lines[1].contains("checkout-a"));
-        assert!(!lines[1].contains("stale"));
-        assert!(!lines[2].contains("checkout-a"));
-        assert!(!lines[2].contains("stale"));
+        let sections: Vec<_> = output.split("\n### ").skip(1).collect();
+        assert!(sections[0].contains("Codebase: `a`"));
+        assert!(sections[0].contains(&root.join("src/lib.rs").display().to_string()));
+        assert!(sections[0].contains("stale"));
+        assert!(sections[1].starts_with("`src/lib.rs:1-2`"));
+        assert!(sections[1].contains("Codebase: `b`"));
+        assert!(!sections[1].contains("checkout-a"));
+        assert!(!sections[1].contains("stale"));
+        assert!(!sections[2].contains("checkout-a"));
+        assert!(!sections[2].contains("stale"));
+        assert!(!sections[2].contains("Codebase:"));
     }
 
     #[test]
@@ -507,6 +565,9 @@ mod tests {
         let mut write = node("dispatch", "run.rs");
         write.enclosing_symbol = Some("reset".into());
         write.is_write = Some(true);
+        write.reference_namespace = Some("Value".into());
+        write.reference_kind = Some("assignment".into());
+        write.qualified_symbol = Some("crate::dispatch".into());
 
         let out = render_hits_inner(
             &[read, write],
@@ -519,9 +580,179 @@ mod tests {
         let lines: Vec<&str> = out.lines().filter(|l| l.contains("run.rs")).collect();
 
         assert!(lines[0].contains("dispatch in run_until"), "{out}");
-        assert!(!lines[0].contains("(write)"), "a read isn't marked: {out}");
+        assert!(lines[0].contains("(read)"), "{out}");
         assert!(lines[1].contains("dispatch in reset"), "{out}");
-        assert!(lines[1].contains("(write)"), "{out}");
+        assert!(
+            lines[1].contains("(write; value; assignment; -> crate::dispatch)"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("Score:"),
+            "graph hits have no relevance score: {out}"
+        );
+    }
+
+    #[test]
+    fn render_count_location_and_stale_warning_lead_the_output() {
+        let hits = [node("first", "dirty.rs"), node("second", "clean.rs")];
+        let output = render_hits_inner(
+            &hits,
+            "none",
+            HitContext::local(Some(std::path::Path::new("/repo"))),
+            true,
+            &HashSet::from(["dirty.rs".to_string()]),
+            false,
+        );
+        let lines: Vec<_> = output.lines().collect();
+        assert_eq!(lines[0], "**2 matches**");
+        assert_eq!(lines[1], "");
+        assert!(lines[2].starts_with("### `"), "{output}");
+        assert!(lines[2].contains("dirty.rs:1-2` — `first`"), "{output}");
+        assert_eq!(lines[3], "⚠ stale (edited since indexed)");
+        assert_eq!(
+            lines[4],
+            "Domain: `code` · Language: `rust` · Kind: `function` · Score: 0.000"
+        );
+    }
+
+    #[test]
+    fn render_fences_preserve_snippet_markdown_and_preview_line_selection() {
+        let mut hit = node("snippet", "source.rs");
+        hit.snippet =
+            "\n  \nfn example() {\n    ```rust\n    ~~~\n    **text** <tag>  \n    omitted\n}"
+                .into();
+        let output = render_hits_inner(
+            &[hit],
+            "none",
+            HitContext::local(None),
+            false,
+            &HashSet::new(),
+            false,
+        );
+        assert!(output.starts_with("**1 match**\n"), "{output}");
+        assert!(
+            output.contains(
+                "\n````rust\nfn example() {\n    ```rust\n    ~~~\n    **text** <tag>  \n````\n"
+            ),
+            "{output}"
+        );
+        assert!(!output.contains("omitted"), "{output}");
+    }
+
+    #[test]
+    fn render_expanded_body_preserves_all_source_bytes() {
+        let mut hit = node("expanded", "source.rs");
+        let source = "\r\n  fn example() {\r\n    one\r\n    two\r\n    three\r\n    four\r\n    `````\r\n  }\r\n";
+        hit.snippet = source.into();
+        let output = render_hits_inner(
+            &[hit],
+            "none",
+            HitContext::local(None),
+            false,
+            &HashSet::new(),
+            true,
+        );
+        assert!(
+            output.contains(&format!("\n``````rust\n{source}``````\n")),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn render_untrusted_values_cannot_open_markdown_blocks() {
+        let mut hit = node("`symbol`\n<!--", "`source`\n```\n.rs");
+        hit.language = Some("rust\n```".into());
+        hit.domain_id = "<details>\n```".into();
+        hit.codebase_id = Some("a`\r\n# hidden".into());
+        hit.snippet = "let value = 1;".into();
+        let output = render_hits_inner(
+            &[hit],
+            "none",
+            HitContext::local(None),
+            true,
+            &HashSet::new(),
+            false,
+        );
+        let lines: Vec<_> = output.lines().collect();
+        assert!(
+            lines[2].contains("```` `source`\\n```\\n.rs:1-2 ````"),
+            "{output}"
+        );
+        assert!(lines[2].contains("`` `symbol`\\n<!-- ``"), "{output}");
+        assert!(
+            lines[3].contains("Codebase: ``a`\\r\\n# hidden``"),
+            "{output}"
+        );
+        assert!(output.contains("\n```\nlet value = 1;\n```\n"), "{output}");
+        assert_eq!(output.matches("\n### ").count(), 1, "{output}");
+    }
+
+    #[test]
+    fn render_keeps_weak_matches_in_one_group() {
+        let mut hits = [
+            node("strong", "a.rs"),
+            node("weak", "b.rs"),
+            node("weaker", "c.rs"),
+        ];
+        hits[0].score = 1.0;
+        hits[1].score = 0.4;
+        hits[2].score = 0.2;
+        let output = render_hits_inner(
+            &hits,
+            "none",
+            HitContext::local(None),
+            true,
+            &HashSet::new(),
+            false,
+        );
+        assert!(output.starts_with("**3 matches**\n"), "{output}");
+        assert_eq!(
+            output
+                .matches("### Weaker matches (below 50% of top score)")
+                .count(),
+            1
+        );
+        assert!(output.find("`strong`").unwrap() < output.find("### Weaker").unwrap());
+        assert!(output.find("### Weaker").unwrap() < output.find("`weak`").unwrap());
+        assert!(output.contains("`weaker`"), "{output}");
+    }
+
+    #[test]
+    fn render_empty_results_preserves_the_exact_message() {
+        for message in ["no results", "nothing calls `run`", ""] {
+            assert_eq!(
+                render_hits_inner(
+                    &[],
+                    message,
+                    HitContext::local(None),
+                    true,
+                    &HashSet::new(),
+                    false,
+                ),
+                message
+            );
+        }
+    }
+
+    #[test]
+    fn render_missing_and_empty_values_remain_visible() {
+        let mut hit = node("", "source.rs");
+        hit.path = None;
+        hit.domain_id.clear();
+        hit.language = None;
+        hit.kind.clear();
+        let output = render_hits_inner(
+            &[hit],
+            "none",
+            HitContext::local(None),
+            false,
+            &HashSet::new(),
+            false,
+        );
+        assert_eq!(
+            output,
+            "**1 match**\n\n### `(no location)` — (empty)\nDomain: (empty)\n\n"
+        );
     }
 
     #[test]

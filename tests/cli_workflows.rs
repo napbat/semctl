@@ -436,7 +436,8 @@ async fn cross_codebase_search_keeps_remote_paths_relative_and_unmarked() {
             String::from_utf8_lossy(&output.stderr)
         );
         let text = String::from_utf8(output.stdout).unwrap();
-        assert!(text.contains("[codebase B] src/lib.rs:1"), "{text}");
+        assert!(text.contains("### `src/lib.rs:1"), "{text}");
+        assert!(text.contains("Codebase: `B`"), "{text}");
         assert!(!text.contains("checkout-a"), "{text}");
         assert!(!text.contains("stale"), "{text}");
         let requests = server.requests();
@@ -482,21 +483,23 @@ async fn mixed_search_marks_only_hits_bound_to_the_local_checkout() {
         String::from_utf8_lossy(&output.stderr)
     );
     let text = String::from_utf8(output.stdout).unwrap();
-    let local = text
-        .lines()
-        .find(|line| line.contains("[codebase A]"))
+    let sections: Vec<_> = text.split("\n### ").skip(1).collect();
+    let local = sections
+        .iter()
+        .find(|section| section.contains("Codebase: `A`"))
         .unwrap();
-    let remote = text
-        .lines()
-        .find(|line| line.contains("[codebase B]"))
+    let remote = sections
+        .iter()
+        .find(|section| section.contains("Codebase: `B`"))
         .unwrap();
-    let unidentified = text
-        .lines()
-        .find(|line| line.starts_with("[code rust] src/lib.rs"))
+    let unidentified = sections
+        .iter()
+        .find(|section| !section.contains("Codebase:"))
         .unwrap();
     assert!(local.contains("checkout-a"), "{text}");
     assert!(local.contains("stale"), "{text}");
-    assert!(remote.contains("[codebase B] src/lib.rs:1"), "{text}");
+    assert!(remote.starts_with("`src/lib.rs:1"), "{text}");
+    assert!(unidentified.starts_with("`src/lib.rs:1"), "{text}");
     assert!(!remote.contains("stale"), "{text}");
     assert!(!unidentified.contains("stale"), "{text}");
     assert_eq!(server.requests().len(), 2);
@@ -532,7 +535,8 @@ async fn corrupt_installation_identity_prevents_local_search_attribution() {
         .await;
     assert!(output.status.success(), "{:?}", output.stderr);
     let text = String::from_utf8(output.stdout).unwrap();
-    assert!(text.contains("[codebase A] src/lib.rs:1"), "{text}");
+    assert!(text.contains("### `src/lib.rs:1"), "{text}");
+    assert!(text.contains("Codebase: `A`"), "{text}");
     assert!(!text.contains("checkout-a"), "{text}");
     assert!(!text.contains("stale"), "{text}");
     let requests = server.requests();
@@ -607,7 +611,8 @@ async fn mcp_scoped_search_works_from_an_unindexed_directory() {
             assert!(response.to_string().contains("mutually exclusive"));
         } else {
             let text = response["result"]["content"][0]["text"].as_str().unwrap();
-            assert!(text.contains("[codebase B] src/lib.rs:1"), "{text}");
+            assert!(text.contains("### `src/lib.rs:1"), "{text}");
+            assert!(text.contains("Codebase: `B`"), "{text}");
             assert!(!text.contains("checkout-a"), "{text}");
             assert!(!text.contains("stale"), "{text}");
         }

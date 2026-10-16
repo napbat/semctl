@@ -42,19 +42,24 @@ use render::{
 /// the same failure. Every hard renderer failure starts its first line with the
 /// stable `<operation> failed:` form; successful output never does.
 pub fn cli_result(output: String) -> anyhow::Result<String> {
+    if is_failure(&output) {
+        anyhow::bail!(output);
+    }
+    Ok(output)
+}
+
+/// Identify the shared query failure prefix without treating source text or
+/// freshness warnings later in a result as a failed operation.
+pub(crate) fn is_failure(output: &str) -> bool {
     let first_line = output.lines().next().unwrap_or_default();
-    let hard_failure = first_line
+    first_line
         .split_once(" failed:")
         .is_some_and(|(operation, _)| {
             !operation.is_empty()
                 && operation
                     .bytes()
                     .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
-        });
-    if hard_failure {
-        anyhow::bail!(output);
-    }
-    Ok(output)
+        })
 }
 
 /// Map the user's `--prefer` value to the server's `SearchPreference` enum name
