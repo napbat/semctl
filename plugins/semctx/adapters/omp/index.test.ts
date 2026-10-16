@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import { createSemctlHookInvoker, type HookChild, type HookProcessRuntime } from "./hook-process";
 import {
 	createSemctxExtension,
 	extractAdditionalContext,
@@ -302,6 +303,222 @@ describe("semctx OMP extension", () => {
 		const harness = makeHarness(invoker);
 		await harness.emit("session_shutdown");
 		expect(invoker.shutdownCalled).toBeTrue();
+	});
+
+	for (const boundary of ["session_switch", "session_shutdown"] as const) {
+		for (const event of ["session_start", "before_agent_start", "tool_call"] as const) {
+			test(`discards delayed ${event} context after ${boundary}`, async () => {
+				const response = Promise.withResolvers<string | undefined>();
+				const invoker = new FakeInvoker(input =>
+					input.source === "resume" ? "current orientation" : response.promise,
+				);
+				const harness = makeHarness(invoker);
+				const pending = harness.emit(event, {
+					prompt: "find the parser",
+					toolName: "grep",
+					input: { pattern: "parser" },
+				});
+				await harness.emit(boundary, { reason: "resume" });
+				response.resolve("stale context");
+				expect(await pending).toBeUndefined();
+				expect(harness.sent.map(entry => entry.message.content)).toEqual(
+					boundary === "session_switch" ? ["current orientation"] : [],
+				);
+			});
+		}
+	}
+
+	test("checks the session generation when it delivers resolved context", async () => {
+		const response = Promise.withResolvers<string | undefined>();
+		const harness = makeHarness(new FakeInvoker(() => response.promise));
+		const pending = harness.emit("before_agent_start", { prompt: "find the parser" });
+		response.resolve("stale context");
+		// Let the invoker and safeInvoke resolve before the handler resumes.
+		await Promise.resolve();
+		await Promise.resolve();
+		await harness.emit("session_shutdown");
+		expect(await pending).toBeUndefined();
+	});
+});
+
+function makeHookProcess(options: {
+	stdinFailure?: "write" | "end";
+	readFailure?: boolean;
+	killFailure?: boolean;
+} = {}) {
+	const exit = Promise.withResolvers<number>();
+	const timers = new Set<() => void>();
+	let killed = 0;
+	let cancelled = 0;
+	let written = "";
+	let output: ReadableStreamDefaultController<Uint8Array>;
+	const child: HookChild = {
+		stdin: {
+			write(data) {
+				if (options.stdinFailure === "write") throw new Error("stdin write failed");
+				written += data;
+				return data.length;
+			},
+			end() {
+				if (options.stdinFailure === "end") throw new Error("stdin end failed");
+				return 0;
+			},
+		},
+		stdout: new ReadableStream<Uint8Array>({
+			start(controller) {
+				output = controller;
+				if (options.readFailure) controller.error(new Error("stdout read failed"));
+			},
+			cancel() {
+				cancelled += 1;
+				// A broken stream need not finish cancellation after its process exits.
+				return new Promise<void>(() => {});
+			},
+		}),
+		exited: exit.promise,
+		kill() {
+			killed += 1;
+			if (options.killFailure) throw new Error("kill failed");
+		},
+	};
+	const runtime: HookProcessRuntime = {
+		spawn: () => child,
+		scheduleTimeout(callback) {
+			timers.add(callback);
+			return () => timers.delete(callback);
+		},
+	};
+	const invoker = createSemctlHookInvoker(runtime);
+	const input: SemctlHookInput = {
+		host: "omp",
+		hook_event_name: "SessionStart",
+		cwd: "/repo",
+		session_id: "session-1",
+	};
+	const ctx: TestContext = {
+		cwd: "/repo",
+		sessionManager: { getSessionId: () => "session-1" },
+		setTimeout: () => {
+			throw new Error("Host timers are unavailable during shutdown");
+		},
+		clearTimer: () => {
+			throw new Error("Host timers are unavailable during shutdown");
+		},
+	};
+	return {
+		invoker,
+		timers,
+		exit,
+		invoke: () => invoker.invoke(input, ctx, 100),
+		timeout: () => {
+			for (const callback of timers) callback();
+		},
+		writeOutput(value: string, close = true) {
+			output.enqueue(new TextEncoder().encode(value));
+			if (close) output.close();
+		},
+		get killed() {
+			return killed;
+		},
+		get cancelled() {
+			return cancelled;
+		},
+		get written() {
+			return written;
+		},
+	};
+}
+
+describe("hook subprocess lifecycle", () => {
+	for (const stdinFailure of ["write", "end"] as const) {
+		test(`kills the child when stdin ${stdinFailure} fails`, async () => {
+			const process = makeHookProcess({ stdinFailure });
+			expect(await process.invoke()).toBeUndefined();
+			expect(process.killed).toBe(1);
+			expect(process.timers.size).toBe(0);
+		});
+	}
+
+	test("kills the child when stdout fails", async () => {
+		const process = makeHookProcess({ readFailure: true });
+		expect(await process.invoke()).toBeUndefined();
+		expect(process.killed).toBe(1);
+		expect(process.timers.size).toBe(0);
+	});
+
+	test("kills the child when its exit promise fails while stdout stays pending", async () => {
+		const process = makeHookProcess();
+		const result = process.invoke();
+		process.exit.reject(new Error("exit failed"));
+		expect(await result).toBeUndefined();
+		expect(process.killed).toBe(1);
+		expect(process.cancelled).toBe(1);
+		expect(process.timers.size).toBe(0);
+	});
+
+	test("settles on shutdown even when killing the child fails", async () => {
+		const process = makeHookProcess({ killFailure: true });
+		const result = process.invoke();
+		process.invoker.shutdown();
+		expect(await result).toBeUndefined();
+		expect(process.killed).toBe(1);
+		expect(process.cancelled).toBe(1);
+		expect(process.timers.size).toBe(0);
+	});
+
+	for (const cancel of ["timeout", "shutdown"] as const) {
+		test(`settles on ${cancel} when the child and stream cancellation stay pending`, async () => {
+			const process = makeHookProcess();
+			const result = process.invoke();
+			if (cancel === "timeout") process.timeout();
+			else process.invoker.shutdown();
+			expect(await result).toBeUndefined();
+			expect(process.killed).toBe(1);
+			expect(process.cancelled).toBe(1);
+			expect(process.timers.size).toBe(0);
+			process.invoker.shutdown();
+			expect(process.killed).toBe(1);
+		});
+	}
+
+	test("times out when stdout closes but the child stays pending", async () => {
+		const process = makeHookProcess();
+		const result = process.invoke();
+		process.writeOutput("{}");
+		process.timeout();
+		expect(await result).toBeUndefined();
+		expect(process.killed).toBe(1);
+	});
+
+	test("times out when the child exits but stdout stays pending", async () => {
+		const process = makeHookProcess();
+		const result = process.invoke();
+		process.exit.resolve(0);
+		process.timeout();
+		expect(await result).toBeUndefined();
+		expect(process.killed).toBe(1);
+	});
+
+	test("kills the child when output exceeds the byte limit", async () => {
+		const process = makeHookProcess();
+		const result = process.invoke();
+		process.writeOutput("x".repeat(64 * 1024 + 1), false);
+		expect(await result).toBeUndefined();
+		expect(process.killed).toBe(1);
+		expect(process.cancelled).toBe(1);
+		expect(process.timers.size).toBe(0);
+	});
+
+	test("returns context after a successful child exit and clears its timeout", async () => {
+		const process = makeHookProcess();
+		const result = process.invoke();
+		process.writeOutput(JSON.stringify({ hookSpecificOutput: { additionalContext: "context" } }));
+		process.exit.resolve(0);
+		expect(await result).toBe("context");
+		expect(JSON.parse(process.written).hook_event_name).toBe("SessionStart");
+		expect(process.timers.size).toBe(0);
+		process.invoker.shutdown();
+		expect(process.killed).toBe(0);
 	});
 });
 

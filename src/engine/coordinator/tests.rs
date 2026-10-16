@@ -484,6 +484,7 @@ fn a_status_from_an_older_daemon_decodes_without_the_newer_fields() {
 
     assert_eq!(status.first_index, None);
     assert_eq!(status.sync_progress, None);
+    assert_eq!(status.retry_after_secs, None);
 }
 
 #[test]

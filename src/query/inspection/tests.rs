@@ -6,10 +6,33 @@
 use super::{current_sync_line, first_index_line, sync_status};
 use crate::client::Client;
 use crate::client::stub::{Reply, Stub};
+use crate::engine::CoordinatorStatus;
+use crate::engine::coordinator::WatcherState;
 use crate::mcp::readiness::FirstIndexPhase;
 use crate::sync::SyncProgress;
 
 const EMPTY_CATALOG_PAGE: &str = r#"{"success":true,"data":[],"page":0,"pageSize":1000,"total":0}"#;
+
+fn checkout(
+    first_index: Option<FirstIndexPhase>,
+    sync_progress: Option<SyncProgress>,
+) -> CoordinatorStatus {
+    CoordinatorStatus {
+        root: "checkout".into(),
+        codebase_id: Some("A".to_string()),
+        leases: 1,
+        watcher: WatcherState::Active,
+        last_job_id: None,
+        running: sync_progress.is_some(),
+        pending_triggers: 0,
+        trigger_overflow: false,
+        last_outcome: None,
+        last_error: None,
+        first_index,
+        sync_progress,
+        retry_after_secs: None,
+    }
+}
 
 async fn catalog_stub() -> (Stub, Client) {
     let stub = Stub::serve(vec![Reply::Answer {
@@ -71,7 +94,7 @@ async fn sync_status_reports_every_phase_after_the_codebase_line() {
             reason: "embedding job 7 failed".to_string(),
         },
     ] {
-        let text = sync_status(&client, None, true, Some(&phase), None)
+        let text = sync_status(&client, Some(&checkout(Some(phase.clone()), None)))
             .await
             .expect("sync_status works while a first index is pending");
         let lines: Vec<&str> = text.lines().collect();
@@ -86,7 +109,7 @@ async fn sync_status_reports_every_phase_after_the_codebase_line() {
 async fn sync_status_has_no_first_index_line_for_a_checkout_without_one() {
     let (_stub, client) = catalog_stub().await;
 
-    let text = sync_status(&client, None, true, None, None)
+    let text = sync_status(&client, Some(&checkout(None, None)))
         .await
         .expect("sync_status answers");
 
@@ -124,10 +147,7 @@ async fn sync_status_puts_the_current_sync_line_after_the_first_index_line() {
 
     let text = sync_status(
         &client,
-        None,
-        true,
-        Some(&FirstIndexPhase::Syncing),
-        Some(&progress),
+        Some(&checkout(Some(FirstIndexPhase::Syncing), Some(progress))),
     )
     .await
     .expect("sync_status answers while a first index syncs");
@@ -148,9 +168,12 @@ async fn sync_status_puts_the_current_sync_line_after_the_first_index_line() {
 async fn sync_status_reports_a_running_resync_without_a_first_index() {
     let (_stub, client) = catalog_stub().await;
 
-    let text = sync_status(&client, None, true, None, Some(&SyncProgress::Finalizing))
-        .await
-        .expect("sync_status answers during a re-sync");
+    let text = sync_status(
+        &client,
+        Some(&checkout(None, Some(SyncProgress::Finalizing))),
+    )
+    .await
+    .expect("sync_status answers during a re-sync");
     let lines: Vec<&str> = text.lines().collect();
 
     assert_eq!(lines[0], "codebase A", "{text}");
@@ -162,9 +185,60 @@ async fn sync_status_reports_a_running_resync_without_a_first_index() {
 async fn sync_status_has_no_current_sync_line_when_no_sync_runs() {
     let (_stub, client) = catalog_stub().await;
 
-    let text = sync_status(&client, None, true, Some(&FirstIndexPhase::Ready), None)
+    let text = sync_status(&client, Some(&checkout(Some(FirstIndexPhase::Ready), None)))
         .await
         .expect("sync_status answers");
 
     assert!(!text.contains("current sync"), "{text}");
+}
+
+#[tokio::test]
+async fn a_local_sync_failure_reports_stale_results_and_the_retry_delay() {
+    let (_stub, client) = catalog_stub().await;
+    let mut status = checkout(None, None);
+    status.last_error = Some("sync plan: gateway unavailable".to_string());
+    status.retry_after_secs = Some(10);
+
+    let text = sync_status(&client, Some(&status)).await.unwrap();
+
+    assert!(text.contains("last local sync failed: sync plan: gateway unavailable"));
+    assert!(text.contains("indexed results may be stale"));
+    assert!(text.contains("next local sync attempt in 10 s"));
+    assert!(text.contains("no server job queued; the local sync failed"));
+    assert!(!text.contains("may still be scanning"));
+}
+
+#[tokio::test]
+async fn a_previous_completed_job_does_not_hide_a_local_sync_failure() {
+    let stub = Stub::serve(vec![
+        Reply::Answer {
+            status: "200 OK",
+            headers: Vec::new(),
+            body: EMPTY_CATALOG_PAGE.to_string(),
+        },
+        Reply::ok(r#"{"id":"old-job","completedAt":"2026-10-01T00:00:00Z","filesEmbedded":0,"filesDeleted":0,"filesFailed":0,"error":null}"#),
+    ])
+    .await;
+    let client = Client::for_test_server(&stub.url).with_codebase("A".to_string());
+    let mut status = checkout(None, None);
+    status.last_job_id = Some("old-job".to_string());
+    status.last_error = Some("upload failed".to_string());
+
+    let text = sync_status(&client, Some(&status)).await.unwrap();
+
+    assert!(text.contains("last local sync failed: upload failed"));
+    assert!(text.contains("indexed results may be stale"));
+    assert!(text.contains("old-job"));
+    assert!(!text.contains("status could not be read"), "{text}");
+}
+
+#[tokio::test]
+async fn a_missing_watcher_is_not_reported_as_active() {
+    let (_stub, client) = catalog_stub().await;
+    let mut status = checkout(None, None);
+    status.watcher = WatcherState::Unavailable("watch limit reached".to_string());
+
+    let text = sync_status(&client, Some(&status)).await.unwrap();
+
+    assert!(text.contains("local checkout watch: not active (watch limit reached)"));
 }

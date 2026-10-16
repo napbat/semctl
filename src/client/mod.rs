@@ -412,17 +412,21 @@ impl Client {
         unwrap_envelope(resp, "GET", &url).await
     }
 
-    /// Like [`Self::get`], but returns `Ok(None)` on a 404 instead of erroring —
+    /// Like [`Self::get`], but returns `Ok(None)` on an API 404 instead of erroring —
     /// for "does this still exist?" probes (e.g. validating a cached codebase id
     /// before trusting it against the current server).
     pub async fn get_opt<T: DeserializeOwned>(&self, path: &str) -> Result<Option<T>> {
-        let (resp, url) = self
-            .send(reqwest::Method::GET, path, None, Idempotency::Idempotent)
-            .await?;
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
+        match self.get(path).await {
+            Ok(data) => Ok(Some(data)),
+            Err(error)
+                if error.downcast_ref::<ApiFailure>().is_some_and(|failure| {
+                    failure.status() == reqwest::StatusCode::NOT_FOUND && failure.is_api_response()
+                }) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
         }
-        unwrap_envelope(resp, "GET", &url).await.map(Some)
     }
 
     /// Like [`Self::get`] but tolerates a successful `data: null` — returns
@@ -610,9 +614,9 @@ async fn unwrap_page<T: DeserializeOwned>(
         .text()
         .await
         .with_context(|| format!("{method} {url}: read body"))?;
-    let env: PageEnvelope<T> = serde_json::from_str(&body).with_context(|| {
-        format!("{method} {url} -> {status}: parse paginated envelope ({body})")
-    })?;
+    let Ok(env) = serde_json::from_str::<PageEnvelope<T>>(&body) else {
+        return Err(gateway_error(method, url, status, retry_after, &body));
+    };
     if !status.is_success() || !env.success {
         let errors = env.errors.as_deref().unwrap_or_default();
         return Err(ApiFailure::from_errors(method, url, status, retry_after, errors).into());

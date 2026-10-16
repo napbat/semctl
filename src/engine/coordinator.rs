@@ -34,12 +34,12 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use notify::Event;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, Semaphore, mpsc};
+use tokio::sync::{Mutex, Notify, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{Interval, MissedTickBehavior, interval_at};
 use tracing::{debug, info, warn};
@@ -53,9 +53,11 @@ use crate::sync::policy::{SourcePolicy, event_may_affect_policy};
 use crate::sync::{self, LastJob, SyncCache, SyncLimits, SyncOutcome, blocking};
 
 mod progress;
+mod reconcile_loop;
 mod status;
 
 use progress::ProgressSlot;
+use reconcile_loop::ReconcileLoop;
 pub(crate) use status::CoordinatorStatus;
 
 /// Reasons a reconcile can be due, before any coalescing.
@@ -63,8 +65,8 @@ const TRIGGER_CAPACITY: usize = 64;
 
 /// Interval for the periodic re-sync when no watcher is available. A session
 /// overrides it with `SEMCTX_MCP_RESYNC_SECS`, which reaches the coordinator as
-/// `resync_secs`; `0` disables the timer and leaves only the startup run and
-/// explicit triggers.
+/// `resync_secs`; `0` disables the timer. Watch events, explicit triggers, and
+/// failure retries remain active.
 const DEFAULT_RESYNC_SECS: u64 = 60;
 
 /// An active watcher reports real edits within the debounce window, so the
@@ -90,6 +92,10 @@ pub(crate) enum Trigger {
 }
 
 impl Trigger {
+    fn bypasses_cooldown(self) -> bool {
+        matches!(self, Self::Startup | Self::Explicit)
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             Self::Startup => "startup",
@@ -193,6 +199,7 @@ enum Watch {
 #[derive(Default)]
 struct RunState {
     running: bool,
+    retry_at: Option<tokio::time::Instant>,
     last_outcome: Option<String>,
     last_error: Option<String>,
 }
@@ -232,6 +239,10 @@ pub(crate) struct CheckoutCoordinator {
     /// Set when a trigger or a watch batch was dropped. The next run is then
     /// unconditional, because what was dropped cannot be judged.
     overflow: Arc<AtomicBool>,
+    /// A full queue must not lose an explicit request's cooldown bypass.
+    immediate_overflow: Arc<AtomicBool>,
+    /// Wake the loop if a full queue is drained before overflow is recorded.
+    overflow_ready: Arc<Notify>,
     run: Mutex<RunState>,
     /// The latest milestone of the reconcile that is running.
     progress: Arc<ProgressSlot>,
@@ -273,6 +284,8 @@ impl CheckoutCoordinator {
             watch: StdMutex::new(watch),
             triggers,
             overflow: setup.overflow,
+            immediate_overflow: Arc::new(AtomicBool::new(false)),
+            overflow_ready: Arc::new(Notify::new()),
             run: Mutex::new(RunState::default()),
             progress: Arc::new(ProgressSlot::new()),
             leases: AtomicUsize::new(0),
@@ -322,6 +335,10 @@ impl CheckoutCoordinator {
     pub(crate) fn trigger(&self, trigger: Trigger) {
         if self.triggers.try_send(trigger).is_err() {
             self.overflow.store(true, Ordering::Release);
+            if trigger.bypasses_cooldown() {
+                self.immediate_overflow.store(true, Ordering::Release);
+            }
+            self.overflow_ready.notify_one();
         }
     }
 
@@ -386,6 +403,10 @@ impl CheckoutCoordinator {
             trigger_overflow: self.overflow.load(Ordering::Acquire),
             last_outcome: run.last_outcome.clone(),
             last_error: run.last_error.clone(),
+            retry_after_secs: run.retry_at.map(|deadline| {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                remaining.as_secs() + u64::from(remaining.subsec_nanos() != 0)
+            }),
         }
     }
 
@@ -507,20 +528,25 @@ impl CheckoutCoordinator {
         stored.is_some()
     }
 
-    /// One reconcile, from permit to recorded result.
+    /// One reconcile, from permit to recorded result. Return whether the
+    /// reconcile failed and needs an automatic retry.
     async fn run_once(
         self: &Arc<Self>,
         trigger: Trigger,
         reconciler: &Arc<dyn Reconciler>,
         scan_permits: &Arc<Semaphore>,
         limits: &SyncLimits,
-    ) {
+    ) -> bool {
         let gate = self.gate().await;
         if !self.await_codebase(gate.as_ref()).await {
-            return;
+            return false;
         }
         let client = self.request_client().await;
-        self.run.lock().await.running = true;
+        {
+            let mut state = self.run.lock().await;
+            state.running = true;
+            state.retry_at = None;
+        }
         // The permit bounds concurrent scans across every checkout in the
         // process. It is held for the whole reconcile, including its uploads,
         // because the scan's retained content is what the bound protects.
@@ -541,6 +567,10 @@ impl CheckoutCoordinator {
         };
         drop(permit);
         self.record(trigger, &result).await;
+        let retry_needed = match &result {
+            Ok(outcome) => !outcome.failed.is_empty(),
+            Err(_) => true,
+        };
         // Any run can report a first index, because a run only starts once the
         // gate has named its codebase. Keying this on the trigger kind would
         // lose the report whenever another reason won the coalescing race, and
@@ -558,6 +588,7 @@ impl CheckoutCoordinator {
         }
         let status = self.status().await.to_string();
         debug!(%status, trigger = trigger.as_str(), "reconcile finished");
+        retry_needed
     }
 
     /// Record what a reconcile did, for status and for the search footer.
@@ -708,96 +739,6 @@ impl CoordinatorTask {
         };
         let handle = tokio::spawn(loop_state.run());
         *lock(&coordinator.task) = Some(handle);
-    }
-}
-
-struct ReconcileLoop {
-    coordinator: Weak<CheckoutCoordinator>,
-    triggers: mpsc::Receiver<Trigger>,
-    batches: mpsc::Receiver<WatchBatch>,
-    reconciler: Arc<dyn Reconciler>,
-    scan_permits: Arc<Semaphore>,
-    limits: SyncLimits,
-}
-
-impl ReconcileLoop {
-    async fn run(mut self) {
-        let Some(coordinator) = self.coordinator.upgrade() else {
-            return;
-        };
-        let root = coordinator.root.clone();
-        let overflow = coordinator.overflow.clone();
-        let mut timer = coordinator.periodic_timer();
-        let mut watching = matches!(coordinator.watcher_state(), WatcherState::Active);
-        // Nothing strong is held while waiting, so the coordinator stays free
-        // to be dropped by its registry.
-        drop(coordinator);
-
-        // Policy sources seen so far. They decide, without a file read, whether
-        // an event can affect the rules themselves.
-        let mut observed: HashSet<PathBuf> = HashSet::new();
-        loop {
-            let mut due: Option<Trigger> = None;
-            let mut events: Vec<Event> = Vec::new();
-            tokio::select! {
-                trigger = self.triggers.recv() => match trigger {
-                    Some(trigger) => due = Some(trigger),
-                    // The coordinator is gone. Nothing can trigger this loop
-                    // again, and nothing owns the checkout it served.
-                    None => return,
-                },
-                batch = self.batches.recv(), if watching => match batch {
-                    Some(batch) => events = batch.events,
-                    // The watch registration was released. Keep serving
-                    // triggers and the periodic backstop.
-                    None => watching = false,
-                },
-                () = next_tick(&mut timer) => due = Some(Trigger::Periodic),
-            }
-
-            // Drain everything that arrived, so a burst becomes one run.
-            while let Ok(trigger) = self.triggers.try_recv() {
-                due = due.or(Some(trigger));
-            }
-            while let Ok(batch) = self.batches.try_recv() {
-                events.extend(batch.events);
-            }
-            // Dropped triggers or events can name any path, so what was lost
-            // cannot be judged: the run becomes unconditional.
-            if overflow.swap(false, Ordering::AcqRel) {
-                due = due.or(Some(Trigger::Watch));
-            }
-            if due.is_none() && !events.is_empty() {
-                let (relevant, next_observed) = relevance(&root, events, observed).await;
-                observed = next_observed;
-                if relevant {
-                    due = Some(Trigger::Watch);
-                }
-            }
-            let Some(trigger) = due else { continue };
-            let Some(coordinator) = self.coordinator.upgrade() else {
-                return;
-            };
-            coordinator
-                .run_once(trigger, &self.reconciler, &self.scan_permits, &self.limits)
-                .await;
-            // A rule can select a file in another directory. Subscribe to it
-            // after the run, so a later edit to that rule still wakes us.
-            if watching {
-                refresh_external_watches(&coordinator).await;
-            }
-            drop(coordinator);
-        }
-    }
-}
-
-/// Wait for the next periodic tick, or forever when the timer is disabled.
-async fn next_tick(timer: &mut Option<Interval>) {
-    match timer {
-        Some(timer) => {
-            timer.tick().await;
-        }
-        None => std::future::pending().await,
     }
 }
 
