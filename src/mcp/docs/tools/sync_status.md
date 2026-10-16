@@ -25,3 +25,5 @@ While a sync runs for the checkout, the answer has a `current sync:` line after 
 During a first index, the `first index: syncing` line and the `current sync:` line together show how far the first index has come. The `current sync:` line is absent while no sync runs, for example while the server embeds the files after the upload. Read the `first index:` line for the phase.
 
 Unlike retrieval/catalog/graph tools, this tool does not wait on a first-index readiness gate, so it can monitor that initial job.
+
+A failed local scan or upload adds a `last local sync failed:` line and warns that indexed results may be stale. This failure stays visible even when the previous server job completed. While background sync waits to retry, `next local sync attempt in <n> s` reports the remaining delay. The watcher line reports the actual watcher state, including the reason when the watcher is unavailable.

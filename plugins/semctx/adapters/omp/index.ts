@@ -1,9 +1,11 @@
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { createSemctlHookInvoker } from "./hook-process";
+
+export { extractAdditionalContext } from "./hook-process";
 
 const HOST = "omp";
 const OMP_SEMCTX_TOOL_PREFIX = "mcp__semctx_semctx_";
-const MAX_HOOK_OUTPUT_BYTES = 64 * 1024;
 const SESSION_TIMEOUT_MS = 8_000;
 const PROMPT_TIMEOUT_MS = 12_000;
 const TOOL_TIMEOUT_MS = 6_000;
@@ -24,17 +26,6 @@ const ROOT_ALIAS = /^[\\/]+$/;
 type SessionSource = "startup" | "resume" | "clear" | "compact";
 type HookEventName = "SessionStart" | "UserPromptSubmit" | "PreToolUse";
 type HookContext = Pick<ExtensionContext, "cwd" | "sessionManager" | "setTimeout" | "clearTimer">;
-type HookTimer = Parameters<HookContext["clearTimer"]>[0];
-
-interface HookChild {
-	stdin: {
-		write(data: string): number;
-		end(): number;
-	};
-	stdout: ReadableStream<Uint8Array>;
-	exited: Promise<number>;
-	kill(): void;
-}
 
 export interface SemctlHookInput {
 	host: typeof HOST;
@@ -51,98 +42,6 @@ export interface SemctlHookInput {
 export interface HookInvoker {
 	invoke(input: SemctlHookInput, ctx: HookContext, timeoutMs: number): Promise<string | undefined>;
 	shutdown(): void;
-}
-
-async function readBounded(stream: ReadableStream<Uint8Array>): Promise<string | undefined> {
-	const reader = stream.getReader();
-	const chunks: Uint8Array[] = [];
-	let total = 0;
-
-	for (;;) {
-		const { done, value } = await reader.read();
-		if (done) break;
-		total += value.byteLength;
-		if (total > MAX_HOOK_OUTPUT_BYTES) {
-			await reader.cancel();
-			return undefined;
-		}
-		chunks.push(value);
-	}
-
-	const output = new Uint8Array(total);
-	let offset = 0;
-	for (const chunk of chunks) {
-		output.set(chunk, offset);
-		offset += chunk.byteLength;
-	}
-	return new TextDecoder().decode(output);
-}
-
-export function extractAdditionalContext(stdout: string): string | undefined {
-	try {
-		const parsed = JSON.parse(stdout) as {
-			hookSpecificOutput?: { additionalContext?: unknown };
-		};
-		const context = parsed.hookSpecificOutput?.additionalContext;
-		return typeof context === "string" && context.trim().length > 0 ? context : undefined;
-	} catch {
-		return undefined;
-	}
-}
-
-function createSemctlHookInvoker(): HookInvoker {
-	const children = new Set<HookChild>();
-
-	return {
-		async invoke(input, ctx, timeoutMs) {
-			if (process.env.SEMCTX_HOOK_DISABLE !== undefined) return undefined;
-			if (input.hook_event_name === "PreToolUse" && process.env.SEMCTX_NUDGE_DISABLE !== undefined) {
-				return undefined;
-			}
-
-			let child: HookChild | undefined;
-			let timer: HookTimer | undefined;
-			try {
-				child = Bun.spawn(["semctl", "hook"], {
-					cwd: ctx.cwd,
-					env: process.env,
-					stdin: "pipe",
-					stdout: "pipe",
-					stderr: "ignore",
-				});
-				children.add(child);
-				child.stdin.write(JSON.stringify(input));
-				child.stdin.end();
-				timer = ctx.setTimeout(() => {
-					try {
-						child?.kill();
-					} catch {
-						// A concurrent clean exit is already the desired state.
-					}
-				}, timeoutMs);
-
-				const stdout = await readBounded(child.stdout);
-				if (stdout === undefined) child.kill();
-				const exitCode = await child.exited;
-				return exitCode === 0 && stdout !== undefined ? extractAdditionalContext(stdout) : undefined;
-			} catch {
-				return undefined;
-			} finally {
-				if (timer !== undefined) ctx.clearTimer(timer);
-				if (child !== undefined) children.delete(child);
-			}
-		},
-		shutdown() {
-			for (const child of children) {
-				try {
-					child.kill();
-				} catch {
-					// Best-effort shutdown must never tear down the OMP session.
-				}
-			}
-			children.clear();
-		},
-	};
 }
 
 function hiddenMessage(customType: string, content: string) {
@@ -223,6 +122,7 @@ export function createSemctxExtension(invoker: HookInvoker = createSemctlHookInv
 	return function semctxExtension(pi: ExtensionAPI): void {
 		const instanceId = `${process.pid}-${Date.now().toString(36)}`;
 		let promptGeneration = 0;
+		let sessionGeneration = 0;
 		let activePromptId = "";
 		// The prompt of a submission that has not started a turn yet. OMP can run
 		// `before_agent_start` again for the same submission before its first
@@ -243,11 +143,13 @@ export function createSemctxExtension(invoker: HookInvoker = createSemctlHookInv
 			}
 		};
 		const resetTurnState = () => {
+			sessionGeneration += 1;
 			activePromptId = "";
 			preparingPrompt = undefined;
 		};
 		const sendOrientation = async (source: SessionSource, ctx: HookContext) => {
 			resetTurnState();
+			const generation = sessionGeneration;
 			const context = await safeInvoke(
 				{
 					host: HOST,
@@ -259,7 +161,7 @@ export function createSemctxExtension(invoker: HookInvoker = createSemctlHookInv
 				ctx,
 				SESSION_TIMEOUT_MS,
 			);
-			if (context !== undefined) {
+			if (generation === sessionGeneration && context !== undefined) {
 				pi.sendMessage(hiddenMessage(ORIENTATION_MESSAGE, context), {
 					deliverAs: "nextTurn",
 				});
@@ -275,6 +177,7 @@ export function createSemctxExtension(invoker: HookInvoker = createSemctlHookInv
 		pi.on("session_compact", async (_event, ctx) => sendOrientation("compact", ctx));
 
 		pi.on("before_agent_start", async (event, ctx) => {
+			const generation = sessionGeneration;
 			if (activePromptId === "" || preparingPrompt !== event.prompt) {
 				activePromptId = allocatePromptId(ctx);
 			}
@@ -291,7 +194,7 @@ export function createSemctxExtension(invoker: HookInvoker = createSemctlHookInv
 				ctx,
 				PROMPT_TIMEOUT_MS,
 			);
-			return context === undefined
+			return generation !== sessionGeneration || context === undefined
 				? undefined
 				: { message: hiddenMessage(PROMPT_CONTEXT_MESSAGE, context) };
 		});
@@ -300,6 +203,7 @@ export function createSemctxExtension(invoker: HookInvoker = createSemctlHookInv
 		});
 
 		pi.on("tool_call", async (event, ctx) => {
+			const generation = sessionGeneration;
 			const call = hookToolCall(event.toolName, event.input, ctx.cwd);
 			if (call === undefined) return undefined;
 			activePromptId ||= allocatePromptId(ctx);
@@ -314,7 +218,9 @@ export function createSemctxExtension(invoker: HookInvoker = createSemctlHookInv
 				ctx,
 				TOOL_TIMEOUT_MS,
 			);
-			return context === undefined ? undefined : { additionalContext: context };
+			return generation !== sessionGeneration || context === undefined
+				? undefined
+				: { additionalContext: context };
 		});
 		pi.on("session_shutdown", () => {
 			resetTurnState();

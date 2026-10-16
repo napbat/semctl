@@ -156,6 +156,12 @@ pool per checkout, however many sessions use that checkout. Nothing changes at
 the MCP tool boundary: the host still launches `semctl mcp`, and that process
 becomes a byte pump between the host and the daemon.
 
+A failed background sync retains pending changes and retries after 5 seconds.
+Repeated failures double the delay up to 60 seconds. A complete sync resets the
+delay. Retries continue when `SEMCTX_MCP_RESYNC_SECS=0` disables periodic sync.
+Explicit index requests run immediately. `semctl daemon status` reports the
+remaining retry delay for each checkout.
+
 `SEMCTX_MCP_DAEMON` selects the role of a `semctl mcp` invocation:
 
 | Value | What it does |

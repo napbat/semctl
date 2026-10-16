@@ -442,6 +442,54 @@ async fn canonical_search_omits_cached_checkout_freshness() {
     );
 }
 
+#[tokio::test]
+async fn a_local_sync_failure_overrides_cached_successful_job_freshness() {
+    use crate::engine::coordinator::{JobAwaited, ReconcileRun, Reconciled, Reconciler};
+
+    struct FailedSync;
+    impl Reconciler for FailedSync {
+        fn reconcile(&self, _run: ReconcileRun) -> Reconciled {
+            Box::pin(async { Err("gateway unavailable".to_string()) })
+        }
+
+        fn await_job(&self, _client: client::Client, _job_id: String) -> JobAwaited {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    let base = client::Client::for_test("codebase", Some("checkout".into()));
+    let server = session(
+        base.clone(),
+        "launch",
+        true,
+        Engine::for_test(Arc::new(FailedSync)),
+    );
+    let coordinator = attach(&server, &base, Path::new("checkout")).await;
+    coordinator.set_last_job("old-job").await;
+    *server.shared.freshness.lock().await = Some(("old-job".into(), None));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while coordinator.status().await.last_error.is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the local sync reports its failure");
+
+    let warning = server
+        .index_freshness(&base, &CallBudget::unbounded())
+        .await
+        .expect("a failed local sync makes indexed results stale");
+    assert!(warning.contains("last local sync FAILED"));
+    assert!(warning.contains("run sync_status"));
+    assert_eq!(
+        server
+            .index_freshness(&base.for_canonical(), &CallBudget::unbounded())
+            .await,
+        None,
+        "a checkout failure must not mark canonical results stale"
+    );
+}
+
 /// Two checkouts can share one codebase id. A bound checkout waits for its own
 /// first index; a request with no checkout waits for every one of them.
 #[tokio::test]

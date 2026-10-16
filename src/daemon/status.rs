@@ -136,6 +136,7 @@ mod tests {
                 trigger_overflow: false,
                 last_outcome: Some("uploaded 3 files".to_string()),
                 last_error: None,
+                retry_after_secs: None,
                 first_index: Some(FirstIndexPhase::Embedding {
                     job_id: Some("job-1".to_string()),
                 }),

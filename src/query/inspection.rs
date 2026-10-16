@@ -7,6 +7,7 @@ use super::render::{
     truncation_note,
 };
 use super::{Client, ToolError, api, bound_codebase, urlencode};
+use crate::engine::CoordinatorStatus;
 use crate::mcp::readiness::FirstIndexPhase;
 use crate::sync::SyncProgress;
 
@@ -159,21 +160,15 @@ pub async fn list_files(
 /// sync has a 0-file plan even when the codebase already contains thousands of
 /// indexed files.
 ///
-/// `first_index` is the phase of the checkout's first index. No tool call waits
-/// for a first index, so this line is how an agent follows it.
-///
-/// `sync_progress` is the latest milestone of the reconcile that runs now. Its
-/// line follows the first-index line, so an agent reads how far a first index
-/// has come. There is no line when no reconcile runs.
+/// The coordinator snapshot supplies local progress and failures. A failed
+/// scan or upload must remain visible even when the previous server job passed.
 pub async fn sync_status(
     client: &Client,
-    job_id: Option<&str>,
-    local_watch_active: bool,
-    first_index: Option<&FirstIndexPhase>,
-    sync_progress: Option<&SyncProgress>,
+    checkout: Option<&CoordinatorStatus>,
 ) -> Result<String, ToolError> {
     let codebase_id = bound_codebase(client, "sync_status")?;
     let totals = catalog_totals(client, codebase_id).await;
+    let job_id = checkout.and_then(|status| status.last_job_id.as_deref());
     let job = match job_id {
         Some(id) => Some((
             id,
@@ -184,17 +179,30 @@ pub async fn sync_status(
         None => None,
     };
 
-    let watch = if local_watch_active {
-        "active"
-    } else {
-        "not active (no local checkout selected)"
+    let watch = match checkout.map(|status| &status.watcher) {
+        Some(crate::engine::coordinator::WatcherState::Active) => "active".to_string(),
+        Some(crate::engine::coordinator::WatcherState::Unavailable(reason)) => {
+            format!("not active ({reason})")
+        }
+        None => "not active (no local checkout selected)".to_string(),
     };
     let mut out = format!("codebase {codebase_id}");
-    if let Some(phase) = first_index {
+    if let Some(phase) = checkout.and_then(|status| status.first_index.as_ref()) {
         write!(out, "\n{}", first_index_line(phase)).expect("writing to a String cannot fail");
     }
-    if let Some(progress) = sync_progress {
+    if let Some(progress) = checkout.and_then(|status| status.sync_progress.as_ref()) {
         write!(out, "\n{}", current_sync_line(progress)).expect("writing to a String cannot fail");
+    }
+    if let Some(error) = checkout.and_then(|status| status.last_error.as_deref()) {
+        write!(
+            out,
+            "\nlast local sync failed: {error}\nindexed results may be stale"
+        )
+        .expect("writing to a String cannot fail");
+    }
+    if let Some(seconds) = checkout.and_then(|status| status.retry_after_secs) {
+        write!(out, "\nnext local sync attempt in {seconds} s")
+            .expect("writing to a String cannot fail");
     }
     write!(out, "\nlocal checkout watch: {watch}\ntotal indexed state:")
         .expect("writing to a String cannot fail");
@@ -226,8 +234,12 @@ pub async fn sync_status(
             write!(out, "\n\nlast sync run {id}: status could not be read: {e}")
                 .expect("writing to a String cannot fail");
         }
-        None if local_watch_active => out.push_str(
-            "\n\nlast sync run: no server job queued yet; the active local watcher may still \
+        None if checkout.is_some_and(|status| status.last_error.is_some()) => out.push_str(
+            "\n\nlast sync run: no server job queued; the local sync failed before it recorded \
+             a job. The totals above are the persisted server state.",
+        ),
+        None if checkout.is_some() => out.push_str(
+            "\n\nlast sync run: no server job queued yet; the local checkout may still \
              be scanning/preparing its initial sync. The totals above are the persisted server \
              state.",
         ),
