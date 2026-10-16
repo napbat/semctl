@@ -2,7 +2,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
@@ -41,6 +41,37 @@ pub(crate) fn lock_file(path: &Path) -> Result<File> {
 
 /// Publish complete owner-only bytes with a same-directory atomic rename.
 pub(crate) fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    let temporary = stage_private(path, bytes)?;
+    let result = fs::rename(&temporary, path);
+    if result.is_err() {
+        // The live file is unchanged. An owner-only temporary file is safe to
+        // retain if this best-effort cleanup also fails.
+        let _ = fs::remove_file(&temporary);
+    }
+    result.with_context(|| format!("publish {}", path.display()))
+}
+
+/// Publish complete owner-only bytes only if `path` does not exist yet.
+/// Returns `false` when another writer published first; its file is kept.
+///
+/// A hard link never replaces a file, and it makes the already-complete
+/// staged bytes visible in one step. A concurrent reader therefore sees no
+/// file or the whole file, never an empty or partial one.
+pub(crate) fn publish_new_private(path: &Path, bytes: &[u8]) -> Result<bool> {
+    let temporary = stage_private(path, bytes)?;
+    let linked = fs::hard_link(&temporary, path);
+    // The staged name is only a source for the link. An owner-only temporary
+    // file is safe to retain if this best-effort cleanup fails.
+    let _ = fs::remove_file(&temporary);
+    match linked {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("publish {}", path.display())),
+    }
+}
+
+/// Write `bytes` to a new owner-only file beside `path` and return its name.
+fn stage_private(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
     let parent = path.parent().context("configuration path has no parent")?;
     fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     let name = path
@@ -63,13 +94,11 @@ pub(crate) fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     };
     let result = file.write_all(bytes).and_then(|()| file.sync_all());
     drop(file);
-    let result = result.and_then(|()| fs::rename(&temporary, path));
-    if result.is_err() {
-        // The live file is unchanged. An owner-only temporary file is safe to
-        // retain if this best-effort cleanup also fails.
+    if let Err(error) = result {
         let _ = fs::remove_file(&temporary);
+        return Err(error).with_context(|| format!("stage {}", path.display()));
     }
-    result.with_context(|| format!("publish {}", path.display()))
+    Ok(temporary)
 }
 
 fn private_options() -> OpenOptions {

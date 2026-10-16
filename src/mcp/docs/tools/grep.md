@@ -7,7 +7,7 @@ Use this for exact strings and patterns: an error message, a config key, a TODO,
 - `pattern` (required) — the pattern to find. A **regular expression** by default (Rust `regex`-crate syntax, matched per line), so `fn \w+\(` finds function definitions and metacharacters are active. Set `literal: true` to match it as an exact substring instead.
 - `literal` — match `pattern` as an exact substring: every character (including `. * ( ) [ ] \`) is taken verbatim, so nothing needs escaping and there are no accidental regex matches. Default false. Use it for exact code like `.unwrap()`, `foo(bar)`, or `Vec<T>`.
 - `ignore_case` — case-insensitive matching. Default false.
-- `path` — optional path substring to narrow which files are scanned (e.g. `server/` or `.rs`).
+- `path` — optional path substring to narrow which files are scanned (e.g. `server/`).
 - `max` — max matches to return, 1–1000. Default 100.
 
 ## Regex syntax
@@ -25,8 +25,9 @@ Example: find function definitions → `{ "pattern": "fn \\w+\\(" }`. To search 
 - **grep** (this tool): exact string / regex, "find all occurrences of X".
 - **search_codebase**: conceptual / natural-language queries when you don't know the exact text.
 - **find_definition / find_references**: a known symbol — faster and precise.
+- **host Grep**: one known local file, or current bytes.
 
 ## Notes
 
 - Searches the indexed snapshot, so brand-new local edits aren't reflected until the codebase re-syncs (see `sync_status`).
-- Results are capped by `max` — raise it or narrow with `path` when completeness matters on a large codebase.
+- Results stop at `max`. Narrow with `path` before raising it.

@@ -15,7 +15,7 @@ fit current bytes at a known path or a narrow file-scoped check.
 
 | You want | Call |
 | --- | --- |
-| fuzzy / conceptual — "how does X work" | `search_codebase` — start with snippets and a focused `top_k` (usually 5–8); the server bounds total result content; use `expand: true` only for the most relevant hit or small set, then reason from those bodies; `prefer: "docs"` or `"code"`; use `scope` or `codebase_ids` for an authorized multi-codebase lens |
+| fuzzy / conceptual — "how does X work" | `search_codebase` — start with snippets; `expand: true` only for the most relevant hits, then reason from those bodies; `prefer: "docs"` or `"code"`; `scope` / `codebase_ids` for a multi-codebase lens |
 | declaration-name discovery | `search_symbols` — exact/prefix/substring/glob/fuzzy qualified-name search with kind/path/project/language filters |
 | where is X defined / where is every resolved use | `find_definition` / `find_references` (exact, case-sensitive names; references include exact occurrences, read/write, namespace, kind, and resolved identity) |
 | who calls X / what implements Y | `who_calls` / `implementations_of` |
@@ -23,7 +23,7 @@ fit current bytes at a known path or a narrow file-scoped check.
 | super/subtype relations | `type_hierarchy` — declared/structural origin, external targets, bounded direction/depth |
 | call cycles / unused definitions / exact duplicates | `cycles` / `unused` / `duplicates` (unused results include reason + completeness caveat; duplicates include hashes) |
 | where does a value flow | `reaches` (forward), `flows_into` (backward), `flows_between` (witness path) |
-| every literal occurrence, incl. strings/comments | `grep` — semctx's own, over indexed content (regex, ignore_case, path filter) |
+| every literal occurrence, incl. strings/comments | `grep` — repo-wide, over indexed content (regex, ignore_case, path filter) |
 | a file's nested shape / more context around a hit | `file_outline` (depth/kind/body controls) / `expand_chunk` |
 | exact source bytes from a remote-only or revision-pinned codebase | `read_source` — request a focused line/byte range; use host `Read` for current bytes at a known local path |
 | what is at path:line | `symbol_at_position` |
@@ -45,10 +45,15 @@ for the rest of the MCP session. A previously indexed repo already has consent
 for retrieval and watcher activation, so use it without asking again; that consent
 does not authorize edits outside the user's requested repository set. Only when a
 repo has never been indexed should you tell the user and call `index_codebase`
-after explicit opt-in. That first-ever index is gated:
-retrieval/catalog/graph tools wait until embedding finishes successfully, while
-`sync_status` remains available for progress. Later re-syncs do not block use of
-the last complete index.
+after explicit opt-in. That first-ever index runs in the background:
+`index_codebase` returns at once and never waits for embedding. Retrieval,
+catalog, and graph tools never serve a partial index. They wait at most 5
+seconds, then fail with a "still running" error. Call `sync_status` every 60
+seconds to follow the first-index phase (registering, syncing, embedding,
+ready, or failed), and use local Read/Grep meanwhile. While the phase is
+syncing, the `current sync:` line shows how many files the upload has sent. If
+the phase is failed, call `index_codebase` for the same path to retry. Later
+re-syncs do not block use of the last complete index.
 
 ## Rules
 
@@ -56,12 +61,9 @@ the last complete index.
   missing evidence rather than reacquiring material already available.
 - Choose semctx for repository discovery, graph relationships, and broad indexed
   coverage. Batch independent exact lookups; avoid overlapping semantic queries.
-- Exact symbol, defined in this repo, in a graph language (Rust, C#, Go,
-  TypeScript/JS, C++) → symbol-graph tools (`find_definition` /
-  `find_references` / `who_calls`), not search.
-- Semantic search responses share a server-enforced result-content budget.
-  Start unexpanded, refine from ranked snippets, and expand only the relevant hit
-  or small set. An expanded body normally replaces a follow-up file read.
+- A symbol defined in this repo, its callers, a call path, implementations, or
+  dependencies, in a graph language (Rust, C#, Go, TypeScript/JS, C++) → the
+  graph tool from the table above, not search or `grep`.
 - Use `grep` instead of `find_references` when you need EVERY occurrence:
   `find_references` returns every resolved code occurrence (including repeated
   same-line uses) but still skips strings, comments, markdown, and any symbol whose
@@ -84,9 +86,13 @@ the last complete index.
 
 ## Degraded states — read the signals, don't guess
 
-- Empty results right after attach → `sync_status`: `queued` / `running`
-  means the index is still building; retry shortly instead of concluding the
-  repo isn't indexed.
+- Empty results right after attach → `sync_status`: a first-index phase of
+  registering, syncing, or embedding, or a job that is `queued` / `running`,
+  means the index is still building; check again in 60 seconds instead of
+  concluding the repo isn't indexed.
+- A tool fails → the error ends with a `next:` line. Follow it. Retry once only
+  when it says the call is retryable. Otherwise use local Read/Grep for that
+  request. Do not repeat the same failing call in a loop.
 - A hit flagged `⚠ stale (edited since indexed)`, or a freshness footer →
   `Read` that file for current bytes. The MCP server auto-syncs edits
   (filesystem watcher + periodic re-sync); do not tell the user to run

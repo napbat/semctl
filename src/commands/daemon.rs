@@ -10,10 +10,16 @@ use crate::daemon;
 
 #[derive(Debug, Subcommand)]
 pub enum DaemonCommand {
-    /// Serve MCP sessions over this user's local endpoint. Started by a
-    /// `semctl mcp` client, not run by hand.
+    /// Serve MCP sessions over this user's local endpoint. A `semctl mcp`
+    /// client normally starts it. Run it by hand when a Windows job blocks
+    /// automatic startup.
     #[command(hide = true)]
-    Run,
+    Run {
+        /// Mark a daemon that a client started. On Windows, such a daemon
+        /// exits before it binds the endpoint if it belongs to any job.
+        #[arg(long, hide = true)]
+        require_detached: bool,
+    },
 
     /// Report the running daemon: its version, uptime, sessions, checkouts,
     /// and scheduler permits. Exits with status 1 when no daemon is running.
@@ -38,7 +44,12 @@ pub struct StatusArgs {
 /// behavior is the same, and only the runtime's worker bounds differ.
 pub(crate) async fn run(command: DaemonCommand) -> Result<()> {
     match command {
-        DaemonCommand::Run => daemon::serve::serve().await,
+        DaemonCommand::Run { require_detached } => {
+            daemon::serve::serve(daemon::serve::Launch::from_require_detached(
+                require_detached,
+            ))
+            .await
+        }
         DaemonCommand::Status(args) => daemon::control::status(args.json).await,
         DaemonCommand::Stop => daemon::control::stop().await,
     }

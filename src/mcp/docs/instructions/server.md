@@ -3,9 +3,9 @@ Code retrieval and graph navigation over semctx-indexed codebases. Tools default
 ## Tool selection
 
 - **find_definition / find_references** — use these FIRST when you know an exact symbol name. Deterministic, fast, precise (no embedding round-trip).
-- **search_codebase** — use for fuzzy / conceptual queries when you don't know the symbol or file. Start with snippets and a focused result set; the server bounds total result content, so expand only the most relevant hit or small set.
+- **search_codebase** — use for fuzzy / conceptual queries when you don't know the symbol or file. Start with snippets; expand only the most relevant hit or small set.
 - **search_symbols** — declaration-name discovery by exact/prefix/substring/glob/fuzzy matching; use between exact `find_definition` and conceptual `search_codebase`.
-- **grep** — exact literal / regex search over file content ("find all occurrences of X"); the exhaustive counterpart to semantic search.
+- **grep** — exact literal / regex search across indexed files ("find all occurrences of X"); for one known local file, use host Grep.
 - **who_calls** — every definition that calls a function (the inverse call edge); the "who calls X" tool.
 - **implementations_of** — the types implementing a trait/interface (the reverse implements edge).
 - **call_path** — a shortest call chain from one function to another.
@@ -25,8 +25,8 @@ Code retrieval and graph navigation over semctx-indexed codebases. Tools default
 - **external_links** — cross-repo "jump to definition": imports that leave this codebase, resolved into the public API of other codebases you can see.
 - **list_codebases / current_context** — discover visible codebases and diagnose the effective server/tenant/codebase/checkout/index/graph binding.
 - **list_domains** — discover what's searchable and which tags are available for filtering.
-- **sync_status** — check the background index job; if `list_files` / `search` are empty right after attaching, this tells you whether indexing is still in progress.
-- **index_codebase** — explicit opt-in indexing. If startup or a tool says the current repository is not indexed, tell the user and ask permission; call this only after they agree.
+- **sync_status** — check the background index job and the first-index phase; if `list_files` / `search` are empty right after attaching, this tells you whether indexing is still in progress.
+- **index_codebase** — explicit opt-in indexing. If startup or a tool says the current repository is not indexed, tell the user and ask permission; call this only after they agree. It returns as soon as the first index starts; follow the first index with `sync_status`.
 - **rename_symbol / safe_delete_symbol / replace_symbol_body / insert_before_symbol / insert_after_symbol** — immediate local edit actions. Each internally consumes the server's grammar-validated plan, verifies source identity, graph generation, paths, and hashes, and goes through the client's normal approval flow.
 - **undo_edit** — reverse a completed symbolic edit by its returned edit id while retained preimages and current postimage hashes still match.
 
@@ -38,17 +38,22 @@ without asking again; that consent does not authorize edits beyond the user's
 requested repository set. Ask only when a directory has never been indexed and
 would need `index_codebase`.
 
-The first-ever `index_codebase` call is a readiness boundary: retrieval, catalog,
-and graph tools for that codebase wait until server embedding completes
-successfully. `sync_status` remains callable while they wait. Later re-syncs do
-not block retrieval and continue to expose the last complete snapshot with
-freshness warnings.
+The first-ever `index_codebase` call starts the first index and returns at once.
+It never waits for embedding. Retrieval, catalog, and graph tools never serve a
+partial first index. They wait at most 5 seconds for it to complete. If it still
+runs, they fail with a "still running" error. `sync_status` stays callable. It
+reports the first-index phase: registering, syncing, embedding, ready, or failed.
+While the phase is syncing, its `current sync:` line shows how many files the
+upload has sent. Call it every 60 seconds, and use local Read/Grep until
+the phase is ready.
+If the phase is failed, call `index_codebase` for the same path to retry. Later
+re-syncs do not block retrieval and continue to expose the last complete
+snapshot with freshness warnings.
 
 ## Workflow
 
-1. Need to discover an unknown location → `search_codebase` with snippets and a
-   focused result set (usually 5–8); refine or expand one relevant hit rather than
-   issuing overlapping expanded searches.
+1. Need to discover an unknown location → `search_codebase`; refine or expand one
+   relevant hit rather than issuing overlapping searches.
 2. Know the symbol name → `find_definition` / `find_references`; callers →
    `who_calls`; the whole neighbourhood → `trace`; many symbols at once →
    `batch_lookup`.
@@ -64,6 +69,8 @@ freshness warnings.
 
 Prefer the symbol-graph tools over search whenever you have an exact name — they're cheaper and more precise. Coverage follows the server's registered language packs: Rust, C#, Go, TypeScript/JavaScript, and C++. C++ needs build context in the checkout and can miss member declarations and calls, so confirm an empty C++ answer with `grep`. Other languages aren't on the graph — use `search_codebase` / `grep`.
 
-Expanded search bodies share the server's total result-content budget. `top_k` is
-an upper bound, not a guarantee that every full body fits. Use expanded bodies
-directly instead of fetching the same files again.
+## When a tool fails
+
+A tool failure arrives as an error result with a `next:` line. Follow that line.
+Retry once only when it says the call is retryable. Otherwise use local
+Read/Grep for that request. Do not repeat the same failing call in a loop.

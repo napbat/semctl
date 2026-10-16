@@ -65,8 +65,9 @@ pub async fn run(args: SearchArgs, cli: &Cli) -> Result<()> {
         scope: args.scope.clone(),
         codebase_ids: args.codebase_ids.clone(),
     };
-    let out = query::search(&client, &args.query, args.top_k, &args.domains, &opts).await;
-    let out = query::cli_result(out)?;
+    let out = query::search(&client, &args.query, args.top_k, &args.domains, &opts)
+        .await
+        .map_err(query::ToolError::into_cli_error)?;
     print!("{out}");
     if !out.ends_with('\n') {
         println!();

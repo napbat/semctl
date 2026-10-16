@@ -32,7 +32,9 @@ pub async fn run(cmd: InspectCommand, cli: &Cli) -> Result<()> {
         InspectCommand::Domains => domains::run(cli).await,
         InspectCommand::Codebases => {
             let client = crate::client::from_cli(cli)?;
-            let out = crate::query::cli_result(crate::query::list_codebases(&client).await)?;
+            let out = crate::query::list_codebases(&client)
+                .await
+                .map_err(crate::query::ToolError::into_cli_error)?;
             println!("{}", out.trim_end());
             Ok(())
         }

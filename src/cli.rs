@@ -86,7 +86,7 @@ pub enum Command {
     /// Update the `semctl` binary and refresh each installed agent integration.
     /// Cross-platform (Windows / macOS / Linux). This does not add or remove an
     /// integration; use `semctl install` to change the selected tools.
-    #[command(alias = "self-update")]
+    #[command(aliases = ["self-update", "update"])]
     Upgrade,
 
     /// Remove semctl: unwire it from your AI tools, take it off PATH, and delete
@@ -141,6 +141,25 @@ impl Cli {
             Command::Mcp => crate::mcp::run(&self).await,
             Command::Daemon(cmd) => commands::daemon::run(cmd).await,
             Command::Hook(args) => commands::hook::run(args, &self).await,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, Command};
+
+    #[test]
+    fn update_and_self_update_run_the_upgrade_command() {
+        for name in ["upgrade", "update", "self-update"] {
+            let cli = Cli::try_parse_from(["semctl", name])
+                .unwrap_or_else(|error| panic!("`semctl {name}` must parse: {error}"));
+            assert!(
+                matches!(cli.command, Command::Upgrade),
+                "`semctl {name}` must run the upgrade command"
+            );
         }
     }
 }

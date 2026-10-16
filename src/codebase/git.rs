@@ -37,6 +37,42 @@ fn sanitized_remote(remote: &str) -> Option<String> {
     Some(remote.to_string())
 }
 
+/// The repository variables that `git rev-parse --local-env-vars` lists.
+///
+/// A Git hook exports them to its children. Every semctl query names its
+/// repository with `git -C dir`, and an inherited `GIT_DIR` or
+/// `GIT_INDEX_FILE` would make Git answer about the hook's repository instead
+/// of `dir`. A `git init` under an inherited `GIT_DIR` would also write into
+/// that repository's configuration.
+const LOCAL_ENV_VARS: [&str; 15] = [
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+];
+
+/// A `git -C dir` command that ignores inherited repository variables, so Git
+/// discovers the repository from `dir` alone.
+pub(super) fn git_in(dir: &Path) -> Command {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(dir).kill_on_drop(true);
+    for variable in LOCAL_ENV_VARS {
+        command.env_remove(variable);
+    }
+    command
+}
+
 /// Run `git -C dir <args>` and return its trimmed stdout, or `None` if git
 /// fails (not a repo, detached, etc.). Uses `tokio::process` with
 /// `kill_on_drop` so a caller timeout cancels the direct child rather than
@@ -44,8 +80,8 @@ fn sanitized_remote(remote: &str) -> Option<String> {
 /// [`git_output`] also avoids the anonymous-pipe startup hang that can strand
 /// Git's real grandchild beyond that direct-child cleanup.
 pub(super) async fn git_capture(dir: &Path, args: &[&str]) -> Option<String> {
-    let mut command = Command::new("git");
-    command.arg("-C").arg(dir).args(args).kill_on_drop(true);
+    let mut command = git_in(dir);
+    command.args(args);
     let out = git_output(&mut command).await.ok()?;
     if !out.status.success() {
         return None;
@@ -57,12 +93,8 @@ pub(super) async fn git_capture(dir: &Path, args: &[&str]) -> Option<String> {
 /// Git emits a native absolute path followed by one line terminator. Preserve
 /// path whitespace and native bytes instead of applying metadata text trimming.
 pub(super) async fn git_working_copy_root(dir: &Path) -> Option<PathBuf> {
-    let mut command = Command::new("git");
-    command
-        .arg("-C")
-        .arg(dir)
-        .args(["rev-parse", "--show-toplevel"])
-        .kill_on_drop(true);
+    let mut command = git_in(dir);
+    command.args(["rev-parse", "--show-toplevel"]);
     let output = git_output(&mut command).await.ok()?;
     if !output.status.success() {
         return None;

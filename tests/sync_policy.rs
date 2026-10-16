@@ -114,6 +114,7 @@ struct Checkout {
     global: PathBuf,
     system: PathBuf,
     config: PathBuf,
+    repository_variables: Vec<String>,
 }
 
 impl Checkout {
@@ -134,6 +135,7 @@ impl Checkout {
             global,
             system,
             config,
+            repository_variables: repository_variables(),
         }
     }
 
@@ -146,14 +148,11 @@ impl Checkout {
             .env("XDG_CONFIG_HOME", &self.config)
             .env("SEMCTX_TOKEN", "offline-fixture-token")
             .env("NO_PROXY", "*");
+        for name in &self.repository_variables {
+            command.env_remove(name);
+        }
         for name in [
-            "GIT_CONFIG",
-            "GIT_CONFIG_PARAMETERS",
-            "GIT_CONFIG_COUNT",
             "GIT_CONFIG_NOSYSTEM",
-            "GIT_DIR",
-            "GIT_WORK_TREE",
-            "GIT_COMMON_DIR",
             "GIT_CEILING_DIRECTORIES",
             "SEMCTX_CODEBASE",
             "SEMCTX_SERVER",
@@ -198,6 +197,27 @@ impl Checkout {
             String::from_utf8_lossy(&result.stderr)
         );
     }
+}
+
+/// The variables that bind a Git process to one repository, as Git itself
+/// lists them. A Git hook exports some of them, such as `GIT_INDEX_FILE`, and a
+/// fixture repository must not read or write the repository that runs the
+/// tests.
+fn repository_variables() -> Vec<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--local-env-vars"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect()
 }
 
 fn restore_mtime(path: &Path, modified: std::time::SystemTime) {

@@ -116,7 +116,8 @@ async fn mcp_exposes_display_metadata_and_preserves_tool_error_text() {
     assert_eq!(failed["result"]["isError"], true);
     assert_eq!(
         failed["result"]["content"][0]["text"],
-        "read_source failed: line_start and line_end must be supplied together"
+        "read_source failed: line_start and line_end must be supplied together\n\
+         next: correct the argument and call again."
     );
 
     drop(stdin);

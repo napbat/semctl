@@ -57,8 +57,16 @@ semctl index        # register + sync the current repo for indexing
 | `semctl daemon status` / `stop`                       | Report or end the shared local daemon that serves the MCP sessions.                                                   |
 | `semctl install`                                      | Add/remove the editor/agent integrations.                                                                             |
 | `semctl uninstall`                                    | Reverse `install`: unwire the tools, remove from PATH, delete the binary (`--purge` also drops config + credentials). |
-| `semctl upgrade`                                      | Update the binary and refresh each installed editor/agent integration.                                                |
+| `semctl upgrade` / `update`                           | Update the binary and refresh each installed editor/agent integration.                                                |
 | `semctl auth login` / `logout` / `whoami` / `tenants` | Account & session.                                                                                                    |
+
+`semctl index` uploads the requested files in batches. A failed batch does not
+stop the other batches. A batch that failed because of a connection, gateway, or
+server error is sent once more, alone, after the other batches. Then the command
+completes the sync for the files that the server received. It exits with an
+error that names the files that the server did not receive. Run `semctl index`
+again to upload them. The MCP auto-index logs the same files, and
+`semctl daemon status` shows them for each checkout.
 
 ## Grammar-native editing
 
@@ -110,6 +118,26 @@ reversed with the hash-guarded `undo_edit` action. Read-only additions include
 reference/search/outline tools expose the richer occurrence, scope, and nesting
 options instead of gaining aliases.
 
+Every read-only MCP tool call ends within one deadline. The default is 25
+seconds, below the 30 seconds after which Oh My Pi ends an MCP request. Set
+`SEMCTX_TOOL_DEADLINE_SECS` to change it. A value from 5 to 600 applies as
+given, a smaller or larger value is held to that range, and `0` or an
+unreadable value means the default. Inside the deadline, a request that meets a
+gateway failure or a refused connection is sent once more after one second, and
+only when it only reads. A call that has no answer in time returns an error
+result that names the cause and the next step. A retrieval call also waits at
+most 5 seconds for a first index before it reports that the index is still
+running. The edit actions have no deadline: a limit that fired after the files
+changed would report a failed edit that was applied.
+
+The `index_codebase` tool does not wait for the first index. It registers the
+codebase, starts the scan and upload in the background, and returns at once with
+the codebase id and the path. The `sync_status` tool then reports the first-index
+phase: registering, syncing, embedding, ready, or failed. While a sync runs, it
+also reports a `current sync:` line with the latest step, such as the number of
+uploaded files. `semctl daemon status` reports the same phase and step for each
+checkout.
+
 ### Coming from the old `semctx` CLI
 
 The first `semctl install` automatically retires a previous `semctx` install: it
@@ -136,10 +164,26 @@ becomes a byte pump between the host and the daemon.
 | `off` | Serve the session in this process, as every earlier version did. |
 | `require` | Attach to the daemon, start one when none is running, and exit with status 1 when that fails. |
 
+On Windows, a daemon that `semctl mcp` starts must belong to no job object
+before it opens the shared endpoint. The client asks Windows to release the
+daemon from the client's jobs. A job that forbids breakaway blocks that
+request, and an ancestor job can keep the daemon even when the request
+succeeds. The daemon rejects membership in any job, including a job that would
+not end the daemon, because Windows offers no simple way to read an ancestor
+job's limits. When the daemon still belongs to a job, `auto` serves this
+session in its own process and `require` reports the startup failure. Clients
+in a job can still attach to an existing daemon. Closing one client's job must
+not end other clients' sessions.
+
+Some hosts run every process in a job that forbids breakaway. To share one
+daemon there, run `semctl daemon run` yourself as the same user and with the
+same configuration as the clients, from a process whose lifetime you control.
+A daemon started by hand skips the job check, and clients attach to it.
+
 Two commands inspect and end a running daemon:
 
 ```sh
-semctl daemon status        # version, pid, uptime, sessions, permits, checkouts
+semctl daemon status        # version, pid, uptime, sessions, permits, checkouts, their first-index phase, and the progress of a running sync
 semctl daemon status --json # the same facts as one JSON object
 semctl daemon stop          # end every session and exit
 ```
@@ -172,9 +216,10 @@ fingerprints; ignore-source identity and byte checks remain in place.
 
 Each permit override is clamped to the range 1 to 1024.
 
-A daemon inherits the environment of the client that started it, minus the six
-per-session variables (`SEMCTX_TOKEN`, `SEMCTX_SERVER`, `SEMCTX_TENANT`,
-`SEMCTX_CODEBASE`, `SEMCTX_MCP_RESYNC_SECS`, `SEMCTX_MCP_UPDATE_CHECK`). Every
+A daemon inherits the environment of the client that started it, minus the
+seven per-session variables (`SEMCTX_TOKEN`, `SEMCTX_SERVER`, `SEMCTX_TENANT`,
+`SEMCTX_CODEBASE`, `SEMCTX_MCP_RESYNC_SECS`, `SEMCTX_TOOL_DEADLINE_SECS`,
+`SEMCTX_MCP_UPDATE_CHECK`). Every
 later session of that daemon therefore runs with the first client's proxy
 settings, its `PATH`, which decides which formatter an edit runs, and its Git
 configuration variables, which decide which rules a source policy reads. Run
@@ -204,8 +249,12 @@ Secrets travel only inside the handshake body: no token appears in an endpoint
 name, a command argument, a log line, or status output.
 
 The full shared-daemon lifecycle suite is Unix-only. Native Windows regressions
-cover console-free Git probes and source-policy syncing. Windows named-pipe
-startup, MCP initialization, tool listing/calls, and client EOF have also been
+cover rejected startup in breakaway-denied and nested jobs, standalone
+fallback, attachment to an existing daemon, console-free Git probes, and
+source-policy syncing. Startup that survives its client's job needs a process
+outside Cargo's job, so that case runs only from the test binary directly (see
+`tests/daemon_windows_jobs.rs`). Windows named-pipe startup, MCP
+initialization, tool listing/calls, and client EOF have also been
 smoke-tested. The macOS daemon path remains compile-checked without runtime
 measurements.
 
@@ -324,6 +373,10 @@ cargo test --workspace --locked
 mise exec -c "bun test plugins/semctx/adapters/omp/index.test.ts"
 python3 tests/bootstrap_installers.py
 ```
+
+The installer test runs the `sh` and `pwsh` installer cases for each shell that
+is installed. It skips a missing shell and reports the skip. CI runs `sh` on
+Linux and `pwsh` on Windows. Use `--shell all` to require both shells.
 
 `plugins/semctx/` is the shared plugin root for every supported coding agent.
 Its `skills/codebase-retrieval/` has one physical source. Claude/Codex consume

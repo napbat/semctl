@@ -273,6 +273,8 @@ pub(super) fn render_hits_inner(
         if hits.len() == 1 { "match" } else { "matches" }
     );
     let mut separated = false;
+    let mut expanded_chars = 0_usize;
+    let mut shortened_hits = 0_usize;
     for h in hits {
         let root = context.root_for(h);
         if let Some(floor) = weak_below
@@ -299,12 +301,19 @@ pub(super) fn render_hits_inner(
         .expect("writing to a String cannot fail");
         if root.is_some() && h.path.as_deref().is_some_and(|p| stale.contains(p)) {
             // Put this warning before metadata so collapsed host views show it.
-            out.push_str("⚠ stale (edited since indexed)\n");
+            out.push_str("⚠ stale (edited since indexed)\n\n");
         }
         render_hit_metadata(&mut out, h, show_score);
+        let expand = full_body
+            && (expanded_chars == 0 || expanded_chars + h.snippet.len() <= EXPANDED_BODY_CHARS);
+        if expand {
+            expanded_chars += h.snippet.len();
+        } else if full_body {
+            shortened_hits += 1;
+        }
         // The preview starts at the first nonblank line. Expanded bodies retain
         // all source bytes, including leading blank lines and indentation.
-        let snippet = if full_body {
+        let snippet = if expand {
             Cow::Borrowed(h.snippet.as_str())
         } else {
             Cow::Owned(
@@ -326,6 +335,14 @@ pub(super) fn render_hits_inner(
             writeln!(out, "{fence}").expect("writing to a String cannot fail");
         }
         out.push('\n');
+    }
+    if shortened_hits > 0 {
+        writeln!(
+            out,
+            "{shortened_hits} hit(s) shown as snippets: expanded bodies stop at \
+             {EXPANDED_BODY_CHARS} characters. Use expand_chunk for one of them."
+        )
+        .expect("writing to a String cannot fail");
     }
     out
 }
@@ -395,6 +412,12 @@ fn fence_language(language: Option<&str>) -> String {
         .unwrap_or_default()
 }
 
+/// The total length of expanded bodies in one search answer. The first hit is
+/// always expanded; a later hit that does not fit is shown as a snippet. The
+/// server has no size limit of its own, and one expanded search with a broad
+/// `top_k` can otherwise return tens of thousands of characters.
+const EXPANDED_BODY_CHARS: usize = 30_000;
+
 /// A hit scoring below this fraction of the top hit's score is sorted under the
 /// "weaker matches" separator. Relative (not absolute) because raw hybrid
 /// scores aren't calibrated across queries.
@@ -456,7 +479,9 @@ pub(super) fn hit_location(h: &api::SearchHit, root: Option<&Path>) -> String {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{HitContext, api, render_hits_inner, render_job, strip_verbatim_prefix};
+    use super::{
+        EXPANDED_BODY_CHARS, HitContext, api, render_hits_inner, render_job, strip_verbatim_prefix,
+    };
 
     /// A `SearchHit` with a chosen chunk id + path — for the render test that
     /// keys on those.
@@ -514,6 +539,52 @@ mod tests {
 
         assert!(dirty.contains("⚠ stale"), "edited file flagged");
         assert!(!clean.contains("⚠ stale"), "untouched file not flagged");
+    }
+
+    /// A hit whose expanded body has `lines` lines of 10 characters each.
+    fn body(id: &str, lines: usize) -> api::SearchHit {
+        let mut hit = node(id, &format!("{id}.rs"));
+        hit.snippet = format!("{id}-body-ln\n").repeat(lines);
+        hit
+    }
+
+    fn expanded(hits: &[api::SearchHit]) -> String {
+        render_hits_inner(
+            hits,
+            "none",
+            HitContext::local(None),
+            true,
+            &HashSet::new(),
+            true,
+        )
+    }
+
+    #[test]
+    fn expanded_bodies_stop_at_the_limit_and_later_hits_that_fit_still_expand() {
+        // 2,000 + 1,500 + 500 lines of 10 characters: the second body would pass
+        // 30,000 characters, the third still fits after it is skipped.
+        let out = expanded(&[body("a", 2_000), body("b", 1_500), body("c", 500)]);
+
+        assert_eq!(out.matches("a-body-ln").count(), 2_000);
+        assert_eq!(out.matches("b-body-ln").count(), 4, "shown as a snippet");
+        assert_eq!(out.matches("c-body-ln").count(), 500);
+        assert!(
+            out.ends_with(&format!(
+                "1 hit(s) shown as snippets: expanded bodies stop at {EXPANDED_BODY_CHARS} \
+                 characters. Use expand_chunk for one of them.\n"
+            )),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn the_first_expanded_body_is_never_cut_and_small_answers_have_no_note() {
+        let oversized = expanded(&[body("a", 4_000)]);
+        assert_eq!(oversized.matches("a-body-ln").count(), 4_000);
+        assert!(!oversized.contains("shown as snippets"), "{oversized}");
+
+        let small = expanded(&[body("a", 10), body("b", 10)]);
+        assert!(!small.contains("shown as snippets"), "{small}");
     }
 
     #[test]
@@ -609,8 +680,9 @@ mod tests {
         assert!(lines[2].starts_with("### `"), "{output}");
         assert!(lines[2].contains("dirty.rs:1-2` — `first`"), "{output}");
         assert_eq!(lines[3], "⚠ stale (edited since indexed)");
+        assert_eq!(lines[4], "");
         assert_eq!(
-            lines[4],
+            lines[5],
             "Domain: `code` · Language: `rust` · Kind: `function` · Score: 0.000"
         );
     }

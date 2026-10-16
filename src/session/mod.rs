@@ -2,8 +2,9 @@
 //!
 //! [`SessionContext`] is the only way per-session invocation state enters the
 //! rest of the program. Everything that used to be read from the process — the
-//! working directory, `SEMCTX_TOKEN`, `SEMCTX_MCP_RESYNC_SECS`, and
-//! `SEMCTX_MCP_UPDATE_CHECK` — is read once, here, and then passed explicitly.
+//! working directory, `SEMCTX_TOKEN`, `SEMCTX_MCP_RESYNC_SECS`,
+//! `SEMCTX_TOOL_DEADLINE_SECS`, and `SEMCTX_MCP_UPDATE_CHECK` — is read once,
+//! here, and then passed explicitly.
 //!
 //! That separation is what lets one process serve several sessions. A process
 //! has one environment and one working directory; a session must not be
@@ -11,7 +12,7 @@
 
 pub(crate) mod credentials;
 
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 
@@ -30,6 +31,20 @@ const RESYNC_SECS_VAR: &str = "SEMCTX_MCP_RESYNC_SECS";
 /// body. Seven days is far longer than any real backstop and safely inside
 /// every instant this program computes from it.
 const MAX_RESYNC_SECS: u64 = 7 * 24 * 60 * 60;
+/// Seconds that one read-only tool call may take before the server ends it.
+const TOOL_DEADLINE_VAR: &str = "SEMCTX_TOOL_DEADLINE_SECS";
+/// The default call deadline. Oh My Pi ends an MCP request after 30 seconds, so
+/// the server must answer, or report a failure, before that.
+const DEFAULT_TOOL_DEADLINE_SECS: u64 = 25;
+/// Shortest call deadline a session may ask for. A shorter deadline would end
+/// calls that need one ordinary round trip and one retry.
+const MIN_TOOL_DEADLINE_SECS: u64 = 5;
+/// Longest call deadline a session may ask for: ten minutes.
+///
+/// The deadline is added to the current instant, and it is external data: it
+/// arrives from an environment variable or from an attach body. A bound keeps
+/// a value near the numeric limit from overflowing that arithmetic.
+const MAX_TOOL_DEADLINE_SECS: u64 = 600;
 /// `0` turns the startup update check off. Any other value leaves it on.
 const UPDATE_CHECK_VAR: &str = "SEMCTX_MCP_UPDATE_CHECK";
 
@@ -40,14 +55,15 @@ const UPDATE_CHECK_VAR: &str = "SEMCTX_MCP_UPDATE_CHECK";
 /// spawns, and a daemon that still finds one warns that it is ignored.
 ///
 /// `SEMCTX_SERVER`, `SEMCTX_TENANT`, and `SEMCTX_CODEBASE` are declared as
-/// clap fallbacks on the global flags in [`crate::cli`]; the other two are read
-/// in this module.
-pub(crate) const PER_SESSION_VARS: [&str; 6] = [
+/// clap fallbacks on the global flags in [`crate::cli`]; the other three are
+/// read in this module.
+pub(crate) const PER_SESSION_VARS: [&str; 7] = [
     credentials::TOKEN_VAR,
     "SEMCTX_SERVER",
     "SEMCTX_TENANT",
     "SEMCTX_CODEBASE",
     RESYNC_SECS_VAR,
+    TOOL_DEADLINE_VAR,
     UPDATE_CHECK_VAR,
 ];
 
@@ -72,6 +88,10 @@ pub(crate) struct SessionContext {
     pub(crate) credentials: CredentialSource,
     /// Periodic re-sync interval in seconds. `None` means the indexing default.
     pub(crate) resync_secs: Option<u64>,
+    /// How long one read-only tool call may take. A call that has no answer by
+    /// then ends with a failure the caller can act on. Edit tools have no
+    /// deadline.
+    pub(crate) tool_deadline: Duration,
     /// Whether this session wants the startup update check.
     pub(crate) update_check: bool,
 }
@@ -83,6 +103,7 @@ pub(crate) struct SessionContext {
 struct Environment {
     credentials: CredentialSource,
     resync_secs: Option<String>,
+    tool_deadline_secs: Option<String>,
     update_check: Option<String>,
 }
 
@@ -99,6 +120,7 @@ impl SessionContext {
         let environment = Environment {
             credentials: CredentialSource::from_environment(),
             resync_secs: std::env::var(RESYNC_SECS_VAR).ok(),
+            tool_deadline_secs: std::env::var(TOOL_DEADLINE_VAR).ok(),
             update_check: std::env::var(UPDATE_CHECK_VAR).ok(),
         };
         Ok(Self::build(cwd, cli, environment))
@@ -127,6 +149,7 @@ impl SessionContext {
             credentials: CredentialSource::from_token(request.token.as_ref().map(Token::expose)),
             // External data, clamped exactly as the environment value is.
             resync_secs: clamp_resync_secs(request.resync_secs),
+            tool_deadline: tool_deadline_from_secs(request.tool_deadline_secs),
             update_check: request.update_check,
         })
     }
@@ -143,6 +166,7 @@ impl SessionContext {
             codebase: None,
             credentials: CredentialSource::Stored,
             resync_secs: None,
+            tool_deadline: Duration::from_secs(DEFAULT_TOOL_DEADLINE_SECS),
             update_check: false,
         }
     }
@@ -162,6 +186,9 @@ impl SessionContext {
             codebase: cli.codebase.clone(),
             credentials: environment.credentials,
             resync_secs: parse_resync_secs(environment.resync_secs.as_deref()),
+            tool_deadline: tool_deadline_from_secs(parse_tool_deadline_secs(
+                environment.tool_deadline_secs.as_deref(),
+            )),
             update_check: update_check_enabled(environment.update_check.as_deref()),
         }
     }
@@ -189,6 +216,7 @@ impl SessionRequest {
                 CredentialSource::Stored => None,
             },
             resync_secs: context.resync_secs,
+            tool_deadline_secs: Some(context.tool_deadline.as_secs()),
             update_check: context.update_check,
         }
     }
@@ -207,6 +235,24 @@ fn clamp_resync_secs(secs: Option<u64>) -> Option<u64> {
     secs.map(|secs| secs.min(MAX_RESYNC_SECS))
 }
 
+/// Parse the call deadline. An absent, zero, or unreadable value means the
+/// default, so a typo cannot leave a call without a bound.
+fn parse_tool_deadline_secs(raw: Option<&str>) -> Option<u64> {
+    raw.and_then(|value| value.trim().parse().ok())
+}
+
+/// The call deadline of a session. `None` and `0` mean the default. Any other
+/// value is held to [`MIN_TOOL_DEADLINE_SECS`] and [`MAX_TOOL_DEADLINE_SECS`].
+///
+/// One rule for both sources: the process environment and the attach body.
+fn tool_deadline_from_secs(secs: Option<u64>) -> Duration {
+    let secs = match secs {
+        None | Some(0) => DEFAULT_TOOL_DEADLINE_SECS,
+        Some(secs) => secs.clamp(MIN_TOOL_DEADLINE_SECS, MAX_TOOL_DEADLINE_SECS),
+    };
+    Duration::from_secs(secs)
+}
+
 /// Only the exact value `0` turns the update check off.
 fn update_check_enabled(raw: Option<&str>) -> bool {
     raw != Some("0")
@@ -214,11 +260,13 @@ fn update_check_enabled(raw: Option<&str>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{path::PathBuf, time::Duration};
 
     use super::{
-        CredentialSource, Environment, MAX_RESYNC_SECS, PER_SESSION_VARS, SessionContext,
-        SessionRequest, Token, parse_resync_secs, update_check_enabled,
+        CredentialSource, DEFAULT_TOOL_DEADLINE_SECS, Environment, MAX_RESYNC_SECS,
+        MAX_TOOL_DEADLINE_SECS, MIN_TOOL_DEADLINE_SECS, PER_SESSION_VARS, SessionContext,
+        SessionRequest, Token, parse_resync_secs, parse_tool_deadline_secs,
+        tool_deadline_from_secs, update_check_enabled,
     };
     use crate::cli::{Cli, Command};
 
@@ -235,6 +283,7 @@ mod tests {
         Environment {
             credentials: CredentialSource::Stored,
             resync_secs: resync_secs.map(str::to_string),
+            tool_deadline_secs: None,
             update_check: update_check.map(str::to_string),
         }
     }
@@ -270,6 +319,10 @@ mod tests {
         assert_eq!(context.tenant, None);
         assert_eq!(context.codebase, None);
         assert_eq!(context.resync_secs, None);
+        assert_eq!(
+            context.tool_deadline,
+            Duration::from_secs(DEFAULT_TOOL_DEADLINE_SECS)
+        );
         assert!(context.update_check);
     }
 
@@ -308,6 +361,92 @@ mod tests {
         assert_eq!(context.resync_secs, Some(MAX_RESYNC_SECS));
     }
 
+    #[test]
+    fn tool_deadline_seconds_are_parsed_and_unreadable_values_are_absent() {
+        assert_eq!(parse_tool_deadline_secs(Some("40")), Some(40));
+        assert_eq!(parse_tool_deadline_secs(Some("  40\n")), Some(40));
+        assert_eq!(parse_tool_deadline_secs(None), None);
+        assert_eq!(parse_tool_deadline_secs(Some("")), None);
+        assert_eq!(parse_tool_deadline_secs(Some("soon")), None);
+        assert_eq!(parse_tool_deadline_secs(Some("-5")), None);
+    }
+
+    /// A deadline of `0` would remove the bound that the setting exists to
+    /// give, so it means the default, as an unreadable value does.
+    #[test]
+    fn a_tool_deadline_is_held_between_its_documented_bounds() {
+        let secs = |value: Option<u64>| tool_deadline_from_secs(value).as_secs();
+
+        assert_eq!(secs(None), DEFAULT_TOOL_DEADLINE_SECS);
+        assert_eq!(secs(Some(0)), DEFAULT_TOOL_DEADLINE_SECS);
+        assert_eq!(secs(Some(1)), MIN_TOOL_DEADLINE_SECS);
+        assert_eq!(
+            secs(Some(MIN_TOOL_DEADLINE_SECS - 1)),
+            MIN_TOOL_DEADLINE_SECS
+        );
+        assert_eq!(secs(Some(MIN_TOOL_DEADLINE_SECS)), MIN_TOOL_DEADLINE_SECS);
+        assert_eq!(secs(Some(40)), 40);
+        assert_eq!(secs(Some(MAX_TOOL_DEADLINE_SECS)), MAX_TOOL_DEADLINE_SECS);
+        assert_eq!(
+            secs(Some(MAX_TOOL_DEADLINE_SECS + 1)),
+            MAX_TOOL_DEADLINE_SECS
+        );
+        assert_eq!(secs(Some(u64::MAX)), MAX_TOOL_DEADLINE_SECS);
+    }
+
+    #[test]
+    fn the_tool_deadline_comes_from_the_environment_and_is_clamped() {
+        let deadline = |raw: &str| {
+            SessionContext::build(
+                PathBuf::from("/work"),
+                &cli(None, None, None),
+                Environment {
+                    tool_deadline_secs: Some(raw.to_string()),
+                    ..environment(None, None)
+                },
+            )
+            .tool_deadline
+        };
+
+        assert_eq!(deadline("40"), Duration::from_secs(40));
+        assert_eq!(deadline("1"), Duration::from_secs(MIN_TOOL_DEADLINE_SECS));
+        assert_eq!(
+            deadline("100000"),
+            Duration::from_secs(MAX_TOOL_DEADLINE_SECS)
+        );
+        for unreadable in ["0", "", "soon", "-5"] {
+            assert_eq!(
+                deadline(unreadable),
+                Duration::from_secs(DEFAULT_TOOL_DEADLINE_SECS),
+                "{unreadable:?} must give the default"
+            );
+        }
+    }
+
+    /// External data: the attach body is clamped as the environment value is,
+    /// and a client that predates the field leaves the default.
+    #[test]
+    fn the_tool_deadline_of_an_attach_body_is_clamped_and_defaults_when_absent() {
+        let deadline = |secs: Option<u64>| {
+            SessionContext::from_handshake(SessionRequest {
+                tool_deadline_secs: secs,
+                ..request("/work", None)
+            })
+            .expect("an absolute working directory is accepted")
+            .tool_deadline
+        };
+
+        assert_eq!(deadline(Some(90)), Duration::from_secs(90));
+        assert_eq!(
+            deadline(Some(u64::MAX)),
+            Duration::from_secs(MAX_TOOL_DEADLINE_SECS)
+        );
+        assert_eq!(
+            deadline(None),
+            Duration::from_secs(DEFAULT_TOOL_DEADLINE_SECS)
+        );
+    }
+
     /// An absolute path on every platform. `/work` has no drive prefix, so
     /// `Path::is_absolute` is false on Windows and the handshake would refuse
     /// it before the behavior under test is reached.
@@ -327,6 +466,7 @@ mod tests {
             codebase: Some("id".to_string()),
             token: token.map(Token::new),
             resync_secs: Some(15),
+            tool_deadline_secs: Some(40),
             update_check: false,
         }
     }
@@ -341,6 +481,7 @@ mod tests {
         assert_eq!(context.tenant.as_deref(), Some("acme"));
         assert_eq!(context.codebase.as_deref(), Some("id"));
         assert_eq!(context.resync_secs, Some(15));
+        assert_eq!(context.tool_deadline, Duration::from_secs(40));
         assert!(!context.update_check);
         match context.credentials {
             CredentialSource::Invocation(secret) => assert_eq!(secret.expose(), "wire-token"),
@@ -386,6 +527,7 @@ mod tests {
             Environment {
                 credentials: CredentialSource::from_test_token("round-trip-token"),
                 resync_secs: Some("45".to_string()),
+                tool_deadline_secs: Some("75".to_string()),
                 update_check: Some("0".to_string()),
             },
         );
@@ -398,12 +540,13 @@ mod tests {
         assert_eq!(restored.tenant, context.tenant);
         assert_eq!(restored.codebase, context.codebase);
         assert_eq!(restored.resync_secs, Some(45));
+        assert_eq!(restored.tool_deadline, Duration::from_secs(75));
         assert!(!restored.update_check);
         assert_eq!(restored.credentials.scope(), context.credentials.scope());
     }
 
     #[test]
-    fn the_per_session_variables_are_the_documented_six() {
+    fn the_per_session_variables_are_the_documented_seven() {
         assert_eq!(
             PER_SESSION_VARS,
             [
@@ -412,6 +555,7 @@ mod tests {
                 "SEMCTX_TENANT",
                 "SEMCTX_CODEBASE",
                 "SEMCTX_MCP_RESYNC_SECS",
+                "SEMCTX_TOOL_DEADLINE_SECS",
                 "SEMCTX_MCP_UPDATE_CHECK",
             ]
         );

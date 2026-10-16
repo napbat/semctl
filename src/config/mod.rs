@@ -7,9 +7,9 @@
 //! with `XDG_CONFIG_HOME`).
 
 use std::fs;
-use std::io::{ErrorKind, Write};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
@@ -18,6 +18,7 @@ mod codebase_cache;
 mod persistence;
 mod state;
 pub use codebase_cache::{cache_codebase, uncache_codebase_id};
+use persistence::publish_new_private;
 pub(crate) use persistence::{atomic_write_private, create_private_new, lock_file, open_lock};
 pub(crate) use state::StateStore;
 
@@ -194,11 +195,16 @@ fn config_path() -> Result<PathBuf> {
 /// A separate file avoids rewriting `config.toml` (and racing another semctl
 /// process) merely to establish the identity.
 pub(crate) fn installation_id() -> Result<String> {
-    let dir = config_dir()?;
-    fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    let path = dir.join("installation-id");
+    installation_id_at(&config_dir()?.join("installation-id"))
+}
 
-    match read_installation_id(&path) {
+/// Read the installation id at `path`, or create it on first use.
+///
+/// Concurrent first runs are normal: two MCP sessions in one daemon bind at
+/// the same moment. The id is published in one step, so a reader sees no file
+/// or a complete id. Exactly one writer wins, and every caller returns its id.
+fn installation_id_at(path: &Path) -> Result<String> {
+    match read_installation_id(path) {
         Ok(id) => return Ok(id),
         Err(error) if error.kind() == ErrorKind::NotFound => {}
         Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
@@ -211,36 +217,14 @@ pub(crate) fn installation_id() -> Result<String> {
             .unwrap_or_default()
             .as_nanos(),
         std::process::id(),
-        dir.display()
+        path.display()
     );
     let id = blake3::hash(seed.as_bytes()).to_hex().to_string();
-
-    match create_private_new(&path) {
-        Ok(mut file) => {
-            file.write_all(id.as_bytes())
-                .and_then(|()| file.write_all(b"\n"))
-                .and_then(|()| file.flush())
-                .with_context(|| format!("write {}", path.display()))?;
-            Ok(id)
-        }
-        Err(error)
-            if error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|error| error.kind() == ErrorKind::AlreadyExists) =>
-        {
-            // Another semctl process won first-run creation. It may still be
-            // finishing its tiny write, so give it a bounded moment to publish.
-            for _ in 0..20 {
-                if let Ok(id) = read_installation_id(&path) {
-                    return Ok(id);
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            read_installation_id(&path)
-                .with_context(|| format!("read concurrently-created {}", path.display()))
-        }
-        Err(error) => Err(error),
+    if publish_new_private(path, format!("{id}\n").as_bytes())? {
+        return Ok(id);
     }
+    read_installation_id(path)
+        .with_context(|| format!("read concurrently-created {}", path.display()))
 }
 
 fn read_installation_id(path: &std::path::Path) -> std::io::Result<String> {

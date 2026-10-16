@@ -3,11 +3,11 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 
 use crate::client::{Client, api};
 
-use super::{local_path, render_hits, urlencode};
+use super::{ToolError, bound_codebase, local_path, render_hits, urlencode};
 
 const CODEBASE_PAGE_SIZE: u32 = 500;
 const MAX_CODEBASE_PAGES: u32 = 100;
@@ -42,9 +42,9 @@ async fn describe_copies(client: &Client, codebase_id: &str, source_id: &str) ->
     }
 }
 
-pub async fn list_codebases(client: &Client) -> String {
+pub async fn list_codebases(client: &Client) -> Result<String, ToolError> {
     match fetch_codebases(client).await {
-        Ok(codebases) if codebases.is_empty() => "no visible codebases".into(),
+        Ok(codebases) if codebases.is_empty() => Ok("no visible codebases".into()),
         Ok(codebases) => {
             let local_source = client
                 .local_root()
@@ -82,9 +82,9 @@ pub async fn list_codebases(client: &Client) -> String {
                 )
                 .expect("writing to a String cannot fail");
             }
-            out
+            Ok(out)
         }
-        Err(error) => format!("list_codebases failed: {error:#}"),
+        Err(error) => Err(ToolError::from_client("list_codebases", &error)),
     }
 }
 
@@ -148,11 +148,8 @@ pub async fn read_source(
     revision: Option<&str>,
     byte_range: Option<(u64, u64)>,
     line_range: Option<(u32, u32)>,
-) -> String {
-    let cb = match client.codebase() {
-        Ok(value) => value,
-        Err(error) => return format!("read_source failed: {error}"),
-    };
+) -> Result<String, ToolError> {
+    let cb = bound_codebase(client, "read_source")?;
     let mut url = format!("/v1/codebases/{cb}/files/content?path={}", urlencode(path));
     if let Some(revision) = revision {
         write!(url, "&revision={}", urlencode(revision)).expect("writing to a String cannot fail");
@@ -163,10 +160,10 @@ pub async fn read_source(
     if let Some((start, end)) = line_range {
         write!(url, "&lineStart={start}&lineEnd={end}").expect("writing to a String cannot fail");
     }
-    let content = match client.get::<api::FileContent>(&url).await {
-        Ok(content) => content,
-        Err(error) => return format!("read_source failed: {error}"),
-    };
+    let content = client
+        .get::<api::FileContent>(&url)
+        .await
+        .map_err(|error| ToolError::from_client("read_source", &error))?;
 
     let mut source = "content-plane";
     let mut body = content.content.clone();
@@ -176,7 +173,7 @@ pub async fn read_source(
         source = "verified-local";
         body = local;
     }
-    format!(
+    Ok(format!(
         "{}\nrevision {}\nbytes {}-{} of {}\nencoding {}\nsource {}{}\n\n{}",
         local_path(client.local_root(), &content.path),
         content.content_hash,
@@ -191,7 +188,7 @@ pub async fn read_source(
             ""
         },
         body
-    )
+    ))
 }
 
 pub struct SymbolSearchOptions<'a> {
@@ -204,11 +201,11 @@ pub struct SymbolSearchOptions<'a> {
     pub limit: u32,
 }
 
-pub async fn search_symbols(client: &Client, options: &SymbolSearchOptions<'_>) -> String {
-    let cb = match client.codebase() {
-        Ok(value) => value,
-        Err(error) => return format!("search_symbols failed: {error}"),
-    };
+pub async fn search_symbols(
+    client: &Client,
+    options: &SymbolSearchOptions<'_>,
+) -> Result<String, ToolError> {
+    let cb = bound_codebase(client, "search_symbols")?;
     let mut url = format!(
         "/v1/codebases/{cb}/graph/symbols?query={}&mode={}&limit={}",
         urlencode(options.query),
@@ -228,7 +225,7 @@ pub async fn search_symbols(client: &Client, options: &SymbolSearchOptions<'_>) 
         }
     }
     match client.get::<Vec<api::SymbolSearchHit>>(&url).await {
-        Ok(hits) if hits.is_empty() => format!("no symbols match `{}`", options.query),
+        Ok(hits) if hits.is_empty() => Ok(format!("no symbols match `{}`", options.query)),
         Ok(hits) => {
             let mut out = String::new();
             for hit in &hits {
@@ -246,17 +243,19 @@ pub async fn search_symbols(client: &Client, options: &SymbolSearchOptions<'_>) 
                 )
                 .expect("writing to a String cannot fail");
             }
-            out
+            Ok(out)
         }
-        Err(error) => format!("search_symbols failed: {error}"),
+        Err(error) => Err(ToolError::from_client("search_symbols", &error)),
     }
 }
 
-pub async fn type_hierarchy(client: &Client, symbol: &str, direction: &str, depth: u32) -> String {
-    let cb = match client.codebase() {
-        Ok(value) => value,
-        Err(error) => return format!("type_hierarchy failed: {error}"),
-    };
+pub async fn type_hierarchy(
+    client: &Client,
+    symbol: &str,
+    direction: &str,
+    depth: u32,
+) -> Result<String, ToolError> {
+    let cb = bound_codebase(client, "type_hierarchy")?;
     let url = format!(
         "/v1/codebases/{cb}/graph/type-hierarchy?symbol={}&direction={}&depth={}",
         urlencode(symbol),
@@ -264,16 +263,18 @@ pub async fn type_hierarchy(client: &Client, symbol: &str, direction: &str, dept
         depth.clamp(1, 16)
     );
     match client.get::<api::TypeHierarchy>(&url).await {
-        Ok(hierarchy) => render_type_hierarchy(client, &hierarchy),
-        Err(error) => format!("type_hierarchy failed: {error}"),
+        Ok(hierarchy) => Ok(render_type_hierarchy(client, &hierarchy)),
+        Err(error) => Err(ToolError::from_client("type_hierarchy", &error)),
     }
 }
 
-pub async fn call_graph(client: &Client, symbol: &str, depth: u32, direction: &str) -> String {
-    let cb = match client.codebase() {
-        Ok(value) => value,
-        Err(error) => return format!("call_graph failed: {error}"),
-    };
+pub async fn call_graph(
+    client: &Client,
+    symbol: &str,
+    depth: u32,
+    direction: &str,
+) -> Result<String, ToolError> {
+    let cb = bound_codebase(client, "call_graph")?;
     let url = format!(
         "/v1/codebases/{cb}/graph/call-graph?symbol={}&depth={}&direction={}",
         urlencode(symbol),
@@ -281,7 +282,7 @@ pub async fn call_graph(client: &Client, symbol: &str, depth: u32, direction: &s
         urlencode(direction)
     );
     match client.get::<api::CallGraph>(&url).await {
-        Ok(graph) if graph.nodes.is_empty() => format!("no call graph for `{symbol}`"),
+        Ok(graph) if graph.nodes.is_empty() => Ok(format!("no call graph for `{symbol}`")),
         Ok(graph) => {
             let mut out = format!("nodes ({})\n", graph.nodes.len());
             out.push_str(&render_hits(&graph.nodes, "", client.local_root(), false));
@@ -291,31 +292,28 @@ pub async fn call_graph(client: &Client, symbol: &str, depth: u32, direction: &s
                 writeln!(out, "  {} -> {}", edge.from, edge.to)
                     .expect("writing to a String cannot fail");
             }
-            out
+            Ok(out)
         }
-        Err(error) => format!("call_graph failed: {error}"),
+        Err(error) => Err(ToolError::from_client("call_graph", &error)),
     }
 }
 
-pub async fn cycles(client: &Client) -> String {
+pub async fn cycles(client: &Client) -> Result<String, ToolError> {
     graph_clusters(client, "cycles", "cycles").await
 }
 
-pub async fn duplicates(client: &Client) -> String {
+pub async fn duplicates(client: &Client) -> Result<String, ToolError> {
     graph_clusters(client, "duplicates", "duplicate groups").await
 }
 
-pub async fn unused(client: &Client, page: u32, page_size: u32) -> String {
-    let cb = match client.codebase() {
-        Ok(value) => value,
-        Err(error) => return format!("unused failed: {error}"),
-    };
+pub async fn unused(client: &Client, page: u32, page_size: u32) -> Result<String, ToolError> {
+    let cb = bound_codebase(client, "unused")?;
     let url = format!(
         "/v1/codebases/{cb}/graph/unused?page={page}&pageSize={}",
         page_size.clamp(1, 500)
     );
     match client.get_page::<api::UnusedDefinition>(&url).await {
-        Ok(result) if result.items.is_empty() => "no unused definitions".into(),
+        Ok(result) if result.items.is_empty() => Ok("no unused definitions".into()),
         Ok(result) => {
             let mut out = String::new();
             for item in &result.items {
@@ -339,9 +337,9 @@ pub async fn unused(client: &Client, page: u32, page_size: u32) -> String {
                 result.total
             )
             .expect("writing to a String cannot fail");
-            out
+            Ok(out)
         }
-        Err(error) => format!("unused failed: {error}"),
+        Err(error) => Err(ToolError::from_client("unused", &error)),
     }
 }
 
@@ -390,9 +388,8 @@ pub async fn plan_insert(
         .await
 }
 
-pub fn render_edit_plan(plan: &api::WorkspaceEditPlan) -> String {
-    serde_json::to_string_pretty(plan)
-        .unwrap_or_else(|error| format!("render plan failed: {error}"))
+pub fn render_edit_plan(plan: &api::WorkspaceEditPlan) -> Result<String> {
+    serde_json::to_string_pretty(plan).context("render plan")
 }
 
 async fn fetch_codebases(client: &Client) -> Result<Vec<api::CodebaseSummary>> {
@@ -486,14 +483,15 @@ fn render_type_hierarchy(client: &Client, hierarchy: &api::TypeHierarchy) -> Str
     out
 }
 
-async fn graph_clusters(client: &Client, endpoint: &str, label: &str) -> String {
-    let cb = match client.codebase() {
-        Ok(value) => value,
-        Err(error) => return format!("{endpoint} failed: {error}"),
-    };
+async fn graph_clusters(
+    client: &Client,
+    endpoint: &'static str,
+    label: &str,
+) -> Result<String, ToolError> {
+    let cb = bound_codebase(client, endpoint)?;
     let url = format!("/v1/codebases/{cb}/graph/{endpoint}");
     match client.get::<Vec<api::GraphCluster>>(&url).await {
-        Ok(groups) if groups.is_empty() => format!("no {label}"),
+        Ok(groups) if groups.is_empty() => Ok(format!("no {label}")),
         Ok(groups) => {
             let mut out = String::new();
             for group in &groups {
@@ -522,9 +520,9 @@ async fn graph_clusters(client: &Client, endpoint: &str, label: &str) -> String 
                     .expect("writing to a String cannot fail");
                 }
             }
-            out
+            Ok(out)
         }
-        Err(error) => format!("{endpoint} failed: {error}"),
+        Err(error) => Err(ToolError::from_client(endpoint, &error)),
     }
 }
 

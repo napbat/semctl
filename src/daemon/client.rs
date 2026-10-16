@@ -10,7 +10,7 @@
 
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use tracing::{debug, warn};
 
 use super::spawn;
@@ -175,10 +175,30 @@ async fn connect_or_start(endpoint: &Endpoint) -> Result<Stream> {
             "no daemon answered this endpoint; starting one"
         ),
     }
-    spawn::spawn_daemon(endpoint)?;
-    ipc::connect(endpoint, Instant::now() + SPAWNED_DEADLINE)
-        .await
-        .context("connect to the daemon this client started")
+    let mut child = spawn::spawn_daemon(endpoint)?;
+    let connection = ipc::connect(endpoint, Instant::now() + SPAWNED_DEADLINE);
+    tokio::pin!(connection);
+    let mut poll = tokio::time::interval(Duration::from_millis(25));
+    loop {
+        tokio::select! {
+            connected = &mut connection => {
+                return connected.context("connect to the daemon this client started");
+            }
+            _ = poll.tick() => {
+                if let Some(status) = child.try_wait().context("check daemon startup")? {
+                    if !status.success() {
+                        bail!(
+                            "the detached semctl daemon exited ({status}) before accepting a connection; see {}",
+                            endpoint.log_path().display()
+                        );
+                    }
+                    // A competing client may have won the endpoint election.
+                    // A clean loser is not a startup failure; await the winner.
+                    return connection.await.context("connect after the daemon election");
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

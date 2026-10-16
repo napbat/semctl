@@ -180,14 +180,30 @@ class BootstrapInstallers(unittest.TestCase):
             self.run_case("sh", f"{DIGEST}  ASSET\n", checksum_tool="shasum", success=True)
 
 
+def shell_available(shell: str) -> bool:
+    if shutil.which(shell) is not None:
+        return True
+    return shell == "pwsh" and shutil.which("powershell") is not None
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--shell", choices=("sh", "pwsh", "all"), default="all")
+    parser.add_argument(
+        "--shell",
+        choices=("available", "sh", "pwsh", "all"),
+        default="available",
+        help="'available' tests each installed shell; the other choices fail when a shell is missing",
+    )
     arguments = parser.parse_args()
-    SHELLS = ["sh", "pwsh"] if arguments.shell == "all" else [arguments.shell]
-    for selected in SHELLS:
-        if shutil.which(selected) is None and not (
-            selected == "pwsh" and shutil.which("powershell") is not None
-        ):
-            parser.error(f"{selected} is required; use --shell to select an available shell")
+    if arguments.shell == "available":
+        SHELLS = [shell for shell in ("sh", "pwsh") if shell_available(shell)]
+        if not SHELLS:
+            parser.error("neither sh nor pwsh is available")
+        for skipped in sorted({"sh", "pwsh"} - set(SHELLS)):
+            print(f"{skipped} is not installed; skipping its installer tests", file=sys.stderr)
+    else:
+        SHELLS = ["sh", "pwsh"] if arguments.shell == "all" else [arguments.shell]
+        for selected in SHELLS:
+            if not shell_available(selected):
+                parser.error(f"{selected} is required; use --shell to select an available shell")
     unittest.main(argv=[sys.argv[0]], verbosity=2)

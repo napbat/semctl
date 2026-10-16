@@ -172,7 +172,7 @@ async fn plan(command: EditCommand, cli: &Cli) -> Result<()> {
         EditCommand::InsertAfter(args) => plan_insert(&client, args, false).await?,
         EditCommand::Apply(_) | EditCommand::Undo(_) => bail!("invalid planning command"),
     };
-    println!("{}", query::render_edit_plan(&plan));
+    println!("{}", query::render_edit_plan(&plan)?);
     Ok(())
 }
 

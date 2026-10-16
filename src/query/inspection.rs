@@ -6,7 +6,9 @@ use super::render::{
     local_path, render_files, render_hits, render_job, render_projects, render_tree,
     truncation_note,
 };
-use super::{Client, api, urlencode};
+use super::{Client, ToolError, api, bound_codebase, urlencode};
+use crate::mcp::readiness::FirstIndexPhase;
+use crate::sync::SyncProgress;
 
 pub(super) const FILES_PAGE_MAX: u32 = 1000;
 
@@ -33,12 +35,9 @@ pub(super) async fn fetch_files_page(
     cb: &str,
     page: u32,
     page_size: u32,
-) -> std::result::Result<api::Page<api::CodebaseFile>, String> {
+) -> anyhow::Result<api::Page<api::CodebaseFile>> {
     let path = format!("/v1/codebases/{cb}/files?page={page}&pageSize={page_size}");
-    client
-        .get_page::<api::CodebaseFile>(&path)
-        .await
-        .map_err(|e| format!("list_files failed: {e}"))
+    client.get_page::<api::CodebaseFile>(&path).await
 }
 
 /// Walk every page of a flat paginated list endpoint into one `Vec`. The graph
@@ -50,16 +49,13 @@ async fn fetch_all_pages<T: serde::de::DeserializeOwned>(
     client: &Client,
     base_path: &str,
     cap: usize,
-) -> std::result::Result<(Vec<T>, u32), String> {
+) -> anyhow::Result<(Vec<T>, u32)> {
     let sep = if base_path.contains('?') { '&' } else { '?' };
     let mut out: Vec<T> = Vec::new();
     let mut total = 0u32;
     for page in 0.. {
         let path = format!("{base_path}{sep}page={page}&pageSize={FILES_PAGE_MAX}");
-        let p = client
-            .get_page::<T>(&path)
-            .await
-            .map_err(|e| e.to_string())?;
+        let p = client.get_page::<T>(&path).await?;
         total = p.total;
         let got = p.items.len();
         out.extend(p.items);
@@ -80,11 +76,8 @@ pub async fn list_files(
     filter: Option<&str>,
     page: Option<u32>,
     page_size: Option<u32>,
-) -> String {
-    let cb = match client.codebase() {
-        Ok(c) => c,
-        Err(e) => return format!("list_files failed: {e}"),
-    };
+) -> Result<String, ToolError> {
+    let cb = bound_codebase(client, "list_files")?;
     let root = client.local_root();
 
     // Filtered: the filter is the narrowing tool, so it spans the whole catalog
@@ -97,10 +90,9 @@ pub async fn list_files(
         let mut total;
         let mut pg = 0u32;
         loop {
-            let p = match fetch_files_page(client, cb, pg, FILES_PAGE_MAX).await {
-                Ok(p) => p,
-                Err(e) => return e,
-            };
+            let p = fetch_files_page(client, cb, pg, FILES_PAGE_MAX)
+                .await
+                .map_err(|e| ToolError::from_client("list_files", &e))?;
             total = p.total as usize;
             let got = p.items.len();
             matches.extend(
@@ -115,18 +107,18 @@ pub async fn list_files(
             pg += 1;
         }
         if total == 0 {
-            return EMPTY_CATALOG.into();
+            return Ok(EMPTY_CATALOG.into());
         }
         if matches.is_empty() {
-            return format!(
+            return Ok(format!(
                 "(no indexed files match `{raw}` — searched all {total} catalogued files)"
-            );
+            ));
         }
         matches.sort_by(|a, b| a.path.cmp(&b.path));
         let mut out = render_files(&matches, root);
         writeln!(out, "({} of {total} files match `{raw}`)", matches.len())
             .expect("writing to a String cannot fail");
-        return out;
+        return Ok(out);
     }
 
     // Unfiltered: one 0-based page, with a footer that says where we are and how
@@ -134,21 +126,20 @@ pub async fn list_files(
     // back in a single call; lower it to page through a very large catalog.
     let page_size = page_size.unwrap_or(FILES_PAGE_MAX).clamp(1, FILES_PAGE_MAX);
     let pg = page.unwrap_or(0);
-    let p = match fetch_files_page(client, cb, pg, page_size).await {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
+    let p = fetch_files_page(client, cb, pg, page_size)
+        .await
+        .map_err(|e| ToolError::from_client("list_files", &e))?;
     let total = p.total as usize;
     if total == 0 {
-        return EMPTY_CATALOG.into();
+        return Ok(EMPTY_CATALOG.into());
     }
     let mut files = p.items;
     if files.is_empty() {
         // total > 0 but this page is empty → scrolled past the end.
         let last = (total - 1) / page_size as usize;
-        return format!(
+        return Ok(format!(
             "(page {pg} is past the end — {total} files span pages 0–{last} at pageSize {page_size})"
-        );
+        ));
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
     let start = pg as usize * page_size as usize; // 0-based index of the first row
@@ -160,22 +151,28 @@ pub async fn list_files(
             .expect("writing to a String cannot fail");
     }
     out.push_str(")\n");
-    out
+    Ok(out)
 }
 
 /// Persisted index totals plus the latest sync run queued by this MCP session.
 /// The catalog totals are deliberately independent of the latest job: a no-op
 /// sync has a 0-file plan even when the codebase already contains thousands of
 /// indexed files.
+///
+/// `first_index` is the phase of the checkout's first index. No tool call waits
+/// for a first index, so this line is how an agent follows it.
+///
+/// `sync_progress` is the latest milestone of the reconcile that runs now. Its
+/// line follows the first-index line, so an agent reads how far a first index
+/// has come. There is no line when no reconcile runs.
 pub async fn sync_status(
     client: &Client,
     job_id: Option<&str>,
     local_watch_active: bool,
-) -> String {
-    let codebase_id = match client.codebase() {
-        Ok(id) => id,
-        Err(e) => return format!("sync_status failed: {e}"),
-    };
+    first_index: Option<&FirstIndexPhase>,
+    sync_progress: Option<&SyncProgress>,
+) -> Result<String, ToolError> {
+    let codebase_id = bound_codebase(client, "sync_status")?;
     let totals = catalog_totals(client, codebase_id).await;
     let job = match job_id {
         Some(id) => Some((
@@ -192,8 +189,15 @@ pub async fn sync_status(
     } else {
         "not active (no local checkout selected)"
     };
-    let mut out =
-        format!("codebase {codebase_id}\nlocal checkout watch: {watch}\ntotal indexed state:");
+    let mut out = format!("codebase {codebase_id}");
+    if let Some(phase) = first_index {
+        write!(out, "\n{}", first_index_line(phase)).expect("writing to a String cannot fail");
+    }
+    if let Some(progress) = sync_progress {
+        write!(out, "\n{}", current_sync_line(progress)).expect("writing to a String cannot fail");
+    }
+    write!(out, "\nlocal checkout watch: {watch}\ntotal indexed state:")
+        .expect("writing to a String cannot fail");
     match totals {
         Ok((files, bytes)) => {
             write!(
@@ -219,7 +223,7 @@ pub async fn sync_status(
             out.push_str(&render_job(id, &status));
         }
         Some((id, Err(e))) => {
-            write!(out, "\n\nlast sync run {id}: status unavailable — {e}")
+            write!(out, "\n\nlast sync run {id}: status could not be read: {e}")
                 .expect("writing to a String cannot fail");
         }
         None if local_watch_active => out.push_str(
@@ -232,13 +236,27 @@ pub async fn sync_status(
              persisted server state.",
         ),
     }
-    out
+    Ok(out)
 }
 
-async fn catalog_totals(
-    client: &Client,
-    codebase_id: &str,
-) -> std::result::Result<(u32, i64), String> {
+/// The `first index:` line of `sync_status`. A failed first index also names
+/// the call that retries it.
+fn first_index_line(phase: &FirstIndexPhase) -> String {
+    match phase {
+        FirstIndexPhase::Failed { .. } => {
+            format!("first index: {phase}; call index_codebase to retry")
+        }
+        _ => format!("first index: {phase}"),
+    }
+}
+
+/// The `current sync:` line of `sync_status`. The milestone text is the one
+/// `semctl index` shows, so both commands use the same words.
+fn current_sync_line(progress: &SyncProgress) -> String {
+    format!("current sync: {progress}")
+}
+
+async fn catalog_totals(client: &Client, codebase_id: &str) -> anyhow::Result<(u32, i64)> {
     let mut page = 0u32;
     let mut bytes = 0i64;
     loop {
@@ -279,34 +297,26 @@ pub(super) fn human_bytes(bytes: i64) -> String {
 }
 
 /// The detected project graph for the codebase.
-pub async fn list_projects(client: &Client) -> String {
-    let cb = match client.codebase() {
-        Ok(c) => c,
-        Err(e) => return format!("list_projects failed: {e}"),
-    };
+pub async fn list_projects(client: &Client) -> Result<String, ToolError> {
+    let cb = bound_codebase(client, "list_projects")?;
     match client
         .get::<api::ProjectGraph>(&format!("/v1/codebases/{cb}/projects"))
         .await
     {
-        Ok(graph) => render_projects(&graph),
-        Err(e) => format!("list_projects failed: {e}"),
+        Ok(graph) => Ok(render_projects(&graph)),
+        Err(e) => Err(ToolError::from_client("list_projects", &e)),
     }
 }
 
 /// File→file import edges across the codebase.
-pub async fn imports(client: &Client) -> String {
-    let cb = match client.codebase() {
-        Ok(c) => c,
-        Err(e) => return format!("imports failed: {e}"),
-    };
+pub async fn imports(client: &Client) -> Result<String, ToolError> {
+    let cb = bound_codebase(client, "imports")?;
     let path = format!("/v1/codebases/{cb}/graph/imports");
-    let (edges, total) =
-        match fetch_all_pages::<api::ImportEdge>(client, &path, GRAPH_LIST_CAP).await {
-            Ok(v) => v,
-            Err(e) => return format!("imports failed: {e}"),
-        };
+    let (edges, total) = fetch_all_pages::<api::ImportEdge>(client, &path, GRAPH_LIST_CAP)
+        .await
+        .map_err(|e| ToolError::from_client("imports", &e))?;
     if edges.is_empty() {
-        return "(no import edges)".into();
+        return Ok("(no import edges)".into());
     }
     let root = client.local_root();
     let mut out = String::new();
@@ -321,23 +331,18 @@ pub async fn imports(client: &Client) -> String {
         .expect("writing to a String cannot fail");
     }
     truncation_note(&mut out, edges.len(), total);
-    out
+    Ok(out)
 }
 
 /// Reference→definition symbol bindings across the codebase.
-pub async fn symbol_edges(client: &Client) -> String {
-    let cb = match client.codebase() {
-        Ok(c) => c,
-        Err(e) => return format!("symbol_edges failed: {e}"),
-    };
+pub async fn symbol_edges(client: &Client) -> Result<String, ToolError> {
+    let cb = bound_codebase(client, "symbol_edges")?;
     let path = format!("/v1/codebases/{cb}/graph/symbol-edges");
-    let (edges, total) =
-        match fetch_all_pages::<api::SymbolEdge>(client, &path, GRAPH_LIST_CAP).await {
-            Ok(v) => v,
-            Err(e) => return format!("symbol_edges failed: {e}"),
-        };
+    let (edges, total) = fetch_all_pages::<api::SymbolEdge>(client, &path, GRAPH_LIST_CAP)
+        .await
+        .map_err(|e| ToolError::from_client("symbol_edges", &e))?;
     if edges.is_empty() {
-        return "(no symbol bindings)".into();
+        return Ok("(no symbol bindings)".into());
     }
     let root = client.local_root();
     let mut out = String::new();
@@ -353,24 +358,19 @@ pub async fn symbol_edges(client: &Client) -> String {
         .expect("writing to a String cannot fail");
     }
     truncation_note(&mut out, edges.len(), total);
-    out
+    Ok(out)
 }
 
 /// Cross-codebase links — this codebase's imports resolved into other
 /// codebases the caller can see.
-pub async fn external_links(client: &Client) -> String {
-    let cb = match client.codebase() {
-        Ok(c) => c,
-        Err(e) => return format!("external_links failed: {e}"),
-    };
+pub async fn external_links(client: &Client) -> Result<String, ToolError> {
+    let cb = bound_codebase(client, "external_links")?;
     let path = format!("/v1/codebases/{cb}/graph/external-links");
-    let (links, total) =
-        match fetch_all_pages::<api::ExternalLink>(client, &path, GRAPH_LIST_CAP).await {
-            Ok(v) => v,
-            Err(e) => return format!("external_links failed: {e}"),
-        };
+    let (links, total) = fetch_all_pages::<api::ExternalLink>(client, &path, GRAPH_LIST_CAP)
+        .await
+        .map_err(|e| ToolError::from_client("external_links", &e))?;
     if links.is_empty() {
-        return "(no cross-codebase links)".into();
+        return Ok("(no cross-codebase links)".into());
     }
     // Only `from_file` is local — `target_file` lives in the linked codebase,
     // so it stays relative (we have no root for it here).
@@ -393,7 +393,7 @@ pub async fn external_links(client: &Client) -> String {
         .expect("writing to a String cannot fail");
     }
     truncation_note(&mut out, links.len(), total);
-    out
+    Ok(out)
 }
 
 /// The symbol at `path:line[:column]` (1-based). With a column, the identifier
@@ -403,11 +403,8 @@ pub async fn symbol_at_position(
     path: &str,
     line: u32,
     column: Option<u32>,
-) -> String {
-    let cb = match client.codebase() {
-        Ok(c) => c,
-        Err(e) => return format!("symbol_at_position failed: {e}"),
-    };
+) -> Result<String, ToolError> {
+    let cb = bound_codebase(client, "symbol_at_position")?;
     let mut url = format!(
         "/v1/codebases/{cb}/graph/symbol-at-position?path={}&line={line}",
         urlencode(path)
@@ -420,27 +417,28 @@ pub async fn symbol_at_position(
         None => format!("{path}:{line}"),
     };
     match client.get_maybe::<api::SearchHit>(&url).await {
-        Ok(Some(hit)) => render_hits(&[hit], "", client.local_root(), false),
-        Ok(None) => format!("(no symbol at {at})"),
-        Err(e) => format!("symbol_at_position failed: {e}"),
+        Ok(Some(hit)) => Ok(render_hits(&[hit], "", client.local_root(), false)),
+        Ok(None) => Ok(format!("(no symbol at {at})")),
+        Err(e) => Err(ToolError::from_client("symbol_at_position", &e)),
     }
 }
 
 /// Resolve many symbols in one call — definitions (or references) for each.
-pub async fn batch_lookup(client: &Client, symbols: &[String], references: bool) -> String {
-    let cb = match client.codebase() {
-        Ok(c) => c,
-        Err(e) => return format!("batch_lookup failed: {e}"),
-    };
+pub async fn batch_lookup(
+    client: &Client,
+    symbols: &[String],
+    references: bool,
+) -> Result<String, ToolError> {
+    let cb = bound_codebase(client, "batch_lookup")?;
     if symbols.is_empty() {
-        return "(no symbols requested)".into();
+        return Ok("(no symbols requested)".into());
     }
     let url = format!("/v1/codebases/{cb}/graph/batch");
     let body = serde_json::json!({ "symbols": symbols, "references": references });
-    let results = match client.post::<_, Vec<api::SymbolHits>>(&url, &body).await {
-        Ok(r) => r,
-        Err(e) => return format!("batch_lookup failed: {e}"),
-    };
+    let results = client
+        .post_read::<_, Vec<api::SymbolHits>>(&url, &body)
+        .await
+        .map_err(|e| ToolError::from_client("batch_lookup", &e))?;
     let kind = if references {
         "references"
     } else {
@@ -467,34 +465,31 @@ pub async fn batch_lookup(client: &Client, symbols: &[String], references: bool)
             .expect("writing to a String cannot fail");
         }
     }
-    out
+    Ok(out)
 }
 
 /// The codebase's files as an indented directory tree.
-pub async fn file_tree(client: &Client) -> String {
-    let cb = match client.codebase() {
-        Ok(c) => c,
-        Err(e) => return format!("file_tree failed: {e}"),
-    };
+pub async fn file_tree(client: &Client) -> Result<String, ToolError> {
+    let cb = bound_codebase(client, "file_tree")?;
     let url = format!("/v1/codebases/{cb}/files/tree");
     match client.get::<Vec<api::FileTreeNode>>(&url).await {
-        Ok(nodes) if nodes.is_empty() => "(no files in the catalog for this codebase)".into(),
+        Ok(nodes) if nodes.is_empty() => Ok("(no files in the catalog for this codebase)".into()),
         Ok(nodes) => {
             let mut out = String::new();
             render_tree(&nodes, 0, &mut out);
-            out
+            Ok(out)
         }
-        Err(e) => format!("file_tree failed: {e}"),
+        Err(e) => Err(ToolError::from_client("file_tree", &e)),
     }
 }
 
 /// List the engine's registered domains + their tag schema.
-pub async fn list_domains(client: &Client) -> String {
+pub async fn list_domains(client: &Client) -> Result<String, ToolError> {
     match client
         .get::<Vec<api::DomainDescriptor>>("/v1/domains")
         .await
     {
-        Ok(domains) if domains.is_empty() => "(no domains registered)".into(),
+        Ok(domains) if domains.is_empty() => Ok("(no domains registered)".into()),
         Ok(domains) => {
             let mut out = String::new();
             for d in &domains {
@@ -505,8 +500,11 @@ pub async fn list_domains(client: &Client) -> String {
                         .expect("writing to a String cannot fail");
                 }
             }
-            out
+            Ok(out)
         }
-        Err(e) => format!("list_domains failed: {e}"),
+        Err(e) => Err(ToolError::from_client("list_domains", &e)),
     }
 }
+
+#[cfg(test)]
+mod tests;
