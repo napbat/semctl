@@ -755,21 +755,7 @@ impl McpServer {
         // Reported from the coordinator that owns this checkout, not from
         // per-session bookkeeping: any session's sync is this index's sync.
         let status = self.checkout_status(&client).await;
-        let watching = status.is_some();
-        query::sync_status(
-            &client,
-            status
-                .as_ref()
-                .and_then(|status| status.last_job_id.as_deref()),
-            watching,
-            status
-                .as_ref()
-                .and_then(|status| status.first_index.as_ref()),
-            status
-                .as_ref()
-                .and_then(|status| status.sync_progress.as_ref()),
-        )
-        .await
+        query::sync_status(&client, status.as_ref()).await
     }
 }
 

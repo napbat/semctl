@@ -24,6 +24,10 @@ pub(crate) struct CoordinatorStatus {
     pub(crate) trigger_overflow: bool,
     pub(crate) last_outcome: Option<String>,
     pub(crate) last_error: Option<String>,
+    /// Seconds until retained work can retry after a failed reconcile. `None`
+    /// means no retry is delayed, or the daemon predates this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) retry_after_secs: Option<u64>,
     /// The phase of this checkout's first index. `None` when the checkout has
     /// no first-index gate, and for a daemon that predates the field.
     #[serde(default)]
@@ -65,6 +69,10 @@ impl std::fmt::Display for CoordinatorStatus {
             },
             self.last_outcome.as_deref().unwrap_or("(none)"),
             self.last_error.as_deref().unwrap_or("(none)"),
-        )
+        )?;
+        if let Some(seconds) = self.retry_after_secs {
+            write!(formatter, " retry in {seconds}s")?;
+        }
+        Ok(())
     }
 }

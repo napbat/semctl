@@ -34,7 +34,7 @@ use tracing::{debug, warn};
 
 use crate::client::{Client, api};
 use scan::ScanResult;
-use upload::UploadFailure;
+pub(crate) use upload::UploadFailure;
 
 /// The process-wide bounds one sync must respect.
 ///

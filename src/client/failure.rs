@@ -14,6 +14,13 @@ use super::bounded_loading_delay;
 /// server answers them with `409` and a `Retry-After` header.
 const LOADING_CODES: [&str; 2] = ["GraphLoading", "FileLoading"];
 
+/// Whether the response follows the API error contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureResponse {
+    Api,
+    Unexpected,
+}
+
 /// A request that the server, or a gateway in front of it, did not answer with
 /// success.
 ///
@@ -22,6 +29,7 @@ const LOADING_CODES: [&str; 2] = ["GraphLoading", "FileLoading"];
 #[derive(Debug)]
 pub(crate) struct ApiFailure {
     status: StatusCode,
+    response: FailureResponse,
     /// The first typed error code of the response, for example `GraphLoading`.
     code: Option<String>,
     /// The delay in seconds that the response asked for with `Retry-After`, for
@@ -41,6 +49,7 @@ impl ApiFailure {
     ) -> Self {
         Self {
             status,
+            response: FailureResponse::Api,
             code,
             retry_after,
             message,
@@ -66,6 +75,12 @@ impl ApiFailure {
     /// The status of the failed response.
     pub(crate) fn status(&self) -> StatusCode {
         self.status
+    }
+
+    /// Only an API response can attribute a failure to the caller's arguments.
+    /// A gateway can return the same status for a missing upstream route.
+    pub(crate) fn is_api_response(&self) -> bool {
+        self.response == FailureResponse::Api
     }
 
     /// The delay that the response asked for before another attempt, when it
@@ -158,9 +173,8 @@ pub(super) fn response_body_error(
 /// which names the CLI's own parser rather than the thing that actually went
 /// wrong, and buries the status code that IS the diagnosis.
 ///
-/// Reported by status instead, because those statuses have specific meanings a
-/// user can act on: 502/503/504 come from the gateway, not the application, and
-/// mean the request never got a real answer.
+/// Reported by status instead. A response outside the API contract cannot
+/// establish that the caller's arguments are invalid.
 pub(super) fn gateway_error(
     method: &str,
     url: &str,
@@ -172,18 +186,20 @@ pub(super) fn gateway_error(
         504 => "the gateway timed out waiting for the server — the request may still be running",
         502 => "the gateway could not reach the server, or the server closed the connection",
         503 => "the server is unavailable behind the gateway (starting, draining, or overloaded)",
+        530 => "the gateway could not route the request to the server",
         _ => "the response was not the API's JSON envelope",
     };
     // A short excerpt only: an HTML error page is pages long and none of it is
     // the diagnosis, but a truncated peek still distinguishes "HTML page" from
     // "empty body" when someone needs it.
     let excerpt: String = body.trim().chars().take(120).collect();
-    anyhow::Error::new(ApiFailure::new(
+    anyhow::Error::new(ApiFailure {
         status,
-        None,
+        response: FailureResponse::Unexpected,
+        code: None,
         retry_after,
-        format!("{method} {url} -> {status}: {hint} (response was not JSON: {excerpt:?})"),
-    ))
+        message: format!("{method} {url} -> {status}: {hint} (unexpected response: {excerpt:?})"),
+    })
 }
 
 /// Read a `Retry-After` header in its delta-seconds form. The HTTP-date form

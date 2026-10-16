@@ -276,15 +276,20 @@ impl McpServer {
         self.shared.engine.update_note().lock().await.take()
     }
 
-    /// A freshness warning for search results, derived from the most recent
-    /// index job this session queued — **only** when there's something to flag
-    /// (a sync running or failed), so a clean index adds no per-search noise.
-    /// `None` too when no sync ran this session: we don't fabricate a freshness
-    /// claim for a codebase indexed earlier (that caveat lives in `sync_status`).
-    /// Cached once the job is terminal, keyed by job id so a later sync recomputes.
+    /// Warn when this checkout's local sync or server job failed.
+    /// Check local failures before the cache because a failed upload may have
+    /// no new server job. Cache terminal server results by job id. A clean
+    /// index and a checkout without a recorded sync add no warning.
     async fn index_freshness(&self, client: &Client, budget: &CallBudget) -> Option<String> {
         client.local_root()?;
-        let job_id = self.checkout_status(client).await?.last_job_id?;
+        let checkout = self.checkout_status(client).await?;
+        if checkout.last_error.is_some() {
+            return Some(
+                "(index freshness: the last local sync FAILED — results may be stale; run sync_status)"
+                    .to_string(),
+            );
+        }
+        let job_id = checkout.last_job_id?;
         if let Some((id, footer)) = self.shared.freshness.lock().await.as_ref()
             && *id == job_id
         {

@@ -6,7 +6,9 @@ use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::{ApiFailure, first_error_code, gateway_error, response_body_error, retry_after};
-use crate::client::{unwrap_envelope, unwrap_page};
+use crate::client::stub::{Reply, Stub};
+use crate::client::{Client, unwrap_envelope, unwrap_page};
+use crate::query::ToolError;
 
 /// Answer one local request with a fixed HTTP response, and return what a
 /// client reads from it. The test needs no network beyond the loopback.
@@ -198,6 +200,105 @@ async fn a_gateway_page_is_a_typed_failure_without_a_code() {
         failure
             .message
             .contains("the gateway could not reach the server")
+    );
+}
+
+#[tokio::test]
+async fn a_gateway_not_found_page_does_not_blame_request_arguments() {
+    let (response, url) = answered("404 Not Found", &[], "404 page not found").await;
+    let error = unwrap_envelope::<serde_json::Value>(response, "GET", &url)
+        .await
+        .unwrap_err();
+
+    let message = ToolError::from_client("find_definition", &error).to_string();
+    assert!(message.contains("404 Not Found"));
+    assert!(message.ends_with("next: use local Read/Grep for this request."));
+}
+
+#[tokio::test]
+async fn an_optional_lookup_does_not_treat_a_gateway_404_as_a_missing_resource() {
+    let stub = Stub::serve(vec![Reply::gateway("404 Not Found")]).await;
+    let client = Client::for_test_server(&stub.url);
+
+    let error = client
+        .get_opt::<serde_json::Value>("/v1/codebases/cached")
+        .await
+        .unwrap_err();
+
+    assert_eq!(typed(&error).status(), StatusCode::NOT_FOUND);
+    assert!(!typed(&error).is_api_response());
+    assert_eq!(stub.requests(), 1);
+}
+
+#[tokio::test]
+async fn an_optional_lookup_still_accepts_an_api_404_as_a_missing_resource() {
+    let stub = Stub::serve(vec![Reply::Answer {
+        status: "404 Not Found",
+        headers: Vec::new(),
+        body: r#"{"success":false,"errors":[{"code":"NotFound"}]}"#.to_string(),
+    }])
+    .await;
+    let client = Client::for_test_server(&stub.url);
+
+    assert!(
+        client
+            .get_opt::<serde_json::Value>("/v1/codebases/cached")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(stub.requests(), 1);
+}
+
+#[tokio::test]
+async fn an_api_not_found_error_still_reports_an_invalid_argument() {
+    let (response, url) = answered(
+        "404 Not Found",
+        &[],
+        r#"{"success":false,"errors":[{"code":"NotFound","message":"unknown symbol"}]}"#,
+    )
+    .await;
+    let error = unwrap_envelope::<serde_json::Value>(response, "GET", &url)
+        .await
+        .unwrap_err();
+
+    let message = ToolError::from_client("find_definition", &error).to_string();
+    assert!(message.contains("unknown symbol"));
+    assert!(message.ends_with("next: correct the argument and call again."));
+}
+
+#[tokio::test]
+async fn paginated_gateway_errors_keep_typed_status_and_bounded_context() {
+    for status in ["404 Not Found", "502 Bad Gateway", "530 Origin DNS Error"] {
+        let body = format!("<html>{}</html>", "gateway failure ".repeat(1000));
+        let (response, url) = answered(status, &[("Retry-After", "7")], &body).await;
+        let error = unwrap_page::<serde_json::Value>(response, "GET", &url)
+            .await
+            .unwrap_err();
+
+        let failure = typed(&error);
+        assert_eq!(failure.status().as_str(), &status[..3]);
+        assert_eq!(failure.retry_after(), Some(Duration::from_secs(7)));
+        let message = ToolError::from_client("list_files", &error).to_string();
+        assert!(message.len() < 600, "the gateway body must stay bounded");
+        assert!(message.ends_with("next: use local Read/Grep for this request."));
+    }
+}
+
+#[test]
+fn a_530_gateway_error_reports_an_upstream_failure() {
+    let error = gateway_error(
+        "GET",
+        "https://example/v1/x",
+        StatusCode::from_u16(530).unwrap(),
+        None,
+        "error code: 1033",
+    );
+
+    assert!(
+        error
+            .to_string()
+            .contains("the gateway could not route the request to the server")
     );
 }
 
