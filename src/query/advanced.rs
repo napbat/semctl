@@ -7,6 +7,7 @@ use anyhow::{Context as _, Result};
 
 use crate::client::{Client, api};
 
+use super::render::{markdown_cell, render_fenced};
 use super::{ToolError, bound_codebase, local_path, render_hits, urlencode};
 
 const CODEBASE_PAGE_SIZE: u32 = 500;
@@ -25,21 +26,49 @@ async fn codebases_for_source(client: &Client, source_id: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// How this codebase's copies relate to the checkout we are standing in.
-async fn describe_copies(client: &Client, codebase_id: &str, source_id: &str) -> String {
-    let Ok(copies) = client
+/// Show server copy identities without inferring per-copy graph state.
+async fn describe_copies(client: &Client, codebase_id: &str, source_id: Option<&str>) -> String {
+    let copies = match client
         .get::<Vec<api::CodebaseVersionSummary>>(&format!("/v1/codebases/{codebase_id}/versions"))
         .await
-    else {
-        return "unknown".into();
+    {
+        Ok(copies) => copies,
+        Err(error) => {
+            return format!(
+                "## Indexed copies\n\nCopies unavailable: {}\n",
+                super::render::markdown_code(&format!("{error:#}"))
+            );
+        }
     };
-    let mine = copies.iter().any(|copy| copy.source_id == source_id);
-    match (mine, copies.len()) {
-        (true, 1) => "this checkout".into(),
-        (true, n) => format!("this checkout, of {n}"),
-        (false, 0) => "none".into(),
-        (false, n) => format!("{n} other copy/copies"),
+    let mut out = String::from("## Indexed copies\n\n");
+    if copies.is_empty() {
+        out.push_str("(no indexed copies)\n");
+        return out;
     }
+    out.push_str(
+        "| Copy | Source identity | Canonical | Checkout | Revision | Files |\n\
+         | --- | --- | --- | --- | --- | ---: |\n",
+    );
+    for copy in copies {
+        let checkout = source_id.map_or("unknown", |source| {
+            if copy.source_id == source {
+                "current"
+            } else {
+                "other"
+            }
+        });
+        writeln!(
+            out,
+            "| {} | {} | {} | {checkout} | {} | {} |",
+            markdown_cell(&copy.id),
+            markdown_cell(&copy.source_id),
+            copy.is_canonical,
+            markdown_cell(copy.revision.as_deref().unwrap_or("-")),
+            copy.files
+        )
+        .expect("writing to a String cannot fail");
+    }
+    out
 }
 
 pub async fn list_codebases(client: &Client) -> Result<String, ToolError> {
@@ -82,7 +111,9 @@ pub async fn list_codebases(client: &Client) -> Result<String, ToolError> {
                 )
                 .expect("writing to a String cannot fail");
             }
-            Ok(out)
+            let mut rendered = String::new();
+            render_fenced(&mut rendered, &out, None);
+            Ok(rendered)
         }
         Err(error) => Err(ToolError::from_client("list_codebases", &error)),
     }
@@ -99,19 +130,20 @@ pub async fn current_context(
         .map_or_else(|| "(none)".into(), |path| path.display().to_string());
     let source = client
         .local_root()
-        .and_then(|path| crate::codebase::checkout_source_id(path).ok())
-        .unwrap_or_else(|| "(none)".into());
+        .and_then(|path| crate::codebase::checkout_source_id(path).ok());
     let codebase = match client.codebase() {
         Ok(value) => value.to_string(),
         Err(_) => "(unbound)".into(),
     };
     let mut out = format!(
-        "server {}\ntenant {}\ncodebase {}\ncheckout root {}\nsource identity {}\nwatcher {}",
-        client.server_url(),
-        tenant,
-        codebase,
-        root,
-        source,
+        "| Field | Value |\n| --- | --- |\n\
+         | server | {} |\n| tenant | {} |\n| codebase | {} |\n\
+         | checkout root | {} |\n| source identity | {} |\n| watcher | {} |\n",
+        markdown_cell(client.server_url()),
+        markdown_cell(&tenant),
+        markdown_cell(&codebase),
+        markdown_cell(&root),
+        markdown_cell(source.as_deref().unwrap_or("(none)")),
         if watcher_active { "active" } else { "inactive" }
     );
 
@@ -123,21 +155,30 @@ pub async fn current_context(
             Ok(summary) => {
                 write!(
                     out,
-                    "\nindexed revision {}\ngraph generation {}/{}\ngraph fresh {}\nserver checkout binding {}",
-                    summary.revision.as_deref().unwrap_or("-"),
+                    "| indexed revision | {} |\n| graph generation | {}/{} |\n\
+                     | graph fresh | {} |\n",
+                    markdown_cell(summary.revision.as_deref().unwrap_or("-")),
                     summary.graph_generation,
                     summary.graph_materialized_generation,
-                    summary.graph_fresh,
-                    describe_copies(client, &codebase, &source).await
+                    summary.graph_fresh
                 )
                 .expect("writing to a String cannot fail");
             }
-            Err(error) => write!(out, "\ngraph/index state unavailable: {error}")
-                .expect("writing to a String cannot fail"),
+            Err(error) => writeln!(
+                out,
+                "| graph/index state unavailable | {} |",
+                markdown_cell(&error.to_string())
+            )
+            .expect("writing to a String cannot fail"),
         }
     }
     if let Some(job) = last_job_id {
-        write!(out, "\nlast session sync job {job}").expect("writing to a String cannot fail");
+        writeln!(out, "| last session sync job | {} |", markdown_cell(job))
+            .expect("writing to a String cannot fail");
+    }
+    if codebase != "(unbound)" {
+        out.push('\n');
+        out.push_str(&describe_copies(client, &codebase, source.as_deref()).await);
     }
     out
 }
@@ -173,8 +214,8 @@ pub async fn read_source(
         source = "verified-local";
         body = local;
     }
-    Ok(format!(
-        "{}\nrevision {}\nbytes {}-{} of {}\nencoding {}\nsource {}{}\n\n{}",
+    let metadata = format!(
+        "{}\nrevision {}\nbytes {}-{} of {}\nencoding {}\nsource {}{}",
         local_path(client.local_root(), &content.path),
         content.content_hash,
         content.byte_start,
@@ -186,9 +227,13 @@ pub async fn read_source(
             " (truncated)"
         } else {
             ""
-        },
-        body
-    ))
+        }
+    );
+    let mut out = String::new();
+    render_fenced(&mut out, &metadata, None);
+    out.push('\n');
+    render_fenced(&mut out, &body, None);
+    Ok(out)
 }
 
 pub struct SymbolSearchOptions<'a> {
@@ -284,13 +329,21 @@ pub async fn call_graph(
     match client.get::<api::CallGraph>(&url).await {
         Ok(graph) if graph.nodes.is_empty() => Ok(format!("no call graph for `{symbol}`")),
         Ok(graph) => {
-            let mut out = format!("nodes ({})\n", graph.nodes.len());
+            let mut out = format!("## Nodes ({})\n\n", graph.nodes.len());
             out.push_str(&render_hits(&graph.nodes, "", client.local_root(), false));
-            writeln!(out, "edges ({})", graph.edges.len())
+            writeln!(out, "## Edges ({})\n", graph.edges.len())
                 .expect("writing to a String cannot fail");
+            if !graph.edges.is_empty() {
+                out.push_str("| From | To |\n| --- | --- |\n");
+            }
             for edge in &graph.edges {
-                writeln!(out, "  {} -> {}", edge.from, edge.to)
-                    .expect("writing to a String cannot fail");
+                writeln!(
+                    out,
+                    "| {} | {} |",
+                    markdown_cell(&edge.from),
+                    markdown_cell(&edge.to)
+                )
+                .expect("writing to a String cannot fail");
             }
             Ok(out)
         }
@@ -337,7 +390,9 @@ pub async fn unused(client: &Client, page: u32, page_size: u32) -> Result<String
                 result.total
             )
             .expect("writing to a String cannot fail");
-            Ok(out)
+            let mut rendered = String::new();
+            render_fenced(&mut rendered, &out, None);
+            Ok(rendered)
         }
         Err(error) => Err(ToolError::from_client("unused", &error)),
     }
@@ -480,7 +535,9 @@ fn render_type_hierarchy(client: &Client, hierarchy: &api::TypeHierarchy) -> Str
         )
         .expect("writing to a String cannot fail");
     }
-    out
+    let mut rendered = String::new();
+    render_fenced(&mut rendered, &out, None);
+    rendered
 }
 
 async fn graph_clusters(
@@ -520,7 +577,9 @@ async fn graph_clusters(
                     .expect("writing to a String cannot fail");
                 }
             }
-            Ok(out)
+            let mut rendered = String::new();
+            render_fenced(&mut rendered, &out, None);
+            Ok(rendered)
         }
         Err(error) => Err(ToolError::from_client(endpoint, &error)),
     }
@@ -531,4 +590,141 @@ fn edit_url(client: &Client, operation: &str) -> Result<String> {
         "/v1/codebases/{}/edits/{operation}",
         client.codebase()?
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{current_context, describe_copies};
+    use crate::client::Client;
+    use crate::client::stub::{Reply, Stub};
+    use crate::query::render::markdown_cell;
+
+    const COPIES: &str = r#"[
+        {"id":"canonical","sourceId":"vcs-source","isCanonical":true,"revision":"canonical-rev","files":99},
+        {"id":"selected","sourceId":"checkout-2","isCanonical":false,"revision":"selected-rev","files":42},
+        {"id":"older","sourceId":"checkout-20","isCanonical":false,"revision":"older-rev","files":17},
+        {"id":"case-distinct","sourceId":"CHECKOUT-2","isCanonical":false,"revision":null,"files":3}
+    ]"#;
+
+    #[tokio::test]
+    async fn indexed_copies_keep_distinct_identities_and_match_the_exact_checkout_source() {
+        let stub = Stub::serve(vec![Reply::ok(COPIES)]).await;
+        let client = Client::for_test_server(&stub.url);
+        let text = describe_copies(&client, "A", Some("checkout-2")).await;
+
+        for (id, source, canonical, checkout, revision, files) in [
+            (
+                "canonical",
+                "vcs-source",
+                true,
+                "other",
+                "canonical-rev",
+                99,
+            ),
+            (
+                "selected",
+                "checkout-2",
+                false,
+                "current",
+                "selected-rev",
+                42,
+            ),
+            ("older", "checkout-20", false, "other", "older-rev", 17),
+            ("case-distinct", "CHECKOUT-2", false, "other", "-", 3),
+        ] {
+            let row = text
+                .lines()
+                .find(|line| line.contains(&markdown_cell(id)))
+                .unwrap();
+            assert!(row.contains(&markdown_cell(source)), "{row}");
+            assert!(
+                row.contains(&format!("| {canonical} | {checkout} |")),
+                "{row}"
+            );
+            assert!(row.contains(&markdown_cell(revision)), "{row}");
+            assert!(row.ends_with(&format!("| {files} |")), "{row}");
+        }
+        assert_eq!(stub.requests(), 1);
+        assert_eq!(
+            stub.request_lines(),
+            ["GET /v1/codebases/A/versions HTTP/1.1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn indexed_copy_cells_cannot_create_columns_or_select_a_missing_checkout() {
+        let id = "copy\\|`id`\n# not a heading";
+        let source = "(none)";
+        let revision = "rev|```";
+        let data = serde_json::json!([{
+            "id": id,
+            "sourceId": source,
+            "isCanonical": true,
+            "revision": revision,
+            "files": 5
+        }]);
+        let stub = Stub::serve(vec![Reply::ok(&data.to_string())]).await;
+        let client = Client::for_test_server(&stub.url);
+        let text = describe_copies(&client, "A", None).await;
+
+        let row = text
+            .lines()
+            .find(|line| line.contains(&markdown_cell(id)))
+            .unwrap();
+        assert!(row.contains(&markdown_cell(source)));
+        assert!(row.contains(&markdown_cell(revision)));
+        assert!(row.contains("| true | unknown |"));
+        assert!(!text.contains("\n# not a heading"));
+        assert_eq!(stub.requests(), 1);
+    }
+
+    #[tokio::test]
+    async fn indexed_copy_failures_keep_native_details_without_opening_markdown_blocks() {
+        let message = "native\n# message with | and ```";
+        let stub = Stub::serve(vec![Reply::Answer {
+            status: "400 Bad Request",
+            headers: Vec::new(),
+            body: serde_json::json!({
+                "success": false,
+                "errors": [{"code": "CopyUnavailable", "message": message}]
+            })
+            .to_string(),
+        }])
+        .await;
+        let client = Client::for_test_server(&stub.url);
+        let text = describe_copies(&client, "A", Some("checkout")).await;
+
+        assert!(text.contains("CopyUnavailable"), "{text}");
+        assert!(text.contains("native\\n# message with | and ```"), "{text}");
+        assert!(!text.contains("\n# message"));
+        assert_eq!(stub.requests(), 1);
+    }
+
+    #[tokio::test]
+    async fn context_reports_copies_even_when_the_codebase_summary_is_unavailable() {
+        let stub = Stub::serve(vec![
+            Reply::Answer {
+                status: "400 Bad Request",
+                headers: Vec::new(),
+                body: r#"{"success":false,"errors":[{"code":"SummaryUnavailable","message":"summary unavailable"}]}"#.into(),
+            },
+            Reply::ok(COPIES),
+        ])
+        .await;
+        let client = Client::for_test_server(&stub.url).with_codebase("A".into());
+        let text = current_context(&client, false, None).await;
+
+        assert!(text.contains("SummaryUnavailable"), "{text}");
+        for id in ["canonical", "selected", "older", "case-distinct"] {
+            assert!(text.contains(&markdown_cell(id)), "{text}");
+        }
+        assert_eq!(stub.requests(), 2);
+        assert_eq!(
+            stub.request_lines(),
+            [
+                "GET /v1/codebases/A HTTP/1.1",
+                "GET /v1/codebases/A/versions HTTP/1.1"
+            ]
+        );
+    }
 }

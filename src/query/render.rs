@@ -87,14 +87,19 @@ pub(super) fn render_compact(
     if hits.is_empty() {
         return format!("{empty_msg}\n");
     }
-    let mut out = String::new();
+    let mut out = String::from("| Location | Symbol | Access |\n| --- | --- | --- |\n");
     for h in hits {
+        let marker = write_marker(h);
         writeln!(
             out,
-            "  {} {}{}",
-            hit_location(h, root),
-            hit_symbol(h),
-            write_marker(h)
+            "| {} | {} | {} |",
+            markdown_cell(&hit_location(h, root)),
+            markdown_cell(&hit_symbol(h)),
+            markdown_cell(if marker.is_empty() {
+                "-"
+            } else {
+                marker.trim()
+            })
         )
         .expect("writing to a String cannot fail");
     }
@@ -109,13 +114,11 @@ pub(super) fn render_boundaries(boundaries: &[String], empty_msg: &str) -> Strin
     }
     let mut out = String::new();
     for b in boundaries {
-        out.push_str("  ");
-        out.push_str(b);
-        out.push('\n');
+        writeln!(out, "- {}", markdown_code(b)).expect("writing to a String cannot fail");
     }
     writeln!(
         out,
-        "({} boundar{})",
+        "\n({} boundar{})",
         boundaries.len(),
         if boundaries.len() == 1 { "y" } else { "ies" }
     )
@@ -126,10 +129,58 @@ pub(super) fn render_boundaries(boundaries: &[String], empty_msg: &str) -> Strin
 /// Render a file list (sorted by path), absolutizing each against the local
 /// checkout when known.
 pub(super) fn render_files(files: &[api::CodebaseFile], root: Option<&Path>) -> String {
-    let mut out = String::new();
+    let mut out = String::from("| Path | Bytes |\n| --- | ---: |\n");
     for f in files {
-        writeln!(out, "{}  ({} bytes)", local_path(root, &f.path), f.size)
+        writeln!(
+            out,
+            "| {} | {} |",
+            markdown_cell(&local_path(root, &f.path)),
+            f.size
+        )
+        .expect("writing to a String cannot fail");
+    }
+    out
+}
+
+/// Keep outline depth explicit and declaration bodies separate from metadata.
+pub(super) fn render_outline(outline: &api::FileOutline, root: Option<&Path>) -> String {
+    let location = local_path(root, &outline.path);
+    let mut out = format!(
+        "{}\n\n| Depth | Lines | Kind | Symbol |\n| ---: | --- | --- | --- |\n",
+        markdown_code(&location)
+    );
+    for entry in &outline.entries {
+        let symbol = entry
+            .qualified_symbol
+            .as_deref()
+            .or(entry.symbol.as_deref())
+            .unwrap_or("-");
+        writeln!(
+            out,
+            "| {} | {}-{} | {} | {} |",
+            entry.depth,
+            entry.line_start,
+            entry.line_end,
+            markdown_cell(entry.symbol_kind.as_deref().unwrap_or(&entry.kind)),
+            markdown_cell(symbol)
+        )
+        .expect("writing to a String cannot fail");
+    }
+    out.push('\n');
+    for entry in &outline.entries {
+        if let Some(body) = &entry.body {
+            writeln!(
+                out,
+                "### {}\n",
+                markdown_code(&format!(
+                    "{location}:{}-{}",
+                    entry.line_start, entry.line_end
+                ))
+            )
             .expect("writing to a String cannot fail");
+            render_fenced(&mut out, body, None);
+            out.push('\n');
+        }
     }
     out
 }
@@ -162,33 +213,43 @@ pub(super) fn render_job(job_id: &str, j: &api::JobStatus) -> String {
     out
 }
 
-/// Render a project graph as readable text — groups (workspaces/solutions),
-/// then leaf projects with their file counts.
+/// Render project fields as Markdown tables. Tables also remain readable in
+/// ordinary terminal output.
 pub fn render_projects(graph: &api::ProjectGraph) -> String {
     if graph.projects.is_empty() && graph.groups.is_empty() {
         return "(no projects detected — synced files may not include manifests)".into();
     }
     let mut out = String::new();
-    for g in &graph.groups {
-        writeln!(
-            out,
-            "[group] {}  ({}, {})  {} member(s)",
-            g.name,
-            g.kind,
-            g.root,
-            g.children.len()
-        )
-        .expect("writing to a String cannot fail");
+    if !graph.groups.is_empty() {
+        out.push_str("| Group | Kind | Root | Members |\n| --- | --- | --- | ---: |\n");
+        for g in &graph.groups {
+            writeln!(
+                out,
+                "| {} | {} | {} | {} |",
+                markdown_cell(&g.name),
+                markdown_cell(&g.kind),
+                markdown_cell(&g.root),
+                g.children.len()
+            )
+            .expect("writing to a String cannot fail");
+        }
+        out.push('\n');
     }
-    for p in &graph.projects {
-        writeln!(
-            out,
-            "{}  ({}, {})  {} file(s)",
-            p.name, p.kind, p.root, p.file_count
-        )
-        .expect("writing to a String cannot fail");
-        if let Some(cfg) = &p.config_file {
-            writeln!(out, "    {cfg}").expect("writing to a String cannot fail");
+    if !graph.projects.is_empty() {
+        out.push_str(
+            "| Project | Kind | Root | Files | Config |\n| --- | --- | --- | ---: | --- |\n",
+        );
+        for p in &graph.projects {
+            writeln!(
+                out,
+                "| {} | {} | {} | {} | {} |",
+                markdown_cell(&p.name),
+                markdown_cell(&p.kind),
+                markdown_cell(&p.root),
+                p.file_count,
+                markdown_cell(p.config_file.as_deref().unwrap_or("-"))
+            )
+            .expect("writing to a String cannot fail");
         }
     }
     out
@@ -326,13 +387,8 @@ pub(super) fn render_hits_inner(
             )
         };
         if !snippet.is_empty() {
-            let fence = "`".repeat(longest_backtick_run(&snippet).saturating_add(1).max(3));
-            let language = fence_language(h.language.as_deref());
-            write!(out, "\n{fence}{language}\n{snippet}").expect("writing to a String cannot fail");
-            if !snippet.ends_with('\n') {
-                out.push('\n');
-            }
-            writeln!(out, "{fence}").expect("writing to a String cannot fail");
+            out.push('\n');
+            render_fenced(&mut out, &snippet, h.language.as_deref());
         }
         out.push('\n');
     }
@@ -369,7 +425,7 @@ fn render_hit_metadata(out: &mut String, hit: &api::SearchHit, show_score: bool)
 }
 
 /// Keep untrusted values on one line and outside Markdown syntax.
-fn markdown_code(value: &str) -> String {
+pub(super) fn markdown_code(value: &str) -> String {
     if value.is_empty() {
         return "(empty)".into();
     }
@@ -389,6 +445,34 @@ fn markdown_code(value: &str) -> String {
         || (text.starts_with(' ') && text.ends_with(' ') && !text.trim().is_empty());
     let padding = if needs_padding { " " } else { "" };
     format!("{fence}{padding}{text}{padding}{fence}")
+}
+
+/// Keep pipe escapes outside code spans, including values ending in backslashes.
+pub(super) fn markdown_cell(value: &str) -> String {
+    if !value.contains('|') {
+        return markdown_code(value);
+    }
+    let mut out = String::new();
+    for (index, part) in value.split('|').enumerate() {
+        if index > 0 {
+            out.push_str("\\|");
+        }
+        if !part.is_empty() {
+            out.push_str(&markdown_code(part));
+        }
+    }
+    out
+}
+
+/// Protect whitespace and source delimiters without changing the body bytes.
+pub(super) fn render_fenced(out: &mut String, body: &str, language: Option<&str>) {
+    let fence = "`".repeat(longest_backtick_run(body).saturating_add(1).max(3));
+    let language = fence_language(language);
+    write!(out, "{fence}{language}\n{body}").expect("writing to a String cannot fail");
+    if !body.ends_with('\n') {
+        out.push('\n');
+    }
+    writeln!(out, "{fence}").expect("writing to a String cannot fail");
 }
 
 fn longest_backtick_run(value: &str) -> usize {

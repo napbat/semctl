@@ -4,6 +4,8 @@ This directory is the shared plugin package. Agent-neutral components live once
 at their conventional root locations:
 
 - `skills/` contains reusable agent skills.
+- `.mcp.json` declares the shared `semctl mcp` server. Claude/Codex manifests
+  reference it; OMP discovers it for linked and npm-installed packages.
 - `hooks/hooks.json` contains the lifecycle-hook subset supported by every
   current host.
 
@@ -29,17 +31,30 @@ of OMP internal URLs (`omp://`,
 `local://`, `skill://`) or web URLs is not repository discovery, so the adapter
 does not send it to `semctl hook`.
 
+The OMP adapter reads the live tool registry to distinguish a package server
+(`mcp__semctx_*`) from a marketplace server (`mcp__semctx_semctx_*`). Rust owns
+the corresponding guidance. When neither is mounted, hooks suppress MCP advice
+but retain clear/compact resets, so guidance can recover after MCP reconnects.
+
 Tool presentation comes from the shared MCP server. Search and symbol results
 start with a match count and source location. Each hit separates metadata from
-the fenced source snippet. Local stale-file warnings remain next to the
-location. Tool names and argument schemas stay stable. Display titles are
-available to clients that support MCP titles. Failed operations set `isError`
-and retain their explanation.
+the fenced source snippet. Trees, status reports and source bodies retain their
+whitespace in fences; catalogs, outlines and dependency edges use pipe tables.
+Table cells escape untrusted delimiters. Expanded source bodies preserve their
+original bytes, including CRLF and embedded Markdown fences.
 
-OMP uses its built-in MCP tool cards. Keep `mcp.renderMarkdownResults` enabled
-to render the headings and source fences. OMP controls the card title, colors,
-and collapsed preview length. Use its expand control to see more output.
-The lifecycle adapter does not register duplicate tools or replace result text.
+Local stale-file warnings remain next to the location. `current_context` lists
+exact indexed-copy identities, canonical status and the matching checkout.
+Codebase graph state is not a claim about each copy's freshness. Tool names and
+argument schemas stay stable. Display titles are available to clients that
+support MCP titles. Failed operations set `isError` and retain their explanation.
+
+OMP uses its built-in MCP tool cards, including when hosted in Tern. Keep
+`mcp.renderMarkdownResults` enabled to render headings, tables and source fences.
+OMP controls the card title, colors and collapsed preview length; expand a card
+to see more output. The lifecycle adapter does not register duplicate tools or
+replace result text. MCP stdout remains JSON-RPC, never terminal escape sequences
+or Tern surface-protocol commands.
 
 Do not manually copy shared skills; when a host requires a projected format,
 generate it from the canonical skill and verify parity in CI.

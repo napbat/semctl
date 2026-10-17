@@ -33,8 +33,8 @@ pub use advanced::*;
 
 pub use render::render_projects;
 use render::{
-    HitContext, hit_location, local_path, render_boundaries, render_compact, render_hits,
-    render_hits_inner,
+    HitContext, hit_location, local_path, markdown_code, render_boundaries, render_compact,
+    render_hits, render_hits_inner, render_outline,
 };
 
 /// Map the user's `--prefer` value to the server's `SearchPreference` enum name
@@ -285,12 +285,12 @@ pub async fn trace(client: &Client, symbol: &str, depth: u32) -> Result<String, 
     }
     let root = client.local_root();
 
-    let mut out = format!("definition of `{symbol}`:\n");
+    let mut out = format!("## Definition of {}\n\n", markdown_code(symbol));
     out.push_str(&render_hits(&t.definition, "", root, false));
 
-    write!(out, "\ncallers ({}):\n", t.callers.len()).expect("writing to a String cannot fail");
+    write!(out, "\n## Callers ({})\n\n", t.callers.len()).expect("writing to a String cannot fail");
     out.push_str(&render_compact(&t.callers, "  (none)", root));
-    write!(out, "\ncallees ({}):\n", t.callees.len()).expect("writing to a String cannot fail");
+    write!(out, "\n## Callees ({})\n\n", t.callees.len()).expect("writing to a String cannot fail");
     out.push_str(&render_compact(&t.callees, "  (none)", root));
     Ok(out)
 }
@@ -540,33 +540,12 @@ pub async fn file_outline(
         .await
         .map_err(|e| ToolError::from_client("file_outline", &e))?;
     if outline.entries.is_empty() {
-        return Ok(format!("{path} is indexed but has no chunks"));
+        return Ok(format!(
+            "{} is indexed but has no chunks",
+            markdown_code(path)
+        ));
     }
-    let local = local_path(client.local_root(), &outline.path);
-    let mut out = format!("{local}\n");
-    for e in &outline.entries {
-        let sym = e
-            .qualified_symbol
-            .as_deref()
-            .or(e.symbol.as_deref())
-            .unwrap_or("-");
-        let symbol_kind = e.symbol_kind.as_deref().unwrap_or(&e.kind);
-        writeln!(
-            out,
-            "  {}{}-{}  {} {sym}",
-            "  ".repeat(e.depth as usize),
-            e.line_start,
-            e.line_end,
-            symbol_kind
-        )
-        .expect("writing to a String cannot fail");
-        if let Some(body) = &e.body {
-            for line in body.lines() {
-                writeln!(out, "      {line}").expect("writing to a String cannot fail");
-            }
-        }
-    }
-    Ok(out)
+    Ok(render_outline(&outline, client.local_root()))
 }
 
 /// Chunks overlapping an inclusive line range in a file — "grow context around

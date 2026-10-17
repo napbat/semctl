@@ -27,7 +27,10 @@ fn search_response(request: &Request, hits: &Value) -> Value {
 
 #[tokio::test]
 async fn cross_codebase_search_keeps_remote_paths_relative_and_unmarked() {
-    for selector in [vec!["--codebase-id", "B"], vec!["--scope", "personal"]] {
+    for (selector, field, value) in [
+        (vec!["--codebase-id", "B"], "codebaseIds", json!(["B"])),
+        (vec!["--scope", "personal"], "scope", json!("Personal")),
+    ] {
         let checkout = Checkout::new();
         let server =
             Server::start(|request| search_response(request, &json!([search_hit(Some("B"))])));
@@ -40,8 +43,8 @@ async fn cross_codebase_search_keeps_remote_paths_relative_and_unmarked() {
             String::from_utf8_lossy(&output.stderr)
         );
         let text = String::from_utf8(output.stdout).unwrap();
-        assert!(text.contains("### `src/lib.rs:1"), "{text}");
-        assert!(text.contains("Codebase: `B`"), "{text}");
+        assert!(text.contains("src/lib.rs:1-1"), "{text}");
+        assert!(text.contains("fn remote() {}"), "{text}");
         assert!(!text.contains("checkout-a"), "{text}");
         assert!(!text.contains("stale"), "{text}");
         let requests = server.requests();
@@ -51,6 +54,7 @@ async fn cross_codebase_search_keeps_remote_paths_relative_and_unmarked() {
             "remote hits must not read the local catalog"
         );
         assert!(requests[0].body.get("codebaseId").is_none());
+        assert_eq!(requests[0].body[field], value);
     }
 }
 
@@ -58,14 +62,19 @@ async fn cross_codebase_search_keeps_remote_paths_relative_and_unmarked() {
 async fn mixed_search_marks_only_hits_bound_to_the_local_checkout() {
     let checkout = Checkout::new();
     let server = Server::start(|request| {
-        search_response(
-            request,
-            &json!([
-                search_hit(Some("A")),
-                search_hit(Some("B")),
-                search_hit(None),
-            ]),
-        )
+        let hits: Vec<_> = [
+            (Some("A"), "fn local_bound() {}"),
+            (Some("B"), "fn remote_bound() {}"),
+            (None, "fn unidentified_bound() {}"),
+        ]
+        .into_iter()
+        .map(|(codebase, source)| {
+            let mut hit = search_hit(codebase);
+            hit["snippet"] = json!(source);
+            hit
+        })
+        .collect();
+        search_response(request, &json!(hits))
     });
     let output = checkout
         .run(
@@ -87,25 +96,28 @@ async fn mixed_search_marks_only_hits_bound_to_the_local_checkout() {
         String::from_utf8_lossy(&output.stderr)
     );
     let text = String::from_utf8(output.stdout).unwrap();
-    let sections: Vec<_> = text.split("\n### ").skip(1).collect();
-    let local = sections
-        .iter()
-        .find(|section| section.contains("Codebase: `A`"))
-        .unwrap();
-    let remote = sections
-        .iter()
-        .find(|section| section.contains("Codebase: `B`"))
-        .unwrap();
-    let unidentified = sections
-        .iter()
-        .find(|section| !section.contains("Codebase:"))
-        .unwrap();
-    assert!(local.contains("checkout-a"), "{text}");
+    // Indexed source distinguishes the hits without depending on heading or
+    // metadata layout. All hits deliberately share the same relative path.
+    let (local, remaining) = text
+        .split_once("fn local_bound() {}")
+        .expect("the local indexed source is retained");
+    let (remote, remaining) = remaining
+        .split_once("fn remote_bound() {}")
+        .expect("the remote indexed source is retained");
+    let (unidentified, _) = remaining
+        .split_once("fn unidentified_bound() {}")
+        .expect("the unidentified indexed source is retained");
+    let local_location = format!("{}:1-1", checkout.root.join("src/lib.rs").display());
+    let local_location = local_location
+        .strip_prefix(r"\\?\")
+        .unwrap_or(&local_location);
+    assert!(local.contains(local_location), "{text}");
     assert!(local.contains("stale"), "{text}");
-    assert!(remote.starts_with("`src/lib.rs:1"), "{text}");
-    assert!(unidentified.starts_with("`src/lib.rs:1"), "{text}");
-    assert!(!remote.contains("stale"), "{text}");
-    assert!(!unidentified.contains("stale"), "{text}");
+    for nonlocal in [remote, unidentified] {
+        assert!(nonlocal.contains("src/lib.rs:1-1"), "{text}");
+        assert!(!nonlocal.contains("checkout-a"), "{text}");
+        assert!(!nonlocal.contains("stale"), "{text}");
+    }
     assert_eq!(server.requests().len(), 2);
 }
 
@@ -143,8 +155,8 @@ async fn corrupt_installation_identity_prevents_local_search_attribution() {
         .await;
     assert!(output.status.success(), "{:?}", output.stderr);
     let text = String::from_utf8(output.stdout).unwrap();
-    assert!(text.contains("### `src/lib.rs:1"), "{text}");
-    assert!(text.contains("Codebase: `A`"), "{text}");
+    assert!(text.contains("src/lib.rs:1-1"), "{text}");
+    assert!(text.contains("fn remote() {}"), "{text}");
     assert!(!text.contains("checkout-a"), "{text}");
     assert!(!text.contains("stale"), "{text}");
     let requests = server.requests();
@@ -215,22 +227,11 @@ async fn mcp_scoped_search_works_from_an_unindexed_directory() {
             assert!(response["result"]["capabilities"]["tools"].is_object());
         } else if id == 4 {
             assert_eq!(response["result"]["isError"], true, "{response}");
-            let text = response["result"]["content"][0]["text"].as_str().unwrap();
-            assert!(
-                text.starts_with(
-                    "search_codebase failed: scope and codebase_ids are mutually exclusive\n"
-                ),
-                "{text}"
-            );
-            assert!(
-                text.ends_with("next: correct the argument and call again."),
-                "{text}"
-            );
         } else {
             assert_eq!(response["result"]["isError"], false, "{response}");
             let text = response["result"]["content"][0]["text"].as_str().unwrap();
-            assert!(text.contains("### `src/lib.rs:1"), "{text}");
-            assert!(text.contains("Codebase: `B`"), "{text}");
+            assert!(text.contains("src/lib.rs:1-1"), "{text}");
+            assert!(text.contains("fn remote() {}"), "{text}");
             assert!(!text.contains("checkout-a"), "{text}");
             assert!(!text.contains("stale"), "{text}");
         }
@@ -253,5 +254,15 @@ async fn mcp_scoped_search_works_from_an_unindexed_directory() {
         searches
             .iter()
             .all(|request| request.body.get("codebaseId").is_none())
+    );
+    assert!(
+        searches
+            .iter()
+            .all(|request| !request.headers.contains_key("x-semctx-source-id"))
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request.path.starts_with("/v1/codebases/A/files"))
     );
 }

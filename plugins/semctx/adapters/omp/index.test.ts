@@ -36,7 +36,7 @@ class FakeInvoker implements HookInvoker {
 	}
 }
 
-function makeHarness(invoker: HookInvoker) {
+function makeHarness(invoker: HookInvoker, tools = ["mcp__semctx_semctx_search_codebase"]) {
 	const handlers = new Map<string, Handler[]>();
 	const sent: Array<{
 		message: Record<string, unknown>;
@@ -44,6 +44,9 @@ function makeHarness(invoker: HookInvoker) {
 	}> = [];
 	let label: string | undefined;
 	const pi = {
+		getAllTools() {
+			return tools.map(name => ({ name }));
+		},
 		setLabel(value: string) {
 			label = value;
 		},
@@ -73,10 +76,53 @@ function makeHarness(invoker: HookInvoker) {
 		return result;
 	};
 
-	return { emit, handlers, sent, label };
+	return {
+		emit,
+		handlers,
+		sent,
+		label,
+		setTools(names: string[]) {
+			tools = names;
+		},
+	};
 }
 
 describe("semctx OMP extension", () => {
+	test("selects the mounted native or marketplace MCP identity on each event", async () => {
+		const invoker = new FakeInvoker(input => input.omp_mcp_tools);
+		const harness = makeHarness(invoker);
+		for (const [tools, expected] of [
+			[["mcp__semctx_search_codebase"], "native"],
+			[["mcp__semctx_semctx_search_codebase"], "marketplace"],
+			[["mcp__semctx_semctx_search_codebase", "mcp__semctx_search_codebase"], "native"],
+			[[], "unavailable"],
+			[["mcp__other_search_codebase"], "unavailable"],
+		] as const) {
+			harness.setTools([...tools]);
+			await harness.emit("session_start");
+			await harness.emit("before_agent_start", { prompt: "find the parser" });
+			await harness.emit("tool_call", { toolName: "grep", input: { pattern: "parser" } });
+			expect(invoker.calls.slice(-3).map(call => call.input.omp_mcp_tools)).toEqual([
+				expected, expected, expected,
+			]);
+			expect(harness.sent.at(-1)?.message.content).toBe(expected);
+		}
+	});
+
+	test("forwards native and marketplace MCP calls for compliance without renaming them", async () => {
+		const invoker = new FakeInvoker(() => undefined);
+		const harness = makeHarness(invoker, ["mcp__semctx_search_codebase"]);
+		for (const toolName of ["mcp__semctx_current_context", "mcp__semctx_semctx_current_context"]) {
+			await harness.emit("tool_call", { toolName, input: {} });
+			expect(invoker.calls.at(-1)?.input).toMatchObject({
+				hook_event_name: "PreToolUse",
+				omp_mcp_tools: "native",
+				tool_name: toolName,
+				tool_input: {},
+			});
+		}
+	});
+
 	test("maps session boundaries and queues hidden orientation", async () => {
 		const invoker = new FakeInvoker(() => "repository orientation");
 		const harness = makeHarness(invoker);

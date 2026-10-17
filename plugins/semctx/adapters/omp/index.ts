@@ -5,7 +5,8 @@ import { createSemctlHookInvoker } from "./hook-process";
 export { extractAdditionalContext } from "./hook-process";
 
 const HOST = "omp";
-const OMP_SEMCTX_TOOL_PREFIX = "mcp__semctx_semctx_";
+const OMP_SEMCTX_TOOL_PREFIX = "mcp__semctx_";
+const OMP_MARKETPLACE_TOOL_PREFIX = "mcp__semctx_semctx_";
 const SESSION_TIMEOUT_MS = 8_000;
 const PROMPT_TIMEOUT_MS = 12_000;
 const TOOL_TIMEOUT_MS = 6_000;
@@ -26,9 +27,11 @@ const ROOT_ALIAS = /^[\\/]+$/;
 type SessionSource = "startup" | "resume" | "clear" | "compact";
 type HookEventName = "SessionStart" | "UserPromptSubmit" | "PreToolUse";
 type HookContext = Pick<ExtensionContext, "cwd" | "sessionManager" | "setTimeout" | "clearTimer">;
+type OmpMcpTools = "native" | "marketplace" | "unavailable";
 
 export interface SemctlHookInput {
 	host: typeof HOST;
+	omp_mcp_tools?: OmpMcpTools;
 	hook_event_name: HookEventName;
 	cwd: string;
 	session_id: string;
@@ -118,6 +121,14 @@ function hookToolCall(toolName: string, input: Record<string, unknown>, cwd: str
 	}
 }
 
+/** Select the mounted server identity without rewriting Rust-owned guidance. */
+function ompMcpTools(pi: ExtensionAPI): OmpMcpTools {
+	const tools = pi.getAllTools();
+	if (tools.some(tool => tool.name === `${OMP_SEMCTX_TOOL_PREFIX}search_codebase`)) return "native";
+	if (tools.some(tool => tool.name === `${OMP_MARKETPLACE_TOOL_PREFIX}search_codebase`)) return "marketplace";
+	return "unavailable";
+}
+
 export function createSemctxExtension(invoker: HookInvoker = createSemctlHookInvoker()) {
 	return function semctxExtension(pi: ExtensionAPI): void {
 		const instanceId = `${process.pid}-${Date.now().toString(36)}`;
@@ -137,7 +148,7 @@ export function createSemctxExtension(invoker: HookInvoker = createSemctlHookInv
 		};
 		const safeInvoke = async (input: SemctlHookInput, ctx: HookContext, timeoutMs: number) => {
 			try {
-				return await invoker.invoke(input, ctx, timeoutMs);
+				return await invoker.invoke({ ...input, omp_mcp_tools: ompMcpTools(pi) }, ctx, timeoutMs);
 			} catch {
 				return undefined;
 			}

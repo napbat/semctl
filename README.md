@@ -3,7 +3,7 @@
 `semctl` is the command-line client for the **semctx** code-intelligence server —
 semantic + exact code search and a precise symbol/call/value-flow graph over your
 repositories, exposed both as a CLI and as an [MCP](https://modelcontextprotocol.io)
-stdio server for AI coding tools (Claude Code, Codex).
+stdio server for AI coding tools (Claude Code, Codex, Oh My Pi).
 
 It's a thin HTTP+JSON client: all indexing and retrieval happen server-side, so
 `semctl` links no engine code and has an entirely public dependency graph.
@@ -117,6 +117,12 @@ reversed with the hash-guarded `undo_edit` action. Read-only additions include
 `type_hierarchy`, `call_graph`, `cycles`, `unused`, and `duplicates`; existing
 reference/search/outline tools expose the richer occurrence, scope, and nesting
 options instead of gaining aliases.
+
+`current_context` reports the selected checkout's opaque source identity and
+lists the server's indexed copies with their exact identities, canonical flag,
+revision and file count. A copy matches only when its source identity equals
+the checkout's. Historical copies remain intact. The codebase's reported graph
+state does not establish per-copy freshness.
 
 Every read-only MCP tool call ends within one deadline. The default is 25
 seconds, below the 30 seconds after which Oh My Pi ends an MCP request. Set
@@ -385,11 +391,13 @@ is installed. It skips a missing shell and reports the skip. CI runs `sh` on
 Linux and `pwsh` on Windows. Use `--shell all` to require both shells.
 
 `plugins/semctx/` is the shared plugin root for every supported coding agent.
-Its `skills/codebase-retrieval/` has one physical source. Claude/Codex consume
-the shared hook manifest; OMP loads `adapters/omp/index.ts`, which maps native
+Its `.mcp.json` declares the MCP server once: Claude/Codex reference it, and OMP
+discovers it in linked and npm-installed packages. Its
+`skills/codebase-retrieval/` has one physical source. Claude/Codex consume the
+shared hook manifest; OMP loads `adapters/omp/index.ts`, which maps native
 lifecycle events onto the same `semctl hook` wire contract. See
-[`plugins/semctx/README.md`](plugins/semctx/README.md) before adding another
-agent integration. Do not copy or symlink shared skills.
+[`plugins/semctx/README.md`](plugins/semctx/README.md) for native MCP presentation
+and host ownership. Do not copy or symlink shared skills.
 
 The deterministic hook and OMP-extension cases run under the normal Rust and Bun
 test commands.

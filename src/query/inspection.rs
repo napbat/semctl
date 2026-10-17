@@ -3,8 +3,8 @@
 use std::fmt::Write;
 
 use super::render::{
-    local_path, render_files, render_hits, render_job, render_projects, render_tree,
-    truncation_note,
+    local_path, markdown_cell, markdown_code, render_fenced, render_files, render_hits, render_job,
+    render_projects, render_tree, truncation_note,
 };
 use super::{Client, ToolError, api, bound_codebase, urlencode};
 use crate::engine::CoordinatorStatus;
@@ -112,13 +112,19 @@ pub async fn list_files(
         }
         if matches.is_empty() {
             return Ok(format!(
-                "(no indexed files match `{raw}` — searched all {total} catalogued files)"
+                "(no indexed files match {} — searched all {total} catalogued files)",
+                markdown_code(raw)
             ));
         }
         matches.sort_by(|a, b| a.path.cmp(&b.path));
         let mut out = render_files(&matches, root);
-        writeln!(out, "({} of {total} files match `{raw}`)", matches.len())
-            .expect("writing to a String cannot fail");
+        writeln!(
+            out,
+            "\n({} of {total} files match {})",
+            matches.len(),
+            markdown_code(raw)
+        )
+        .expect("writing to a String cannot fail");
         return Ok(out);
     }
 
@@ -146,7 +152,7 @@ pub async fn list_files(
     let start = pg as usize * page_size as usize; // 0-based index of the first row
     let end = start + files.len(); // exclusive
     let mut out = render_files(&files, root);
-    write!(out, "(rows {}–{end} of {total}", start + 1).expect("writing to a String cannot fail");
+    write!(out, "\n(rows {}–{end} of {total}", start + 1).expect("writing to a String cannot fail");
     if end < total {
         write!(out, "; pass page={} for the next {page_size}", pg + 1)
             .expect("writing to a String cannot fail");
@@ -248,7 +254,9 @@ pub async fn sync_status(
              persisted server state.",
         ),
     }
-    Ok(out)
+    let mut rendered = String::new();
+    render_fenced(&mut rendered, &out, None);
+    Ok(rendered)
 }
 
 /// The `first index:` line of `sync_status`. A failed first index also names
@@ -331,14 +339,14 @@ pub async fn imports(client: &Client) -> Result<String, ToolError> {
         return Ok("(no import edges)".into());
     }
     let root = client.local_root();
-    let mut out = String::new();
+    let mut out = String::from("| From | To | Import |\n| --- | --- | --- |\n");
     for e in &edges {
         writeln!(
             out,
-            "{}  ->  {}  ({})",
-            local_path(root, &e.from),
-            local_path(root, &e.to),
-            e.import_path
+            "| {} | {} | {} |",
+            markdown_cell(&local_path(root, &e.from)),
+            markdown_cell(&local_path(root, &e.to)),
+            markdown_cell(&e.import_path)
         )
         .expect("writing to a String cannot fail");
     }
@@ -357,15 +365,15 @@ pub async fn symbol_edges(client: &Client) -> Result<String, ToolError> {
         return Ok("(no symbol bindings)".into());
     }
     let root = client.local_root();
-    let mut out = String::new();
+    let mut out = String::from("| From | Name | To | Moniker |\n| --- | --- | --- | --- |\n");
     for e in &edges {
         writeln!(
             out,
-            "{} `{}`  ->  {}  ({})",
-            local_path(root, &e.from_file),
-            e.name,
-            local_path(root, &e.to_file),
-            e.moniker
+            "| {} | {} | {} | {} |",
+            markdown_cell(&local_path(root, &e.from_file)),
+            markdown_cell(&e.name),
+            markdown_cell(&local_path(root, &e.to_file)),
+            markdown_cell(&e.moniker)
         )
         .expect("writing to a String cannot fail");
     }
@@ -405,7 +413,9 @@ pub async fn external_links(client: &Client) -> Result<String, ToolError> {
         .expect("writing to a String cannot fail");
     }
     truncation_note(&mut out, links.len(), total);
-    Ok(out)
+    let mut rendered = String::new();
+    render_fenced(&mut rendered, &out, None);
+    Ok(rendered)
 }
 
 /// The symbol at `path:line[:column]` (1-based). With a column, the identifier
@@ -460,22 +470,33 @@ pub async fn batch_lookup(
     let mut out = String::new();
     for r in &results {
         if r.hits.is_empty() {
-            writeln!(out, "{} — no {kind}", r.symbol).expect("writing to a String cannot fail");
+            writeln!(out, "### {} — no {kind}\n", markdown_code(&r.symbol))
+                .expect("writing to a String cannot fail");
             continue;
         }
-        writeln!(out, "{} ({} {kind}):", r.symbol, r.hits.len())
-            .expect("writing to a String cannot fail");
+        writeln!(
+            out,
+            "### {} ({} {kind})\n",
+            markdown_code(&r.symbol),
+            r.hits.len()
+        )
+        .expect("writing to a String cannot fail");
+        out.push_str("| Location |\n| --- |\n");
         for h in &r.hits {
             let loc = h.path.as_deref().unwrap_or("?");
             writeln!(
                 out,
-                "  {}:{}-{}",
-                local_path(root, loc),
-                h.line_start.unwrap_or(0),
-                h.line_end.unwrap_or(0)
+                "| {} |",
+                markdown_cell(&format!(
+                    "{}:{}-{}",
+                    local_path(root, loc),
+                    h.line_start.unwrap_or(0),
+                    h.line_end.unwrap_or(0)
+                ))
             )
             .expect("writing to a String cannot fail");
         }
+        out.push('\n');
     }
     Ok(out)
 }
@@ -489,7 +510,9 @@ pub async fn file_tree(client: &Client) -> Result<String, ToolError> {
         Ok(nodes) => {
             let mut out = String::new();
             render_tree(&nodes, 0, &mut out);
-            Ok(out)
+            let mut rendered = String::new();
+            render_fenced(&mut rendered, &out, None);
+            Ok(rendered)
         }
         Err(e) => Err(ToolError::from_client("file_tree", &e)),
     }
@@ -512,7 +535,9 @@ pub async fn list_domains(client: &Client) -> Result<String, ToolError> {
                         .expect("writing to a String cannot fail");
                 }
             }
-            Ok(out)
+            let mut rendered = String::new();
+            render_fenced(&mut rendered, &out, None);
+            Ok(rendered)
         }
         Err(e) => Err(ToolError::from_client("list_domains", &e)),
     }

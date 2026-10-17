@@ -68,12 +68,83 @@ for (const adapter of HOST_ADAPTERS) {
 				expect(events).toContain("SessionStart");
 				expect(events).toContain("UserPromptSubmit");
 				for (const record of session.trace) expect(record.host).toBe(adapter.hookHost);
-				expect(session.trace.find(record => record.event === "SessionStart")?.context).toBeTrue();
+				// OMP can mount MCP after session_start. The prompt hook must
+				// restore the manual before the first model request in that case.
+				expect(
+					session.trace.some(
+						record => ["SessionStart", "UserPromptSubmit"].includes(record.event) && record.context,
+					),
+				).toBeTrue();
 				expect(toolDecisions(session)).toEqual(["unavailable"]);
 
 				const [manualLead] = fs.readFileSync(SERVER_MANUAL, "utf8").split("\n");
 				expect(session.requests.length).toBeGreaterThanOrEqual(2);
 				expect(session.requests[0]).toContain(JSON.stringify(manualLead).slice(1, -1));
+			},
+			SESSION_TEST_TIMEOUT_MS,
+		);
+
+		test.skipIf(adapter.id !== "omp")(
+			"the local package exposes native MCP tools and returns a server error while logged out",
+			async () => {
+				const toolName = "mcp__semctx_current_context";
+				const session = await suite.run("show the codebase context", [
+					{
+						toolCall: {
+							name: "write",
+							arguments: { path: `xd://${toolName}`, content: "{}", i: "Reading codebase context" },
+						},
+					},
+					{ text: "done" },
+				]);
+				expect(session.exitCode, session.output).toBe(0);
+				expect(session.requests.length, session.output).toBeGreaterThanOrEqual(2);
+				const compliance = session.trace.filter(record => record.event === "PreToolUse" && record.tool === toolName);
+				expect(compliance, session.output).toHaveLength(1);
+				expect(compliance[0]).toMatchObject({ host: adapter.hookHost, outcome: "semctx_use" });
+
+				// OMP mounts MCP tools as xd:// devices. The model must receive
+				// those routes and the native write transport, not phantom functions.
+				const firstRequest = JSON.parse(session.requests[0]);
+				const names = firstRequest.tools.map((tool: { function: { name: string } }) => tool.function.name);
+				expect(names, session.output).toContain("write");
+				for (const name of ["current_context", "search_codebase", "find_definition", "replace_symbol_body"]) {
+					expect(session.requests[0], session.output).toContain(`xd://mcp__semctx_${name}`);
+				}
+
+				const events = session.stdout
+					.split("\n")
+					.filter(line => line.trim().length > 0)
+					.map(line => JSON.parse(line));
+				const completed = events.filter(event => event.type === "tool_execution_end" && event.toolName === "write");
+				expect(completed, session.output).toHaveLength(1);
+				const [call] = completed;
+				expect(call.isError).toBeTrue();
+				const dispatch = call.result.details.xdev;
+				expect(dispatch).toMatchObject({ tool: toolName, mode: "execute", args: {} });
+				expect(dispatch.inner).toMatchObject({
+					serverName: "semctx",
+					mcpToolName: "current_context",
+					isError: true,
+				});
+
+				// A missing tool or failed transport is a host error without raw
+				// MCP content. Logged-out semctl instead returns isError content.
+				// Compare that content with the next model request, not prose.
+				const raw = dispatch.inner.rawContent;
+				expect(Array.isArray(raw), session.output).toBeTrue();
+				expect(raw.length).toBeGreaterThan(0);
+				const nextRequest = JSON.parse(session.requests[1]);
+				const results = nextRequest.messages.filter(
+					(message: { role: string; tool_call_id?: string }) =>
+						message.role === "tool" && message.tool_call_id === call.toolCallId,
+				);
+				expect(results).toHaveLength(1);
+				for (const block of raw) {
+					expect(block.type).toBe("text");
+					expect(block.text.trim().length).toBeGreaterThan(0);
+					expect(JSON.stringify(results[0].content)).toContain(JSON.stringify(block.text).slice(1, -1));
+				}
 			},
 			SESSION_TEST_TIMEOUT_MS,
 		);
