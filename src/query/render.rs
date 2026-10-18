@@ -292,45 +292,23 @@ pub(super) fn render_hits_inner(
     if hits.is_empty() {
         return empty_msg.to_string();
     }
-    // Grouping (search only): hits arrive ranked, with a long low-relevance tail.
-    // Split the tail off under a separator so strong matches aren't visually equal
-    // to the noise — without DROPPING any hit (a relevance floor could silently cut
-    // recall). "Weak" is relative to the top hit, adapting to each query's scale.
-    let weak_below = show_score
-        .then(|| hits.iter().map(|h| h.score).fold(f64::MIN, f64::max) * WEAK_HIT_FRACTION);
-
     let mut out = format!(
         "**{} {}**",
         hits.len(),
         if hits.len() == 1 { "match" } else { "matches" }
     );
-    if show_score {
-        out.push_str(" · hybrid scores are query-relative, not confidence");
-    }
     out.push('\n');
-    let mut separated = false;
+    if show_score {
+        render_search_table(&mut out, hits, context, sources);
+    }
     let mut expanded_chars = 0_usize;
     let mut shortened_hits = 0_usize;
     for (index, h) in hits.iter().enumerate() {
         let root = context.root_for(h);
-        if let Some(floor) = weak_below
-            && !separated
-            && h.score < floor
-        {
-            out.push_str("### Weaker matches (below ");
-            write!(out, "{:.0}% of top score)\n\n", WEAK_HIT_FRACTION * 100.0)
-                .expect("writing to a String cannot fail");
-            separated = true;
-        }
-        render_hit_heading(&mut out, h, root, show_score.then_some(index + 1));
-        if let Some(source) = sources.get(index) {
-            let label = match source {
-                HitSource::Bound => "bytes and coordinates verified",
-                HitSource::ChangedLocal => "local bytes changed",
-                HitSource::IndexedRangeMismatch => "indexed range mismatch",
-                HitSource::Unverified(_) => "unverified",
-            };
-            writeln!(out, "Source: {label}").expect("writing to a String cannot fail");
+        if show_score {
+            writeln!(out, "\n**{}**", index + 1).expect("writing to a String cannot fail");
+        } else {
+            render_hit_heading(&mut out, h, root);
         }
         let expand = full_body
             && (expanded_chars == 0 || expanded_chars + h.snippet.len() <= EXPANDED_BODY_CHARS);
@@ -357,6 +335,9 @@ pub(super) fn render_hits_inner(
             render_fenced(&mut out, &snippet, h.language.as_deref());
         }
         render_hit_metadata(&mut out, h);
+        if show_score {
+            writeln!(out, "Score: {:.3}", h.score).expect("writing to a String cannot fail");
+        }
         if let Some(source) = sources.get(index) {
             if matches!(
                 source,
@@ -386,16 +367,51 @@ pub(super) fn render_hits_inner(
     out
 }
 
-fn render_hit_heading(
+/// Rank rows summarize the same evidence retained in the source previews below.
+fn render_search_table(
     out: &mut String,
-    hit: &api::SearchHit,
-    root: Option<&Path>,
-    rank: Option<usize>,
+    hits: &[api::SearchHit],
+    context: HitContext<'_>,
+    sources: &[HitSource],
 ) {
-    out.push_str("### ");
-    if let Some(rank) = rank {
-        write!(out, "{rank}. ").expect("writing to a String cannot fail");
+    // Match the native inspector: signed or unavailable scores have no ratio bar.
+    let maximum = hits
+        .iter()
+        .all(|hit| hit.score.is_finite() && hit.score >= 0.0)
+        .then(|| hits.iter().map(|hit| hit.score).fold(0.0, f64::max))
+        .filter(|maximum| *maximum > 0.0);
+    out.push_str("\n| | Match | Source |\n| --- | --- | --- |\n");
+    for (index, hit) in hits.iter().enumerate() {
+        let binding = match sources.get(index) {
+            Some(HitSource::Bound) => "bound",
+            Some(HitSource::ChangedLocal) => "changed",
+            Some(HitSource::IndexedRangeMismatch) => "range mismatch",
+            Some(HitSource::Unverified(_)) => "unverified",
+            None => "not probed",
+        };
+        writeln!(
+            out,
+            "| {}\u{a0}{} | {} — {} | {} |",
+            index + 1,
+            score_bar(hit.score, maximum),
+            markdown_code(&hit_location(hit, context.root_for(hit))).replace('|', "\\|"),
+            markdown_code(&format!("{}{}", hit_symbol(hit), write_marker(hit))).replace('|', "\\|"),
+            binding,
+        )
+        .expect("writing to a String cannot fail");
     }
+}
+
+fn score_bar(score: f64, maximum: Option<f64>) -> &'static str {
+    const BARS: [&str; 6] = ["▱▱▱▱▱", "▰▱▱▱▱", "▰▰▱▱▱", "▰▰▰▱▱", "▰▰▰▰▱", "▰▰▰▰▰"];
+    maximum.map_or("—", |maximum| {
+        let ratio = score / maximum;
+        BARS[[0.0, 0.2, 0.4, 0.6, 0.8].partition_point(|threshold| ratio > *threshold)]
+    })
+}
+
+fn render_hit_heading(out: &mut String, hit: &api::SearchHit, root: Option<&Path>) {
+    out.push_str("### ");
     write!(
         out,
         "{} — {}",
@@ -406,9 +422,6 @@ fn render_hit_heading(
     let marker = write_marker(hit);
     if !marker.is_empty() {
         write!(out, " {}", markdown_code(marker.trim())).expect("writing to a String cannot fail");
-    }
-    if rank.is_some() {
-        write!(out, " · hybrid score {:.3}", hit.score).expect("writing to a String cannot fail");
     }
     out.push('\n');
 }
@@ -541,11 +554,6 @@ fn fence_language(language: Option<&str>) -> Cow<'_, str> {
 /// server has no size limit of its own, and one expanded search with a broad
 /// `top_k` can otherwise return tens of thousands of characters.
 const EXPANDED_BODY_CHARS: usize = 30_000;
-
-/// A hit scoring below this fraction of the top hit's score is sorted under the
-/// "weaker matches" separator. Relative (not absolute) because raw hybrid
-/// scores aren't calibrated across queries.
-const WEAK_HIT_FRACTION: f64 = 0.5;
 
 /// The symbol column: the MATCHED symbol, qualified by the declaration that
 /// contains it when the server reports one (`dispatch in run_until`). Without
@@ -694,14 +702,22 @@ mod tests {
             &sources,
             false,
         );
-        let sections: Vec<_> = output.split("\n### ").skip(1).collect();
-        assert!(sections[0].contains("Codebase: `a`"));
-        assert!(sections[0].contains(&root.join("src/lib.rs").display().to_string()));
-        assert!(sections[1].contains("`src/lib.rs:1-2`"));
-        assert!(sections[1].contains("Codebase: `b`"));
-        assert!(!sections[1].contains("checkout-a"));
-        assert!(!sections[2].contains("checkout-a"));
-        assert!(!sections[2].contains("Codebase:"));
+        let local_row = output
+            .lines()
+            .find(|line| line.contains("`local`"))
+            .unwrap();
+        let remote_row = output
+            .lines()
+            .find(|line| line.contains("`remote`"))
+            .unwrap();
+        let unknown_row = output
+            .lines()
+            .find(|line| line.contains("`unidentified`"))
+            .unwrap();
+        assert!(local_row.contains(&root.join("src/lib.rs").display().to_string()));
+        assert!(remote_row.contains("`src/lib.rs:1-2`") && !remote_row.contains("checkout-a"));
+        assert!(unknown_row.contains("`src/lib.rs:1-2`") && !unknown_row.contains("checkout-a"));
+        assert!(output.contains("Codebase: `a`") && output.contains("Codebase: `b`"));
     }
 
     #[test]
@@ -774,7 +790,6 @@ mod tests {
             "\n  \nfn example() {\n    ```rust\n    ~~~\n    **text** <tag>  \n    omitted\n}"
                 .into();
         let output = render_hits_inner(&[hit], "none", HitContext::local(None), false, &[], false);
-        assert!(output.starts_with("**1 match**\n"), "{output}");
         assert!(
             output.contains(
                 "\n````rust\nfn example() {\n    ```rust\n    ~~~\n    **text** <tag>  \n````\n"
@@ -798,58 +813,20 @@ mod tests {
 
     #[test]
     fn render_untrusted_values_cannot_open_markdown_blocks() {
-        let mut hit = node("`symbol`\n<!--", "`source`\n```\n.rs");
+        let mut hit = node("`symbol`|\n<!--", "`source`|\n```\n.rs");
         hit.language = Some("rust\n```".into());
         hit.domain_id = "<details>\n```".into();
         hit.codebase_id = Some("a`\r\n# hidden".into());
         hit.snippet = "let value = 1;".into();
         let output = render_hits_inner(&[hit], "none", HitContext::local(None), true, &[], false);
-        let heading = output
+        let row = output
             .lines()
-            .find(|line| line.starts_with("### "))
+            .find(|line| line.contains("`symbol`"))
             .unwrap();
-        assert!(heading.contains("```` `source`\\n```\\n.rs:1-2 ````"));
-        assert!(heading.contains("`` `symbol`\\n<!-- ``"));
+        assert!(row.contains("```` `source`\\|\\n```\\n.rs:1-2 ````"));
+        assert!(row.contains("`` `symbol`\\|\\n<!-- ``"));
         assert!(output.contains("Codebase: ``a`\\r\\n# hidden``"));
         assert!(output.contains("\n```text\nlet value = 1;\n```\n"));
-        assert_eq!(output.matches("\n### ").count(), 1, "{output}");
-    }
-
-    #[test]
-    fn render_keeps_weak_matches_in_one_group() {
-        let mut hits = [
-            node("strong", "a.rs"),
-            node("boundary", "boundary.rs"),
-            node("weak", "b.rs"),
-            node("weaker", "c.rs"),
-        ];
-        hits[0].score = 1.0;
-        hits[1].score = 0.5;
-        hits[2].score = 0.4;
-        hits[3].score = -0.2;
-        let output = render_hits_inner(&hits, "none", HitContext::local(None), true, &[], false);
-        assert!(
-            output.contains("query-relative, not confidence"),
-            "{output}"
-        );
-        for (rank, hit) in hits.iter().enumerate() {
-            let heading = output
-                .lines()
-                .find(|line| line.starts_with(&format!("### {}. ", rank + 1)))
-                .unwrap();
-            assert!(heading.contains(&format!("`{}`", hit.symbol.as_deref().unwrap())));
-            assert!(heading.contains(&format!("hybrid score {:.3}", hit.score)));
-        }
-        assert_eq!(
-            output
-                .matches("### Weaker matches (below 50% of top score)")
-                .count(),
-            1
-        );
-        assert!(output.find("`strong`").unwrap() < output.find("### Weaker").unwrap());
-        assert!(output.find("`boundary`").unwrap() < output.find("### Weaker").unwrap());
-        assert!(output.find("### Weaker").unwrap() < output.find("`weak`").unwrap());
-        assert!(output.contains("`weaker`"), "{output}");
     }
 
     #[test]

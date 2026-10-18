@@ -142,7 +142,7 @@ pub async fn search(
     );
     if hits.is_empty() {
         return Ok(QueryOutput::new(
-            "no results".to_string(),
+            format!("**Search** {}\n\nno results", markdown_code(query)),
             if presentation == QueryPresentation::Inspector {
                 display::search(client, query, &hits, &[], context)
             } else {
@@ -151,7 +151,15 @@ pub async fn search(
         ));
     }
     let sources = source::hit_sources_in_context(client, &hits, context).await;
-    let text = render_hits_inner(&hits, "no results", context, true, &sources, opts.expand);
+    let mut text = format!("**Search** {}\n\n", markdown_code(query));
+    text.push_str(&render_hits_inner(
+        &hits,
+        "no results",
+        context,
+        true,
+        &sources,
+        opts.expand,
+    ));
     let display = if presentation == QueryPresentation::Inspector {
         display::search(client, query, &hits, &sources, context)
     } else {

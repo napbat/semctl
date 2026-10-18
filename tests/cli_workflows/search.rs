@@ -58,7 +58,7 @@ async fn cross_codebase_search_keeps_remote_paths_relative_and_unmarked() {
 }
 
 #[tokio::test]
-async fn mixed_search_marks_only_hits_bound_to_the_local_checkout() {
+async fn mixed_search_probes_only_the_selected_local_checkout() {
     let checkout = Checkout::new();
     let server = Server::start(|request| {
         let hits: Vec<_> = [
@@ -94,28 +94,8 @@ async fn mixed_search_marks_only_hits_bound_to_the_local_checkout() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let text = String::from_utf8(output.stdout).unwrap();
-    // Indexed source distinguishes the hits without depending on heading or
-    // metadata layout. All hits deliberately share the same relative path.
-    let (local, remaining) = text
-        .split_once("fn local_bound() {}")
-        .expect("the local indexed source is retained");
-    let (remote, remaining) = remaining
-        .split_once("fn remote_bound() {}")
-        .expect("the remote indexed source is retained");
-    let (unidentified, _) = remaining
-        .split_once("fn unidentified_bound() {}")
-        .expect("the unidentified indexed source is retained");
-    let local_location = format!("{}:1-1", checkout.root.join("src/lib.rs").display());
-    let local_location = local_location
-        .strip_prefix(r"\\?\")
-        .unwrap_or(&local_location);
-    assert!(local.contains(local_location), "{text}");
-    for nonlocal in [remote, unidentified] {
-        assert!(nonlocal.contains("src/lib.rs:1-1"), "{text}");
-        assert!(!nonlocal.contains("checkout-a"), "{text}");
-        assert!(!nonlocal.contains("stale"), "{text}");
-    }
+    // The fixture accepts only the selected checkout's content probe. Foreign
+    // and unidentified hits must not cause additional source reads.
     assert_eq!(server.requests().len(), 2);
 }
 

@@ -80,6 +80,18 @@ OMP modification or a replacement MCP tool. The original MCP result stays in the
 transcript, including its text, errors, approvals, and cancellation behavior.
 OMP still controls its built-in MCP cards and output-size limits.
 
+Search results in that original transcript put the exact query above a compact
+ranked table, without per-match Markdown headings or a separate weak-match
+section. Source previews, raw scores, copy/domain identity and verification
+diagnostics remain below the table. Text score bars use the same nonnegative,
+query-relative scale as the native inspector; an unavailable scale stays unknown.
+
+Replacing the MCP executable does not reload an already-running OMP extension.
+OMP 18.12.1's `/restart` relaunches the process and resumes the saved conversation,
+which loads the updated adapter. Session-history reload, `/reload-plugins` and
+`/mcp reload` do not re-evaluate extension modules. Finish or preserve active work
+before restarting, and verify the new live surface rather than only its install path.
+
 The inspector consumes versioned, typed `_meta.semctlDisplay` data. It does not
 parse Markdown or use `structuredContent` to add display data to model context.
 The payload is limited to 32 KiB and at most 32 total hits per call. Overflow

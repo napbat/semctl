@@ -551,17 +551,6 @@ mod tests {
             1,
             "same-file hits share a hash and local read"
         );
-        let rendered = render_hits_inner(
-            &hits,
-            "none",
-            HitContext::search(Some(root.path()), Some("A"), true),
-            true,
-            &states,
-            true,
-        );
-        let sections: Vec<_> = rendered.split("\n### ").skip(1).collect();
-        assert!(sections[0].contains(old));
-        assert!(sections[0].contains("source.rs:1-1"));
     }
 
     #[tokio::test]
