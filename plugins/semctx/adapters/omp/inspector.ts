@@ -1,12 +1,12 @@
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
-import type { ExtensionAPI, ExtensionContext, ToolCallEvent, ToolResultEvent } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import type { Component, DescribeContext, NativeNode, NativeUiEvent } from "@oh-my-pi/pi-tui";
+import type { NativeChild } from "@oh-my-pi/pi-tui/native/node";
+import type { ToolRendererFactory } from "@oh-my-pi/pi-tui/tools";
 
-const WIDGET_KEY = "semctl.inspector";
 const MAX_BYTES = 32 * 1024;
 const MAX_HITS = 32;
-const MAX_INFLIGHT = 64;
 const OPERATIONS: Record<string, Display["kind"]> = {
 	search_codebase: "search", read_source: "source", batch_lookup: "batch", sync_status: "status",
 };
@@ -30,7 +30,7 @@ const VERIFICATION: Record<Hit["binding"]["state"], { name: string; tone: "succe
 	unverified: { name: "info", tone: "muted" },
 	"not-probed": { name: "info", tone: "muted" },
 };
-interface Search { kind: "search"; query: string; hits: Hit[] }
+interface Search { kind: "search"; query: string; hits: Hit[]; indexWarning: string | null }
 interface Source {
 	kind: "source"; path: string; text: string; language: string | null; sourceOrigin: string;
 	contentHash: string; encoding: string; binary: boolean; truncated: boolean;
@@ -42,11 +42,6 @@ interface Status {
 	catalogError: string | null; jobId: string | null; job: Obj | null; jobError: string | null;
 }
 export type Display = { version: 1; identity: Identity } & (Search | Source | Batch | Status);
-export interface InspectorCall {
-	id: string; toolName: string; operation: string; order: number; started: number;
-	state: "pending" | "running" | "done" | "error" | "cancelled";
-	finished?: number; display?: Display; note?: string;
-}
 const object = (v: unknown): v is Obj => v !== null && typeof v === "object" && !Array.isArray(v);
 const nullableString = (v: unknown): v is string | null => v === null || typeof v === "string";
 const integer = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v);
@@ -94,7 +89,7 @@ export function readDisplay(value: unknown, operation: string): Display | undefi
 		if (!object(id) || !["codebaseId", "name", "localRoot"].every(k => nullableString(id[k])) || !["checkout", "canonical"].includes(String(id.copy))) return undefined;
 		if (id.copy === "canonical" && id.localRoot !== null) return undefined;
 		switch (value.kind) {
-			case "search": if (typeof value.query !== "string" || !hits(value.hits)) return undefined; break;
+			case "search": if (typeof value.query !== "string" || !hits(value.hits) || !nullableString(value.indexWarning)) return undefined; break;
 			case "batch": {
 				if (!Array.isArray(value.symbols)) return undefined;
 				let count = 0;
@@ -166,53 +161,29 @@ function verificationIcon(h: Hit, cx: DescribeContext): NativeNode {
 		: text(h.binding.state, { tone: status.tone, title, shrink: 0 });
 }
 
-export class InspectorModel {
-	private call: InspectorCall | undefined;
-	private sequence = 0;
-	constructor(private readonly now: () => number = Date.now) {}
-	start(id: string, toolName: string, operation: string): void {
-		if (this.call?.id === id && (this.call.state === "pending" || this.call.state === "running")) return;
-		this.call = { id, toolName, operation, order: ++this.sequence, started: this.now(), state: "pending" };
-	}
-	running(id: string): void {
-		const c = this.call;
-		if (c?.id === id && c.state === "pending") { c.state = "running"; c.started = this.now(); }
-	}
-	finish(id: string, display: Display | undefined, error: boolean, note?: string): void {
-		const c = this.call;
-		if (!c || c.id !== id || (c.state !== "pending" && c.state !== "running")) return;
-		c.state = error ? "error" : "done"; c.finished = this.now(); c.display = error ? undefined : display;
-		c.note = note ?? (error ? "Call failed; see the original error in the transcript." : display ? undefined : "Native display unavailable; original result remains in transcript.");
-	}
-	cancel(): void {
-		const c = this.call;
-		if (c && (c.state === "pending" || c.state === "running")) {
-			c.state = "cancelled"; c.finished = this.now(); c.display = undefined; c.note = "Call ended without a display result.";
-		}
-	}
-	reset(): void { this.call = undefined; }
-	get current(): InspectorCall | undefined { return this.call; }
-	age(c: InspectorCall): number { return Math.max(0, (c.finished ?? this.now()) - c.started); }
-}
 
 export class SemctlInspector implements Component {
-	private expanded = true;
 	private hitIndex = 0;
-	private hitCall = 0;
 	private matchesExpanded = false;
 	private readonly expandedSections = new Set<string>();
-	constructor(readonly model: InspectorModel, private readonly requestRender: () => void) {}
+	constructor(
+		readonly display: Display,
+		private readonly requestRender: () => void,
+		private readonly fallbackBody: () => readonly NativeChild[] = () => [],
+		private readonly fallbackText = "",
+	) {}
 	invalidate(): void {}
 	handleNativeEvent(event: NativeUiEvent): void {
-		if (event.type === "toggle" && event.key === "") this.expanded = !event.collapsed;
-		else if (event.type === "toggle") {
+		if (event.type === "toggle" && event.key !== "") {
 			if (event.collapsed) this.expandedSections.delete(event.key);
 			else this.expandedSections.add(event.key);
 		}
 		else if (event.type === "action" && event.act.startsWith("hit:")) {
 			const n = Number(event.act.slice(4));
-			if (Number.isSafeInteger(n) && n >= 0 && n < MAX_HITS) this.hitIndex = n;
-		} else if (event.type === "action" && event.key === `matches-control-${this.model.current?.order}` &&
+			const d = this.display;
+			const count = d.kind === "search" ? d.hits.length : d.kind === "batch" ? d.symbols.reduce((sum, s) => sum + s.hits.length, 0) : 0;
+			if (Number.isSafeInteger(n) && n >= 0 && n < count) this.hitIndex = n;
+		} else if (event.type === "action" && event.key === "matches-control" &&
 			(event.act === "matches:more" || event.act === "matches:less")) {
 			this.matchesExpanded = event.act === "matches:more";
 		} else return;
@@ -230,7 +201,7 @@ export class SemctlInspector implements Component {
 		return out;
 	}
 	private sourceNodes(source: string, info: { path?: string; language?: string; start?: number; focus?: number; limit: number }, cx: DescribeContext): NativeNode[] {
-		// Keep the fixed composer widget bounded; the original MCP card owns full-source expansion.
+		// The host owns full-result expansion; keep only the selected source window here.
 		const lines = source.match(/[^\n]*\n|[^\n]+$/g) ?? [];
 		const focusIndex = info.start !== undefined && info.focus !== undefined ? info.focus - info.start : 0;
 		const offset = lines.length > info.limit
@@ -244,7 +215,7 @@ export class SemctlInspector implements Component {
 			k: "code", key: "source", p: { text: clean(shown), path: info.path, lang: info.language, start,
 				numbers: start !== undefined, wrap: false, marks: focus !== undefined ? [{ line: focus, tone: "accent" }] : undefined },
 		} : { k: "text", p: { text: clean(shown), wrap: "none" } }];
-		if (lines.length > info.limit) result.push(text(`${info.limit} of ${lines.length} lines · full source in transcript`, { tone: "muted" }));
+		if (lines.length > info.limit) result.push(text(`${info.limit} of ${lines.length} lines · expand tool for full result`, { tone: "muted" }));
 		return result;
 	}
 	private hitRows(d: Display, rows: Hit[], cx: DescribeContext): NativeNode[] {
@@ -265,66 +236,57 @@ export class SemctlInspector implements Component {
 		});
 	}
 	describe(cx: DescribeContext): NativeNode | null {
-		if (cx.cols < 36 || !(["card", "col", "row", "text"] as const).every(k => cx.supports(k))) return null;
-		const call = this.model.current;
-		if (!call) return null;
-		if (this.hitCall !== call.order) { this.hitCall = call.order; this.hitIndex = 0; this.matchesExpanded = false; }
+		if (cx.cols < 36 || !(["col", "row", "text"] as const).every(k => cx.supports(k))) {
+			return { k: "col", c: [...this.fallbackBody()] };
+		}
 		const children: NativeNode[] = [];
-		if (call.state === "running" || call.state === "pending") {
-			const running: NativeNode[] = [text(call.state === "pending" ? "Call requested · awaiting execution / result" : "Executing MCP call")];
-			if (call.state === "running" && cx.supports("spinner")) running.unshift({ k: "spinner", p: { style: "dots" } });
-			if (call.state === "running" && cx.supports("elapsed")) running.push({ k: "elapsed", p: { age: this.model.age(call), format: "short" } });
-			children.push({ k: "row", p: { gap: "sm" }, c: running });
-		}
-		if (call.note) children.push(text(call.note, { tone: call.state === "error" ? "error" : "muted" }));
-		const d = call.display;
-		if (d) {
-			if (d.kind === "search") children.push({ k: "text", key: "query", p: {
-				spans: [{ t: "Query: ", s: "muted" }, { t: d.query, s: "strong accent" }], lines: 2, wrap: "word", title: d.query,
-			} });
-			const id = d.identity;
-			const displayName = id.name ?? (id.localRoot !== null && path.isAbsolute(id.localRoot) ? path.basename(id.localRoot) || "checkout" : "Codebase");
-			children.push(text(`${id.copy} · ${displayName}`, { tone: "muted", title: `Codebase ID: ${id.codebaseId ?? "unbound"}\nCopy: ${id.copy}\nLocal root: ${id.localRoot ?? "none"}` }));
-			if (d.kind === "search" || d.kind === "batch") {
-				const rows = d.kind === "search" ? d.hits : d.symbols.flatMap(s => s.hits);
-				children.push(text(`${rows.length} matches`, { tone: "muted", title: "Relative match scores are query-relative, not confidence. Exact raw hybrid scores are available on each bar or dash." }));
-				// Native table cells are text/spans only: aligned native rows retain meters, score titles and source selection.
-				children.push({ k: "row", key: "columns", p: { gap: "sm", align: "center", wrap: false, tone: "muted" }, c: [
-					text("#", { min: { w: "3ch" }, max: { w: "3ch" }, shrink: 0, wrap: "none" }),
-					text("", { min: { w: "8ch" }, max: { w: "8ch" }, shrink: 0, wrap: "none", title: "Relative match score: query-relative, not confidence", aria: "Relative match score" }),
-					text("File:line", { grow: 3, basis: 0, min: { w: 0 }, wrap: "none", truncate: "end" }),
-					text("Symbol", { grow: 2, basis: 0, min: { w: 0 }, wrap: "none", truncate: "end" }),
-				] });
-				const rendered = this.hitRows(d, rows, cx);
-				const entries: NativeNode[] = [];
-				if (d.kind === "batch") {
-					let offset = 0;
-					for (const [index, s] of d.symbols.entries()) {
-						entries.push({ ...text(`${s.symbol} · ${s.hits.length ? `${s.hits.length} matches` : "no match"}`, { tone: "muted", wrap: "none", truncate: "end" }),
-							key: `${s.hits.length ? "batch-group" : "batch-miss"}-${index}` });
-						entries.push(...rendered.slice(offset, offset + s.hits.length)); offset += s.hits.length;
-					}
-				} else entries.push(...rendered);
-				const visible = this.matchesExpanded ? entries : entries.slice(0, 8);
-				// Do not leave a group heading alone when its first match is outside the compact window.
-				if (!this.matchesExpanded && visible.at(-1)?.key?.startsWith("batch-group-")) visible.pop();
-				children.push(...visible);
-				if (entries.length > visible.length || this.matchesExpanded) children.push({
-					...text(this.matchesExpanded ? "Show fewer matches" : `Show more matches (${entries.length - visible.length} more rows)`, {
-						tone: "accent", wrap: "none", actions: { click: this.matchesExpanded ? "matches:less" : "matches:more" },
-					}), key: `matches-control-${call.order}`,
-				});
-				const selected = rows[this.hitIndex] ?? rows[0];
-				if (selected) children.push(...this.preview(selected, cx));
-			} else if (d.kind === "source") {
-				children.push(text(`${d.path} · ${d.sourceOrigin} · bytes ${d.byteStart}–${d.byteEnd}/${d.fileSize}${d.truncated ? " · truncated" : ""}${d.binary ? " · binary" : ""}`, { title: `Content hash ${d.contentHash} · ${d.encoding}` }));
-				const numbered = d.lineStart !== null && d.lineStart > 0 && d.lineEnd !== null && lineCount(d.text) === d.lineEnd - d.lineStart + 1;
-				children.push(...this.sourceNodes(d.text, { path: d.path, language: d.language ?? undefined, start: numbered ? d.lineStart! : undefined, limit: 16 }, cx));
-			} else children.push(...this.status(d, cx));
-		}
-		// Keep the last control clear of Tern's floating context meter above the editor.
-		children.push(text("", { min: { h: "1lines" } }));
-		return { k: "card", p: { head: `semctl · ${call.operation}`, status: call.state, variant: "bare", collapsible: true, collapsed: !this.expanded, preview: { lines: 3 } }, c: children };
+		const d = this.display;
+		const id = d.identity;
+		const displayName = id.name ?? (id.localRoot !== null && path.isAbsolute(id.localRoot) ? path.basename(id.localRoot) || "checkout" : "Codebase");
+		const identity = text(`${id.copy} · ${displayName}`, { tone: "muted", title: `Codebase ID: ${id.codebaseId ?? "unbound"}\nCopy: ${id.copy}\nLocal root: ${id.localRoot ?? "none"}` });
+		if (d.kind === "search" && d.indexWarning) {
+			const props = { tone: "warning" as const, title: d.indexWarning, aria: `Index warning: ${d.indexWarning}` };
+			children.push({ k: "row", p: { gap: "sm", align: "center" }, c: [identity,
+				cx.supports("icon") ? { k: "icon", p: { name: "warn", ...props } } : text("Index warning", props),
+			] });
+		} else children.push(identity);
+		if (d.kind === "search" || d.kind === "batch") {
+			const rows = d.kind === "search" ? d.hits : d.symbols.flatMap(s => s.hits);
+			// Native table cells are text/spans only: rows retain meters, score titles and source selection.
+			children.push({ k: "row", key: "columns", p: { gap: "sm", align: "center", wrap: false, tone: "muted" }, c: [
+				text("#", { min: { w: "3ch" }, max: { w: "3ch" }, shrink: 0, wrap: "none" }),
+				text("", { min: { w: "8ch" }, max: { w: "8ch" }, shrink: 0, wrap: "none", title: "Relative match score: query-relative, not confidence", aria: "Relative match score" }),
+				text("File:line", { grow: 3, basis: 0, min: { w: 0 }, wrap: "none", truncate: "end" }),
+				text("Symbol", { grow: 2, basis: 0, min: { w: 0 }, wrap: "none", truncate: "end" }),
+			] });
+			const rendered = this.hitRows(d, rows, cx);
+			const entries: NativeNode[] = [];
+			if (d.kind === "batch") {
+				let offset = 0;
+				for (const [index, s] of d.symbols.entries()) {
+					entries.push({ ...text(`${s.symbol} · ${s.hits.length ? `${s.hits.length} matches` : "no match"}`, { tone: "muted", wrap: "none", truncate: "end" }),
+						key: `${s.hits.length ? "batch-group" : "batch-miss"}-${index}` });
+					entries.push(...rendered.slice(offset, offset + s.hits.length)); offset += s.hits.length;
+				}
+			} else entries.push(...rendered);
+			const visible = this.matchesExpanded ? entries : entries.slice(0, 8);
+			// Do not leave a group heading alone when its first match is outside the compact window.
+			if (!this.matchesExpanded && visible.at(-1)?.key?.startsWith("batch-group-")) visible.pop();
+			children.push(...visible);
+			if (entries.length > visible.length || this.matchesExpanded) children.push({
+				...text(this.matchesExpanded ? "Show fewer matches" : `Show more matches (${entries.length - visible.length} more rows)`, {
+					tone: "accent", wrap: "none", aria: this.matchesExpanded ? "Show fewer matches" : "Show more matches",
+					actions: { click: this.matchesExpanded ? "matches:less" : "matches:more" },
+				}), key: "matches-control",
+			});
+			const selected = rows[this.hitIndex] ?? rows[0];
+			if (selected) children.push(...this.preview(selected, cx));
+		} else if (d.kind === "source") {
+			children.push(text(`${d.path} · ${d.sourceOrigin} · bytes ${d.byteStart}–${d.byteEnd}/${d.fileSize}${d.truncated ? " · truncated" : ""}${d.binary ? " · binary" : ""}`, { title: `Content hash ${d.contentHash} · ${d.encoding}` }));
+			const numbered = d.lineStart !== null && d.lineStart > 0 && d.lineEnd !== null && lineCount(d.text) === d.lineEnd - d.lineStart + 1;
+			children.push(...this.sourceNodes(d.text, { path: d.path, language: d.language ?? undefined, start: numbered ? d.lineStart! : undefined, limit: 16 }, cx));
+		} else children.push(...this.status(d, cx));
+		return { k: "col", c: children };
 	}
 	private status(d: Status, cx: DescribeContext): NativeNode[] {
 		const out = [text("Index snapshot · not live progress", { tone: "muted" })];
@@ -342,110 +304,54 @@ export class SemctlInspector implements Component {
 		return out;
 	}
 	render(width: number): readonly string[] {
-		const c = this.model.current;
-		if (!c) return [];
-		const lines = [`semctl ${c.operation}: ${c.state}`, "Full result remains in transcript."];
-		const d = c.display;
-		if (this.expanded && d) {
-			if (d.kind === "search") lines.push(`Search: ${d.hits.length} matches.`);
-			else if (d.kind === "batch") {
-				const matches = d.symbols.reduce((total, symbol) => total + symbol.hits.length, 0);
-				const misses = d.symbols.filter(symbol => symbol.hits.length === 0).length;
-				lines.push(`Batch: ${d.symbols.length} symbols, ${matches} matches, ${misses} misses.`);
-			} else if (d.kind === "source") {
-				lines.push(`Source bytes: ${d.byteStart}-${d.byteEnd}/${d.fileSize}${d.truncated ? " (truncated)" : ""}.`);
-			} else lines.push(d.catalog ? `Status snapshot: ${d.catalog.files} catalog files.` : "Status snapshot: catalog count unknown.");
-		}
-		return lines.map(line => line.slice(0, Math.max(0, Math.floor(width))));
+		return clean(this.fallbackText).split(/\r?\n/).map(line => line.slice(0, Math.max(0, Math.floor(width))));
 	}
 }
 
-function route(pi: ExtensionAPI, toolName: string, input: Record<string, unknown>): { operation: string; target: string } | undefined {
-	const target = toolName === "write" && typeof input.path === "string" && /^xd:\/\/[a-z0-9_]+$/.test(input.path)
-		? input.path.slice("xd://".length) : toolName;
-	if (!pi.getAllTools().some(t => t.name === target)) return undefined;
-	for (const prefix of Object.values(SERVERS).sort((a, b) => b.length - a.length)) {
-		if (target.startsWith(prefix)) {
-			const operation = target.slice(prefix.length);
-			if (/^[a-z][a-z0-9_]*$/.test(operation)) return { operation, target };
-		}
-	}
-	return undefined;
+/** One renderer instance belongs to one native tool card, including xd:// calls. */
+export function createInspectorRenderer(server: string, operation: string): ToolRendererFactory {
+	return ({ requestRender, fallback }) => {
+		let view: SemctlInspector | undefined;
+		return {
+			...fallback,
+			mergeCallAndResult: true,
+			describeCall(args, options) {
+				const original = fallback.describeCall?.(args, options);
+				if (operation !== "search_codebase" || !object(args) || typeof args.query !== "string") return original;
+				return { ...original, tool: { ...original?.tool, title: `${server}/${operation}`, target: clean(args.query), targetKind: "text" } };
+			},
+			describeResult(result, options, args) {
+				const details = result.details;
+				const display = !result.isError && object(details) && details.isError !== true &&
+					details.serverName === server && details.mcpToolName === operation && object(details.mcpMeta)
+					? readDisplay(details.mcpMeta.semctlDisplay, operation) : undefined;
+				if (!display || options.expanded || options.isPartial || options.cancelled) {
+					return fallback.describeResult?.(result, options, args);
+				}
+				if (view?.display !== display) {
+					view = new SemctlInspector(display, requestRender,
+						() => fallback.describeResult?.(result, options, args)?.body ?? [],
+						result.content.filter(block => block.type === "text").map(block => block.text ?? "").join("\n\n"));
+				}
+				const count = display.kind === "search" ? display.hits.length :
+					display.kind === "batch" ? display.symbols.reduce((sum, s) => sum + s.hits.length, 0) : undefined;
+				return {
+					tool: { title: `${server}/${operation}`, target: display.kind === "search" ? clean(display.query) : display.kind === "source" ? display.path : undefined,
+						targetKind: display.kind === "source" ? "path" : "text", meta: count === undefined ? undefined : [`${count} matches`] },
+					body: [view],
+					preview: "children",
+				};
+			},
+		};
+	};
 }
 
-/** Side-effect-only observer: no tool result, context, approval or transport replacement. */
-export function installInspector(pi: ExtensionAPI): (ctx: ExtensionContext) => void {
-	const model = new InspectorModel();
-	// Keep in-flight authority independently of the current result, including across resets.
-	const authority = new Map<string, { target: string; toolName: string; retired: boolean; executing: boolean }>();
-	let saturated = false;
-	let mounted = false;
-	let requestRender: (() => void) | undefined;
-	const refresh = (ctx: ExtensionContext) => {
-		if (!ctx.hasUI) return;
-		if (!mounted) {
-			mounted = true;
-			ctx.ui.setWidget(WIDGET_KEY, tui => {
-				requestRender = () => tui.requestRender();
-				return new SemctlInspector(model, requestRender);
-			}, { placement: "aboveEditor" });
+/** Older hosts keep their normal MCP cards; never mount a replacement result widget. */
+export function installInspector(pi: ExtensionAPI): void {
+	if (typeof pi.registerToolRenderer !== "function") return;
+	for (const [server, prefix] of Object.entries(SERVERS)) {
+		for (const operation of Object.keys(OPERATIONS)) {
+			pi.registerToolRenderer(`${prefix}${operation}`, createInspectorRenderer(server, operation));
 		}
-		requestRender?.();
-	};
-	const reset = (ctx: ExtensionContext) => {
-		model.reset();
-		for (const call of authority.values()) call.retired = true;
-		mounted = false; requestRender = undefined;
-		if (ctx.hasUI) ctx.ui.setWidget(WIDGET_KEY, undefined);
-	};
-	const finish = (id: string, toolName: string, details: unknown, isError: boolean, ctx: ExtensionContext, terminal = false) => {
-		const owner = authority.get(id);
-		if (!owner || owner.toolName !== toolName) return;
-		const call = model.current;
-		if (!saturated && !owner.retired && call?.id === id && call.toolName === toolName && (call.state === "pending" || call.state === "running")) {
-			let detail = details;
-			let wrapperMatches = toolName !== "write";
-			if (toolName === "write" && object(details) && object(details.xdev)) {
-				const xdev = details.xdev;
-				wrapperMatches = xdev.mode === "execute" && xdev.tool === owner.target;
-				detail = xdev.inner;
-			}
-			const origin = wrapperMatches && object(detail) && typeof detail.serverName === "string" && Object.hasOwn(SERVERS, detail.serverName) &&
-				detail.mcpToolName === call.operation && owner.target === `${SERVERS[detail.serverName]}${call.operation}`;
-			const display = origin && object(detail) && object(detail.mcpMeta) ? readDisplay(detail.mcpMeta.semctlDisplay, call.operation) : undefined;
-			const failed = isError || (object(detail) && detail.isError === true);
-			model.finish(id, display, failed, failed ? "MCP call failed; see the original error in the transcript." : origin ? undefined : "Unrecognized MCP origin; original result remains in transcript.");
-			refresh(ctx);
-		}
-		// Loop calls terminate at execution_end; bridged calls have only their outer result.
-		if (terminal || !owner.executing) authority.delete(id);
-	};
-	pi.on("tool_call", (event: ToolCallEvent, ctx) => {
-		const found = route(pi, event.toolName, event.input);
-		if (!found || !ctx.hasUI || saturated || authority.has(event.toolCallId)) return;
-		if (authority.size >= MAX_INFLIGHT) {
-			// An untracked in-flight ID cannot safely become a nested start after reset.
-			// Stay closed for this observer instance rather than discard authority or grow without bound.
-			saturated = true; reset(ctx); return;
-		}
-		authority.set(event.toolCallId, { target: found.target, toolName: event.toolName, retired: false, executing: false });
-		model.start(event.toolCallId, event.toolName, found.operation);
-		refresh(ctx);
-	});
-	pi.on("tool_execution_start", (event, ctx) => {
-		const owner = authority.get(event.toolCallId);
-		if (!owner || owner.toolName !== event.toolName) return;
-		owner.executing = true;
-		if (!saturated && !owner.retired) { model.running(event.toolCallId); if (model.current?.id === event.toolCallId) refresh(ctx); }
-	});
-	pi.on("tool_result", (event: ToolResultEvent, ctx) => { finish(event.toolCallId, event.toolName, event.details, event.isError, ctx); });
-	pi.on("tool_execution_end", (event, ctx) => {
-		finish(event.toolCallId, event.toolName, object(event.result) ? event.result.details : undefined, event.isError, ctx, true);
-	});
-	pi.on("agent_end", (_event, ctx) => {
-		model.cancel();
-		for (const call of authority.values()) call.retired = true;
-		if (!saturated && model.current) refresh(ctx);
-	});
-	return reset;
+	}
 }

@@ -390,6 +390,8 @@ describe("semctx OMP extension", () => {
 
 function makeHookProcess(options: {
 	stdinFailure?: "write" | "end";
+	writeResult?: Promise<number>;
+	endResult?: Promise<number>;
 	readFailure?: boolean;
 	killFailure?: boolean;
 } = {}) {
@@ -404,11 +406,11 @@ function makeHookProcess(options: {
 			write(data) {
 				if (options.stdinFailure === "write") throw new Error("stdin write failed");
 				written += data;
-				return data.length;
+				return options.writeResult ?? data.length;
 			},
 			end() {
 				if (options.stdinFailure === "end") throw new Error("stdin end failed");
-				return 0;
+				return options.endResult ?? 0;
 			},
 		},
 		stdout: new ReadableStream<Uint8Array>({
@@ -477,6 +479,31 @@ function makeHookProcess(options: {
 }
 
 describe("hook subprocess lifecycle", () => {
+	for (const phase of ["writeResult", "endResult"] as const) {
+		test(`rejects failed asynchronous stdin ${phase} even after successful output and exit`, async () => {
+			const pending = Promise.withResolvers<number>();
+			const process = makeHookProcess({ [phase]: pending.promise });
+			const result = process.invoke();
+			process.writeOutput(JSON.stringify({ hookSpecificOutput: { additionalContext: "incomplete input" } }));
+			process.exit.resolve(0);
+			pending.reject(new Error("asynchronous stdin failure"));
+			expect(await result).toBeUndefined();
+			expect(process.killed).toBe(1);
+			expect(process.timers.size).toBe(0);
+		});
+		test(`cancels an unresolved asynchronous stdin ${phase}`, async () => {
+			const pending = Promise.withResolvers<number>();
+			const process = makeHookProcess({ [phase]: pending.promise });
+			const result = process.invoke();
+			process.writeOutput(JSON.stringify({ hookSpecificOutput: { additionalContext: "pending input" } }));
+			process.exit.resolve(0);
+			process.timeout();
+			expect(await result).toBeUndefined();
+			expect(process.killed).toBe(1);
+			expect(process.timers.size).toBe(0);
+			pending.resolve(0);
+		});
+	}
 	for (const stdinFailure of ["write", "end"] as const) {
 		test(`kills the child when stdin ${stdinFailure} fails`, async () => {
 			const process = makeHookProcess({ stdinFailure });

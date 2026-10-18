@@ -5,6 +5,9 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{ChildStdin, ChildStdout, Command};
 
+#[path = "support/mcp.rs"]
+mod mcp;
+
 async fn send(stdin: &mut ChildStdin, message: Value) {
     let mut bytes = serde_json::to_vec(&message).expect("serialize MCP message");
     bytes.push(b'\n');
@@ -12,12 +15,9 @@ async fn send(stdin: &mut ChildStdin, message: Value) {
 }
 
 async fn receive(stdout: &mut Lines<BufReader<ChildStdout>>) -> Value {
-    let line = tokio::time::timeout(Duration::from_secs(10), stdout.next_line())
+    mcp::response(stdout, Duration::from_secs(10), "MCP response timed out")
         .await
-        .expect("MCP response timed out")
-        .expect("read MCP response")
-        .expect("MCP server closed stdout before responding");
-    serde_json::from_str(&line).expect("parse MCP response")
+        .1
 }
 
 #[tokio::test]

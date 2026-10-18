@@ -2,6 +2,7 @@ import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { createSemctlHookInvoker } from "./hook-process";
 import { installInspector } from "./inspector";
+import { installSyncStatus } from "./status";
 
 export { extractAdditionalContext } from "./hook-process";
 
@@ -27,7 +28,9 @@ const ROOT_ALIAS = /^[\\/]+$/;
 
 type SessionSource = "startup" | "resume" | "clear" | "compact";
 type HookEventName = "SessionStart" | "UserPromptSubmit" | "PreToolUse";
-type HookContext = Pick<ExtensionContext, "cwd" | "sessionManager" | "setTimeout" | "clearTimer">;
+type HookContext = Pick<ExtensionContext, "cwd"> & {
+	sessionManager: Pick<ExtensionContext["sessionManager"], "getSessionId">;
+};
 type OmpMcpTools = "native" | "marketplace" | "unavailable";
 
 export interface SemctlHookInput {
@@ -85,13 +88,17 @@ const CONTENT_SEARCH_PATTERN: Record<string, string> = {
 	find: "query",
 };
 
+const isObject = (input: unknown): input is Record<string, unknown> =>
+	input !== null && typeof input === "object" && !Array.isArray(input);
+
 /**
  * Map an OMP tool call onto the wire contract. OMP input shapes differ from
  * Claude's: `glob` carries its pattern in `path`, `grep` accepts a line
  * selector on one file, and `bash` can run in its own `cwd`. A search of
  * internal or web URLs is not repository discovery, so it is not sent.
  */
-function hookToolCall(toolName: string, input: Record<string, unknown>, cwd: string): HookToolCall | undefined {
+function hookToolCall(toolName: string, input: unknown, cwd: string): HookToolCall | undefined {
+	if (!isObject(input)) return undefined;
 	if (toolName.startsWith(OMP_SEMCTX_TOOL_PREFIX)) return { tool_name: toolName, tool_input: input, cwd };
 	const patternField = CONTENT_SEARCH_PATTERN[toolName];
 	if (patternField !== undefined) {
@@ -154,14 +161,13 @@ export function createSemctxExtension(invoker: HookInvoker = createSemctlHookInv
 				return undefined;
 			}
 		};
-		const resetTurnState = (ctx: ExtensionContext) => {
+		const resetTurnState = () => {
 			sessionGeneration += 1;
 			activePromptId = "";
 			preparingPrompt = undefined;
-			resetInspector(ctx);
 		};
 		const sendOrientation = async (source: SessionSource, ctx: ExtensionContext) => {
-			resetTurnState(ctx);
+			resetTurnState();
 			const generation = sessionGeneration;
 			const context = await safeInvoke(
 				{
@@ -235,11 +241,12 @@ export function createSemctxExtension(invoker: HookInvoker = createSemctlHookInv
 				? undefined
 				: { additionalContext: context };
 		});
-		pi.on("session_shutdown", (_event, ctx) => {
-			resetTurnState(ctx);
+		pi.on("session_shutdown", () => {
+			resetTurnState();
 			invoker.shutdown();
 		});
-		const resetInspector = installInspector(pi);
+		installInspector(pi);
+		installSyncStatus(pi);
 	};
 }
 

@@ -106,6 +106,7 @@ impl ReconcileLoop {
                 retry = RetryBackoff::default();
             }
             coordinator.run.lock().await.retry_at = retry.deadline;
+            coordinator.progress.notify_status();
             // A rule can select another directory. Subscribe after each run.
             if watching {
                 refresh_external_watches(&coordinator).await;

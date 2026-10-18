@@ -379,11 +379,18 @@ fn uploading(uploaded_files: usize, total_files: usize) -> SyncProgress {
     }
 }
 
-/// Poll the coordinator's status until its sync progress is `expected`.
+/// Wait for a published progress change, without polling the coordinator.
 async fn wait_for_progress(coordinator: &CheckoutCoordinator, expected: Option<SyncProgress>) {
+    let mut changes = coordinator.subscribe_status();
     tokio::time::timeout(Duration::from_secs(5), async {
-        while coordinator.status().await.sync_progress != expected {
-            tokio::task::yield_now().await;
+        loop {
+            if coordinator.status().await.sync_progress == expected {
+                return;
+            }
+            changes
+                .changed()
+                .await
+                .expect("the coordinator owns its publisher");
         }
     })
     .await
@@ -412,6 +419,7 @@ async fn status_shows_the_running_reconciles_progress_until_it_ends() {
 
     runs.release(1);
     wait_for_progress(&coordinator, None).await;
+    assert!(!coordinator.status().await.running);
     assert!(
         coordinator
             .status()
@@ -427,26 +435,40 @@ async fn status_shows_the_running_reconciles_progress_until_it_ends() {
 async fn a_failed_reconcile_clears_its_progress() {
     let (reconciler, mut runs) = CountingReconciler::reporting(uploading(3, 10), Some("boom"));
     let (coordinator, task) = coordinator(reconciler).await;
+    coordinator
+        .record(
+            Trigger::Startup,
+            &Ok(SyncOutcome {
+                codebase_id: "codebase".into(),
+                job_id: "previous-success".into(),
+                uploaded: 1,
+                to_delete: 0,
+                failed: Vec::new(),
+            }),
+        )
+        .await;
     task.spawn();
 
     coordinator.trigger(Trigger::Explicit);
     runs.next_start().await;
     wait_for_progress(&coordinator, Some(uploading(3, 10))).await;
+    let mut changes = coordinator.subscribe_status();
+    let recording = coordinator.run.lock().await;
     runs.release(1);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), changes.changed())
+            .await
+            .is_err(),
+        "clearing progress must wait until this attempt's outcome is recorded",
+    );
+    drop(recording);
 
-    // The error is recorded after the progress is cleared, so the status that
-    // shows the error must show no progress.
-    let status = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let status = coordinator.status().await;
-            if status.last_error.is_some() {
-                return status;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("a failed run records its error");
+    // The first cleared milestone must already carry this attempt's error,
+    // even though the retained server job belongs to an earlier success.
+    wait_for_progress(&coordinator, None).await;
+    let status = coordinator.status().await;
+    assert!(!status.running);
+    assert_eq!(status.last_job_id.as_deref(), Some("previous-success"));
     assert_eq!(status.last_error.as_deref(), Some("boom"));
     assert_eq!(status.sync_progress, None);
 }
@@ -465,6 +487,7 @@ async fn a_cancelled_reconcile_clears_its_progress() {
     coordinator.cancel();
 
     wait_for_progress(&coordinator, None).await;
+    assert!(!coordinator.status().await.running);
 }
 
 /// The daemon status crosses the process boundary. A daemon that predates the

@@ -10,7 +10,7 @@ use rmcp::{
         CallToolRequestParams, CallToolResult, Implementation, IntoContents, ListToolsResult, Meta,
         ServerCapabilities, ServerInfo, Tool,
     },
-    service::RequestContext,
+    service::{NotificationContext, RequestContext},
     tool, tool_handler, tool_router,
 };
 use tokio::time::Instant;
@@ -108,13 +108,16 @@ impl McpServer {
         .await?;
         drop(indexes);
         // The launch checkout's watcher does not describe a broader search.
-        if opts.scope.is_none()
-            && opts.codebase_ids.is_empty()
-            && let Some(footer) = self.index_freshness(&client, &budget).await
-        {
+        let warning = if opts.scope.is_none() && opts.codebase_ids.is_empty() {
+            self.index_freshness(&client, &budget).await
+        } else {
+            None
+        };
+        if let Some(footer) = &warning {
             out.text.push_str("\n\n");
-            out.text.push_str(&footer);
+            out.text.push_str(footer);
         }
+        out.set_index_warning(warning);
         // One-shot ride-along fallback when a newer CLI is published. The
         // SessionStart hook is the primary user-facing notice; consuming this
         // note prevents repeated search results from spending tokens on it.
@@ -790,6 +793,10 @@ impl McpServer {
 
 #[tool_handler]
 impl ServerHandler for McpServer {
+    async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
+        self.shared.sync_notifications.start(context.peer).await;
+    }
+
     // Defining `list_tools` and `get_tool` here makes `#[tool_handler]` skip its
     // generated versions (it checks `has_method`), so the Markdown descriptions
     // reach the host. `call_tool` is defined here for the same reason: it gives

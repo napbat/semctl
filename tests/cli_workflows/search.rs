@@ -3,7 +3,7 @@ use std::{fs, process::Stdio, time::Duration};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-use super::{Checkout, Request, Server};
+use super::{Checkout, Request, Server, mcp};
 
 fn search_hit(codebase: Option<&str>) -> Value {
     json!({
@@ -194,12 +194,12 @@ async fn mcp_scoped_search_works_from_an_unindexed_directory() {
         let Some(id) = message.get("id") else {
             continue;
         };
-        let line = tokio::time::timeout(Duration::from_secs(10), stdout.next_line())
-            .await
-            .expect("MCP scoped search timed out")
-            .unwrap()
-            .expect("MCP server closed stdout");
-        let response: Value = serde_json::from_str(&line).unwrap();
+        let (_, response) = mcp::response(
+            &mut stdout,
+            Duration::from_secs(10),
+            "MCP scoped search timed out",
+        )
+        .await;
         assert_eq!(&response["id"], id, "{response}");
         if id == 1 {
             assert!(response["result"]["capabilities"]["tools"].is_object());

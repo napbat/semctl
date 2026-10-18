@@ -74,76 +74,92 @@ freshness. Tool names and argument schemas stay stable. Failed operations set
 
 ### OMP native inspector
 
-The semctl adapter adds one replace-in-place native inspector above the editor
-through OMP's existing public extension APIs. This is semctl plugin code, not an
-OMP modification or a replacement MCP tool. The original MCP result stays in the
-transcript, including its text, errors, approvals, and cancellation behavior.
-OMP still controls its built-in MCP cards and output-size limits.
+The adapter renders `search_codebase`, `read_source`, `batch_lookup`, and
+`sync_status` inside their original OMP tool cards. Calls and results stay in the
+normal transcript, including calls routed through `xd://`. There is no
+above-editor result widget, second history, or replacement MCP tool. Each card
+owns its selection and expansion state; concurrent calls cannot replace one
+another's results.
 
-Search results in that original transcript put the exact query above a compact
-ranked table, without per-match Markdown headings or a separate weak-match
-section. Source previews, raw scores, copy/domain identity and verification
-diagnostics remain below the table. Text score bars use the same nonnegative,
-query-relative scale as the native inspector; an unavailable scale stays unknown.
+Inline presentation requires the rendering-only `registerToolRenderer` extension
+API. The adapter feature-detects it; hosts without it retain their native MCP
+cards rather than installing a floating-widget fallback. OMP owns execution,
+schemas, approvals, cancellation, status glyphs, elapsed time, and full-result
+expansion. The original MCP text and result details are unchanged.
+
+Plain-text search results put the exact query above a compact ranked table,
+without per-match Markdown headings or a separate weak-match section. Source
+previews, raw scores, copy/domain identity, and verification diagnostics remain
+below the table. Text score bars use the same nonnegative, query-relative scale
+as the native renderer; an unavailable scale stays unknown.
 
 Replacing the MCP executable does not reload an already-running OMP extension.
 OMP 18.12.1's `/restart` relaunches the process and resumes the saved conversation,
-which loads the updated adapter. Session-history reload, `/reload-plugins` and
+which loads the updated adapter. Session-history reload, `/reload-plugins`, and
 `/mcp reload` do not re-evaluate extension modules. Finish or preserve active work
-before restarting, and verify the new live surface rather than only its install path.
+before restarting, and verify the loaded backend and live surface, not just
+configured paths. Stock hosts need the rendering API before inline presentation
+can activate.
 
-The inspector consumes versioned, typed `_meta.semctlDisplay` data. It does not
-parse Markdown or use `structuredContent` to add display data to model context.
-The payload is limited to 32 KiB and at most 32 total hits per call. Overflow
-omits the display payload instead of silently showing a partial result; the
-original result remains available. The widget retains only the latest requested
-call, without a numbered history or result tabs. Earlier results remain in the
-original transcript. It supports display payloads from `search_codebase`,
-`read_source`, `batch_lookup`, and `sync_status`; other semctl calls replace the
-current view with an unavailable notice.
-Display data reuses source evidence already fetched by the query. The inspector
-does not fetch more source, combine calls automatically, or establish token
-savings.
+The renderer consumes versioned, typed `_meta.semctlDisplay` data, not parsed
+Markdown or model-facing `structuredContent`. The payload is limited to 32 KiB
+and at most 32 total hits per call. Overflow omits the payload rather than
+silently showing a partial result. Search metadata includes the nullable
+`indexWarning`; compact results retain a warning icon with the original
+freshness diagnostic on hover. A missing or malformed warning field falls back
+to the complete native result, so older producer metadata cannot hide a warning.
+Missing/invalid metadata, wrong origins, errors, partial results, and
+cancellation also retain native rendering.
 
-In-flight call authority is tracked separately, including across resets. The
-observer closes after 64 unfinished calls rather than forget an old call's
-identity or grow without bound; a fresh host restores it. This affects only the
-inspector, not MCP execution or the original transcript.
+The exact query appears in the native call header. Match rows align rank,
+unlabeled relative-score bars, file/location, and symbol columns. The public
+native table API accepts text cells, not embedded meters, per-cell actions, or
+row selection; composed rows preserve those interactions without a dashboard
+border or fill. Show-more controls reveal additional rows. Below 36 columns or
+without the required native primitives, the original native result body is used.
+ANSI and noninteractive output retain the original renderer.
 
-The exact search query appears above the matches, with a two-line preview and
-the complete query on hover. Match rows align rank, unlabeled relative-score
-bars, file/location, and symbol columns. This is not a `TspTable` with embedded meters.
-The public table API accepts text cells; it does not expose meter nodes,
-per-cell titles/actions, or per-row selection. Composed rows retain native
-meters, score titles, and source selection without a dashboard border or fill.
-At widths below 36 columns or without native nodes, the inspector shows a compact
-ASCII lifecycle/count summary; complete results remain in the MCP transcript.
+Score bars are query-relative, not confidence; hover exposes exact values.
+Verification icons distinguish bound, changed-local, range-mismatch, and
+unverified/not-probed states. Their hover retains the reason and the
+byte/coordinate-only scope; semantic symbol/focus identity is not verified.
+A compact state label replaces the icon when icons are unavailable. Batch
+results retain caller order and misses; batch source locations are not probed
+for verification. Source opening requires a bound path inside the selected
+checkout for the same codebase. Numbering uses supplied valid coordinates;
+indexed focus marks require bound source and a focus inside the displayed window.
+Each card previews at most 12 search-source lines or 16 `read_source` lines and
+states when more exist. Native full-result expansion preserves all returned
+bytes; returning to compact view retains selection. Presentation makes no
+additional source requests, automatically combined calls, or token-saving claim.
 
-Score bars are query-relative, not confidence; hover exposes their exact values.
-Native verification icons
-distinguish bound, changed-local, range-mismatch, and unverified/not-probed
-states. Their title/hover retains the precise reason and the byte/coordinate-only
-scope; semantic symbol/focus identity is not verified. A compact state label
-replaces the icon when native icons are unavailable. Batch results retain
-caller order and misses; batch source locations are not probed for verification.
-Native source opening requires a bound path inside the selected checkout for the
-same codebase. Source numbering uses supplied valid coordinates. Indexed focus
-marks require bound source and a focus inside the displayed window.
-The fixed inspector previews at most 12 search-source lines or 16 `read_source`
-lines and states when more exist. The original MCP card owns full-source
-expansion and preserves the complete returned bytes. There is no second source
-expander in the composer widget.
-Status uses the supplied snapshot and named counters, not a server-plan
-percentage. Spinner and elapsed time follow actual execution events, not
-background indexing estimates. Noninteractive contexts do not show the widget.
-Missing or invalid metadata and errors replace the current view. Cancellation
-finalizes the current call, and late results cannot replace a newer request.
-Session resets remove the widget. A plain rendering fallback remains available.
+Nested Eval calls currently retain OMP's native trace presentation, not these
+custom result cards. Eval stores summaries rather than canonical child result
+metadata. A separate follow-up needs a bounded, per-run presentation contract at
+`eval/js/context-manager.ts` / `tool-bridge.ts`, with explicit persistence for
+restored cards, errors and cancellation. Do not infer parentage from whichever
+Eval is active, parse scripts, or restore an above-editor result widget. Direct
+`batch_lookup` and parallel MCP calls already use the normal-feed renderers.
 
-Native layout, theme glyphs, hover details, expansion, narrow widths, and
-cancellation/reset behavior require acceptance in the actual OMP/Tern host.
-Source-level support alone does not establish that runtime acceptance.
-MCP stdout remains JSON-RPC, never terminal escape sequences or Tern
+### OMP layout sync indicator
+
+A separate `setStatus` indicator reports producer-backed coordinator snapshots
+from `notifications/semctl/sync_status`. The version-1 notification carries the
+existing coordinator status, an initial reset, or a detached-root reset. It does
+not introduce another indexing state machine, polling timer, or progress owner.
+The deepest observed checkout containing the session directory supplies the
+indicator; unrelated checkouts do not replace it. Upload counts appear only when
+the producer supplies valid completed/total counts. No percentage is invented.
+
+Idle `watching` describes the observed watcher, not graph freshness or a completed
+index. Search freshness warnings and `sync_status` remain separate evidence.
+Session shutdown and connection resets clear observed status. An abrupt transport
+loss cannot deliver a reset; its last snapshot may remain until reconnect or
+session shutdown. The indicator does not establish transport liveness.
+
+Native layout, hover details, expansion, narrow widths, and lifecycle behavior
+need acceptance in the actual OMP/Tern host. Source support alone is not runtime
+acceptance. MCP stdout remains JSON-RPC, never ANSI escapes or Tern
 surface-protocol commands.
 
 Do not manually copy shared skills; when a host requires a projected format,

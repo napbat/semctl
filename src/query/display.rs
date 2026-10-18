@@ -32,6 +32,20 @@ impl QueryOutput {
     pub(super) fn new(text: String, display: Option<Value>) -> Self {
         Self { text, display }
     }
+
+    /// Finalize search freshness after the query without bypassing the display cap.
+    pub(crate) fn set_index_warning(&mut self, warning: Option<String>) {
+        if let Some(mut display) = self.display.take() {
+            display["indexWarning"] = warning.map_or(Value::Null, Value::String);
+            let mut limit = BoundedWriter {
+                inner: io::sink(),
+                written: 0,
+            };
+            if serde_json::to_writer(&mut limit, &display).is_ok() {
+                self.display = Some(display);
+            }
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -222,27 +236,34 @@ struct Job<'a> {
     completed_at: Option<&'a str>,
 }
 
-/// Stop serialization at the cap rather than allocating an oversized JSON copy.
-struct BoundedBytes(Vec<u8>);
+/// Enforce the same encoded-byte cap during construction and late metadata additions.
+struct BoundedWriter<W> {
+    inner: W,
+    written: usize,
+}
 
-impl Write for BoundedBytes {
+impl<W: Write> Write for BoundedWriter<W> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if bytes.len() > MAX_DISPLAY_BYTES.saturating_sub(self.0.len()) {
+        if bytes.len() > MAX_DISPLAY_BYTES.saturating_sub(self.written) {
             return Err(io::Error::other("display exceeds byte limit"));
         }
-        self.0.extend_from_slice(bytes);
-        Ok(bytes.len())
+        let written = self.inner.write(bytes)?;
+        self.written += written;
+        Ok(written)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        self.inner.flush()
     }
 }
 
 fn bounded(display: &Display<'_>) -> Option<Value> {
-    let mut bytes = BoundedBytes(Vec::new());
+    let mut bytes = BoundedWriter {
+        inner: Vec::new(),
+        written: 0,
+    };
     serde_json::to_writer(&mut bytes, display).ok()?;
-    serde_json::from_slice(&bytes.0).ok()
+    serde_json::from_slice(&bytes.inner).ok()
 }
 
 pub(super) fn search(
@@ -482,6 +503,38 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn late_index_warning_obeys_the_encoded_cap_without_losing_native_text() {
+        let client = Client::for_test("A", None);
+        let scope = HitContext::search(None, Some("A"), true);
+        let warning = "stale \"snapshot\"\n雪";
+        let mut empty = QueryOutput::new(String::new(), search(&client, "", &[], &[], scope));
+        empty.set_index_warning(Some(warning.into()));
+        let overhead = serde_json::to_vec(empty.display.as_ref().unwrap())
+            .unwrap()
+            .len();
+        for extra in [0, 1] {
+            let query = "x".repeat(MAX_DISPLAY_BYTES - overhead + extra);
+            let mut output = QueryOutput::new(
+                "complete native result".into(),
+                search(&client, &query, &[], &[], scope),
+            );
+            assert!(output.display.is_some());
+            output.set_index_warning(Some(warning.into()));
+            if extra == 0 {
+                let display = output.display.as_ref().unwrap();
+                assert_eq!(display["indexWarning"], warning);
+                assert_eq!(
+                    serde_json::to_vec(display).unwrap().len(),
+                    MAX_DISPLAY_BYTES
+                );
+            } else {
+                assert!(output.display.is_none());
+            }
+            assert_eq!(output.text, "complete native result");
+        }
     }
 
     #[test]

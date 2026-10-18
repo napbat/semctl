@@ -1,11 +1,12 @@
+import type { ReadableStream, ReadableStreamDefaultReader } from "node:stream/web";
 import type { HookInvoker } from "./index";
 
 const MAX_HOOK_OUTPUT_BYTES = 64 * 1024;
 
 export interface HookChild {
 	stdin: {
-		write(data: string): number;
-		end(): number;
+		write(data: string): number | Promise<number>;
+		end(): number | Promise<number>;
 	};
 	stdout: ReadableStream<Uint8Array>;
 	exited: Promise<number>;
@@ -105,11 +106,13 @@ export function createSemctlHookInvoker(processRuntime: HookProcessRuntime = run
 				void child.exited.catch(() => {});
 				cancellations.add(cancel);
 				cancelTimeout = processRuntime.scheduleTimeout(cancel, timeoutMs);
-				child.stdin.write(JSON.stringify(input));
-				child.stdin.end();
+				const stdin = child.stdin;
+				const written = Promise.resolve(stdin.write(JSON.stringify(input))).then(() => {
+					if (!cancelled) return stdin.end();
+				});
 				reader = child.stdout.getReader();
 				const result = await Promise.race([
-					Promise.all([readBounded(reader), child.exited]),
+					Promise.all([readBounded(reader), child.exited, written]),
 					cancellation,
 				]);
 				if (cancelled || result === undefined) return undefined;

@@ -56,7 +56,7 @@ mod progress;
 mod reconcile_loop;
 mod status;
 
-use progress::ProgressSlot;
+pub(crate) use progress::ProgressSlot;
 use reconcile_loop::ReconcileLoop;
 pub(crate) use status::CoordinatorStatus;
 
@@ -198,7 +198,6 @@ enum Watch {
 /// What the last reconcile did.
 #[derive(Default)]
 struct RunState {
-    running: bool,
     retry_at: Option<tokio::time::Instant>,
     last_outcome: Option<String>,
     last_error: Option<String>,
@@ -271,6 +270,10 @@ impl CheckoutCoordinator {
                 Watch::Unavailable(reason)
             }
         };
+        let progress = Arc::new(ProgressSlot::new());
+        if let Some(gate) = &setup.gate {
+            gate.observe_status(&progress);
+        }
         let coordinator = Arc::new(Self {
             key: setup.key,
             root,
@@ -287,7 +290,7 @@ impl CheckoutCoordinator {
             immediate_overflow: Arc::new(AtomicBool::new(false)),
             overflow_ready: Arc::new(Notify::new()),
             run: Mutex::new(RunState::default()),
-            progress: Arc::new(ProgressSlot::new()),
+            progress,
             leases: AtomicUsize::new(0),
             released_at: StdMutex::new(None),
             task: StdMutex::new(None),
@@ -340,6 +343,7 @@ impl CheckoutCoordinator {
             }
             self.overflow_ready.notify_one();
         }
+        self.progress.notify_status();
     }
 
     /// The gate an `index_codebase` caller waits on.
@@ -356,8 +360,10 @@ impl CheckoutCoordinator {
             return gate.clone();
         }
         let gate = Arc::new(InitialIndexGate::pending());
+        gate.observe_status(&self.progress);
         *slot = Some(gate.clone());
         drop(slot);
+        self.progress.notify_status();
         self.trigger(Trigger::Startup);
         gate
     }
@@ -365,6 +371,12 @@ impl CheckoutCoordinator {
     /// The gate of a first index in progress, completed, or failed here.
     pub(crate) async fn gate(&self) -> Option<Arc<InitialIndexGate>> {
         self.gate.lock().await.clone()
+    }
+
+    pub(crate) fn subscribe_status(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<sync::SyncProgress>> {
+        self.progress.subscribe()
     }
 
     pub(crate) fn watcher_state(&self) -> WatcherState {
@@ -396,7 +408,7 @@ impl CheckoutCoordinator {
             leases: self.leases.load(Ordering::Acquire),
             watcher: self.watcher_state(),
             last_job_id,
-            running: run.running,
+            running: self.progress.running(),
             first_index,
             sync_progress: self.progress.latest(),
             pending_triggers: self.triggers.max_capacity() - self.triggers.capacity(),
@@ -413,6 +425,7 @@ impl CheckoutCoordinator {
     /// Take one lease. Only [`super::registry::CoordinatorLease`] calls this.
     pub(super) fn hold_lease(&self) {
         self.leases.fetch_add(1, Ordering::AcqRel);
+        self.progress.notify_status();
     }
 
     /// Release one lease and record when the last one went.
@@ -420,6 +433,7 @@ impl CheckoutCoordinator {
         if self.leases.fetch_sub(1, Ordering::AcqRel) == 1 {
             *lock(&self.released_at) = Some(Instant::now());
         }
+        self.progress.notify_status();
     }
 
     /// Whether no session has held this coordinator for at least `grace`.
@@ -452,6 +466,7 @@ impl CheckoutCoordinator {
             release_watch(registration);
         }
         // 3. The client goes with the last handle to this coordinator.
+        self.progress.notify_status();
         debug!(root = %self.root.display(), "coordinator cancelled");
     }
 
@@ -544,29 +559,27 @@ impl CheckoutCoordinator {
         let client = self.request_client().await;
         {
             let mut state = self.run.lock().await;
-            state.running = true;
             state.retry_at = None;
         }
+        // Clearing follows recording, so observers cannot see an old success
+        // between a failed upload's last milestone and its error.
+        let progress = self.progress.scope();
         // The permit bounds concurrent scans across every checkout in the
         // process. It is held for the whole reconcile, including its uploads,
         // because the scan's retained content is what the bound protects.
         let permit = scheduler::permit(scan_permits).await;
-        let result = {
-            // The scope clears the milestone when the reconcile ends, fails,
-            // or is cancelled by dropping this future.
-            let _progress = self.progress.scope();
-            reconciler
-                .reconcile(ReconcileRun {
-                    client: client.clone(),
-                    root: self.root.clone(),
-                    cache: self.cache.clone(),
-                    limits: limits.clone(),
-                    progress: self.progress.clone(),
-                })
-                .await
-        };
+        let result = reconciler
+            .reconcile(ReconcileRun {
+                client: client.clone(),
+                root: self.root.clone(),
+                cache: self.cache.clone(),
+                limits: limits.clone(),
+                progress: self.progress.clone(),
+            })
+            .await;
         drop(permit);
         self.record(trigger, &result).await;
+        drop(progress);
         let retry_needed = match &result {
             Ok(outcome) => !outcome.failed.is_empty(),
             Err(_) => true,
@@ -599,7 +612,6 @@ impl CheckoutCoordinator {
     /// pointing at the last meaningful job.
     async fn record(&self, trigger: Trigger, result: &Result<SyncOutcome, String>) {
         let mut state = self.run.lock().await;
-        state.running = false;
         match result {
             Ok(outcome) => {
                 let changed = outcome.uploaded > 0 || outcome.to_delete > 0;
