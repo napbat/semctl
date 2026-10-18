@@ -36,12 +36,25 @@ The OMP adapter reads the live tool registry to distinguish a package server
 the corresponding guidance. When neither is mounted, hooks suppress MCP advice
 but retain clear/compact resets, so guidance can recover after MCP reconnects.
 
-Tool presentation comes from the shared MCP server. Search and symbol results
-start with a match count and source location. Each hit separates metadata from
-the fenced source snippet. Trees, status reports and source bodies retain their
-whitespace in fences; catalogs, outlines and dependency edges use pipe tables.
-Table cells escape untrusted delimiters. Expanded source bodies preserve their
-original bytes, including CRLF and embedded Markdown fences.
+Tool presentation comes from the shared MCP server. Search results lead with a
+match count, numbered ranks and raw hybrid scores. Scores are query-relative,
+not confidence; weaker matches retain their separate heading. `batch_lookup`
+uses one table in caller order, keeping unmatched symbols and every location.
+Table cells escape untrusted delimiters.
+
+Source and outline bodies use language-tagged fences. Filename suffixes are
+display hints, not claims about semantic indexing support; unknown grammars
+remain readable as plain text. Mermaid and SVG source stays literal code rather
+than becoming a diagram or image. `read_source` keeps the selected range and
+source origin before the body, with its full revision and encoding afterward.
+Source text retains its original bytes, including CRLF and embedded fences.
+
+`sync_status` leads with the current failure or phase, then separates persisted
+catalog state from the last recorded server job. Counts include failed files;
+a completed or zero-file job does not prove checkout freshness. Job labels use
+Done, Running, Pending and Failed, without colored emoji. Native diagnostics
+remain complete. This is a status snapshot, not an invented live percentage or
+elapsed-time measurement.
 
 Local stale-file warnings remain next to the location. `current_context` lists
 exact indexed-copy identities, canonical status and the matching checkout.
@@ -51,10 +64,16 @@ support MCP titles. Failed operations set `isError` and retain their explanation
 
 OMP uses its built-in MCP tool cards, including when hosted in Tern. Keep
 `mcp.renderMarkdownResults` enabled to render headings, tables and source fences.
-OMP controls the card title, colors and collapsed preview length; expand a card
-to see more output. The lifecycle adapter does not register duplicate tools or
-replace result text. MCP stdout remains JSON-RPC, never terminal escape sequences
-or Tern surface-protocol commands.
+OMP controls the card title, colors and collapsed preview length. Its native
+Show all control expands the returned payload; semctl does not shorten source
+text to create the preview or add a competing expander. Host output-size limits
+still apply. Nested code-block headers may occupy the collapsed preview, so expand
+source cards to inspect highlighted code. The lifecycle adapter does not register
+duplicate tools or replace result text. OMP draws its script-status glyphs through
+a native component that its MCP Markdown renderer does not expose; the plain
+checkmark beside Done is not that themed component.
+MCP stdout remains JSON-RPC, never terminal escape sequences or Tern
+surface-protocol commands.
 
 Do not manually copy shared skills; when a host requires a projected format,
 generate it from the canonical skill and verify parity in CI.

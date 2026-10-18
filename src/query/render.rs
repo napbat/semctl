@@ -146,8 +146,9 @@ pub(super) fn render_files(files: &[api::CodebaseFile], root: Option<&Path>) -> 
 pub(super) fn render_outline(outline: &api::FileOutline, root: Option<&Path>) -> String {
     let location = local_path(root, &outline.path);
     let mut out = format!(
-        "{}\n\n| Depth | Lines | Kind | Symbol |\n| ---: | --- | --- | --- |\n",
-        markdown_code(&location)
+        "{} · {} outline entries\n\n| Depth | Lines | Kind | Symbol |\n| ---: | --- | --- | --- |\n",
+        markdown_code(&location),
+        outline.entries.len(),
     );
     for entry in &outline.entries {
         let symbol = entry
@@ -178,37 +179,9 @@ pub(super) fn render_outline(outline: &api::FileOutline, root: Option<&Path>) ->
                 ))
             )
             .expect("writing to a String cannot fail");
-            render_fenced(&mut out, body, None);
+            render_fenced(&mut out, body, source_language_hint(&outline.path));
             out.push('\n');
         }
-    }
-    out
-}
-
-/// Render a job's progress. The phase is derived from timestamps/error rather
-/// than the server's status enum, so it's robust to the enum's wire encoding.
-pub(super) fn render_job(job_id: &str, j: &api::JobStatus) -> String {
-    let phase = if j.error.is_some() {
-        "failed"
-    } else if j.completed_at.is_some() {
-        "done"
-    } else if j.started_at.is_some() {
-        "running"
-    } else {
-        "queued"
-    };
-    let done = j.files_embedded + j.files_deleted + j.files_failed;
-    let total = j.files_to_embed + j.files_to_delete;
-    let mut out = format!(
-        "last sync run {job_id}: {phase}\n  \
-             files: {done}/{total} processed (embedded {}, deleted {}, failed {})",
-        j.files_embedded, j.files_deleted, j.files_failed,
-    );
-    if let Some(e) = &j.error {
-        write!(out, "\n  error: {e}").expect("writing to a String cannot fail");
-    }
-    if phase == "done" && total == 0 {
-        out.push_str("\n  (up to date — nothing to sync)");
     }
     out
 }
@@ -283,7 +256,7 @@ pub(super) fn render_tree(nodes: &[api::FileTreeNode], depth: usize, out: &mut S
 }
 
 /// Render a hit list as Markdown. The count and first location lead the output.
-/// Each hit has a heading, metadata, and a fenced snippet.
+/// Each hit has a heading, a fenced snippet, and source metadata.
 ///
 /// `show_score` gates the relevance score: it's meaningful for `search`
 /// (ranked by hybrid similarity) but a constant 0.000 for the symbol-graph
@@ -329,14 +302,18 @@ pub(super) fn render_hits_inner(
         .then(|| hits.iter().map(|h| h.score).fold(f64::MIN, f64::max) * WEAK_HIT_FRACTION);
 
     let mut out = format!(
-        "**{} {}**\n\n",
+        "**{} {}**",
         hits.len(),
         if hits.len() == 1 { "match" } else { "matches" }
     );
+    if show_score {
+        out.push_str(" · hybrid scores are query-relative, not confidence");
+    }
+    out.push('\n');
     let mut separated = false;
     let mut expanded_chars = 0_usize;
     let mut shortened_hits = 0_usize;
-    for h in hits {
+    for (index, h) in hits.iter().enumerate() {
         let root = context.root_for(h);
         if let Some(floor) = weak_below
             && !separated
@@ -353,18 +330,25 @@ pub(super) fn render_hits_inner(
         } else {
             format!(" {}", markdown_code(marker.trim()))
         };
-        writeln!(
+        out.push_str("### ");
+        if show_score {
+            write!(out, "{}. ", index + 1).expect("writing to a String cannot fail");
+        }
+        write!(
             out,
-            "### {} — {}{classification}",
+            "{} — {}{classification}",
             markdown_code(&hit_location(h, root)),
             markdown_code(&hit_symbol(h))
         )
         .expect("writing to a String cannot fail");
-        if root.is_some() && h.path.as_deref().is_some_and(|p| stale.contains(p)) {
-            // Put this warning before metadata so collapsed host views show it.
-            out.push_str("⚠ stale (edited since indexed)\n\n");
+        if show_score {
+            write!(out, " · hybrid score {:.3}", h.score).expect("writing to a String cannot fail");
         }
-        render_hit_metadata(&mut out, h, show_score);
+        out.push('\n');
+        if root.is_some() && h.path.as_deref().is_some_and(|p| stale.contains(p)) {
+            // Keep warnings before source so collapsed host views show them.
+            out.push_str("⚠ stale (edited since indexed)\n");
+        }
         let expand = full_body
             && (expanded_chars == 0 || expanded_chars + h.snippet.len() <= EXPANDED_BODY_CHARS);
         if expand {
@@ -387,9 +371,9 @@ pub(super) fn render_hits_inner(
             )
         };
         if !snippet.is_empty() {
-            out.push('\n');
             render_fenced(&mut out, &snippet, h.language.as_deref());
         }
+        render_hit_metadata(&mut out, h);
         out.push('\n');
     }
     if shortened_hits > 0 {
@@ -403,19 +387,12 @@ pub(super) fn render_hits_inner(
     out
 }
 
-fn render_hit_metadata(out: &mut String, hit: &api::SearchHit, show_score: bool) {
+fn render_hit_metadata(out: &mut String, hit: &api::SearchHit) {
     write!(out, "Domain: {}", markdown_code(&hit.domain_id))
         .expect("writing to a String cannot fail");
-    if let Some(language) = &hit.language {
-        write!(out, " · Language: {}", markdown_code(language))
-            .expect("writing to a String cannot fail");
-    }
     if !hit.kind.is_empty() {
         write!(out, " · Kind: {}", markdown_code(&hit.kind))
             .expect("writing to a String cannot fail");
-    }
-    if show_score {
-        write!(out, " · Score: {:.3}", hit.score).expect("writing to a String cannot fail");
     }
     if let Some(codebase) = &hit.codebase_id {
         write!(out, " · Codebase: {}", markdown_code(codebase))
@@ -464,6 +441,21 @@ pub(super) fn markdown_cell(value: &str) -> String {
     out
 }
 
+/// Pass suffixes as display-only hints to the host's grammar-alias resolver.
+/// This does not identify a parser language; absent or unsafe hints render text.
+pub(super) fn source_language_hint(path: &str) -> Option<&str> {
+    let path = Path::new(path);
+    match path.file_name()?.to_str()? {
+        "CMakeLists.txt" => return Some("cmake"),
+        "Makefile" | "makefile" => return Some("makefile"),
+        "Dockerfile" => return Some("dockerfile"),
+        _ => {}
+    }
+    let suffix = path.extension()?.to_str()?;
+    // Fence normalization lowercases hints. Preserve the C++ meaning of `.C`.
+    Some(if suffix == "C" { "cpp" } else { suffix })
+}
+
 /// Protect whitespace and source delimiters without changing the body bytes.
 pub(super) fn render_fenced(out: &mut String, body: &str, language: Option<&str>) {
     let fence = "`".repeat(longest_backtick_run(body).saturating_add(1).max(3));
@@ -483,17 +475,26 @@ fn longest_backtick_run(value: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// A fence language must be a single token with no Markdown delimiters.
-fn fence_language(language: Option<&str>) -> String {
-    language
+/// Keep source literal even when the host reserves a fence for rich rendering.
+fn fence_language(language: Option<&str>) -> Cow<'_, str> {
+    let language = language
         .filter(|value| {
-            value.chars().all(|character| {
-                character.is_ascii_alphanumeric()
-                    || matches!(character, '_' | '-' | '+' | '#' | '.')
-            })
+            !value.is_empty()
+                && value.chars().all(|character| {
+                    character.is_ascii_alphanumeric()
+                        || matches!(character, '_' | '-' | '+' | '#' | '.')
+                })
         })
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_default()
+        .unwrap_or("text");
+    if language.eq_ignore_ascii_case("mermaid") {
+        Cow::Borrowed("text")
+    } else if language.eq_ignore_ascii_case("svg") {
+        Cow::Borrowed("xml")
+    } else if language.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Cow::Owned(language.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(language)
+    }
 }
 
 /// The total length of expanded bodies in one search answer. The first hit is
@@ -563,9 +564,7 @@ pub(super) fn hit_location(h: &api::SearchHit, root: Option<&Path>) -> String {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{
-        EXPANDED_BODY_CHARS, HitContext, api, render_hits_inner, render_job, strip_verbatim_prefix,
-    };
+    use super::{EXPANDED_BODY_CHARS, HitContext, api, render_hits_inner, strip_verbatim_prefix};
 
     /// A `SearchHit` with a chosen chunk id + path — for the render test that
     /// keys on those.
@@ -693,7 +692,7 @@ mod tests {
         assert!(sections[0].contains("Codebase: `a`"));
         assert!(sections[0].contains(&root.join("src/lib.rs").display().to_string()));
         assert!(sections[0].contains("stale"));
-        assert!(sections[1].starts_with("`src/lib.rs:1-2`"));
+        assert!(sections[1].contains("`src/lib.rs:1-2`"));
         assert!(sections[1].contains("Codebase: `b`"));
         assert!(!sections[1].contains("checkout-a"));
         assert!(!sections[1].contains("stale"));
@@ -742,14 +741,17 @@ mod tests {
             "{out}"
         );
         assert!(
-            !out.contains("Score:"),
+            !out.contains("hybrid score"),
             "graph hits have no relevance score: {out}"
         );
     }
 
     #[test]
     fn render_count_location_and_stale_warning_lead_the_output() {
-        let hits = [node("first", "dirty.rs"), node("second", "clean.rs")];
+        let mut hits = [node("first", "dirty.rs"), node("second", "clean.rs")];
+        hits[0].snippet = "first source line".into();
+        hits[0].score = 0.8;
+        hits[1].score = 1.0;
         let output = render_hits_inner(
             &hits,
             "none",
@@ -759,16 +761,17 @@ mod tests {
             false,
         );
         let lines: Vec<_> = output.lines().collect();
-        assert_eq!(lines[0], "**2 matches**");
-        assert_eq!(lines[1], "");
-        assert!(lines[2].starts_with("### `"), "{output}");
-        assert!(lines[2].contains("dirty.rs:1-2` — `first`"), "{output}");
-        assert_eq!(lines[3], "⚠ stale (edited since indexed)");
-        assert_eq!(lines[4], "");
-        assert_eq!(
-            lines[5],
-            "Domain: `code` · Language: `rust` · Kind: `function` · Score: 0.000"
+        assert!(lines[0].contains("2 matches"));
+        assert!(lines[1].contains("dirty.rs:1-2` — `first`"));
+        assert!(lines[1].starts_with("### 1. "));
+        assert!(
+            output
+                .lines()
+                .any(|line| line.starts_with("### 2. ") && line.contains("`second`"))
         );
+        assert!(lines[2].contains("⚠ stale"));
+        assert!(output.find("⚠ stale").unwrap() < output.find("first source line").unwrap());
+        assert!(output.find("first source line").unwrap() < output.find("Domain:").unwrap());
     }
 
     #[test]
@@ -829,17 +832,14 @@ mod tests {
             &HashSet::new(),
             false,
         );
-        let lines: Vec<_> = output.lines().collect();
-        assert!(
-            lines[2].contains("```` `source`\\n```\\n.rs:1-2 ````"),
-            "{output}"
-        );
-        assert!(lines[2].contains("`` `symbol`\\n<!-- ``"), "{output}");
-        assert!(
-            lines[3].contains("Codebase: ``a`\\r\\n# hidden``"),
-            "{output}"
-        );
-        assert!(output.contains("\n```\nlet value = 1;\n```\n"), "{output}");
+        let heading = output
+            .lines()
+            .find(|line| line.starts_with("### "))
+            .unwrap();
+        assert!(heading.contains("```` `source`\\n```\\n.rs:1-2 ````"));
+        assert!(heading.contains("`` `symbol`\\n<!-- ``"));
+        assert!(output.contains("Codebase: ``a`\\r\\n# hidden``"));
+        assert!(output.contains("\n```text\nlet value = 1;\n```\n"));
         assert_eq!(output.matches("\n### ").count(), 1, "{output}");
     }
 
@@ -847,12 +847,14 @@ mod tests {
     fn render_keeps_weak_matches_in_one_group() {
         let mut hits = [
             node("strong", "a.rs"),
+            node("boundary", "boundary.rs"),
             node("weak", "b.rs"),
             node("weaker", "c.rs"),
         ];
         hits[0].score = 1.0;
-        hits[1].score = 0.4;
-        hits[2].score = 0.2;
+        hits[1].score = 0.5;
+        hits[2].score = 0.4;
+        hits[3].score = -0.2;
         let output = render_hits_inner(
             &hits,
             "none",
@@ -861,7 +863,18 @@ mod tests {
             &HashSet::new(),
             false,
         );
-        assert!(output.starts_with("**3 matches**\n"), "{output}");
+        assert!(
+            output.contains("query-relative, not confidence"),
+            "{output}"
+        );
+        for (rank, hit) in hits.iter().enumerate() {
+            let heading = output
+                .lines()
+                .find(|line| line.starts_with(&format!("### {}. ", rank + 1)))
+                .unwrap();
+            assert!(heading.contains(&format!("`{}`", hit.symbol.as_deref().unwrap())));
+            assert!(heading.contains(&format!("hybrid score {:.3}", hit.score)));
+        }
         assert_eq!(
             output
                 .matches("### Weaker matches (below 50% of top score)")
@@ -869,6 +882,7 @@ mod tests {
             1
         );
         assert!(output.find("`strong`").unwrap() < output.find("### Weaker").unwrap());
+        assert!(output.find("`boundary`").unwrap() < output.find("### Weaker").unwrap());
         assert!(output.find("### Weaker").unwrap() < output.find("`weak`").unwrap());
         assert!(output.contains("`weaker`"), "{output}");
     }
@@ -905,10 +919,8 @@ mod tests {
             &HashSet::new(),
             false,
         );
-        assert_eq!(
-            output,
-            "**1 match**\n\n### `(no location)` — (empty)\nDomain: (empty)\n\n"
-        );
+        assert!(output.contains("`(no location)` — (empty)"));
+        assert!(output.contains("Domain: (empty)"));
     }
 
     #[test]
@@ -938,23 +950,5 @@ mod tests {
             strip_verbatim_prefix("/home/dev/repo/src/lib.rs".into()),
             "/home/dev/repo/src/lib.rs"
         );
-    }
-
-    #[test]
-    fn job_progress_counts_failed_files_as_processed() {
-        let job = api::JobStatus {
-            files_to_embed: 10,
-            files_to_delete: 2,
-            files_embedded: 4,
-            files_deleted: 2,
-            files_failed: 3,
-            chunk_count: None,
-            error: None,
-            started_at: Some("2026-07-14T00:00:00Z".into()),
-            completed_at: None,
-        };
-
-        let out = render_job("job-1", &job);
-        assert!(out.contains("files: 9/12 processed"), "{out}");
     }
 }

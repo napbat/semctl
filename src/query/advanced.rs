@@ -7,7 +7,7 @@ use anyhow::{Context as _, Result};
 
 use crate::client::{Client, api};
 
-use super::render::{markdown_cell, render_fenced};
+use super::render::{markdown_cell, markdown_code, render_fenced, source_language_hint};
 use super::{ToolError, bound_codebase, local_path, render_hits, urlencode};
 
 const CODEBASE_PAGE_SIZE: u32 = 500;
@@ -206,33 +206,41 @@ pub async fn read_source(
         .await
         .map_err(|error| ToolError::from_client("read_source", &error))?;
 
-    let mut source = "content-plane";
-    let mut body = content.content.clone();
-    if let Some(root) = client.local_root()
-        && let Some(local) = verified_local_window(root, path, &content)
-    {
-        source = "verified-local";
-        body = local;
-    }
-    let metadata = format!(
-        "{}\nrevision {}\nbytes {}-{} of {}\nencoding {}\nsource {}{}",
-        local_path(client.local_root(), &content.path),
-        content.content_hash,
+    let local = client
+        .local_root()
+        .and_then(|root| verified_local_window(root, path, &content));
+    let (source, body) = local
+        .as_deref()
+        .map_or(("content-plane", content.content.as_str()), |body| {
+            ("verified-local", body)
+        });
+    let mut out = format!(
+        "{} · bytes {}-{} of {} · source {}",
+        markdown_code(&local_path(client.local_root(), &content.path)),
         content.byte_start,
         content.byte_end,
         content.size,
-        content.encoding,
-        source,
-        if content.truncated {
-            " (truncated)"
-        } else {
-            ""
-        }
+        markdown_code(source),
     );
-    let mut out = String::new();
-    render_fenced(&mut out, &metadata, None);
+    if let (Some(start), Some(end)) = (content.line_start, content.line_end) {
+        write!(out, " · lines {start}-{end}").expect("writing to a String cannot fail");
+    }
+    if content.truncated {
+        out.push_str(" · **truncated**");
+    }
     out.push('\n');
-    render_fenced(&mut out, &body, None);
+    let language = (!content.is_binary)
+        .then(|| source_language_hint(&content.path))
+        .flatten();
+    render_fenced(&mut out, body, language);
+    writeln!(
+        out,
+        "Revision: {} · Encoding: {} · Codebase: {}",
+        markdown_code(&content.content_hash),
+        markdown_code(&content.encoding),
+        markdown_code(cb),
+    )
+    .expect("writing to a String cannot fail");
     Ok(out)
 }
 
@@ -594,10 +602,12 @@ fn edit_url(client: &Client, operation: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{current_context, describe_copies};
+    use super::{current_context, describe_copies, read_source, verified_local_window};
     use crate::client::Client;
     use crate::client::stub::{Reply, Stub};
-    use crate::query::render::markdown_cell;
+    use crate::query::render::{
+        markdown_cell, render_fenced, render_outline, source_language_hint,
+    };
 
     const COPIES: &str = r#"[
         {"id":"canonical","sourceId":"vcs-source","isCanonical":true,"revision":"canonical-rev","files":99},
@@ -605,6 +615,117 @@ mod tests {
         {"id":"older","sourceId":"checkout-20","isCanonical":false,"revision":"older-rev","files":17},
         {"id":"case-distinct","sourceId":"CHECKOUT-2","isCanonical":false,"revision":null,"files":3}
     ]"#;
+
+    #[test]
+    fn source_hints_delegate_suffix_aliases_and_reject_unsafe_fence_tokens() {
+        for (path, language) in [
+            ("source.rs", "rs"),
+            ("source.RS", "rs"),
+            ("source.C", "cpp"),
+            ("source.c", "c"),
+            ("source.h", "h"),
+            ("source.S", "s"),
+            ("source.ps1", "ps1"),
+            ("CMakeLists.txt", "cmake"),
+            ("Makefile", "makefile"),
+            ("Dockerfile", "dockerfile"),
+            ("Dockerfile.custom", "custom"),
+            ("source.unknown", "unknown"),
+            ("source.mermaid", "text"),
+            ("source.MERMAID", "text"),
+            ("source.svg", "xml"),
+            ("source.rs\n```", "text"),
+            ("README", "text"),
+        ] {
+            let mut text = String::new();
+            render_fenced(&mut text, "body", source_language_hint(path));
+            assert!(text.starts_with(&format!("```{language}\n")));
+            let outline = serde_json::from_value(serde_json::json!({
+                "path": path,
+                "entries": [{
+                    "chunkId": "one", "lineStart": 2, "lineEnd": 3,
+                    "kind": "function", "body": "\r\n    ```\r\n"
+                }]
+            }))
+            .unwrap();
+            let text = render_outline(&outline, None);
+            assert!(text.contains(&format!("\n````{language}\n\r\n    ```\r\n````\n")));
+        }
+        for invalid in [None, Some(""), Some("rust\n```")] {
+            let mut text = String::new();
+            render_fenced(&mut text, "body", invalid);
+            assert!(text.starts_with("```text\n"));
+        }
+    }
+
+    #[tokio::test]
+    async fn source_results_keep_full_bodies_and_place_bounds_before_provenance() {
+        let source = format!("\r\n    ```\r\n{}", "    source line\r\n".repeat(3_000));
+        for (path, binary, language) in [
+            ("remote/source.rs", false, "rs"),
+            ("remote/source.unknown", false, "unknown"),
+            ("remote/source.mermaid", false, "text"),
+            ("remote/source.svg", false, "xml"),
+            ("remote/source.rs", true, "text"),
+        ] {
+            let body = if binary { "YmluYXJ5AA==" } else { &source };
+            let end = body.len() + 20;
+            let response = serde_json::json!({
+                "path": path, "contentHash": "pinned-hash", "content": body,
+                "encoding": if binary { "base64" } else { "utf-8" },
+                "isBinary": binary, "size": end + 100,
+                "byteStart": 20, "byteEnd": end, "lineStart": 4, "lineEnd": 8,
+                "truncated": true
+            });
+            let stub = Stub::serve(vec![Reply::ok(&response.to_string())]).await;
+            let client = Client::for_test_server(&stub.url).with_codebase("A".into());
+            let text = read_source(
+                &client,
+                path,
+                Some("pinned-hash"),
+                Some((20, u64::try_from(end).unwrap())),
+                None,
+            )
+            .await
+            .unwrap();
+            let heading = text.lines().next().unwrap();
+            assert!(heading.contains(path));
+            assert!(heading.contains(&format!("20-{end} of {}", end + 100)));
+            assert!(heading.contains("lines 4-8"));
+            assert!(heading.contains("content-plane"));
+            assert!(heading.contains("truncated"));
+            let fence = if binary { "```" } else { "````" };
+            let separator = if body.ends_with('\n') { "" } else { "\n" };
+            assert!(text.contains(&format!("{fence}{language}\n{body}{separator}{fence}\n")));
+            let body_end = text.find(body).unwrap() + body.len();
+            assert!(text[body_end..].contains("pinned-hash"));
+            assert!(text[body_end..].contains("Codebase: `A`"));
+            assert_eq!(stub.requests(), 1);
+            assert!(
+                stub.request_lines()[0]
+                    .contains(&format!("revision=pinned-hash&byteStart=20&byteEnd={end}"))
+            );
+        }
+    }
+
+    #[test]
+    fn verified_local_windows_require_matching_content_identity_and_preserve_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let source = "prefix\r\n    exact source\t\r\nsuffix";
+        std::fs::write(root.path().join("source.rs"), source).unwrap();
+        let mut content: crate::client::api::FileContent = serde_json::from_value(serde_json::json!({
+            "path": "source.rs", "contentHash": blake3::hash(source.as_bytes()).to_hex().to_string(),
+            "content": "server body", "encoding": "utf-8", "isBinary": false,
+            "size": source.len(), "byteStart": 6, "byteEnd": source.len() - 6,
+            "truncated": false
+        })).unwrap();
+        assert_eq!(
+            verified_local_window(root.path(), "source.rs", &content).as_deref(),
+            Some("\r\n    exact source\t\r\n"),
+        );
+        content.content_hash = "different-revision".into();
+        assert!(verified_local_window(root.path(), "source.rs", &content).is_none());
+    }
 
     #[tokio::test]
     async fn indexed_copies_keep_distinct_identities_and_match_the_exact_checkout_source() {

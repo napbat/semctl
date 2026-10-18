@@ -3,7 +3,7 @@
 use std::fmt::Write;
 
 use super::render::{
-    local_path, markdown_cell, markdown_code, render_fenced, render_files, render_hits, render_job,
+    local_path, markdown_cell, markdown_code, render_fenced, render_files, render_hits,
     render_projects, render_tree, truncation_note,
 };
 use super::{Client, ToolError, api, bound_codebase, urlencode};
@@ -185,95 +185,320 @@ pub async fn sync_status(
         None => None,
     };
 
-    let watch = match checkout.map(|status| &status.watcher) {
-        Some(crate::engine::coordinator::WatcherState::Active) => "active".to_string(),
-        Some(crate::engine::coordinator::WatcherState::Unavailable(reason)) => {
-            format!("not active ({reason})")
+    let first_index = checkout.and_then(|status| status.first_index.as_ref());
+    let local_error = checkout.and_then(|status| status.last_error.as_deref());
+    let job_status = job.as_ref().and_then(|(_, result)| result.as_ref().ok());
+    let unavailable = totals.is_err() || job.as_ref().is_some_and(|(_, result)| result.is_err());
+    let mut out = format!("{}  \n", sync_summary(checkout, job_status, unavailable));
+    let diagnostic = match first_index {
+        Some(FirstIndexPhase::Failed { reason }) => {
+            Some(("First-index diagnostic", reason.as_str()))
         }
-        None => "not active (no local checkout selected)".to_string(),
-    };
-    let mut out = format!("codebase {codebase_id}");
-    if let Some(phase) = checkout.and_then(|status| status.first_index.as_ref()) {
-        write!(out, "\n{}", first_index_line(phase)).expect("writing to a String cannot fail");
+        _ => local_error.map(|error| ("Local diagnostic", error)),
     }
-    if let Some(progress) = checkout.and_then(|status| status.sync_progress.as_ref()) {
-        write!(out, "\n{}", current_sync_line(progress)).expect("writing to a String cannot fail");
-    }
-    if let Some(error) = checkout.and_then(|status| status.last_error.as_deref()) {
-        write!(
+    .or_else(|| {
+        job_status
+            .and_then(|status| status.error.as_deref())
+            .map(|error| ("Last server diagnostic", error))
+    });
+    if let Some((label, reason)) = diagnostic {
+        writeln!(out, "{label}: {}  ", markdown_code(reason))
+            .expect("writing to a String cannot fail");
+    } else if let Some(status) = job_status.filter(|status| status.files_failed > 0) {
+        writeln!(
             out,
-            "\nlast local sync failed: {error}\nindexed results may be stale"
+            "Last server job: {} failed files.  ",
+            status.files_failed
+        )
+        .expect("writing to a String cannot fail");
+    } else if let Some(error) = job
+        .as_ref()
+        .and_then(|(_, result)| result.as_ref().err())
+        .or(totals.as_ref().err())
+    {
+        writeln!(
+            out,
+            "Status diagnostic: {}  ",
+            markdown_code(&error.to_string())
         )
         .expect("writing to a String cannot fail");
     }
-    if let Some(seconds) = checkout.and_then(|status| status.retry_after_secs) {
-        write!(out, "\nnext local sync attempt in {seconds} s")
+    writeln!(out, "Codebase {} · snapshot.  ", markdown_code(codebase_id))
+        .expect("writing to a String cannot fail");
+    if let Some(progress) = checkout.and_then(|status| status.sync_progress.as_ref()) {
+        writeln!(out, "{}  ", markdown_code(&current_sync_line(progress)))
             .expect("writing to a String cannot fail");
     }
-    write!(out, "\nlocal checkout watch: {watch}\ntotal indexed state:")
-        .expect("writing to a String cannot fail");
+    if let Some(phase) = first_index {
+        writeln!(out, "{}  ", first_index_line(phase)).expect("writing to a String cannot fail");
+    }
+    render_sync_state(&mut out, checkout, &totals, job_status);
+    render_local_sync_failures(&mut out, checkout);
+    render_sync_job(
+        &mut out,
+        checkout,
+        job.as_ref().map(|(id, result)| (*id, result)),
+    );
+    Ok(out)
+}
+
+/// Persisted totals and coordinator state describe different scopes: neither
+/// the latest job's plan nor its outcome replaces the catalog.
+fn render_sync_state(
+    out: &mut String,
+    checkout: Option<&CoordinatorStatus>,
+    totals: &anyhow::Result<(u32, i64)>,
+    job: Option<&api::JobStatus>,
+) {
+    out.push_str("\n| State | Reported value |\n| --- | --- |\n");
     match totals {
         Ok((files, bytes)) => {
-            write!(
+            writeln!(
                 out,
-                "\n  files: {files}\n  source bytes: {} ({bytes} bytes)",
-                human_bytes(bytes)
+                "| Persisted catalog files | {files} |\n| Persisted source size | {} ({bytes} bytes) |",
+                human_bytes(*bytes)
             )
             .expect("writing to a String cannot fail");
         }
-        Err(e) => write!(out, "\n  catalog totals unavailable: {e}")
-            .expect("writing to a String cannot fail"),
+        Err(_) => out.push_str("| Persisted catalog totals | ⚠ Unknown — request failed |\n"),
     }
-    if let Some((_, Ok(status))) = &job
-        && let Some(chunks) = status.chunk_count
-    {
-        write!(out, "\n  chunks: {chunks} (post-sync total)")
+    if let Some(chunks) = job.and_then(|status| status.chunk_count) {
+        writeln!(out, "| Chunks reported by last server job | {chunks} |")
             .expect("writing to a String cannot fail");
     }
-
-    match job {
-        Some((id, Ok(status))) => {
-            out.push_str("\n\n");
-            out.push_str(&render_job(id, &status));
+    let watch = match checkout.map(|status| &status.watcher) {
+        Some(crate::engine::coordinator::WatcherState::Active) => "active".to_string(),
+        Some(crate::engine::coordinator::WatcherState::Unavailable(reason)) => {
+            format!("not active ({reason}); periodic reconciliation may still run")
         }
-        Some((id, Err(e))) => {
-            write!(out, "\n\nlast sync run {id}: status could not be read: {e}")
-                .expect("writing to a String cannot fail");
+        None => "not active (no local checkout selected)".to_string(),
+    };
+    writeln!(out, "| Local checkout watch | {} |", markdown_cell(&watch))
+        .expect("writing to a String cannot fail");
+    if let Some(status) = checkout {
+        writeln!(
+            out,
+            "| Local reconcile | {} |\n| Pending local triggers | {}{} |",
+            if status.running || status.sync_progress.is_some() {
+                "running"
+            } else {
+                "idle"
+            },
+            status.pending_triggers,
+            if status.trigger_overflow {
+                " (overflowed; changes coalesced)"
+            } else {
+                ""
+            }
+        )
+        .expect("writing to a String cannot fail");
+        if let Some(seconds) = status.retry_after_secs {
+            writeln!(
+                out,
+                "| Retry schedule | next local sync attempt in {seconds} s |"
+            )
+            .expect("writing to a String cannot fail");
         }
-        None if checkout.is_some_and(|status| status.last_error.is_some()) => out.push_str(
-            "\n\nlast sync run: no server job queued; the local sync failed before it recorded \
-             a job. The totals above are the persisted server state.",
-        ),
-        None if checkout.is_some() => out.push_str(
-            "\n\nlast sync run: no server job queued yet; the local checkout may still \
-             be scanning/preparing its initial sync. The totals above are the persisted server \
-             state.",
-        ),
-        None => out.push_str(
-            "\n\nlast sync run: none queued by this MCP session; the totals above are the \
-             persisted server state.",
-        ),
     }
-    let mut rendered = String::new();
-    render_fenced(&mut rendered, &out, None);
-    Ok(rendered)
+    out.push_str(
+        "\nCatalog totals are persisted state; a 0-file plan does not mean an empty index.\n",
+    );
+    if let Err(error) = totals {
+        out.push_str("\n### Catalog totals unavailable\n\n");
+        render_fenced(out, &error.to_string(), None);
+        out.push_str("\nResolve the reported access/connectivity error, then call `sync_status` again; unknown totals are not zero.\n");
+    }
 }
 
-/// The `first index:` line of `sync_status`. A failed first index also names
-/// the call that retries it.
+/// Keep complete local diagnostics and the first-index retry gate together,
+/// independent of any server job left over from an earlier reconcile.
+fn render_local_sync_failures(out: &mut String, checkout: Option<&CoordinatorStatus>) {
+    let Some(status) = checkout else { return };
+    let first_failed = matches!(status.first_index, Some(FirstIndexPhase::Failed { .. }));
+    if let Some(error) = &status.last_error {
+        out.push_str("\n### Local scan/upload failure\n\n");
+        render_fenced(out, error, None);
+        out.push_str(
+            "\nCorrect the reported local access, authentication, or server connectivity failure. ",
+        );
+        if !first_failed {
+            if status.retry_after_secs.is_some() {
+                out.push_str("Retained work retries on the reported schedule.\n");
+            } else {
+                out.push_str(
+                    "No retry delay was reported; inspect a later `sync_status` snapshot.\n",
+                );
+            }
+        }
+    }
+    if let Some(FirstIndexPhase::Failed { reason }) = &status.first_index {
+        out.push_str("\n### First-index failure\n\n");
+        render_fenced(out, reason, None);
+        out.push_str("\nCall `index_codebase` for this codebase to renew the failed first index; local retries alone do not establish retrieval readiness.\n");
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobPhase {
+    Pending,
+    Running,
+    Done,
+    Failed,
+}
+
+/// Timestamps and failure evidence take precedence over the wire status enum.
+fn job_phase(job: &api::JobStatus) -> JobPhase {
+    if job.error.is_some() || job.files_failed > 0 {
+        JobPhase::Failed
+    } else if job.completed_at.is_some() {
+        JobPhase::Done
+    } else if job.started_at.is_some() {
+        JobPhase::Running
+    } else {
+        JobPhase::Pending
+    }
+}
+
+fn render_job(job_id: &str, j: &api::JobStatus) -> String {
+    let phase = job_phase(j);
+    let label = match phase {
+        JobPhase::Failed => "**Failed**",
+        JobPhase::Done => "✓ **Done**",
+        JobPhase::Running => "**Running**",
+        JobPhase::Pending => "**Pending**",
+    };
+    let processed =
+        i128::from(j.files_embedded) + i128::from(j.files_deleted) + i128::from(j.files_failed);
+    let total = i128::from(j.files_to_embed) + i128::from(j.files_to_delete);
+    let mut out = format!(
+        "{label} · Server job {}\n\n\
+         | Work | Reported count |\n| --- | --- |\n\
+         | Processed files, including failures | {processed}/{total} |\n\
+         | Embedded | {} |\n| Deleted | {} |\n| Failed | {} |\n",
+        markdown_code(job_id),
+        j.files_embedded,
+        j.files_deleted,
+        j.files_failed,
+    );
+    if let Some(error) = &j.error {
+        out.push_str("\nServer diagnostic:\n\n");
+        render_fenced(&mut out, error, None);
+    }
+    if phase == JobPhase::Done && j.files_to_embed == 0 && j.files_to_delete == 0 {
+        out.push_str(
+            "\nThis job reported no planned work; this does not establish checkout freshness.\n",
+        );
+    }
+    out
+}
+
+/// A recorded server job may predate the current local attempt. Preserve its
+/// units, outcome and diagnostic without treating it as that attempt's result.
+fn render_sync_job(
+    out: &mut String,
+    checkout: Option<&CoordinatorStatus>,
+    job: Option<(&str, &anyhow::Result<api::JobStatus>)>,
+) {
+    match job {
+        Some((id, Ok(status))) => {
+            out.push_str("\n### Last recorded server job\n\n");
+            if checkout.is_some_and(|local| {
+                local.running || local.sync_progress.is_some() || local.last_error.is_some()
+                    || matches!(local.first_index, Some(FirstIndexPhase::Registering | FirstIndexPhase::Syncing))
+            }) {
+                out.push_str("This job may precede the current local attempt.\n\n");
+            }
+            out.push_str(&render_job(id, status));
+            if status.error.is_some() || status.files_failed > 0 {
+                out.push_str("\nCorrect the server failure before retrying; a failed job does not imply a retry was queued. First-index retries require `index_codebase`.\n");
+            }
+        }
+        Some((id, Err(error))) => {
+            writeln!(
+                out,
+                "\n### Server job status unknown\n\nLast sync run {}: status could not be read.\n",
+                markdown_code(id)
+            )
+            .expect("writing to a String cannot fail");
+            render_fenced(out, &error.to_string(), None);
+            out.push_str("\nResolve the reported access/connectivity error, then call `sync_status` again; the job outcome remains unknown.\n");
+        }
+        None if checkout.is_some_and(|status| status.last_error.is_some()) => out.push_str(
+            "\nNo server job queued; the local sync failed before it recorded a job.\n",
+        ),
+        None if checkout.is_some() => out.push_str(
+            "\nNo server job queued yet; local scanning/preparation or retained work may still be pending.\n",
+        ),
+        None => out.push_str(
+            "\nNo server job queued by this MCP session; local progress and checkout freshness are unknown.\n",
+        ),
+    }
+}
+
+/// Local failures and active work take precedence over a previously recorded
+/// server job. Neither an HTTP success nor catalog totals prove indexing passed.
+fn sync_summary(
+    checkout: Option<&CoordinatorStatus>,
+    job: Option<&api::JobStatus>,
+    unavailable: bool,
+) -> &'static str {
+    let first = checkout.and_then(|status| status.first_index.as_ref());
+    if matches!(first, Some(FirstIndexPhase::Failed { .. })) {
+        return "**First index failed — retrieval not ready**";
+    }
+    if checkout.is_some_and(|status| status.last_error.is_some()) {
+        return "**Local sync failed — indexed results may be stale**";
+    }
+    if checkout.is_some_and(|status| status.running || status.sync_progress.is_some()) {
+        return "**Local sync running — indexing not yet complete**";
+    }
+    match first {
+        Some(FirstIndexPhase::Registering) => {
+            return "**First index registering — retrieval not ready**";
+        }
+        Some(FirstIndexPhase::Syncing) => {
+            return "**First index syncing — retrieval not ready**";
+        }
+        _ => {}
+    }
+    let phase = job.map(job_phase);
+    if phase == Some(JobPhase::Failed) {
+        return "**Server indexing failed — indexed results may be stale**";
+    }
+    if matches!(first, Some(FirstIndexPhase::Embedding { .. })) {
+        return "**First index embedding — retrieval not ready**";
+    }
+    if unavailable {
+        return "**Status incomplete — server state unknown**";
+    }
+    if matches!(phase, Some(JobPhase::Pending | JobPhase::Running)) {
+        return if phase == Some(JobPhase::Running) {
+            "**Server indexing running — not yet complete**"
+        } else {
+            "**Server indexing queued — not yet complete**"
+        };
+    }
+    if checkout.is_some_and(|status| status.pending_triggers > 0 || status.trigger_overflow) {
+        return "**Local sync pending — indexed results may be stale**";
+    }
+    if matches!(first, Some(FirstIndexPhase::Ready)) || phase == Some(JobPhase::Done) {
+        return "✓ **Done** · Indexing — checkout freshness not established";
+    }
+    "**Indexing state unknown — no completion reported**"
+}
+
 fn first_index_line(phase: &FirstIndexPhase) -> String {
     match phase {
         FirstIndexPhase::Failed { .. } => {
-            format!("first index: {phase}; call index_codebase to retry")
+            "First index: failed; call `index_codebase` to retry".into()
         }
-        _ => format!("first index: {phase}"),
+        _ => format!("First index: {}", markdown_code(&phase.to_string())),
     }
 }
 
-/// The `current sync:` line of `sync_status`. The milestone text is the one
-/// `semctl index` shows, so both commands use the same words.
+/// Reuse the engine's milestones and authoritative upload-batch counters.
 fn current_sync_line(progress: &SyncProgress) -> String {
-    format!("current sync: {progress}")
+    format!("Current sync: {progress}")
 }
 
 async fn catalog_totals(client: &Client, codebase_id: &str) -> anyhow::Result<(u32, i64)> {
@@ -461,32 +686,34 @@ pub async fn batch_lookup(
         .post_read::<_, Vec<api::SymbolHits>>(&url, &body)
         .await
         .map_err(|e| ToolError::from_client("batch_lookup", &e))?;
-    let kind = if references {
-        "references"
+    let (kind, column) = if references {
+        ("references", "Reference location")
     } else {
-        "definitions"
+        ("definitions", "Definition location")
     };
+    let (matches, unmatched) = results.iter().fold((0, 0), |(matches, unmatched), result| {
+        (
+            matches + result.hits.len(),
+            unmatched + usize::from(result.hits.is_empty()),
+        )
+    });
     let root = client.local_root();
-    let mut out = String::new();
+    let mut out = format!(
+        "**{} symbols · {matches} {kind} · {unmatched} unmatched**\n\n\
+         | Symbol | {column} |\n| --- | --- |\n",
+        results.len(),
+    );
     for r in &results {
+        let symbol = markdown_cell(&r.symbol);
         if r.hits.is_empty() {
-            writeln!(out, "### {} — no {kind}\n", markdown_code(&r.symbol))
-                .expect("writing to a String cannot fail");
+            writeln!(out, "| {symbol} | No {kind} |").expect("writing to a String cannot fail");
             continue;
         }
-        writeln!(
-            out,
-            "### {} ({} {kind})\n",
-            markdown_code(&r.symbol),
-            r.hits.len()
-        )
-        .expect("writing to a String cannot fail");
-        out.push_str("| Location |\n| --- |\n");
         for h in &r.hits {
             let loc = h.path.as_deref().unwrap_or("?");
             writeln!(
                 out,
-                "| {} |",
+                "| {symbol} | {} |",
                 markdown_cell(&format!(
                     "{}:{}-{}",
                     local_path(root, loc),
@@ -496,7 +723,6 @@ pub async fn batch_lookup(
             )
             .expect("writing to a String cannot fail");
         }
-        out.push('\n');
     }
     Ok(out)
 }

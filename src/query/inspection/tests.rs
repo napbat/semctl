@@ -1,17 +1,22 @@
 //! Structural results retain source bytes and relationships in Markdown hosts.
 
-use super::{current_sync_line, first_index_line, sync_status};
+use super::{
+    JobPhase, current_sync_line, first_index_line, job_phase, render_job, sync_status, sync_summary,
+};
 use crate::client::Client;
 use crate::client::stub::{Reply, Stub};
 use crate::engine::CoordinatorStatus;
 use crate::engine::coordinator::WatcherState;
 use crate::mcp::readiness::FirstIndexPhase;
-use crate::query::render::{markdown_cell, render_fenced, render_outline, render_projects};
+use crate::query::render::{
+    markdown_cell, markdown_code, render_fenced, render_outline, render_projects,
+};
 use crate::sync::SyncProgress;
 
 fn fenced_body(text: &str) -> &str {
-    let (fence, rest) = text.split_once('\n').expect("a fenced block has an opener");
-    assert!(fence.len() >= 3 && fence.bytes().all(|byte| byte == b'`'));
+    let (opener, rest) = text.split_once('\n').expect("a fenced block has an opener");
+    let fence = &opener[..opener.bytes().take_while(|byte| *byte == b'`').count()];
+    assert!(fence.len() >= 3);
     let body = rest
         .strip_suffix(&format!("{fence}\n"))
         .expect("the matching closer terminates the block");
@@ -23,6 +28,114 @@ fn fenced_body(text: &str) -> &str {
         "body delimiters cannot terminate the block early"
     );
     body
+}
+
+fn first_fenced_block(text: &str) -> &str {
+    let mut start = 0;
+    for opener in text.split_inclusive('\n') {
+        let fence_len = opener.bytes().take_while(|byte| *byte == b'`').count();
+        if fence_len >= 3 {
+            let fence = &opener[..fence_len];
+            let mut end = start + opener.len();
+            for line in text[end..].split_inclusive('\n') {
+                end += line.len();
+                if line.trim_end_matches(['\r', '\n']) == fence {
+                    return &text[start..end];
+                }
+            }
+            panic!("missing matching fence closer: {text}");
+        }
+        start += opener.len();
+    }
+    panic!("missing fenced block: {text}");
+}
+
+#[tokio::test]
+async fn batch_results_keep_unmatched_and_multiple_locations_attributed() {
+    let results = serde_json::json!([
+        {"symbol": "missing|symbol", "hits": []},
+        {"symbol": "lookup", "hits": [
+            {"domainId": "code", "id": "first", "score": 0.0,
+             "path": "z|source.rs", "lineStart": 7, "lineEnd": 9, "snippet": ""},
+            {"domainId": "code", "id": "second", "score": 0.0,
+             "path": "a.rs", "lineStart": 12, "lineEnd": 15, "snippet": ""}
+        ]},
+        {"symbol": "last", "hits": [
+            {"domainId": "code", "id": "third", "score": 0.0,
+             "path": "b.rs", "lineStart": 30, "lineEnd": 31, "snippet": ""}
+        ]}
+    ]);
+    for references in [false, true] {
+        let stub = Stub::serve(vec![Reply::ok(&results.to_string())]).await;
+        let client = Client::for_test_server(&stub.url).with_codebase("A".into());
+        let text = super::batch_lookup(
+            &client,
+            &["missing|symbol".into(), "lookup".into(), "last".into()],
+            references,
+        )
+        .await
+        .unwrap();
+        let kind = if references {
+            "references"
+        } else {
+            "definitions"
+        };
+        let summary = text.lines().next().unwrap();
+        assert!(summary.contains("3 symbols"), "{text}");
+        assert!(summary.contains(&format!("3 {kind}")), "{text}");
+        assert!(summary.contains("1 unmatched"), "{text}");
+
+        let missing = markdown_cell("missing|symbol");
+        let missing_row = text.lines().find(|line| line.contains(&missing)).unwrap();
+        assert!(missing_row.contains(&format!("No {kind}")), "{text}");
+        let mut previous = text.find(&missing).unwrap();
+        for (symbol, location) in [
+            ("lookup", "z|source.rs:7-9"),
+            ("lookup", "a.rs:12-15"),
+            ("last", "b.rs:30-31"),
+        ] {
+            let location = markdown_cell(location);
+            let row = text.lines().find(|line| line.contains(&location)).unwrap();
+            assert!(row.contains(&markdown_cell(symbol)), "{row}");
+            let position = text.find(&location).unwrap();
+            assert!(position > previous, "server order must survive: {text}");
+            previous = position;
+        }
+    }
+}
+
+#[test]
+fn a_ready_first_index_reports_the_same_outcome_as_a_successful_job() {
+    let ready = checkout(Some(FirstIndexPhase::Ready), None);
+    assert_eq!(
+        sync_summary(Some(&ready), None, false),
+        sync_summary(None, Some(&completed_job()), false),
+    );
+    let mut active = ready;
+    active.running = true;
+    assert_ne!(
+        sync_summary(Some(&active), None, false),
+        sync_summary(None, Some(&completed_job()), false),
+    );
+}
+
+#[test]
+fn a_new_first_index_attempt_supersedes_an_older_job_until_embedding() {
+    let mut job = completed_job();
+    job.error = Some("older attempt failed".into());
+    for phase in [FirstIndexPhase::Registering, FirstIndexPhase::Syncing] {
+        let status = checkout(Some(phase), None);
+        let summary = sync_summary(Some(&status), Some(&job), false);
+        assert!(summary.contains("not ready"), "{summary}");
+        assert!(!summary.contains("Server indexing failed"), "{summary}");
+    }
+    let status = checkout(
+        Some(FirstIndexPhase::Embedding {
+            job_id: Some("current-job".into()),
+        }),
+        None,
+    );
+    assert!(sync_summary(Some(&status), Some(&job), false).contains("Server indexing failed"));
 }
 
 const EMPTY_CATALOG_PAGE: &str = r#"{"success":true,"data":[],"page":0,"pageSize":1000,"total":0}"#;
@@ -60,192 +173,253 @@ async fn catalog_stub() -> (Stub, Client) {
 }
 
 #[test]
-fn each_phase_has_one_plain_line() {
-    for (phase, line) in [
-        (FirstIndexPhase::Registering, "first index: registering"),
-        (FirstIndexPhase::Syncing, "first index: syncing"),
-        (
-            FirstIndexPhase::Embedding {
-                job_id: Some("job-7".to_string()),
-            },
-            "first index: embedding (job job-7)",
-        ),
-        (
-            FirstIndexPhase::Embedding { job_id: None },
-            "first index: embedding",
-        ),
-        (FirstIndexPhase::Ready, "first index: ready"),
+fn shared_progress_preserves_counters_without_inventing_totals() {
+    for progress in [
+        SyncProgress::Preparing,
+        SyncProgress::Scanning {
+            root: "checkout".into(),
+        },
+        SyncProgress::Planning {
+            files: 3607,
+            cached_files: 3500,
+        },
+        SyncProgress::Uploading {
+            uploaded_files: 1200,
+            total_files: 3607,
+        },
+        SyncProgress::Finalizing,
     ] {
-        assert_eq!(first_index_line(&phase), line);
+        assert!(current_sync_line(&progress).ends_with(&progress.to_string()));
     }
 }
 
-#[test]
-fn a_failed_first_index_names_the_reason_and_the_retry() {
-    let phase = FirstIndexPhase::Failed {
-        reason: "embedding job 7 failed".to_string(),
-    };
-
-    assert_eq!(
-        first_index_line(&phase),
-        "first index: failed — embedding job 7 failed; call index_codebase to retry"
-    );
-}
-
-/// An agent reads the top of the answer first, and nothing waits for a first
-/// index. The phase therefore comes straight after the codebase line.
 #[tokio::test]
-async fn sync_status_reports_every_phase_after_the_codebase_line() {
+async fn pending_first_index_phases_remain_visible_without_a_server_job() {
     let (_stub, client) = catalog_stub().await;
     for phase in [
         FirstIndexPhase::Registering,
         FirstIndexPhase::Syncing,
         FirstIndexPhase::Embedding {
-            job_id: Some("job-7".to_string()),
+            job_id: Some("job-7".into()),
         },
-        FirstIndexPhase::Ready,
-        FirstIndexPhase::Failed {
-            reason: "embedding job 7 failed".to_string(),
-        },
+        FirstIndexPhase::Embedding { job_id: None },
     ] {
         let text = sync_status(&client, Some(&checkout(Some(phase.clone()), None)))
             .await
-            .expect("sync_status works while a first index is pending");
-        let lines: Vec<&str> = fenced_body(&text).lines().collect();
-
-        assert_eq!(lines[0], "codebase A", "{text}");
-        assert_eq!(lines[1], first_index_line(&phase), "{text}");
-        assert_eq!(lines[2], "local checkout watch: active", "{text}");
+            .expect("status queries succeed while indexing is pending");
+        assert!(text.lines().next().unwrap().contains("not ready"), "{text}");
+        assert!(text.contains(&first_index_line(&phase)), "{text}");
+        assert!(!text.starts_with("```"), "{text}");
     }
 }
 
 #[tokio::test]
-async fn sync_status_has_no_first_index_line_for_a_checkout_without_one() {
+async fn running_upload_counters_are_visible_in_the_compact_preview() {
     let (_stub, client) = catalog_stub().await;
-
-    let text = sync_status(&client, Some(&checkout(None, None)))
-        .await
-        .expect("sync_status answers");
-
-    assert!(!text.contains("first index"), "{text}");
-    assert_eq!(
-        fenced_body(&text).lines().nth(1),
-        Some("local checkout watch: active")
-    );
-}
-
-#[test]
-fn the_current_sync_line_names_the_milestone_in_the_shared_words() {
-    assert_eq!(
-        current_sync_line(&SyncProgress::Uploading {
-            uploaded_files: 1200,
-            total_files: 3607,
-        }),
-        "current sync: uploading 1200/3607 files"
-    );
-    assert_eq!(
-        current_sync_line(&SyncProgress::Planning {
-            files: 3607,
-            cached_files: 3500,
-        }),
-        "current sync: scanned 3607 files (3500 filter decisions reused) — checking for changes"
-    );
-}
-
-/// The phase says that the first index syncs. The next line says how far the
-/// sync has come, so the two lines stay together.
-#[tokio::test]
-async fn sync_status_puts_the_current_sync_line_after_the_first_index_line() {
-    let (_stub, client) = catalog_stub().await;
-    let progress = SyncProgress::Uploading {
-        uploaded_files: 1200,
-        total_files: 3607,
-    };
-
     let text = sync_status(
         &client,
-        Some(&checkout(Some(FirstIndexPhase::Syncing), Some(progress))),
+        Some(&checkout(
+            Some(FirstIndexPhase::Syncing),
+            Some(SyncProgress::Uploading {
+                uploaded_files: 1200,
+                total_files: 3607,
+            }),
+        )),
     )
     .await
-    .expect("sync_status answers while a first index syncs");
-    let lines: Vec<&str> = fenced_body(&text).lines().collect();
-
-    assert_eq!(lines[0], "codebase A", "{text}");
-    assert_eq!(lines[1], "first index: syncing", "{text}");
-    assert_eq!(
-        lines[2], "current sync: uploading 1200/3607 files",
-        "{text}"
-    );
-    assert_eq!(lines[3], "local checkout watch: active", "{text}");
+    .unwrap();
+    let preview = text.lines().take(4).collect::<Vec<_>>().join("\n");
+    assert!(preview.contains("1200/3607"), "{text}");
+    assert!(preview.contains("not yet complete"), "{text}");
+    assert!(!preview.contains('%'), "{text}");
 }
 
-/// A re-sync of an indexed checkout has no first-index gate. Its progress line
-/// then follows the codebase line.
 #[tokio::test]
-async fn sync_status_reports_a_running_resync_without_a_first_index() {
+async fn a_running_resync_does_not_gain_a_first_index_gate() {
     let (_stub, client) = catalog_stub().await;
-
     let text = sync_status(
         &client,
         Some(&checkout(None, Some(SyncProgress::Finalizing))),
     )
     .await
-    .expect("sync_status answers during a re-sync");
-    let lines: Vec<&str> = fenced_body(&text).lines().collect();
-
-    assert_eq!(lines[0], "codebase A", "{text}");
-    assert_eq!(lines[1], "current sync: finalizing upload", "{text}");
-    assert_eq!(lines[2], "local checkout watch: active", "{text}");
+    .unwrap();
+    assert!(
+        text.contains(&SyncProgress::Finalizing.to_string()),
+        "{text}"
+    );
+    assert!(!text.contains("First index:"), "{text}");
 }
 
 #[tokio::test]
-async fn sync_status_has_no_current_sync_line_when_no_sync_runs() {
+async fn a_failed_first_index_keeps_its_raw_reason_and_explicit_retry() {
     let (_stub, client) = catalog_stub().await;
-
-    let text = sync_status(&client, Some(&checkout(Some(FirstIndexPhase::Ready), None)))
-        .await
-        .expect("sync_status answers");
-
-    assert!(!text.contains("current sync"), "{text}");
+    let reason = "embedding failed\n`````\n# literal reason";
+    let text = sync_status(
+        &client,
+        Some(&checkout(
+            Some(FirstIndexPhase::Failed {
+                reason: reason.into(),
+            }),
+            None,
+        )),
+    )
+    .await
+    .expect("a successful status query can report indexing failure");
+    assert!(text.lines().next().unwrap().contains("failed"), "{text}");
+    assert!(text.contains(reason), "{text}");
+    assert!(
+        text.lines()
+            .take(4)
+            .any(|line| line.contains(&markdown_code(reason))),
+        "the compact preview exposes the first-index diagnostic: {text}"
+    );
+    assert!(text.contains("`index_codebase`"), "{text}");
+    assert!(text.contains("not ready"), "{text}");
 }
 
 #[tokio::test]
 async fn a_local_sync_failure_reports_stale_results_and_the_retry_delay() {
     let (_stub, client) = catalog_stub().await;
     let mut status = checkout(None, None);
-    status.last_error = Some("sync plan: gateway unavailable".to_string());
+    status.last_error = Some("sync plan: gateway unavailable".into());
     status.retry_after_secs = Some(10);
-
     let text = sync_status(&client, Some(&status)).await.unwrap();
+    assert!(text.lines().next().unwrap().contains("failed"), "{text}");
+    assert!(
+        text.contains(status.last_error.as_deref().unwrap()),
+        "{text}"
+    );
+    assert!(text.contains("may be stale"), "{text}");
+    assert!(text.contains("next local sync attempt in 10 s"), "{text}");
+    assert!(
+        text.contains("No server job queued; the local sync failed"),
+        "{text}"
+    );
+}
 
-    assert!(text.contains("last local sync failed: sync plan: gateway unavailable"));
-    assert!(text.contains("indexed results may be stale"));
-    assert!(text.contains("next local sync attempt in 10 s"));
-    assert!(text.contains("no server job queued; the local sync failed"));
-    assert!(!text.contains("may still be scanning"));
+fn completed_job() -> crate::client::api::JobStatus {
+    serde_json::from_value(serde_json::json!({
+        "completedAt": "2026-10-01T00:00:00Z",
+        "filesEmbedded": 0, "filesDeleted": 0, "filesFailed": 0
+    }))
+    .unwrap()
+}
+
+#[test]
+fn job_progress_counts_failures_without_overflow_and_keeps_raw_diagnostics() {
+    let mut job: crate::client::api::JobStatus = serde_json::from_value(serde_json::json!({
+        "filesToEmbed": 10, "filesToDelete": 2, "filesEmbedded": 4,
+        "filesDeleted": 2, "filesFailed": 3, "startedAt": "started"
+    }))
+    .unwrap();
+    let text = render_job("job-1", &job);
+    assert_eq!(job_phase(&job), JobPhase::Failed);
+    assert!(text.contains("including failures | 9/12"));
+    let diagnostic = "\r\n```text\r\n# raw diagnostic\r\n";
+    job.error = Some(diagnostic.into());
+    let text = render_job("job`\n# hidden", &job);
+    assert!(text.contains(&format!("\n````text\n{diagnostic}````\n")));
+    assert!(!text.contains("\n# hidden"));
+    job.files_to_embed = i64::MAX;
+    job.files_to_delete = i64::MAX;
+    job.files_embedded = i64::MAX;
+    job.files_deleted = i64::MAX;
+    job.files_failed = i64::MAX;
+    let text = render_job("large-counters", &job);
+    assert!(text.contains(&format!(
+        "{}/{}",
+        i128::from(i64::MAX) * 3,
+        i128::from(i64::MAX) * 2
+    )));
+    assert!(!text.contains('%'));
+}
+
+#[test]
+fn job_phases_keep_queued_running_completed_and_no_op_freshness_distinct() {
+    let mut job: crate::client::api::JobStatus = serde_json::from_value(serde_json::json!({
+        "filesEmbedded": 0, "filesFailed": 0
+    }))
+    .unwrap();
+    assert_eq!(job_phase(&job), JobPhase::Pending);
+    job.started_at = Some("started".into());
+    assert_eq!(job_phase(&job), JobPhase::Running);
+    job.completed_at = Some("completed".into());
+    let text = render_job("job", &job);
+    assert_eq!(job_phase(&job), JobPhase::Done);
+    assert!(text.contains("does not establish checkout freshness"));
+    job.files_to_embed = 1;
+    job.files_to_delete = -1;
+    assert!(!render_job("job", &job).contains("no planned work"));
+}
+
+#[test]
+fn local_failure_and_active_retry_take_precedence_over_previous_jobs() {
+    let mut job = completed_job();
+    let mut status = checkout(Some(FirstIndexPhase::Ready), None);
+    status.last_error = Some("scan access denied".into());
+    assert!(sync_summary(Some(&status), Some(&job), false).contains("Local sync failed"));
+    status.first_index = Some(FirstIndexPhase::Failed {
+        reason: "no usable index".into(),
+    });
+    assert!(sync_summary(Some(&status), Some(&job), false).contains("First index failed"));
+    status.first_index = None;
+    status.last_error = None;
+    status.running = true;
+    job.error = Some("previous job failed".into());
+    assert!(sync_summary(Some(&status), Some(&job), false).contains("Local sync running"));
+}
+
+#[test]
+fn pending_and_failed_jobs_never_count_as_completed_indexing() {
+    let mut job = completed_job();
+    job.files_failed = 1;
+    assert!(sync_summary(None, Some(&job), false).contains("failed"));
+    job.files_failed = 0;
+    job.error = Some("worker failed".into());
+    assert!(sync_summary(None, Some(&job), false).contains("failed"));
+    job.error = None;
+    job.completed_at = None;
+    assert!(sync_summary(None, Some(&job), false).contains("queued"));
+    job.started_at = Some("2026-10-01T00:00:00Z".into());
+    assert!(sync_summary(None, Some(&job), false).contains("running"));
+    job.completed_at = Some("2026-10-01T00:01:00Z".into());
+    let mut status = checkout(Some(FirstIndexPhase::Ready), None);
+    status.pending_triggers = 1;
+    assert!(sync_summary(Some(&status), Some(&job), false).contains("pending"));
+    status.pending_triggers = 0;
+    status.trigger_overflow = true;
+    assert!(sync_summary(Some(&status), Some(&job), false).contains("pending"));
+}
+
+#[test]
+fn completion_does_not_claim_checkout_freshness_and_missing_state_is_unknown() {
+    let job = completed_job();
+    assert!(sync_summary(None, Some(&job), false).contains("freshness not established"));
+    assert!(sync_summary(None, Some(&job), true).contains("unknown"));
+    assert!(sync_summary(None, None, false).contains("unknown"));
 }
 
 #[tokio::test]
 async fn a_previous_completed_job_does_not_hide_a_local_sync_failure() {
     let stub = Stub::serve(vec![
         Reply::Answer {
-            status: "200 OK",
-            headers: Vec::new(),
-            body: EMPTY_CATALOG_PAGE.to_string(),
+            status: "200 OK", headers: Vec::new(), body: EMPTY_CATALOG_PAGE.into(),
         },
         Reply::ok(r#"{"id":"old-job","completedAt":"2026-10-01T00:00:00Z","filesEmbedded":0,"filesDeleted":0,"filesFailed":0,"error":null}"#),
     ])
     .await;
-    let client = Client::for_test_server(&stub.url).with_codebase("A".to_string());
+    let client = Client::for_test_server(&stub.url).with_codebase("A".into());
     let mut status = checkout(None, None);
-    status.last_job_id = Some("old-job".to_string());
-    status.last_error = Some("upload failed".to_string());
-
+    status.last_job_id = Some("old-job".into());
+    status.last_error = Some("upload failed".into());
     let text = sync_status(&client, Some(&status)).await.unwrap();
-
-    assert!(text.contains("last local sync failed: upload failed"));
-    assert!(text.contains("indexed results may be stale"));
-    assert!(text.contains("old-job"));
+    assert!(
+        text.lines().next().unwrap().contains("Local sync failed"),
+        "{text}"
+    );
+    assert!(text.contains("upload failed"), "{text}");
+    assert!(text.contains("may be stale"), "{text}");
+    assert!(text.contains("old-job"), "{text}");
     assert!(!text.contains("status could not be read"), "{text}");
 }
 
@@ -253,11 +427,79 @@ async fn a_previous_completed_job_does_not_hide_a_local_sync_failure() {
 async fn a_missing_watcher_is_not_reported_as_active() {
     let (_stub, client) = catalog_stub().await;
     let mut status = checkout(None, None);
-    status.watcher = WatcherState::Unavailable("watch limit reached".to_string());
-
+    status.watcher = WatcherState::Unavailable("watch limit reached".into());
     let text = sync_status(&client, Some(&status)).await.unwrap();
+    assert!(text.contains("not active (watch limit reached)"), "{text}");
+    assert!(
+        !text.lines().next().unwrap().contains("completed"),
+        "{text}"
+    );
+}
 
-    assert!(text.contains("local checkout watch: not active (watch limit reached)"));
+#[tokio::test]
+async fn catalog_failure_is_unknown_not_an_empty_catalog() {
+    let stub = Stub::serve(vec![Reply::Answer {
+        status: "503 Service Unavailable",
+        headers: Vec::new(),
+        body: "gateway unavailable".into(),
+    }])
+    .await;
+    let client = Client::for_test_server(&stub.url).with_codebase("A".into());
+    let text = sync_status(&client, None).await.unwrap();
+    assert!(text.lines().next().unwrap().contains("unknown"), "{text}");
+    assert!(!text.contains("| Persisted catalog files | 0 |"), "{text}");
+    assert!(text.contains("`sync_status` again"), "{text}");
+}
+
+#[tokio::test]
+async fn unreadable_server_job_is_unknown_not_successful_or_failed() {
+    let stub = Stub::serve(vec![
+        Reply::Answer {
+            status: "200 OK",
+            headers: Vec::new(),
+            body: EMPTY_CATALOG_PAGE.into(),
+        },
+        Reply::Answer {
+            status: "503 Service Unavailable",
+            headers: Vec::new(),
+            body: "job endpoint unavailable".into(),
+        },
+    ])
+    .await;
+    let client = Client::for_test_server(&stub.url).with_codebase("A".into());
+    let mut status = checkout(Some(FirstIndexPhase::Ready), None);
+    status.last_job_id = Some("job-7".into());
+    let text = sync_status(&client, Some(&status)).await.unwrap();
+    assert!(text.lines().next().unwrap().contains("unknown"), "{text}");
+    assert!(text.contains("job-7"), "{text}");
+    assert!(text.contains("status could not be read"), "{text}");
+}
+
+#[tokio::test]
+async fn no_op_job_does_not_replace_persisted_catalog_totals() {
+    let stub = Stub::serve(vec![
+        Reply::Answer {
+            status: "200 OK", headers: Vec::new(),
+            body: r#"{"success":true,"data":[{"path":"source.rs","size":2048}],"page":0,"pageSize":1000,"total":1}"#.into(),
+        },
+        Reply::ok(r#"{"completedAt":"2026-10-01T00:00:00Z","filesEmbedded":0,"filesDeleted":0,"filesFailed":0,"chunkCount":9}"#),
+    ])
+    .await;
+    let client = Client::for_test_server(&stub.url).with_codebase("A".into());
+    let mut status = checkout(None, None);
+    status.last_job_id = Some("no-op".into());
+    let text = sync_status(&client, Some(&status)).await.unwrap();
+    assert!(text.contains("| Persisted catalog files | 1 |"), "{text}");
+    assert!(text.contains("2048 bytes"), "{text}");
+    assert!(
+        text.contains("| Chunks reported by last server job | 9 |"),
+        "{text}"
+    );
+    assert!(text.contains("no-op"), "{text}");
+    assert!(
+        text.contains("0-file plan does not mean an empty index"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -396,13 +638,10 @@ async fn source_windows_keep_original_bytes_and_truncation_identity() {
     )
     .await
     .unwrap();
-    let (metadata, body) = text.split_once("\n\n").unwrap();
-    let metadata_block = format!("{metadata}\n");
-    let metadata = fenced_body(&metadata_block);
-    assert!(metadata.contains("pinned-hash"));
-    assert!(metadata.contains("20-80 of 500"));
-    assert!(metadata.contains("truncated"));
-    assert_eq!(fenced_body(body), source);
+    assert!(text.contains("pinned-hash"), "{text}");
+    assert!(text.contains("20-80 of 500"), "{text}");
+    assert!(text.contains("truncated"), "{text}");
+    assert_eq!(fenced_body(first_fenced_block(&text)), source);
 }
 
 #[tokio::test]
@@ -414,8 +653,54 @@ async fn sync_errors_cannot_hide_staleness_or_retry_information() {
     status.retry_after_secs = Some(10);
 
     let text = sync_status(&client, Some(&status)).await.unwrap();
-    let body = fenced_body(&text);
-    assert!(body.contains(reason));
-    assert!(body.contains("indexed results may be stale"));
-    assert!(body.contains("next local sync attempt in 10 s"));
+    assert!(
+        fenced_body(first_fenced_block(&text)).starts_with(reason),
+        "{text}"
+    );
+    assert!(
+        text.lines()
+            .take(4)
+            .any(|line| line.contains(&markdown_code(reason))),
+        "the compact preview exposes a safely escaped local diagnostic: {text}"
+    );
+    assert!(text.contains("may be stale"), "{text}");
+    assert!(text.contains("next local sync attempt in 10 s"), "{text}");
+}
+
+#[tokio::test]
+async fn a_failed_server_job_exposes_its_diagnostic_before_state_details() {
+    let reason = "embedding unavailable\n`````\n# literal server diagnostic";
+    let stub = Stub::serve(vec![
+        Reply::Answer {
+            status: "200 OK",
+            headers: Vec::new(),
+            body: EMPTY_CATALOG_PAGE.into(),
+        },
+        Reply::ok(
+            &serde_json::json!({
+                "completedAt": "2026-10-01T00:00:00Z",
+                "filesEmbedded": 0,
+                "filesDeleted": 0,
+                "filesFailed": 1,
+                "error": reason
+            })
+            .to_string(),
+        ),
+    ])
+    .await;
+    let client = Client::for_test_server(&stub.url).with_codebase("A".into());
+    let mut status = checkout(None, None);
+    status.last_job_id = Some("failed-job".into());
+    let text = sync_status(&client, Some(&status)).await.unwrap();
+    assert!(text.lines().next().unwrap().contains("failed"), "{text}");
+    assert!(
+        text.lines()
+            .take(4)
+            .any(|line| line.contains(&markdown_code(reason))),
+        "the compact preview exposes a safely escaped server diagnostic: {text}"
+    );
+    assert!(
+        fenced_body(first_fenced_block(&text)).starts_with(reason),
+        "the complete raw diagnostic remains available: {text}"
+    );
 }

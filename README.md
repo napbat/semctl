@@ -124,6 +124,11 @@ revision and file count. A copy matches only when its source identity equals
 the checkout's. Historical copies remain intact. The codebase's reported graph
 state does not establish per-copy freshness.
 
+Native MCP results use ranked snippets, attributed batch tables, language-tagged
+source and phase-first sync snapshots. Source bytes and provenance remain intact
+behind the host's expand control. Hybrid scores are query-relative, not confidence;
+status output distinguishes current local work from the last recorded server job.
+
 Every read-only MCP tool call ends within one deadline. The default is 25
 seconds, below the 30 seconds after which Oh My Pi ends an MCP request. Set
 `SEMCTX_TOOL_DEADLINE_SECS` to change it. A value from 5 to 600 applies as
