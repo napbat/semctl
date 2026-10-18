@@ -41,10 +41,12 @@
       "skills": ["codebase-retrieval"],
       "query": "Search results for code I edited about 30 seconds ago look stale in this session. What do you check and what do you do about it?",
       "expected_behavior": [
-        "Checks sync_status and/or points at the per-hit '⚠ stale (edited since indexed)' flag and freshness footer",
+        "Checks sync_status and available source-binding evidence; distinguishes verified snapshot bytes/coordinates from changed, mismatched, or unavailable verification without treating symbol/focus identity as verified or requiring a particular warning phrase",
         "Explains the MCP server auto-syncs (filesystem watcher + periodic re-sync)",
         "Does NOT recommend running `semctx index` while a known local checkout is active in the MCP session",
-        "Reads the edited file with host Read when current bytes are needed"
+        "Reads the edited file with host Read when current bytes are needed",
+        "Preserves reported diagnostics and follows the reported recovery instead of requesting automatic reindexing or blindly retrying",
+        "Treats missing server counters as unknown and named reported counts as evidence, not a processed/total completion ratio"
       ]
     },
     {

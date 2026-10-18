@@ -171,7 +171,8 @@ pub async fn list_files(
 pub async fn sync_status(
     client: &Client,
     checkout: Option<&CoordinatorStatus>,
-) -> Result<String, ToolError> {
+    presentation: super::QueryPresentation,
+) -> Result<super::QueryOutput, ToolError> {
     let codebase_id = bound_codebase(client, "sync_status")?;
     let totals = catalog_totals(client, codebase_id).await;
     let job_id = checkout.and_then(|status| status.last_job_id.as_deref());
@@ -188,49 +189,71 @@ pub async fn sync_status(
     let first_index = checkout.and_then(|status| status.first_index.as_ref());
     let local_error = checkout.and_then(|status| status.last_error.as_deref());
     let job_status = job.as_ref().and_then(|(_, result)| result.as_ref().ok());
-    let unavailable = totals.is_err() || job.as_ref().is_some_and(|(_, result)| result.is_err());
-    let mut out = format!("{}  \n", sync_summary(checkout, job_status, unavailable));
-    let diagnostic = match first_index {
-        Some(FirstIndexPhase::Failed { reason }) => {
-            Some(("First-index diagnostic", reason.as_str()))
-        }
-        _ => local_error.map(|error| ("Local diagnostic", error)),
-    }
-    .or_else(|| {
-        job_status
-            .and_then(|status| status.error.as_deref())
-            .map(|error| ("Last server diagnostic", error))
-    });
-    if let Some((label, reason)) = diagnostic {
-        writeln!(out, "{label}: {}  ", markdown_code(reason))
-            .expect("writing to a String cannot fail");
-    } else if let Some(status) = job_status.filter(|status| status.files_failed > 0) {
-        writeln!(
-            out,
-            "Last server job: {} failed files.  ",
-            status.files_failed
-        )
-        .expect("writing to a String cannot fail");
-    } else if let Some(error) = job
+    let status_error = job
         .as_ref()
         .and_then(|(_, result)| result.as_ref().err())
-        .or(totals.as_ref().err())
-    {
+        .or(totals.as_ref().err());
+    let root = checkout
+        .map(|status| status.root.as_path())
+        .or(client.local_root());
+    // A basename is only a display label for this already-bound checkout, never
+    // an identity lookup. The full root and immutable id remain below.
+    let label = root
+        .and_then(|path| path.file_name())
+        .map(|name| name.to_string_lossy());
+    let mut out = format!(
+        "{} · {}",
+        markdown_code(label.as_deref().unwrap_or(codebase_id)),
+        sync_summary(checkout, job_status, status_error.is_some()),
+    );
+    let local_attempt = checkout.is_some_and(|status| {
+        status.running
+            || status.sync_progress.is_some()
+            || matches!(
+                status.first_index,
+                Some(FirstIndexPhase::Registering | FirstIndexPhase::Syncing)
+            )
+    });
+    if let Some(progress) = checkout.and_then(|status| status.sync_progress.as_ref()) {
+        write!(out, " · {}", markdown_code(&progress.to_string()))
+            .expect("writing to a String cannot fail");
+    } else if !local_attempt && let Some(status) = job_status {
+        out.push_str(" · last server job: ");
+        render_job_counts(&mut out, status);
+    }
+    let diagnostic = match first_index {
+        Some(FirstIndexPhase::Failed { reason }) => Some(reason.as_str()),
+        _ => local_error,
+    }
+    .or_else(|| {
+        if local_attempt {
+            None
+        } else {
+            job_status.and_then(|status| status.error.as_deref())
+        }
+    });
+    if let Some(reason) = diagnostic {
+        write!(out, " · {}", diagnostic_preview(reason)).expect("writing to a String cannot fail");
+    }
+    out.push_str("  \n");
+    render_sync_recovery(&mut out, checkout, job_status, local_attempt, status_error);
+    out.push_str("\n### Status evidence\n\n");
+    writeln!(out, "Codebase: {}  ", markdown_code(codebase_id))
+        .expect("writing to a String cannot fail");
+    if let Some(root) = root {
         writeln!(
             out,
-            "Status diagnostic: {}  ",
-            markdown_code(&error.to_string())
+            "Local root: {}  ",
+            markdown_code(&root.display().to_string())
         )
         .expect("writing to a String cannot fail");
-    }
-    writeln!(out, "Codebase {} · snapshot.  ", markdown_code(codebase_id))
-        .expect("writing to a String cannot fail");
-    if let Some(progress) = checkout.and_then(|status| status.sync_progress.as_ref()) {
-        writeln!(out, "{}  ", markdown_code(&current_sync_line(progress)))
-            .expect("writing to a String cannot fail");
     }
     if let Some(phase) = first_index {
         writeln!(out, "{}  ", first_index_line(phase)).expect("writing to a String cannot fail");
+    }
+    if let Some(progress) = checkout.and_then(|status| status.sync_progress.as_ref()) {
+        writeln!(out, "{}  ", markdown_code(&current_sync_line(progress)))
+            .expect("writing to a String cannot fail");
     }
     render_sync_state(&mut out, checkout, &totals, job_status);
     render_local_sync_failures(&mut out, checkout);
@@ -239,31 +262,101 @@ pub async fn sync_status(
         checkout,
         job.as_ref().map(|(id, result)| (*id, result)),
     );
-    Ok(out)
+    let display = if presentation == super::QueryPresentation::Inspector {
+        super::display::status(
+            client,
+            checkout,
+            &totals,
+            job.as_ref().map(|(id, result)| (*id, result)),
+        )
+    } else {
+        None
+    };
+    Ok(super::QueryOutput::new(out, display))
 }
 
-/// Persisted totals and coordinator state describe different scopes: neither
-/// the latest job's plan nor its outcome replaces the catalog.
+/// Keep corrective actions beside the compact failure preview, not repeated
+/// throughout the expanded evidence.
+fn render_sync_recovery(
+    out: &mut String,
+    checkout: Option<&CoordinatorStatus>,
+    job_status: Option<&api::JobStatus>,
+    local_attempt: bool,
+    status_error: Option<&anyhow::Error>,
+) {
+    let first_failed = checkout
+        .is_some_and(|status| matches!(status.first_index, Some(FirstIndexPhase::Failed { .. })));
+    let local_failed = checkout.is_some_and(|status| status.last_error.is_some());
+    if first_failed {
+        out.push_str("Correct the reported failure, then call `index_codebase` for this codebase to retry the failed first index.  \n");
+    } else if local_failed {
+        if let Some(seconds) = checkout.and_then(|status| status.retry_after_secs) {
+            writeln!(
+                out,
+                "Correct the local failure; next local sync attempt in {seconds} s.  "
+            )
+            .expect("writing to a String cannot fail");
+        } else {
+            out.push_str("Correct the local failure; no retry delay reported.  \n");
+        }
+    }
+    if let Some(status) = job_status.filter(|status| job_phase(status) == JobPhase::Failed) {
+        out.push_str("Last server job failed");
+        if (local_attempt || local_failed || first_failed)
+            && let Some(reason) = &status.error
+        {
+            write!(out, ": {}", diagnostic_preview(reason))
+                .expect("writing to a String cannot fail");
+        }
+        if status.files_failed > 0 {
+            write!(out, ": {} failed files", status.files_failed)
+                .expect("writing to a String cannot fail");
+        }
+        out.push_str("; correct the server failure before retrying.  \n");
+    }
+    if let Some(error) = status_error {
+        writeln!(
+            out,
+            "Status unavailable: {}; resolve access/connectivity and call `sync_status` again.  ",
+            diagnostic_preview(&error.to_string()),
+        )
+        .expect("writing to a String cannot fail");
+    }
+}
+
+/// Keep the native collapsed preview short; the fenced diagnostic below is raw.
+fn diagnostic_preview(reason: &str) -> String {
+    let line = reason
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("(empty diagnostic)");
+    let mut preview: String = line.chars().take(160).collect();
+    if line.chars().nth(160).is_some() {
+        preview.push('…');
+    }
+    markdown_code(&preview)
+}
+
+/// Catalog totals are persisted evidence, not a current sync's work counters.
 fn render_sync_state(
     out: &mut String,
     checkout: Option<&CoordinatorStatus>,
     totals: &anyhow::Result<(u32, i64)>,
     job: Option<&api::JobStatus>,
 ) {
-    out.push_str("\n| State | Reported value |\n| --- | --- |\n");
     match totals {
         Ok((files, bytes)) => {
             writeln!(
                 out,
-                "| Persisted catalog files | {files} |\n| Persisted source size | {} ({bytes} bytes) |",
+                "Persisted catalog: {files} files; {} ({bytes} bytes).  ",
                 human_bytes(*bytes)
             )
             .expect("writing to a String cannot fail");
         }
-        Err(_) => out.push_str("| Persisted catalog totals | ⚠ Unknown — request failed |\n"),
+        Err(_) => out.push_str("Persisted catalog totals: unknown (request failed).  \n"),
     }
     if let Some(chunks) = job.and_then(|status| status.chunk_count) {
-        writeln!(out, "| Chunks reported by last server job | {chunks} |")
+        writeln!(out, "Chunks reported by last server job: {chunks}.  ")
             .expect("writing to a String cannot fail");
     }
     let watch = match checkout.map(|status| &status.watcher) {
@@ -273,12 +366,12 @@ fn render_sync_state(
         }
         None => "not active (no local checkout selected)".to_string(),
     };
-    writeln!(out, "| Local checkout watch | {} |", markdown_cell(&watch))
+    writeln!(out, "Local checkout watch: {}  ", markdown_code(&watch))
         .expect("writing to a String cannot fail");
     if let Some(status) = checkout {
         writeln!(
             out,
-            "| Local reconcile | {} |\n| Pending local triggers | {}{} |",
+            "Local reconcile: {}; pending triggers: {}{}; leases: {}.  ",
             if status.running || status.sync_progress.is_some() {
                 "running"
             } else {
@@ -289,20 +382,26 @@ fn render_sync_state(
                 " (overflowed; changes coalesced)"
             } else {
                 ""
-            }
+            },
+            status.leases,
         )
         .expect("writing to a String cannot fail");
         if let Some(seconds) = status.retry_after_secs {
             writeln!(
                 out,
-                "| Retry schedule | next local sync attempt in {seconds} s |"
+                "Retry schedule: next local sync attempt in {seconds} s.  "
             )
             .expect("writing to a String cannot fail");
         }
+        if let Some(outcome) = &status.last_outcome {
+            out.push_str("\nLast local outcome:\n\n");
+            render_fenced(out, outcome, None);
+        }
+        if let crate::engine::coordinator::WatcherState::Unavailable(reason) = &status.watcher {
+            out.push_str("\nWatcher diagnostic:\n\n");
+            render_fenced(out, reason, None);
+        }
     }
-    out.push_str(
-        "\nCatalog totals are persisted state; a 0-file plan does not mean an empty index.\n",
-    );
     if let Err(error) = totals {
         out.push_str("\n### Catalog totals unavailable\n\n");
         render_fenced(out, &error.to_string(), None);
@@ -315,7 +414,9 @@ fn render_sync_state(
 fn render_local_sync_failures(out: &mut String, checkout: Option<&CoordinatorStatus>) {
     let Some(status) = checkout else { return };
     let first_failed = matches!(status.first_index, Some(FirstIndexPhase::Failed { .. }));
-    if let Some(error) = &status.last_error {
+    if let Some(error) = &status.last_error
+        && !matches!(&status.first_index, Some(FirstIndexPhase::Failed { reason }) if reason == error)
+    {
         out.push_str("\n### Local scan/upload failure\n\n");
         render_fenced(out, error, None);
         out.push_str(
@@ -334,7 +435,6 @@ fn render_local_sync_failures(out: &mut String, checkout: Option<&CoordinatorSta
     if let Some(FirstIndexPhase::Failed { reason }) = &status.first_index {
         out.push_str("\n### First-index failure\n\n");
         render_fenced(out, reason, None);
-        out.push_str("\nCall `index_codebase` for this codebase to renew the failed first index; local retries alone do not establish retrieval readiness.\n");
     }
 }
 
@@ -363,33 +463,54 @@ fn render_job(job_id: &str, j: &api::JobStatus) -> String {
     let phase = job_phase(j);
     let label = match phase {
         JobPhase::Failed => "**Failed**",
-        JobPhase::Done => "✓ **Done**",
+        JobPhase::Done => "**Done**",
         JobPhase::Running => "**Running**",
         JobPhase::Pending => "**Pending**",
     };
-    let processed =
-        i128::from(j.files_embedded) + i128::from(j.files_deleted) + i128::from(j.files_failed);
-    let total = i128::from(j.files_to_embed) + i128::from(j.files_to_delete);
-    let mut out = format!(
-        "{label} · Server job {}\n\n\
-         | Work | Reported count |\n| --- | --- |\n\
-         | Processed files, including failures | {processed}/{total} |\n\
-         | Embedded | {} |\n| Deleted | {} |\n| Failed | {} |\n",
-        markdown_code(job_id),
-        j.files_embedded,
-        j.files_deleted,
-        j.files_failed,
-    );
+    let mut out = format!("{label} · Server job {} · ", markdown_code(job_id));
+    render_job_counts(&mut out, j);
+    out.push_str("  \n");
+    if let Some(started) = &j.started_at {
+        writeln!(out, "Started: {}  ", markdown_code(started))
+            .expect("writing to a String cannot fail");
+    }
+    if let Some(completed) = &j.completed_at {
+        writeln!(out, "Completed: {}  ", markdown_code(completed))
+            .expect("writing to a String cannot fail");
+    }
     if let Some(error) = &j.error {
         out.push_str("\nServer diagnostic:\n\n");
         render_fenced(&mut out, error, None);
     }
-    if phase == JobPhase::Done && j.files_to_embed == 0 && j.files_to_delete == 0 {
+    if phase == JobPhase::Done && j.files_to_embed == Some(0) && j.files_to_delete == Some(0) {
         out.push_str(
             "\nThis job reported no planned work; this does not establish checkout freshness.\n",
         );
     }
     out
+}
+
+/// Named wire counters are evidence, not a derived completion ratio.
+fn render_job_counts(out: &mut String, job: &api::JobStatus) {
+    for (index, (label, count)) in [
+        ("embedded", Some(job.files_embedded)),
+        ("deleted", job.files_deleted),
+        ("failed", Some(job.files_failed)),
+        ("planned embed", job.files_to_embed),
+        ("planned delete", job.files_to_delete),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if index > 0 {
+            out.push_str("; ");
+        }
+        write!(out, "{label} ").expect("writing to a String cannot fail");
+        match count {
+            Some(value) => write!(out, "{value}").expect("writing to a String cannot fail"),
+            None => out.push_str("unknown"),
+        }
+    }
 }
 
 /// A recorded server job may predate the current local attempt. Preserve its
@@ -409,9 +530,6 @@ fn render_sync_job(
                 out.push_str("This job may precede the current local attempt.\n\n");
             }
             out.push_str(&render_job(id, status));
-            if status.error.is_some() || status.files_failed > 0 {
-                out.push_str("\nCorrect the server failure before retrying; a failed job does not imply a retry was queued. First-index retries require `index_codebase`.\n");
-            }
         }
         Some((id, Err(error))) => {
             writeln!(
@@ -457,7 +575,7 @@ fn sync_summary(
             return "**First index registering — retrieval not ready**";
         }
         Some(FirstIndexPhase::Syncing) => {
-            return "**First index syncing — retrieval not ready**";
+            return "**First index syncing — waiting for local work; retrieval not ready**";
         }
         _ => {}
     }
@@ -481,17 +599,18 @@ fn sync_summary(
     if checkout.is_some_and(|status| status.pending_triggers > 0 || status.trigger_overflow) {
         return "**Local sync pending — indexed results may be stale**";
     }
-    if matches!(first, Some(FirstIndexPhase::Ready)) || phase == Some(JobPhase::Done) {
-        return "✓ **Done** · Indexing — checkout freshness not established";
+    if matches!(first, Some(FirstIndexPhase::Ready)) {
+        return "**Ready** · Retrieval available; checkout freshness not established";
+    }
+    if phase == Some(JobPhase::Done) {
+        return "**Last server job done** · Checkout freshness not established";
     }
     "**Indexing state unknown — no completion reported**"
 }
 
 fn first_index_line(phase: &FirstIndexPhase) -> String {
     match phase {
-        FirstIndexPhase::Failed { .. } => {
-            "First index: failed; call `index_codebase` to retry".into()
-        }
+        FirstIndexPhase::Failed { .. } => "First index: failed".into(),
         _ => format!("First index: {}", markdown_code(&phase.to_string())),
     }
 }
@@ -675,10 +794,18 @@ pub async fn batch_lookup(
     client: &Client,
     symbols: &[String],
     references: bool,
-) -> Result<String, ToolError> {
+    presentation: super::QueryPresentation,
+) -> Result<super::QueryOutput, ToolError> {
     let cb = bound_codebase(client, "batch_lookup")?;
     if symbols.is_empty() {
-        return Ok("(no symbols requested)".into());
+        return Ok(super::QueryOutput::new(
+            "(no symbols requested)".into(),
+            if presentation == super::QueryPresentation::Inspector {
+                super::display::batch(client, &[])
+            } else {
+                None
+            },
+        ));
     }
     let url = format!("/v1/codebases/{cb}/graph/batch");
     let body = serde_json::json!({ "symbols": symbols, "references": references });
@@ -724,7 +851,12 @@ pub async fn batch_lookup(
             .expect("writing to a String cannot fail");
         }
     }
-    Ok(out)
+    let display = if presentation == super::QueryPresentation::Inspector {
+        super::display::batch(client, &results)
+    } else {
+        None
+    };
+    Ok(super::QueryOutput::new(out, display))
 }
 
 /// The codebase's files as an indented directory tree.

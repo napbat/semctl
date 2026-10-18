@@ -71,7 +71,8 @@ function makeHarness(invoker: HookInvoker, tools = ["mcp__semctx_semctx_search_c
 	const emit = async (event: string, payload: Record<string, unknown> = {}) => {
 		let result: unknown;
 		for (const handler of handlers.get(event) ?? []) {
-			result = await handler({ type: event, ...payload }, ctx);
+			const next = await handler({ type: event, ...payload }, ctx);
+			if (next !== undefined) result = next;
 		}
 		return result;
 	};

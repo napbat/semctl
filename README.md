@@ -124,10 +124,23 @@ revision and file count. A copy matches only when its source identity equals
 the checkout's. Historical copies remain intact. The codebase's reported graph
 state does not establish per-copy freshness.
 
-Native MCP results use ranked snippets, attributed batch tables, language-tagged
-source and phase-first sync snapshots. Source bytes and provenance remain intact
-behind the host's expand control. Hybrid scores are query-relative, not confidence;
-status output distinguishes current local work from the last recorded server job.
+MCP results use ranked snippets, attributed batch tables, language-tagged source,
+and phase-first sync snapshots. Source bytes, provenance, and full diagnostics
+remain in the original result. Hybrid scores are query-relative, not confidence.
+Search source binding requires a local byte snapshot to match the ready
+content-plane full-file hash, plus exact snippet bytes and supplied byte/line
+coordinates in that snapshot. It does not verify semantic symbol/focus identity
+or guarantee that the file stays unchanged. Changed bytes, mismatched ranges,
+and unavailable verification stay distinct. Use local Read/Grep for current
+locations when binding is not established. Verification does not start a reindex.
+
+The semctl OMP adapter adds one replace-in-place native inspector above the editor
+through the existing extension APIs. It reads bounded, typed
+`_meta.semctlDisplay` metadata rather than parsing Markdown or changing
+model-facing content. The original MCP transcript, errors, approvals, and
+cancellation remain intact. The inspector requires no OMP modification or extra
+source fetches. It does not automatically combine calls or establish token
+savings. See the [plugin documentation](plugins/semctx/README.md) for limits.
 
 Every read-only MCP tool call ends within one deadline. The default is 25
 seconds, below the 30 seconds after which Oh My Pi ends an MCP request. Set
@@ -143,11 +156,16 @@ changed would report a failed edit that was applied.
 
 The `index_codebase` tool does not wait for the first index. It registers the
 codebase, starts the scan and upload in the background, and returns at once with
-the codebase id and the path. The `sync_status` tool then reports the first-index
-phase: registering, syncing, embedding, ready, or failed. While a sync runs, it
-also reports a `current sync:` line with the latest step, such as the number of
-uploaded files. `semctl daemon status` reports the same phase and step for each
-checkout.
+the codebase id and the path. The `sync_status` tool reports the first-index
+phase: registering, syncing, embedding, ready, or failed. It reports the latest
+local scan/upload step when available. `semctl daemon status` exposes the same
+local phase and step for each checkout. Do not depend on a fixed line layout.
+Status separates current local work, persisted catalog totals, and the last
+recorded server job. Missing server counters are unknown; named reported counts
+are not a processed/total completion ratio. A completed or zero-file job does not
+establish checkout freshness. Inspect and correct a first-index failure before
+calling `index_codebase` for the same path to retry. Active local checkouts use
+their watcher and periodic reconciliation.
 
 ### Coming from the old `semctx` CLI
 

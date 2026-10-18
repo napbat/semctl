@@ -17,9 +17,12 @@ fn search_hit(codebase: Option<&str>) -> Value {
 fn search_response(request: &Request, hits: &Value) -> Value {
     match (request.method.as_str(), request.path.as_str()) {
         ("POST", "/v1/search") => json!({"success": true, "data": hits}),
-        ("GET", "/v1/codebases/A/files?page=0&pageSize=1000") => json!({
-            "success": true, "data": [{"path": "src/lib.rs", "size": 17, "contentHash": "old-index-hash"}],
-            "page": 0, "pageSize": 1000, "total": 1
+        ("GET", "/v1/codebases/A/files/content?path=src%2Flib.rs&byteStart=0&byteEnd=1") => json!({
+            "success": true, "data": {
+                "path": "src/lib.rs", "contentHash": "old-index-hash",
+                "content": "f", "encoding": "utf-8", "isBinary": false,
+                "size": 17, "byteStart": 0, "byteEnd": 1, "truncated": true
+            }
         }),
         _ => panic!("unexpected search request: {request:?}"),
     }
@@ -48,11 +51,7 @@ async fn cross_codebase_search_keeps_remote_paths_relative_and_unmarked() {
         assert!(!text.contains("checkout-a"), "{text}");
         assert!(!text.contains("stale"), "{text}");
         let requests = server.requests();
-        assert_eq!(
-            requests.len(),
-            1,
-            "remote hits must not read the local catalog"
-        );
+        assert_eq!(requests.len(), 1, "remote hits must not probe local source");
         assert!(requests[0].body.get("codebaseId").is_none());
         assert_eq!(requests[0].body[field], value);
     }
@@ -112,7 +111,6 @@ async fn mixed_search_marks_only_hits_bound_to_the_local_checkout() {
         .strip_prefix(r"\\?\")
         .unwrap_or(&local_location);
     assert!(local.contains(local_location), "{text}");
-    assert!(local.contains("stale"), "{text}");
     for nonlocal in [remote, unidentified] {
         assert!(nonlocal.contains("src/lib.rs:1-1"), "{text}");
         assert!(!nonlocal.contains("checkout-a"), "{text}");
@@ -264,5 +262,104 @@ async fn mcp_scoped_search_works_from_an_unindexed_directory() {
         requests
             .iter()
             .all(|request| !request.path.starts_with("/v1/codebases/A/files"))
+    );
+}
+
+#[tokio::test]
+async fn search_keeps_old_evidence_visible_when_source_is_pending_despite_current_catalog() {
+    let checkout = Checkout::new();
+    let current = "fn current_name() {}\n";
+    fs::write(checkout.root.join("src/lib.rs"), current).unwrap();
+    let server = Server::start(move |request| match request.path.as_str() {
+        "/v1/search" => {
+            let mut hit = search_hit(Some("A"));
+            hit["snippet"] = json!("fn old_name() {}");
+            hit["snippetByteStart"] = json!(0);
+            hit["snippetByteEnd"] = json!(16);
+            json!({"success": true, "data": [hit]})
+        }
+        "/v1/codebases/A/files?page=0&pageSize=1000" => json!({
+            "success": true, "data": [{
+                "path": "src/lib.rs", "size": current.len(),
+                "contentHash": blake3::hash(current.as_bytes()).to_hex().to_string()
+            }], "page": 0, "pageSize": 1000, "total": 1
+        }),
+        "/v1/codebases/A/files/content?path=src%2Flib.rs&byteStart=0&byteEnd=1" => json!({
+            "success": false,
+            "errors": [{"code": "FileNotIndexed", "message": "source unavailable", "details": {"status": "Pending"}}]
+        }),
+        _ => panic!("unexpected search request: {request:?}"),
+    });
+    let output = checkout
+        .run(
+            &server,
+            &checkout.root,
+            &["--codebase", "A", "search", "old function"],
+        )
+        .await;
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let text = String::from_utf8(output.stdout).unwrap();
+    let local_location = format!("{}:1-1", checkout.root.join("src/lib.rs").display());
+    let local_location = local_location
+        .strip_prefix(r"\\?\")
+        .unwrap_or(&local_location);
+    assert!(
+        text.contains("FileNotIndexed") && text.contains("Pending"),
+        "{text}"
+    );
+    assert!(
+        text.contains(local_location) && text.contains("fn old_name() {}"),
+        "{text}"
+    );
+    assert!(!text.contains(current.trim()), "{text}");
+}
+
+#[tokio::test]
+async fn automatic_candidate_hints_do_not_silently_accept_pending_source() {
+    let checkout = Checkout::new();
+    let server = Server::start(|request| match request.path.as_str() {
+        "/v1/codebases/A" => json!({"id": "A", "slug": "a", "sourceKind": "Local"}),
+        "/v1/search" => json!({"success": true, "data": [search_hit(Some("A"))]}),
+        "/v1/codebases/A/files/content?path=src%2Flib.rs&byteStart=0&byteEnd=1" => json!({
+            "success": false,
+            "errors": [{"code": "FileNotIndexed", "message": "source unavailable", "details": {"status": "Pending"}}]
+        }),
+        _ => panic!("unexpected hook request: {request:?}"),
+    });
+    let mut command = checkout.command(&server, &checkout.root, &["hook"]);
+    command
+        .stdin(Stdio::piped())
+        .env_remove("SEMCTX_HOOK_DISABLE")
+        .env_remove("SEMCTX_HOOK_MIN_SCORE")
+        .env("SEMCTX_HOOK_TOP_K", "1");
+    let mut child = command.spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin
+        .write_all(
+            &serde_json::to_vec(&json!({
+                "hook_event_name": "UserPromptSubmit",
+                "cwd": checkout.root, "prompt": "Where is repository source handling implemented?"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    drop(stdin);
+    let output = tokio::time::timeout(Duration::from_secs(15), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let text = result["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(
+        text.contains("src/lib.rs:1-1") && text.contains("remote"),
+        "{text}"
+    );
+    assert!(
+        text.contains("FileNotIndexed") && text.contains("Pending"),
+        "{text}"
     );
 }

@@ -741,10 +741,10 @@ async fn private_scratch_events_are_never_relevant() {
 
 fn job(completed: bool, failed: i64, error: Option<&str>) -> api::JobStatus {
     api::JobStatus {
-        files_to_embed: 3,
-        files_to_delete: 0,
+        files_to_embed: Some(3),
+        files_to_delete: Some(0),
         files_embedded: if completed { 3 - failed } else { 1 },
-        files_deleted: 0,
+        files_deleted: Some(0),
         files_failed: failed,
         chunk_count: completed.then_some(12),
         error: error.map(str::to_string),

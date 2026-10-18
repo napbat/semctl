@@ -68,13 +68,22 @@ async fn batch_results_keep_unmatched_and_multiple_locations_attributed() {
     for references in [false, true] {
         let stub = Stub::serve(vec![Reply::ok(&results.to_string())]).await;
         let client = Client::for_test_server(&stub.url).with_codebase("A".into());
-        let text = super::batch_lookup(
+        let output = super::batch_lookup(
             &client,
             &["missing|symbol".into(), "lookup".into(), "last".into()],
             references,
+            crate::query::QueryPresentation::Inspector,
         )
         .await
         .unwrap();
+        let display = output.display.as_ref().unwrap();
+        assert_eq!(display["symbols"][0]["symbol"], "missing|symbol");
+        assert_eq!(display["symbols"][0]["hits"], serde_json::json!([]));
+        assert_eq!(
+            display["symbols"][1]["hits"][0]["binding"]["state"],
+            "not-probed"
+        );
+        let text = output.text;
         let kind = if references {
             "references"
         } else {
@@ -102,21 +111,6 @@ async fn batch_results_keep_unmatched_and_multiple_locations_attributed() {
             previous = position;
         }
     }
-}
-
-#[test]
-fn a_ready_first_index_reports_the_same_outcome_as_a_successful_job() {
-    let ready = checkout(Some(FirstIndexPhase::Ready), None);
-    assert_eq!(
-        sync_summary(Some(&ready), None, false),
-        sync_summary(None, Some(&completed_job()), false),
-    );
-    let mut active = ready;
-    active.running = true;
-    assert_ne!(
-        sync_summary(Some(&active), None, false),
-        sync_summary(None, Some(&completed_job()), false),
-    );
 }
 
 #[test]
@@ -204,9 +198,14 @@ async fn pending_first_index_phases_remain_visible_without_a_server_job() {
         },
         FirstIndexPhase::Embedding { job_id: None },
     ] {
-        let text = sync_status(&client, Some(&checkout(Some(phase.clone()), None)))
-            .await
-            .expect("status queries succeed while indexing is pending");
+        let text = sync_status(
+            &client,
+            Some(&checkout(Some(phase.clone()), None)),
+            crate::query::QueryPresentation::Plain,
+        )
+        .await
+        .expect("status queries succeed while indexing is pending")
+        .text;
         assert!(text.lines().next().unwrap().contains("not ready"), "{text}");
         assert!(text.contains(&first_index_line(&phase)), "{text}");
         assert!(!text.starts_with("```"), "{text}");
@@ -225,12 +224,14 @@ async fn running_upload_counters_are_visible_in_the_compact_preview() {
                 total_files: 3607,
             }),
         )),
+        crate::query::QueryPresentation::Plain,
     )
     .await
-    .unwrap();
-    let preview = text.lines().take(4).collect::<Vec<_>>().join("\n");
+    .unwrap()
+    .text;
+    let preview = text.lines().next().unwrap();
     assert!(preview.contains("1200/3607"), "{text}");
-    assert!(preview.contains("not yet complete"), "{text}");
+    assert!(preview.contains("running"), "{text}");
     assert!(!preview.contains('%'), "{text}");
 }
 
@@ -240,9 +241,11 @@ async fn a_running_resync_does_not_gain_a_first_index_gate() {
     let text = sync_status(
         &client,
         Some(&checkout(None, Some(SyncProgress::Finalizing))),
+        crate::query::QueryPresentation::Plain,
     )
     .await
-    .unwrap();
+    .unwrap()
+    .text;
     assert!(
         text.contains(&SyncProgress::Finalizing.to_string()),
         "{text}"
@@ -262,15 +265,18 @@ async fn a_failed_first_index_keeps_its_raw_reason_and_explicit_retry() {
             }),
             None,
         )),
+        crate::query::QueryPresentation::Plain,
     )
     .await
-    .expect("a successful status query can report indexing failure");
+    .expect("a successful status query can report indexing failure")
+    .text;
     assert!(text.lines().next().unwrap().contains("failed"), "{text}");
-    assert!(text.contains(reason), "{text}");
+    assert_eq!(
+        fenced_body(first_fenced_block(&text)),
+        format!("{reason}\n")
+    );
     assert!(
-        text.lines()
-            .take(4)
-            .any(|line| line.contains(&markdown_code(reason))),
+        text.lines().next().unwrap().contains("embedding failed"),
         "the compact preview exposes the first-index diagnostic: {text}"
     );
     assert!(text.contains("`index_codebase`"), "{text}");
@@ -283,7 +289,14 @@ async fn a_local_sync_failure_reports_stale_results_and_the_retry_delay() {
     let mut status = checkout(None, None);
     status.last_error = Some("sync plan: gateway unavailable".into());
     status.retry_after_secs = Some(10);
-    let text = sync_status(&client, Some(&status)).await.unwrap();
+    let text = sync_status(
+        &client,
+        Some(&status),
+        crate::query::QueryPresentation::Plain,
+    )
+    .await
+    .unwrap()
+    .text;
     assert!(text.lines().next().unwrap().contains("failed"), "{text}");
     assert!(
         text.contains(status.last_error.as_deref().unwrap()),
@@ -306,36 +319,22 @@ fn completed_job() -> crate::client::api::JobStatus {
 }
 
 #[test]
-fn job_progress_counts_failures_without_overflow_and_keeps_raw_diagnostics() {
+fn job_failures_keep_raw_diagnostics() {
     let mut job: crate::client::api::JobStatus = serde_json::from_value(serde_json::json!({
         "filesToEmbed": 10, "filesToDelete": 2, "filesEmbedded": 4,
         "filesDeleted": 2, "filesFailed": 3, "startedAt": "started"
     }))
     .unwrap();
-    let text = render_job("job-1", &job);
     assert_eq!(job_phase(&job), JobPhase::Failed);
-    assert!(text.contains("including failures | 9/12"));
     let diagnostic = "\r\n```text\r\n# raw diagnostic\r\n";
     job.error = Some(diagnostic.into());
     let text = render_job("job`\n# hidden", &job);
     assert!(text.contains(&format!("\n````text\n{diagnostic}````\n")));
     assert!(!text.contains("\n# hidden"));
-    job.files_to_embed = i64::MAX;
-    job.files_to_delete = i64::MAX;
-    job.files_embedded = i64::MAX;
-    job.files_deleted = i64::MAX;
-    job.files_failed = i64::MAX;
-    let text = render_job("large-counters", &job);
-    assert!(text.contains(&format!(
-        "{}/{}",
-        i128::from(i64::MAX) * 3,
-        i128::from(i64::MAX) * 2
-    )));
-    assert!(!text.contains('%'));
 }
 
 #[test]
-fn job_phases_keep_queued_running_completed_and_no_op_freshness_distinct() {
+fn job_phases_keep_queued_running_and_completed_distinct() {
     let mut job: crate::client::api::JobStatus = serde_json::from_value(serde_json::json!({
         "filesEmbedded": 0, "filesFailed": 0
     }))
@@ -344,12 +343,57 @@ fn job_phases_keep_queued_running_completed_and_no_op_freshness_distinct() {
     job.started_at = Some("started".into());
     assert_eq!(job_phase(&job), JobPhase::Running);
     job.completed_at = Some("completed".into());
-    let text = render_job("job", &job);
     assert_eq!(job_phase(&job), JobPhase::Done);
-    assert!(text.contains("does not establish checkout freshness"));
-    job.files_to_embed = 1;
-    job.files_to_delete = -1;
-    assert!(!render_job("job", &job).contains("no planned work"));
+}
+
+#[test]
+fn missing_job_counts_are_unknown_and_only_explicit_zero_plan_is_no_work() {
+    let missing = completed_job();
+    assert_eq!(missing.files_to_embed, None);
+    assert_eq!(missing.files_to_delete, None);
+    assert_eq!(missing.files_deleted, Some(0));
+    let text = render_job("missing-plan", &missing);
+    assert!(text.contains("planned embed unknown"), "{text}");
+    assert!(text.contains("planned delete unknown"), "{text}");
+    assert!(!text.contains("no planned work"), "{text}");
+
+    let mut zero: crate::client::api::JobStatus = serde_json::from_value(serde_json::json!({
+        "completedAt": "completed",
+        "filesEmbedded": 0,
+        "filesFailed": 0,
+        "filesToEmbed": 0,
+        "filesToDelete": 0
+    }))
+    .unwrap();
+    assert_eq!(zero.files_to_embed, Some(0));
+    assert_eq!(zero.files_to_delete, Some(0));
+    assert_eq!(zero.files_deleted, None);
+    let text = render_job("zero-plan", &zero);
+    assert!(text.contains("deleted unknown"), "{text}");
+    assert!(text.contains("no planned work"), "{text}");
+    zero.files_to_delete = None;
+    assert!(!render_job("partial-plan", &zero).contains("no planned work"));
+}
+
+#[test]
+fn terminal_job_counts_are_named_evidence_not_a_completion_ratio() {
+    let mut job: crate::client::api::JobStatus = serde_json::from_value(serde_json::json!({
+        "filesToEmbed": 7,
+        "filesEmbedded": 1,
+        "filesFailed": 0,
+        "startedAt": "started",
+        "completedAt": "completed"
+    }))
+    .unwrap();
+    assert_eq!(job_phase(&job), JobPhase::Done);
+    let text = render_job("job", &job);
+    assert!(text.contains("embedded 1"), "{text}");
+    assert!(text.contains("planned embed 7"), "{text}");
+    assert!(!text.contains("1/7"), "{text}");
+    assert!(!text.contains("processed"), "{text}");
+    assert!(!text.contains("no planned work"), "{text}");
+    job.completed_at = None;
+    assert_eq!(job_phase(&job), JobPhase::Running);
 }
 
 #[test]
@@ -412,7 +456,14 @@ async fn a_previous_completed_job_does_not_hide_a_local_sync_failure() {
     let mut status = checkout(None, None);
     status.last_job_id = Some("old-job".into());
     status.last_error = Some("upload failed".into());
-    let text = sync_status(&client, Some(&status)).await.unwrap();
+    let text = sync_status(
+        &client,
+        Some(&status),
+        crate::query::QueryPresentation::Plain,
+    )
+    .await
+    .unwrap()
+    .text;
     assert!(
         text.lines().next().unwrap().contains("Local sync failed"),
         "{text}"
@@ -428,7 +479,14 @@ async fn a_missing_watcher_is_not_reported_as_active() {
     let (_stub, client) = catalog_stub().await;
     let mut status = checkout(None, None);
     status.watcher = WatcherState::Unavailable("watch limit reached".into());
-    let text = sync_status(&client, Some(&status)).await.unwrap();
+    let text = sync_status(
+        &client,
+        Some(&status),
+        crate::query::QueryPresentation::Plain,
+    )
+    .await
+    .unwrap()
+    .text;
     assert!(text.contains("not active (watch limit reached)"), "{text}");
     assert!(
         !text.lines().next().unwrap().contains("completed"),
@@ -445,9 +503,20 @@ async fn catalog_failure_is_unknown_not_an_empty_catalog() {
     }])
     .await;
     let client = Client::for_test_server(&stub.url).with_codebase("A".into());
-    let text = sync_status(&client, None).await.unwrap();
+    let output = sync_status(&client, None, crate::query::QueryPresentation::Inspector)
+        .await
+        .unwrap();
+    let display = output.display.as_ref().unwrap();
+    assert!(display["catalog"].is_null());
+    assert!(
+        display["catalogError"]
+            .as_str()
+            .unwrap()
+            .contains("gateway unavailable")
+    );
+    let text = output.text;
     assert!(text.lines().next().unwrap().contains("unknown"), "{text}");
-    assert!(!text.contains("| Persisted catalog files | 0 |"), "{text}");
+    assert!(!text.contains("0 files"), "{text}");
     assert!(text.contains("`sync_status` again"), "{text}");
 }
 
@@ -469,7 +538,14 @@ async fn unreadable_server_job_is_unknown_not_successful_or_failed() {
     let client = Client::for_test_server(&stub.url).with_codebase("A".into());
     let mut status = checkout(Some(FirstIndexPhase::Ready), None);
     status.last_job_id = Some("job-7".into());
-    let text = sync_status(&client, Some(&status)).await.unwrap();
+    let text = sync_status(
+        &client,
+        Some(&status),
+        crate::query::QueryPresentation::Plain,
+    )
+    .await
+    .unwrap()
+    .text;
     assert!(text.lines().next().unwrap().contains("unknown"), "{text}");
     assert!(text.contains("job-7"), "{text}");
     assert!(text.contains("status could not be read"), "{text}");
@@ -482,24 +558,106 @@ async fn no_op_job_does_not_replace_persisted_catalog_totals() {
             status: "200 OK", headers: Vec::new(),
             body: r#"{"success":true,"data":[{"path":"source.rs","size":2048}],"page":0,"pageSize":1000,"total":1}"#.into(),
         },
-        Reply::ok(r#"{"completedAt":"2026-10-01T00:00:00Z","filesEmbedded":0,"filesDeleted":0,"filesFailed":0,"chunkCount":9}"#),
+        Reply::ok(r#"{"completedAt":"2026-10-01T00:00:00Z","filesToEmbed":0,"filesToDelete":0,"filesEmbedded":0,"filesDeleted":0,"filesFailed":0,"chunkCount":91234567}"#),
     ])
     .await;
     let client = Client::for_test_server(&stub.url).with_codebase("A".into());
     let mut status = checkout(None, None);
     status.last_job_id = Some("no-op".into());
-    let text = sync_status(&client, Some(&status)).await.unwrap();
-    assert!(text.contains("| Persisted catalog files | 1 |"), "{text}");
+    let text = sync_status(
+        &client,
+        Some(&status),
+        crate::query::QueryPresentation::Plain,
+    )
+    .await
+    .unwrap()
+    .text;
+    assert!(text.contains("1 files"), "{text}");
     assert!(text.contains("2048 bytes"), "{text}");
-    assert!(
-        text.contains("| Chunks reported by last server job | 9 |"),
-        "{text}"
-    );
     assert!(text.contains("no-op"), "{text}");
-    assert!(
-        text.contains("0-file plan does not mean an empty index"),
-        "{text}"
+    assert!(text.contains("91234567"), "{text}");
+}
+
+#[tokio::test]
+async fn active_local_work_never_borrows_a_previous_jobs_progress() {
+    let stub = Stub::serve(vec![
+        Reply::Answer {
+            status: "200 OK",
+            headers: Vec::new(),
+            body: EMPTY_CATALOG_PAGE.into(),
+        },
+        Reply::ok(r#"{"filesToEmbed":73,"filesEmbedded":41,"filesFailed":0,"completedAt":"old-completion","error":"old worker failure"}"#),
+    ])
+    .await;
+    let client = Client::for_test_server(&stub.url).with_codebase("A".into());
+    let mut status = checkout(
+        None,
+        Some(SyncProgress::Uploading {
+            uploaded_files: 2,
+            total_files: 5,
+        }),
     );
+    status.root = "parent/project".into();
+    status.last_job_id = Some("previous-job".into());
+    let text = sync_status(
+        &client,
+        Some(&status),
+        crate::query::QueryPresentation::Plain,
+    )
+    .await
+    .unwrap()
+    .text;
+    let preview = text.lines().next().unwrap();
+    assert!(preview.starts_with(&markdown_code("project")), "{text}");
+    assert!(preview.contains("2/5"), "{text}");
+    assert!(!preview.contains("embedded 41"), "{text}");
+    assert!(!preview.contains("planned embed 73"), "{text}");
+    assert!(text.contains("embedded 41"), "{text}");
+    assert!(text.contains("planned embed 73"), "{text}");
+    assert!(text.contains("old worker failure"), "{text}");
+    assert!(text.contains("old-completion"), "{text}");
+    assert!(text.contains("parent/project"), "{text}");
+    assert!(text.contains(&markdown_code("A")), "{text}");
+}
+
+#[tokio::test]
+async fn a_failed_server_job_exposes_its_diagnostic_before_completion_evidence() {
+    let reason = format!("{}\r\n```\r\nraw server detail\r\n", "failure".repeat(40));
+    let job = serde_json::json!({
+        "filesToEmbed": 12,
+        "filesEmbedded": 8,
+        "filesFailed": 4,
+        "startedAt": "started-evidence",
+        "completedAt": "completed-evidence",
+        "error": reason,
+    });
+    let stub = Stub::serve(vec![
+        Reply::Answer {
+            status: "200 OK",
+            headers: Vec::new(),
+            body: EMPTY_CATALOG_PAGE.into(),
+        },
+        Reply::ok(&job.to_string()),
+    ])
+    .await;
+    let client = Client::for_test_server(&stub.url).with_codebase("A".into());
+    let mut status = checkout(Some(FirstIndexPhase::Ready), None);
+    status.last_job_id = Some("failed-job".into());
+    let text = sync_status(
+        &client,
+        Some(&status),
+        crate::query::QueryPresentation::Plain,
+    )
+    .await
+    .unwrap()
+    .text;
+    let preview = text.split_once("\n\n").unwrap().0;
+    assert!(preview.contains("failed"), "{text}");
+    assert!(preview.contains(&"failure".repeat(20)), "{text}");
+    assert!(!preview.contains("completed-evidence"), "{text}");
+    assert!(text.contains("started-evidence"), "{text}");
+    assert!(text.contains("completed-evidence"), "{text}");
+    assert_eq!(fenced_body(first_fenced_block(&text)), reason);
 }
 
 #[test]
@@ -629,15 +787,21 @@ async fn source_windows_keep_original_bytes_and_truncation_identity() {
     )])
     .await;
     let client = Client::for_test_server(&stub.url).with_codebase("A".to_string());
-    let text = crate::query::read_source(
+    let output = crate::query::read_source(
         &client,
         "remote/source.md",
         Some("pinned-hash"),
         Some((20, 80)),
         None,
+        crate::query::QueryPresentation::Plain,
     )
     .await
     .unwrap();
+    assert!(
+        output.display.is_none(),
+        "plain queries do not construct inspector metadata"
+    );
+    let text = output.text;
     assert!(text.contains("pinned-hash"), "{text}");
     assert!(text.contains("20-80 of 500"), "{text}");
     assert!(text.contains("truncated"), "{text}");
@@ -652,55 +816,20 @@ async fn sync_errors_cannot_hide_staleness_or_retry_information() {
     status.last_error = Some(reason.to_string());
     status.retry_after_secs = Some(10);
 
-    let text = sync_status(&client, Some(&status)).await.unwrap();
-    assert!(
-        fenced_body(first_fenced_block(&text)).starts_with(reason),
-        "{text}"
-    );
-    assert!(
-        text.lines()
-            .take(4)
-            .any(|line| line.contains(&markdown_code(reason))),
-        "the compact preview exposes a safely escaped local diagnostic: {text}"
+    let text = sync_status(
+        &client,
+        Some(&status),
+        crate::query::QueryPresentation::Plain,
+    )
+    .await
+    .unwrap()
+    .text;
+    assert_eq!(
+        fenced_body(first_fenced_block(&text))
+            .strip_suffix('\n')
+            .expect("a diagnostic without a terminal newline needs a closing-fence separator"),
+        reason
     );
     assert!(text.contains("may be stale"), "{text}");
     assert!(text.contains("next local sync attempt in 10 s"), "{text}");
-}
-
-#[tokio::test]
-async fn a_failed_server_job_exposes_its_diagnostic_before_state_details() {
-    let reason = "embedding unavailable\n`````\n# literal server diagnostic";
-    let stub = Stub::serve(vec![
-        Reply::Answer {
-            status: "200 OK",
-            headers: Vec::new(),
-            body: EMPTY_CATALOG_PAGE.into(),
-        },
-        Reply::ok(
-            &serde_json::json!({
-                "completedAt": "2026-10-01T00:00:00Z",
-                "filesEmbedded": 0,
-                "filesDeleted": 0,
-                "filesFailed": 1,
-                "error": reason
-            })
-            .to_string(),
-        ),
-    ])
-    .await;
-    let client = Client::for_test_server(&stub.url).with_codebase("A".into());
-    let mut status = checkout(None, None);
-    status.last_job_id = Some("failed-job".into());
-    let text = sync_status(&client, Some(&status)).await.unwrap();
-    assert!(text.lines().next().unwrap().contains("failed"), "{text}");
-    assert!(
-        text.lines()
-            .take(4)
-            .any(|line| line.contains(&markdown_code(reason))),
-        "the compact preview exposes a safely escaped server diagnostic: {text}"
-    );
-    assert!(
-        fenced_body(first_fenced_block(&text)).starts_with(reason),
-        "the complete raw diagnostic remains available: {text}"
-    );
 }

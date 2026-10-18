@@ -239,10 +239,11 @@ async fn user_prompt_context(cli: &Cli, input: &HookInput) -> Option<String> {
     };
     let search = async {
         let hits: Vec<api::SearchHit> = client.post("/v1/search", &body).await.ok()?;
-        let stale = crate::query::stale_paths(&client, &hits).await;
-        Some((hits, stale))
+        let hits = std::sync::Arc::new(hits);
+        let sources = crate::query::hit_sources(&client, &hits).await;
+        Some((hits, sources))
     };
-    let (hits, stale) =
+    let (hits, sources) =
         match tokio::time::timeout(Duration::from_secs(HOOK_SEARCH_TIMEOUT_SECS), search).await {
             Ok(Some(result)) => result,
             Ok(None) => {
@@ -255,9 +256,10 @@ async fn user_prompt_context(cli: &Cli, input: &HookInput) -> Option<String> {
             }
         };
     let min_score = env_parse::<f32>("SEMCTX_HOOK_MIN_SCORE");
-    let hits: Vec<&api::SearchHit> = hits
+    let hits: Vec<(&api::SearchHit, &crate::query::HitSource)> = hits
         .iter()
-        .filter(|h| min_score.is_none_or(|m| h.score >= f64::from(m)))
+        .zip(&sources)
+        .filter(|(h, _)| min_score.is_none_or(|m| h.score >= f64::from(m)))
         .take(top_k)
         .collect();
     if hits.is_empty() {
@@ -265,23 +267,21 @@ async fn user_prompt_context(cli: &Cli, input: &HookInput) -> Option<String> {
     }
 
     let mut out = String::from(
-        "semctl — candidate locations from the current index for this prompt. \
+        "semctl — candidate locations from indexed evidence for this prompt. \
          Use them when additional repository evidence is needed. Existing fresh \
          context may already support the task; read a known local path directly \
          when current working-tree bytes matter:\n",
     );
-    for h in hits {
+    for (h, source) in &hits {
         let loc = match (h.line_start, h.line_end) {
             (Some(s), Some(e)) => format!(":{s}-{e}"),
             (Some(s), None) => format!(":{s}"),
             _ => String::new(),
         };
         let path = h.path.as_deref().unwrap_or("(no path)");
-        let freshness = if stale.contains(path) {
-            "  ⚠ stale; read the local file"
-        } else {
-            ""
-        };
+        let freshness = source.warning().map_or_else(String::new, |warning| {
+            format!("  [source verification: {warning}]")
+        });
         let sym = h
             .symbol
             .as_deref()
@@ -294,6 +294,13 @@ async fn user_prompt_context(cli: &Cli, input: &HookInput) -> Option<String> {
             .unwrap_or_default();
         writeln!(out, "- {path}{loc}{sym}{lang}  ({:.3}){freshness}", h.score)
             .expect("writing to a String cannot fail");
+    }
+    for (h, source) in hits {
+        crate::query::render_source_diagnostic(
+            &mut out,
+            h.path.as_deref().unwrap_or("(no path)"),
+            source,
+        );
     }
     Some(out)
 }

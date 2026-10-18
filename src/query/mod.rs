@@ -8,30 +8,32 @@
 //! `/v1/codebases/{id}/…` paths from it. `search` / `list_domains` don't need
 //! a codebase.
 
-use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
-use std::path::Path;
 
 use crate::client::{Client, api};
 
 mod advanced;
+mod display;
 mod error;
 mod inspection;
 mod render;
+mod source;
 
+pub use display::{QueryOutput, QueryPresentation};
 pub use error::{FailureKind, ToolError};
 
 #[cfg(test)]
 use inspection::human_bytes;
-use inspection::{FILES_PAGE_MAX, fetch_files_page};
 pub use inspection::{
     batch_lookup, external_links, file_tree, imports, list_domains, list_files, list_projects,
     symbol_at_position, symbol_edges, sync_status,
 };
+pub(crate) use source::{HitSource, hit_sources};
 
 pub use advanced::*;
 
 pub use render::render_projects;
+pub(crate) use render::render_source_diagnostic;
 use render::{
     HitContext, hit_location, local_path, markdown_code, render_boundaries, render_compact,
     render_hits, render_hits_inner, render_outline,
@@ -94,14 +96,15 @@ impl SearchOpts {
 
 /// Cross-domain search, scoped to the launched codebase when one is set. The
 /// server applies the kind filter, ranking bias, and symbol granularity; the
-/// client sends the options, annotates local staleness, and renders.
+/// client sends the options, checks source binding, and renders.
 pub async fn search(
     client: &Client,
     query: &str,
     top_k: u32,
     domains: &[String],
     opts: &SearchOpts,
-) -> Result<String, ToolError> {
+    presentation: QueryPresentation,
+) -> Result<QueryOutput, ToolError> {
     let scope = opts.normalized_scope()?;
     let body = api::SearchRequestBody {
         query,
@@ -129,25 +132,32 @@ pub async fn search(
         .post_read::<_, Vec<api::SearchHit>>("/v1/search", &body)
         .await
         .map_err(|e| ToolError::from_client("search_codebase", &e))?;
-    if hits.is_empty() {
-        return Ok("no results".to_string());
-    }
+    let hits = std::sync::Arc::new(hits);
 
-    // Staleness is the one shaping the client owns — only it has the local bytes.
+    // Only exact source bytes and coordinates can bind an indexed hit locally.
     let context = HitContext::search(
         client.local_root(),
         client.codebase_raw(),
         opts.scope.is_none() && opts.codebase_ids.is_empty() && client.codebase_raw().is_some(),
     );
-    let stale = stale_paths_in_context(client, &hits, context).await;
-    Ok(render_hits_inner(
-        &hits,
-        "no results",
-        context,
-        true,
-        &stale,
-        opts.expand,
-    ))
+    if hits.is_empty() {
+        return Ok(QueryOutput::new(
+            "no results".to_string(),
+            if presentation == QueryPresentation::Inspector {
+                display::search(client, query, &hits, &[], context)
+            } else {
+                None
+            },
+        ));
+    }
+    let sources = source::hit_sources_in_context(client, &hits, context).await;
+    let text = render_hits_inner(&hits, "no results", context, true, &sources, opts.expand);
+    let display = if presentation == QueryPresentation::Inspector {
+        display::search(client, query, &hits, &sources, context)
+    } else {
+        None
+    };
+    Ok(QueryOutput::new(text, display))
 }
 
 fn normalize_scope(scope: &str) -> Option<&'static str> {
@@ -158,106 +168,6 @@ fn normalize_scope(scope: &str) -> Option<&'static str> {
         "global" => Some("Global"),
         _ => None,
     }
-}
-
-/// The set of hit paths whose local file no longer matches what the index
-/// holds — best-effort. Empty (no annotations) when there's no local checkout
-/// to compare against, or anything goes wrong: a missing staleness flag must
-/// never be mistaken for "fresh", but a spurious one is worse, so we only flag
-/// a genuine hash mismatch (or a file that's gone). Only the hits' own paths
-/// are hashed, not the whole tree.
-pub(crate) async fn stale_paths(client: &Client, hits: &[api::SearchHit]) -> HashSet<String> {
-    let context = HitContext::search(client.local_root(), client.codebase_raw(), true);
-    stale_paths_in_context(client, hits, context).await
-}
-
-async fn stale_paths_in_context(
-    client: &Client,
-    hits: &[api::SearchHit],
-    context: HitContext<'_>,
-) -> HashSet<String> {
-    let Some(root) = client.local_root() else {
-        // Server-pulled codebase with no local bytes — staleness is a
-        // local-edit concern, so there's nothing to compare.
-        return HashSet::new();
-    };
-    let paths: HashSet<String> = hits
-        .iter()
-        .filter(|hit| context.root_for(hit).is_some())
-        .filter_map(|hit| hit.path.clone())
-        .collect();
-    if paths.is_empty() {
-        return HashSet::new();
-    }
-    let Ok(catalog) = catalog_hashes(client).await else {
-        return HashSet::new();
-    };
-    let root = root.to_path_buf();
-    // Hashing local content can block on storage. A failed freshness check only
-    // omits annotations; it never authorizes an edit or changes indexed state.
-    tokio::task::spawn_blocking(move || {
-        let mut stale = HashSet::new();
-        for rel in paths {
-            // Only decide when the catalog has a recorded hash for this path; an
-            // unknown path (not yet catalogued) isn't flagged, to avoid noise.
-            let Some(Some(indexed)) = catalog.get(&rel) else {
-                continue;
-            };
-            let local = std::fs::canonicalize(root.join(&rel))
-                .ok()
-                .filter(|path| path.starts_with(&root))
-                .and_then(|path| local_blake3(&path));
-            if is_stale(indexed, local.as_deref()) {
-                stale.insert(rel);
-            }
-        }
-        stale
-    })
-    .await
-    .unwrap_or_default()
-}
-
-/// Whether a hit is stale: its `local` hash differs from the `indexed` one, or
-/// the local file is gone/unreadable (`None`) while the index still references
-/// it. A matching hash is fresh. Pure — the decision the staleness sweep makes.
-fn is_stale(indexed: &str, local: Option<&str>) -> bool {
-    match local {
-        Some(local) => local != indexed,
-        None => true,
-    }
-}
-
-/// The MCP server pages a normal repo's catalog in a single request; cap the
-/// walk so a pathological catalog can't turn one search into many round-trips.
-const STALENESS_MAX_PAGES: u32 = 5;
-
-/// Build a `codebase-relative path -> indexed content hash` map from the file
-/// catalog. Best-effort and bounded by [`STALENESS_MAX_PAGES`].
-async fn catalog_hashes(client: &Client) -> anyhow::Result<HashMap<String, Option<String>>> {
-    let cb = client.codebase()?;
-    let mut map = HashMap::new();
-    let mut page = 0u32;
-    loop {
-        let p = fetch_files_page(client, cb, page, FILES_PAGE_MAX).await?;
-        let total = p.total;
-        for f in p.items {
-            map.insert(f.path, f.content_hash);
-        }
-        page += 1;
-        if page * FILES_PAGE_MAX >= total || page >= STALENESS_MAX_PAGES {
-            break;
-        }
-    }
-    Ok(map)
-}
-
-/// Blake3 hex of a local file's UTF-8 content — matching exactly what the sync
-/// manifest hashes (see `crate::sync::sync_with_progress`), so the digest is
-/// comparable to the catalog's `content_hash`. `None` if the file can't be read
-/// as UTF-8.
-fn local_blake3(path: &Path) -> Option<String> {
-    let content = std::fs::read_to_string(path).ok()?;
-    Some(blake3::hash(content.as_bytes()).to_hex().to_string())
 }
 
 /// The codebase of `client`, or the `op` failure that says why none is bound.
@@ -645,10 +555,7 @@ fn urlencode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        SearchOpts, bound_codebase, human_bytes, is_stale, local_blake3, normalize_prefer,
-        single_file_target,
-    };
+    use super::{SearchOpts, bound_codebase, human_bytes, normalize_prefer, single_file_target};
     use crate::client::{Client, api};
 
     fn at(path: &str) -> api::GrepMatch {
@@ -724,27 +631,5 @@ mod tests {
         assert_eq!(normalize_prefer("docs"), Some("Docs"));
         assert_eq!(normalize_prefer("doc"), Some("Docs"));
         assert_eq!(normalize_prefer("nonsense"), None);
-    }
-
-    #[test]
-    fn is_stale_decisions() {
-        assert!(!is_stale("abc", Some("abc")), "unchanged → fresh");
-        assert!(is_stale("abc", Some("xyz")), "different hash → stale");
-        assert!(is_stale("abc", None), "gone/unreadable → stale");
-    }
-
-    #[test]
-    fn local_blake3_matches_manifest_hashing() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("f.rs");
-        std::fs::write(&p, "fn main() {}\n").unwrap();
-
-        // Must equal exactly what `crate::sync::sync_with_progress` writes to
-        // the manifest.
-        let want = blake3::hash("fn main() {}\n".as_bytes())
-            .to_hex()
-            .to_string();
-        assert_eq!(local_blake3(&p).as_deref(), Some(want.as_str()));
-        assert!(local_blake3(&dir.path().join("missing.rs")).is_none());
     }
 }

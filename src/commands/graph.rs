@@ -181,7 +181,14 @@ pub async fn run(command: GraphCommand, cli: &Cli) -> Result<()> {
         GraphCommand::Batch {
             symbols,
             references,
-        } => query::batch_lookup(&client, &symbols, references).await,
+        } => query::batch_lookup(
+            &client,
+            &symbols,
+            references,
+            query::QueryPresentation::Plain,
+        )
+        .await
+        .map(|output| output.text),
         GraphCommand::SearchSymbols {
             query: symbol_query,
             mode,

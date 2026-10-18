@@ -698,13 +698,14 @@ pub struct SyncContentRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JobStatus {
+    /// The server may omit plan/deletion counters. Absence is unknown, not zero.
     #[serde(default)]
-    pub files_to_embed: i64,
+    pub files_to_embed: Option<i64>,
     #[serde(default)]
-    pub files_to_delete: i64,
+    pub files_to_delete: Option<i64>,
     pub files_embedded: i64,
     #[serde(default)]
-    pub files_deleted: i64,
+    pub files_deleted: Option<i64>,
     pub files_failed: i64,
     #[serde(default)]
     pub chunk_count: Option<i64>,

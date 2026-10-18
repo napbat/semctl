@@ -7,8 +7,8 @@ use rmcp::{
         common::Extension, router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters,
     },
     model::{
-        CallToolRequestParams, CallToolResult, Implementation, ListToolsResult, ServerCapabilities,
-        ServerInfo, Tool,
+        CallToolRequestParams, CallToolResult, Implementation, IntoContents, ListToolsResult, Meta,
+        ServerCapabilities, ServerInfo, Tool,
     },
     service::RequestContext,
     tool, tool_handler, tool_router,
@@ -26,6 +26,19 @@ use super::tool_types::{
 };
 use super::{CallBudget, FailureKind, McpServer, ToolError, client, query, ready_for_codebases};
 
+/// Add inspector metadata without changing the original model-facing content.
+fn query_result(output: query::QueryOutput) -> CallToolResult {
+    let result = CallToolResult::success(output.text.into_contents());
+    match output.display {
+        Some(display) => {
+            let mut meta = Meta::new();
+            meta.insert("semctlDisplay".to_string(), display);
+            result.with_meta(Some(meta))
+        }
+        None => result,
+    }
+}
+
 // Tool descriptions come entirely from `docs/tools/<name>.md`: the `#[tool]`
 // macro's `description` is a string literal (darling FromMeta) that can't take
 // `include_str!`, so the macro leaves it empty and `tool_doc` injects the
@@ -37,7 +50,7 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<SearchArgs>,
         Extension(budget): Extension<CallBudget>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<CallToolResult, ToolError> {
         let opts = query::SearchOpts {
             prefer: args.prefer,
             kinds: args.kinds.unwrap_or_default(),
@@ -90,6 +103,7 @@ impl McpServer {
             args.top_k.unwrap_or(8),
             &args.domains.unwrap_or_default(),
             &opts,
+            query::QueryPresentation::Inspector,
         )
         .await?;
         drop(indexes);
@@ -98,17 +112,17 @@ impl McpServer {
             && opts.codebase_ids.is_empty()
             && let Some(footer) = self.index_freshness(&client, &budget).await
         {
-            out.push_str("\n\n");
-            out.push_str(&footer);
+            out.text.push_str("\n\n");
+            out.text.push_str(&footer);
         }
         // One-shot ride-along fallback when a newer CLI is published. The
         // SessionStart hook is the primary user-facing notice; consuming this
         // note prevents repeated search results from spending tokens on it.
         if let Some(note) = self.update_note().await {
-            out.push_str("\n\n");
-            out.push_str(&note);
+            out.text.push_str("\n\n");
+            out.text.push_str(&note);
         }
-        Ok(out)
+        Ok(query_result(out))
     }
 
     #[tool]
@@ -317,11 +331,18 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<BatchArgs>,
         Extension(budget): Extension<CallBudget>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<CallToolResult, ToolError> {
         let client = self
             .client_for("batch_lookup", args.codebase.as_deref(), &budget)
             .await?;
-        query::batch_lookup(&client, &args.symbols, args.references.unwrap_or(false)).await
+        query::batch_lookup(
+            &client,
+            &args.symbols,
+            args.references.unwrap_or(false),
+            query::QueryPresentation::Inspector,
+        )
+        .await
+        .map(query_result)
     }
 
     #[tool]
@@ -448,7 +469,7 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<ReadSourceArgs>,
         Extension(budget): Extension<CallBudget>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<CallToolResult, ToolError> {
         let client = self
             .client_for_copy(
                 "read_source",
@@ -492,8 +513,10 @@ impl McpServer {
             args.revision.as_deref(),
             byte_range,
             line_range,
+            query::QueryPresentation::Inspector,
         )
         .await
+        .map(query_result)
     }
 
     #[tool]
@@ -745,7 +768,7 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<NoArgs>,
         Extension(budget): Extension<CallBudget>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<CallToolResult, ToolError> {
         let client = self
             .client_for_unchecked("sync_status", args.codebase.as_deref(), &budget)
             .await?;
@@ -755,7 +778,13 @@ impl McpServer {
         // Reported from the coordinator that owns this checkout, not from
         // per-session bookkeeping: any session's sync is this index's sync.
         let status = self.checkout_status(&client).await;
-        query::sync_status(&client, status.as_ref()).await
+        query::sync_status(
+            &client,
+            status.as_ref(),
+            query::QueryPresentation::Inspector,
+        )
+        .await
+        .map(query_result)
     }
 }
 
@@ -832,4 +861,35 @@ impl ServerHandler for McpServer {
 
 pub(super) fn router() -> ToolRouter<McpServer> {
     McpServer::tool_router()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inspector_metadata_never_replaces_or_duplicates_plain_content() {
+        let text = "original result\n```rs\nfn exact() {}\n```\n";
+        let display = serde_json::json!({
+            "version": 1, "kind": "source", "text": "inspector-only source"
+        });
+        let result = query_result(query::QueryOutput {
+            text: text.to_string(),
+            display: Some(display.clone()),
+        });
+        let wire = serde_json::to_value(result).unwrap();
+        let plain = serde_json::to_value(CallToolResult::success(text.to_string().into_contents()))
+            .unwrap();
+        assert_eq!(wire["content"], plain["content"]);
+        assert_eq!(wire["isError"], plain["isError"]);
+        assert_eq!(wire["_meta"]["semctlDisplay"], display);
+        assert!(wire.get("structuredContent").is_none());
+
+        let omitted = serde_json::to_value(query_result(query::QueryOutput {
+            text: text.to_string(),
+            display: None,
+        }))
+        .unwrap();
+        assert_eq!(omitted, plain);
+    }
 }

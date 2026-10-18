@@ -1,14 +1,14 @@
 //! P0 inspection and P1 workspace-edit query surfaces.
 
 use std::fmt::Write as _;
-use std::path::Path;
 
 use anyhow::{Context as _, Result};
 
 use crate::client::{Client, api};
 
 use super::render::{markdown_cell, markdown_code, render_fenced, source_language_hint};
-use super::{ToolError, bound_codebase, local_path, render_hits, urlencode};
+use super::source::{fetch_source, verified_local_window};
+use super::{FailureKind, ToolError, bound_codebase, local_path, render_hits, urlencode};
 
 const CODEBASE_PAGE_SIZE: u32 = 500;
 const MAX_CODEBASE_PAGES: u32 = 100;
@@ -189,26 +189,25 @@ pub async fn read_source(
     revision: Option<&str>,
     byte_range: Option<(u64, u64)>,
     line_range: Option<(u32, u32)>,
-) -> Result<String, ToolError> {
+    presentation: super::QueryPresentation,
+) -> Result<super::QueryOutput, ToolError> {
     let cb = bound_codebase(client, "read_source")?;
-    let mut url = format!("/v1/codebases/{cb}/files/content?path={}", urlencode(path));
-    if let Some(revision) = revision {
-        write!(url, "&revision={}", urlencode(revision)).expect("writing to a String cannot fail");
-    }
-    if let Some((start, end)) = byte_range {
-        write!(url, "&byteStart={start}&byteEnd={end}").expect("writing to a String cannot fail");
-    }
-    if let Some((start, end)) = line_range {
-        write!(url, "&lineStart={start}&lineEnd={end}").expect("writing to a String cannot fail");
-    }
-    let content = client
-        .get::<api::FileContent>(&url)
-        .await
-        .map_err(|error| ToolError::from_client("read_source", &error))?;
+    let content = fetch_source(client, path, revision, byte_range, line_range).await?;
 
-    let local = client
-        .local_root()
-        .and_then(|root| verified_local_window(root, path, &content));
+    let (content, local) = if let Some(root) = client.local_root() {
+        let root = root.to_path_buf();
+        let path = path.to_string();
+        tokio::task::spawn_blocking(move || {
+            let local = verified_local_window(&root, &path, &content);
+            (content, local)
+        })
+        .await
+        .map_err(|error| {
+            ToolError::new("read_source", FailureKind::Unavailable, error.to_string())
+        })?
+    } else {
+        (content, None)
+    };
     let (source, body) = local
         .as_deref()
         .map_or(("content-plane", content.content.as_str()), |body| {
@@ -241,7 +240,14 @@ pub async fn read_source(
         markdown_code(cb),
     )
     .expect("writing to a String cannot fail");
-    Ok(out)
+    Ok(super::QueryOutput::new(
+        out,
+        if presentation == super::QueryPresentation::Inspector {
+            super::display::source(client, &content, body, language, source)
+        } else {
+            None
+        },
+    ))
 }
 
 pub struct SymbolSearchOptions<'a> {
@@ -486,27 +492,6 @@ fn enum_label(value: &serde_json::Value, numeric: &[&str]) -> String {
         .unwrap_or_else(|| value.to_string())
 }
 
-fn verified_local_window(root: &Path, path: &str, content: &api::FileContent) -> Option<String> {
-    let target = std::fs::canonicalize(root.join(path)).ok()?;
-    let root = std::fs::canonicalize(root).ok()?;
-    if !target.starts_with(root) {
-        return None;
-    }
-    let bytes = std::fs::read(target).ok()?;
-    if blake3::hash(&bytes).to_hex().as_str() != content.content_hash {
-        return None;
-    }
-    let start = usize::try_from(content.byte_start).ok()?;
-    let end = usize::try_from(content.byte_end).ok()?;
-    let window = bytes.get(start..end)?;
-    if content.is_binary {
-        use base64::Engine as _;
-        Some(base64::engine::general_purpose::STANDARD.encode(window))
-    } else {
-        String::from_utf8(window.to_vec()).ok()
-    }
-}
-
 fn render_type_hierarchy(client: &Client, hierarchy: &api::TypeHierarchy) -> String {
     let mut out = format!(
         "roots: {}\ncomplete: {}{}\n",
@@ -679,15 +664,29 @@ mod tests {
             });
             let stub = Stub::serve(vec![Reply::ok(&response.to_string())]).await;
             let client = Client::for_test_server(&stub.url).with_codebase("A".into());
-            let text = read_source(
+            let output = read_source(
                 &client,
                 path,
                 Some("pinned-hash"),
                 Some((20, u64::try_from(end).unwrap())),
                 None,
+                crate::query::QueryPresentation::Inspector,
             )
             .await
             .unwrap();
+            if binary {
+                let display = output.display.as_ref().unwrap();
+                assert_eq!(display["text"], body);
+                assert_eq!(display["sourceOrigin"], "content-plane");
+                assert_eq!(display["binary"], true);
+                assert_eq!(display["encoding"], "base64");
+            } else {
+                assert!(
+                    output.display.is_none(),
+                    "oversized source display is omitted, not truncated"
+                );
+            }
+            let text = output.text;
             let heading = text.lines().next().unwrap();
             assert!(heading.contains(path));
             assert!(heading.contains(&format!("20-{end} of {}", end + 100)));

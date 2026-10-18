@@ -49,29 +49,88 @@ than becoming a diagram or image. `read_source` keeps the selected range and
 source origin before the body, with its full revision and encoding afterward.
 Source text retains its original bytes, including CRLF and embedded fences.
 
-`sync_status` leads with the current failure or phase, then separates persisted
-catalog state from the last recorded server job. Counts include failed files;
-a completed or zero-file job does not prove checkout freshness. Job labels use
-Done, Running, Pending and Failed, without colored emoji. Native diagnostics
-remain complete. This is a status snapshot, not an invented live percentage or
-elapsed-time measurement.
+`sync_status` leads with the current failure or phase. It separates persisted
+catalog state, current local work, and the last recorded server job. Named
+embedded/deleted/failed and planned counts are not a processed/total ratio.
+Missing counters remain unknown. A completed or zero-file job does not prove
+checkout freshness. Job labels use Done, Running, Pending, and Failed. Complete
+native diagnostics remain in the original result. Status is a snapshot, not live
+push progress or an inferred server percentage or elapsed-time measurement.
+Correct the reported cause before retrying a failed first index. Local failures
+retain the reported retry schedule when one exists.
 
-Local stale-file warnings remain next to the location. `current_context` lists
-exact indexed-copy identities, canonical status and the matching checkout.
-Codebase graph state is not a claim about each copy's freshness. Tool names and
-argument schemas stay stable. Display titles are available to clients that
-support MCP titles. Failed operations set `isError` and retain their explanation.
+Search source binding compares a bounded local byte snapshot with the ready
+content-plane full-file hash. Bound hits also require exact snippet bytes and
+agreement with supplied byte/line coordinates in that snapshot. Binding does not
+verify semantic symbol/focus identity or guarantee that bytes stay unchanged.
+Changed local bytes, mismatched ranges, and unavailable verification remain
+distinct, with native diagnostics preserved. Use host Read/Grep for current
+locations when binding is not established. Verification does not start a reindex;
+active local checkouts use their watcher and periodic reconciliation.
+`current_context` lists exact indexed-copy identities, canonical status, and the
+matching checkout. Codebase graph state is not a claim about each copy's
+freshness. Tool names and argument schemas stay stable. Failed operations set
+`isError` and retain their explanation.
 
-OMP uses its built-in MCP tool cards, including when hosted in Tern. Keep
-`mcp.renderMarkdownResults` enabled to render headings, tables and source fences.
-OMP controls the card title, colors and collapsed preview length. Its native
-Show all control expands the returned payload; semctl does not shorten source
-text to create the preview or add a competing expander. Host output-size limits
-still apply. Nested code-block headers may occupy the collapsed preview, so expand
-source cards to inspect highlighted code. The lifecycle adapter does not register
-duplicate tools or replace result text. OMP draws its script-status glyphs through
-a native component that its MCP Markdown renderer does not expose; the plain
-checkmark beside Done is not that themed component.
+### OMP native inspector
+
+The semctl adapter adds one replace-in-place native inspector above the editor
+through OMP's existing public extension APIs. This is semctl plugin code, not an
+OMP modification or a replacement MCP tool. The original MCP result stays in the
+transcript, including its text, errors, approvals, and cancellation behavior.
+OMP still controls its built-in MCP cards and output-size limits.
+
+The inspector consumes versioned, typed `_meta.semctlDisplay` data. It does not
+parse Markdown or use `structuredContent` to add display data to model context.
+The payload is limited to 32 KiB and at most 32 total hits per call. Overflow
+omits the display payload instead of silently showing a partial result; the
+original result remains available. The widget retains only the latest requested
+call, without a numbered history or result tabs. Earlier results remain in the
+original transcript. It supports display payloads from `search_codebase`,
+`read_source`, `batch_lookup`, and `sync_status`; other semctl calls replace the
+current view with an unavailable notice.
+Display data reuses source evidence already fetched by the query. The inspector
+does not fetch more source, combine calls automatically, or establish token
+savings.
+
+In-flight call authority is tracked separately, including across resets. The
+observer closes after 64 unfinished calls rather than forget an old call's
+identity or grow without bound; a fresh host restores it. This affects only the
+inspector, not MCP execution or the original transcript.
+
+The exact search query appears above the matches, with a two-line preview and
+the complete query on hover. Match rows align rank, unlabeled relative-score
+bars, file/location, and symbol columns. This is not a `TspTable` with embedded meters.
+The public table API accepts text cells; it does not expose meter nodes,
+per-cell titles/actions, or per-row selection. Composed rows retain native
+meters, score titles, and source selection without a dashboard border or fill.
+At widths below 36 columns or without native nodes, the inspector shows a compact
+ASCII lifecycle/count summary; complete results remain in the MCP transcript.
+
+Score bars are query-relative, not confidence; hover exposes their exact values.
+Native verification icons
+distinguish bound, changed-local, range-mismatch, and unverified/not-probed
+states. Their title/hover retains the precise reason and the byte/coordinate-only
+scope; semantic symbol/focus identity is not verified. A compact state label
+replaces the icon when native icons are unavailable. Batch results retain
+caller order and misses; batch source locations are not probed for verification.
+Native source opening requires a bound path inside the selected checkout for the
+same codebase. Source numbering uses supplied valid coordinates. Indexed focus
+marks require bound source and a focus inside the displayed window.
+The fixed inspector previews at most 12 search-source lines or 16 `read_source`
+lines and states when more exist. The original MCP card owns full-source
+expansion and preserves the complete returned bytes. There is no second source
+expander in the composer widget.
+Status uses the supplied snapshot and named counters, not a server-plan
+percentage. Spinner and elapsed time follow actual execution events, not
+background indexing estimates. Noninteractive contexts do not show the widget.
+Missing or invalid metadata and errors replace the current view. Cancellation
+finalizes the current call, and late results cannot replace a newer request.
+Session resets remove the widget. A plain rendering fallback remains available.
+
+Native layout, theme glyphs, hover details, expansion, narrow widths, and
+cancellation/reset behavior require acceptance in the actual OMP/Tern host.
+Source-level support alone does not establish that runtime acceptance.
 MCP stdout remains JSON-RPC, never terminal escape sequences or Tern
 surface-protocol commands.
 

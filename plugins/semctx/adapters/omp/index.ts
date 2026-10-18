@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { createSemctlHookInvoker } from "./hook-process";
+import { installInspector } from "./inspector";
 
 export { extractAdditionalContext } from "./hook-process";
 
@@ -153,13 +154,14 @@ export function createSemctxExtension(invoker: HookInvoker = createSemctlHookInv
 				return undefined;
 			}
 		};
-		const resetTurnState = () => {
+		const resetTurnState = (ctx: ExtensionContext) => {
 			sessionGeneration += 1;
 			activePromptId = "";
 			preparingPrompt = undefined;
+			resetInspector(ctx);
 		};
-		const sendOrientation = async (source: SessionSource, ctx: HookContext) => {
-			resetTurnState();
+		const sendOrientation = async (source: SessionSource, ctx: ExtensionContext) => {
+			resetTurnState(ctx);
 			const generation = sessionGeneration;
 			const context = await safeInvoke(
 				{
@@ -233,10 +235,11 @@ export function createSemctxExtension(invoker: HookInvoker = createSemctlHookInv
 				? undefined
 				: { additionalContext: context };
 		});
-		pi.on("session_shutdown", () => {
-			resetTurnState();
+		pi.on("session_shutdown", (_event, ctx) => {
+			resetTurnState(ctx);
 			invoker.shutdown();
 		});
+		const resetInspector = installInspector(pi);
 	};
 }
 

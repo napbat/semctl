@@ -4,13 +4,13 @@
 //! layer is cheap to unit-test in isolation.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
 use std::fmt::Write;
 use std::path::Path;
 
 use crate::client::api;
 
 use super::inspection::GRAPH_LIST_CAP;
+use super::source::HitSource;
 
 /// Local paths are valid only for hits from the selected checkout.
 #[derive(Clone, Copy)]
@@ -273,22 +273,20 @@ pub(super) fn render_hits(
         empty_msg,
         HitContext::local(root),
         show_score,
-        &HashSet::new(),
+        &[],
         false,
     )
 }
 
-/// As [`render_hits`], but annotates any hit whose codebase-relative path is in
-/// `stale` (its local file no longer matches the index), and — when `full_body`
-/// — prints the whole snippet instead of the first four lines (for `--expand`,
-/// where the server already returned the full enclosing-symbol body). The public
-/// [`render_hits`] passes an empty set and `false`; only `search` varies them.
+/// As [`render_hits`], but includes the per-hit source-binding outcome before
+/// indexed evidence. `full_body` prints the full returned snippet; source
+/// validation never replaces or relocates that evidence.
 pub(super) fn render_hits_inner(
     hits: &[api::SearchHit],
     empty_msg: &str,
     context: HitContext<'_>,
     show_score: bool,
-    stale: &HashSet<String>,
+    sources: &[HitSource],
     full_body: bool,
 ) -> String {
     if hits.is_empty() {
@@ -324,30 +322,15 @@ pub(super) fn render_hits_inner(
                 .expect("writing to a String cannot fail");
             separated = true;
         }
-        let marker = write_marker(h);
-        let classification = if marker.is_empty() {
-            String::new()
-        } else {
-            format!(" {}", markdown_code(marker.trim()))
-        };
-        out.push_str("### ");
-        if show_score {
-            write!(out, "{}. ", index + 1).expect("writing to a String cannot fail");
-        }
-        write!(
-            out,
-            "{} — {}{classification}",
-            markdown_code(&hit_location(h, root)),
-            markdown_code(&hit_symbol(h))
-        )
-        .expect("writing to a String cannot fail");
-        if show_score {
-            write!(out, " · hybrid score {:.3}", h.score).expect("writing to a String cannot fail");
-        }
-        out.push('\n');
-        if root.is_some() && h.path.as_deref().is_some_and(|p| stale.contains(p)) {
-            // Keep warnings before source so collapsed host views show them.
-            out.push_str("⚠ stale (edited since indexed)\n");
+        render_hit_heading(&mut out, h, root, show_score.then_some(index + 1));
+        if let Some(source) = sources.get(index) {
+            let label = match source {
+                HitSource::Bound => "bytes and coordinates verified",
+                HitSource::ChangedLocal => "local bytes changed",
+                HitSource::IndexedRangeMismatch => "indexed range mismatch",
+                HitSource::Unverified(_) => "unverified",
+            };
+            writeln!(out, "Source: {label}").expect("writing to a String cannot fail");
         }
         let expand = full_body
             && (expanded_chars == 0 || expanded_chars + h.snippet.len() <= EXPANDED_BODY_CHARS);
@@ -374,7 +357,23 @@ pub(super) fn render_hits_inner(
             render_fenced(&mut out, &snippet, h.language.as_deref());
         }
         render_hit_metadata(&mut out, h);
+        if let Some(source) = sources.get(index) {
+            if matches!(
+                source,
+                HitSource::ChangedLocal | HitSource::IndexedRangeMismatch
+            ) && let Some(reason) = source.warning()
+            {
+                writeln!(out, "Source detail: {reason}").expect("writing to a String cannot fail");
+            }
+            render_source_diagnostic(&mut out, h.path.as_deref().unwrap_or("(no path)"), source);
+        }
         out.push('\n');
+    }
+    if sources
+        .iter()
+        .any(|source| matches!(source, HitSource::Bound))
+    {
+        out.push_str("Verified source means matching ready-source bytes and reported coordinates, not semantic symbol/focus identity.\n");
     }
     if shortened_hits > 0 {
         writeln!(
@@ -385,6 +384,46 @@ pub(super) fn render_hits_inner(
         .expect("writing to a String cannot fail");
     }
     out
+}
+
+fn render_hit_heading(
+    out: &mut String,
+    hit: &api::SearchHit,
+    root: Option<&Path>,
+    rank: Option<usize>,
+) {
+    out.push_str("### ");
+    if let Some(rank) = rank {
+        write!(out, "{rank}. ").expect("writing to a String cannot fail");
+    }
+    write!(
+        out,
+        "{} — {}",
+        markdown_code(&hit_location(hit, root)),
+        markdown_code(&hit_symbol(hit))
+    )
+    .expect("writing to a String cannot fail");
+    let marker = write_marker(hit);
+    if !marker.is_empty() {
+        write!(out, " {}", markdown_code(marker.trim())).expect("writing to a String cannot fail");
+    }
+    if rank.is_some() {
+        write!(out, " · hybrid score {:.3}", hit.score).expect("writing to a String cannot fail");
+    }
+    out.push('\n');
+}
+
+/// Raw failures follow the preview and remain fenced, including hostile Markdown.
+pub(crate) fn render_source_diagnostic(out: &mut String, path: &str, source: &HitSource) {
+    if let HitSource::Unverified(reason) = source {
+        writeln!(
+            out,
+            "\nSource verification diagnostic for {}:",
+            markdown_code(path)
+        )
+        .expect("writing to a String cannot fail");
+        render_fenced(out, reason, Some("text"));
+    }
 }
 
 fn render_hit_metadata(out: &mut String, hit: &api::SearchHit) {
@@ -562,9 +601,9 @@ pub(super) fn hit_location(h: &api::SearchHit, root: Option<&Path>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
 
     use super::{EXPANDED_BODY_CHARS, HitContext, api, render_hits_inner, strip_verbatim_prefix};
+    use crate::query::HitSource;
 
     /// A `SearchHit` with a chosen chunk id + path — for the render test that
     /// keys on those.
@@ -598,32 +637,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn render_marks_only_stale_paths() {
-        let hits = [node("a", "dirty.rs"), node("b", "clean.rs")];
-        let stale: HashSet<String> = ["dirty.rs".to_string()].into_iter().collect();
-
-        let out = render_hits_inner(
-            &hits,
-            "none",
-            HitContext::local(Some(std::path::Path::new("/repo"))),
-            true,
-            &stale,
-            false,
-        );
-        let dirty = out
-            .split("\n### ")
-            .find(|hit| hit.contains("dirty.rs"))
-            .unwrap();
-        let clean = out
-            .split("\n### ")
-            .find(|hit| hit.contains("clean.rs"))
-            .unwrap();
-
-        assert!(dirty.contains("⚠ stale"), "edited file flagged");
-        assert!(!clean.contains("⚠ stale"), "untouched file not flagged");
-    }
-
     /// A hit whose expanded body has `lines` lines of 10 characters each.
     fn body(id: &str, lines: usize) -> api::SearchHit {
         let mut hit = node(id, &format!("{id}.rs"));
@@ -632,14 +645,7 @@ mod tests {
     }
 
     fn expanded(hits: &[api::SearchHit]) -> String {
-        render_hits_inner(
-            hits,
-            "none",
-            HitContext::local(None),
-            true,
-            &HashSet::new(),
-            true,
-        )
+        render_hits_inner(hits, "none", HitContext::local(None), true, &[], true)
     }
 
     #[test]
@@ -679,25 +685,22 @@ mod tests {
         remote.codebase_id = Some("b".into());
         let unidentified = node("unidentified", "src/lib.rs");
         let context = HitContext::search(Some(root), Some("a"), false);
-        let stale = HashSet::from(["src/lib.rs".to_string()]);
+        let sources = [HitSource::ChangedLocal];
         let output = render_hits_inner(
             &[local, remote, unidentified],
             "none",
             context,
             true,
-            &stale,
+            &sources,
             false,
         );
         let sections: Vec<_> = output.split("\n### ").skip(1).collect();
         assert!(sections[0].contains("Codebase: `a`"));
         assert!(sections[0].contains(&root.join("src/lib.rs").display().to_string()));
-        assert!(sections[0].contains("stale"));
         assert!(sections[1].contains("`src/lib.rs:1-2`"));
         assert!(sections[1].contains("Codebase: `b`"));
         assert!(!sections[1].contains("checkout-a"));
-        assert!(!sections[1].contains("stale"));
         assert!(!sections[2].contains("checkout-a"));
-        assert!(!sections[2].contains("stale"));
         assert!(!sections[2].contains("Codebase:"));
     }
 
@@ -728,7 +731,7 @@ mod tests {
             "none",
             HitContext::local(None),
             false,
-            &HashSet::new(),
+            &[],
             false,
         );
         let lines: Vec<&str> = out.lines().filter(|l| l.contains("run.rs")).collect();
@@ -747,31 +750,21 @@ mod tests {
     }
 
     #[test]
-    fn render_count_location_and_stale_warning_lead_the_output() {
-        let mut hits = [node("first", "dirty.rs"), node("second", "clean.rs")];
-        hits[0].snippet = "first source line".into();
-        hits[0].score = 0.8;
-        hits[1].score = 1.0;
+    fn source_diagnostics_preserve_raw_failure_after_source_without_markdown_injection() {
+        let mut hit = node("original", "source.rs");
+        hit.snippet = "fn original() {}".into();
+        let diagnostic = "FileNotIndexed Pending\n```\n# injected heading\n````\n";
         let output = render_hits_inner(
-            &hits,
+            &[hit],
             "none",
-            HitContext::local(Some(std::path::Path::new("/repo"))),
-            true,
-            &HashSet::from(["dirty.rs".to_string()]),
+            HitContext::local(None),
             false,
+            &[HitSource::Unverified(diagnostic.into())],
+            true,
         );
-        let lines: Vec<_> = output.lines().collect();
-        assert!(lines[0].contains("2 matches"));
-        assert!(lines[1].contains("dirty.rs:1-2` — `first`"));
-        assert!(lines[1].starts_with("### 1. "));
-        assert!(
-            output
-                .lines()
-                .any(|line| line.starts_with("### 2. ") && line.contains("`second`"))
-        );
-        assert!(lines[2].contains("⚠ stale"));
-        assert!(output.find("⚠ stale").unwrap() < output.find("first source line").unwrap());
-        assert!(output.find("first source line").unwrap() < output.find("Domain:").unwrap());
+        assert!(output.contains("source.rs:1-2") && output.contains("fn original() {}"));
+        assert!(output.find("fn original() {}").unwrap() < output.find("FileNotIndexed").unwrap());
+        assert!(output.contains(&format!("`````text\n{diagnostic}`````\n")));
     }
 
     #[test]
@@ -780,14 +773,7 @@ mod tests {
         hit.snippet =
             "\n  \nfn example() {\n    ```rust\n    ~~~\n    **text** <tag>  \n    omitted\n}"
                 .into();
-        let output = render_hits_inner(
-            &[hit],
-            "none",
-            HitContext::local(None),
-            false,
-            &HashSet::new(),
-            false,
-        );
+        let output = render_hits_inner(&[hit], "none", HitContext::local(None), false, &[], false);
         assert!(output.starts_with("**1 match**\n"), "{output}");
         assert!(
             output.contains(
@@ -803,14 +789,7 @@ mod tests {
         let mut hit = node("expanded", "source.rs");
         let source = "\r\n  fn example() {\r\n    one\r\n    two\r\n    three\r\n    four\r\n    `````\r\n  }\r\n";
         hit.snippet = source.into();
-        let output = render_hits_inner(
-            &[hit],
-            "none",
-            HitContext::local(None),
-            false,
-            &HashSet::new(),
-            true,
-        );
+        let output = render_hits_inner(&[hit], "none", HitContext::local(None), false, &[], true);
         assert!(
             output.contains(&format!("\n``````rust\n{source}``````\n")),
             "{output}"
@@ -824,14 +803,7 @@ mod tests {
         hit.domain_id = "<details>\n```".into();
         hit.codebase_id = Some("a`\r\n# hidden".into());
         hit.snippet = "let value = 1;".into();
-        let output = render_hits_inner(
-            &[hit],
-            "none",
-            HitContext::local(None),
-            true,
-            &HashSet::new(),
-            false,
-        );
+        let output = render_hits_inner(&[hit], "none", HitContext::local(None), true, &[], false);
         let heading = output
             .lines()
             .find(|line| line.starts_with("### "))
@@ -855,14 +827,7 @@ mod tests {
         hits[1].score = 0.5;
         hits[2].score = 0.4;
         hits[3].score = -0.2;
-        let output = render_hits_inner(
-            &hits,
-            "none",
-            HitContext::local(None),
-            true,
-            &HashSet::new(),
-            false,
-        );
+        let output = render_hits_inner(&hits, "none", HitContext::local(None), true, &[], false);
         assert!(
             output.contains("query-relative, not confidence"),
             "{output}"
@@ -891,14 +856,7 @@ mod tests {
     fn render_empty_results_preserves_the_exact_message() {
         for message in ["no results", "nothing calls `run`", ""] {
             assert_eq!(
-                render_hits_inner(
-                    &[],
-                    message,
-                    HitContext::local(None),
-                    true,
-                    &HashSet::new(),
-                    false,
-                ),
+                render_hits_inner(&[], message, HitContext::local(None), true, &[], false,),
                 message
             );
         }
@@ -911,14 +869,7 @@ mod tests {
         hit.domain_id.clear();
         hit.language = None;
         hit.kind.clear();
-        let output = render_hits_inner(
-            &[hit],
-            "none",
-            HitContext::local(None),
-            false,
-            &HashSet::new(),
-            false,
-        );
+        let output = render_hits_inner(&[hit], "none", HitContext::local(None), false, &[], false);
         assert!(output.contains("`(no location)` — (empty)"));
         assert!(output.contains("Domain: (empty)"));
     }
