@@ -415,7 +415,7 @@ mod tests {
                 (7, 4)
             ],
         );
-        assert!(requested_lines(b"", vec![0, 1]).is_empty());
+        assert_eq!(requested_lines(b"", vec![0, 1]), [] as [(usize, u32); 0]);
     }
 
     #[test]

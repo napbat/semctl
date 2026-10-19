@@ -253,7 +253,7 @@ fn clusters_are_membership_only_and_unused_preserves_current_and_legacy_page_fac
         }]);
         let page: api::Page<api::UnusedDefinition> = serde_json::from_value(source).unwrap();
         let value = view(GraphInput::Unused { page: &page });
-        assert!(value["edges"].as_array().unwrap().is_empty());
+        assert_eq!(value["edges"], json!([]));
         assert_eq!(
             node(&value, "unused")["detail"],
             "No resolved incoming references"
@@ -338,7 +338,7 @@ fn project_membership_and_outline_depth_do_not_invent_parentage_or_source_ranges
         ]
     })).unwrap();
     let value = view(GraphInput::Outline(&outline));
-    assert!(value["edges"].as_array().unwrap().is_empty());
+    assert_eq!(value["edges"], json!([]));
     assert_eq!(node(&value, "child")["hit"]["snippet"], "fn run() {}");
     assert_eq!(node(&value, "child")["hit"]["startLine"], 3);
     assert!(node(&value, "child")["hit"]["startByte"].is_null());
@@ -443,6 +443,6 @@ fn dangling_source_endpoints_are_not_replaced_with_invented_nodes_or_edges() {
         graph: &graph,
     });
     assert_eq!(value["nodes"].as_array().unwrap().len(), 1);
-    assert!(value["edges"].as_array().unwrap().is_empty());
+    assert_eq!(value["edges"], json!([]));
     assert_eq!(value["truncated"], true);
 }
