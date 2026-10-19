@@ -18,6 +18,9 @@ mod mcp;
 #[path = "cli_workflows/search.rs"]
 mod search;
 
+#[path = "cli_workflows/lookups.rs"]
+mod lookups;
+
 const PREIMAGE: &str = "fn old_name() {}\n";
 const POSTIMAGE: &str = "fn new_name() {}\n";
 const PLAN_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";

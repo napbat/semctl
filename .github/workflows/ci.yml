@@ -63,7 +63,7 @@ jobs:
       # PowerShell installer, which also runs on the platform it targets.
       - name: OMP extension test
         if: runner.os == 'Linux'
-        run: mise exec -c "bun test plugins/semctx/adapters/omp/index.test.ts"
+        run: mise exec -c "bun test plugins/semctx/adapters/omp"
       - name: Bootstrap installer test
         if: runner.os == 'Linux'
         run: python3 tests/bootstrap_installers.py

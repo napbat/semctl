@@ -144,6 +144,7 @@ mod tests {
                     uploaded_files: 3,
                     total_files: 10,
                 }),
+                embedding: None,
             }],
         }
     }

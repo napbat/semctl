@@ -47,15 +47,20 @@ use tracing::{debug, info, warn};
 use super::registry::CheckoutKey;
 use super::scheduler;
 use super::watch_hub::{WatchBatch, WatchRegistration, can_change_tree};
-use crate::client::{self, Client};
+use crate::client::Client;
 use crate::mcp::readiness::InitialIndexGate;
 use crate::sync::policy::{SourcePolicy, event_may_affect_policy};
 use crate::sync::{self, LastJob, SyncCache, SyncLimits, SyncOutcome, blocking};
 
+mod embedding;
 mod progress;
 mod reconcile_loop;
 mod status;
 
+pub(crate) use embedding::JobObserver;
+#[cfg(test)]
+pub(crate) use embedding::initial_job_result;
+use embedding::wait_for_embedding_job;
 pub(crate) use progress::ProgressSlot;
 use reconcile_loop::ReconcileLoop;
 pub(crate) use status::CoordinatorStatus;
@@ -75,7 +80,7 @@ const DEFAULT_RESYNC_SECS: u64 = 60;
 /// affordable.
 const WATCHED_RESYNC_MULTIPLIER: u64 = 5;
 
-/// How often the first-index gate polls the server's embedding job.
+/// How often owned embedding observers poll the server.
 const JOB_POLL_EVERY: Duration = Duration::from_millis(500);
 
 /// Why a reconcile is due.
@@ -131,9 +136,8 @@ pub(crate) trait Reconciler: Send + Sync + 'static {
     /// Walk the checkout, diff it against the server, and upload what changed.
     fn reconcile(&self, run: ReconcileRun) -> Reconciled;
 
-    /// Wait for the server to finish embedding one job. Only the first-index
-    /// gate needs this: retrieval must not run against a partial first index.
-    fn await_job(&self, client: Client, job_id: String) -> JobAwaited;
+    /// Observe one embedding job without blocking the reconcile loop.
+    fn await_job(&self, client: Client, job_id: String, observer: JobObserver) -> JobAwaited;
 }
 
 /// The production reconciler: the shared sync engine and the job poll.
@@ -154,8 +158,8 @@ impl Reconciler for SyncReconciler {
         })
     }
 
-    fn await_job(&self, client: Client, job_id: String) -> JobAwaited {
-        Box::pin(async move { wait_for_initial_job(&client, &job_id).await })
+    fn await_job(&self, client: Client, job_id: String, observer: JobObserver) -> JobAwaited {
+        Box::pin(async move { wait_for_embedding_job(&client, &job_id, &observer).await })
     }
 }
 
@@ -173,7 +177,7 @@ impl Reconciler for IdleReconciler {
         Box::pin(std::future::pending())
     }
 
-    fn await_job(&self, _client: Client, _job_id: String) -> JobAwaited {
+    fn await_job(&self, _client: Client, _job_id: String, _observer: JobObserver) -> JobAwaited {
         Box::pin(std::future::pending())
     }
 }
@@ -251,6 +255,8 @@ pub(crate) struct CheckoutCoordinator {
     task: StdMutex<Option<JoinHandle<()>>>,
     /// The detached poll that finishes a first-index gate.
     gate_task: StdMutex<Option<JoinHandle<()>>>,
+    /// The latest later-job observer. Superseding work cancels this task.
+    job_task: StdMutex<Option<JoinHandle<()>>>,
     resync_secs: Option<u64>,
 }
 
@@ -295,6 +301,7 @@ impl CheckoutCoordinator {
             released_at: StdMutex::new(None),
             task: StdMutex::new(None),
             gate_task: StdMutex::new(None),
+            job_task: StdMutex::new(None),
             resync_secs: setup.resync_secs,
         });
         let task = CoordinatorTask {
@@ -411,6 +418,7 @@ impl CheckoutCoordinator {
             running: self.progress.running(),
             first_index,
             sync_progress: self.progress.latest(),
+            embedding: self.progress.embedding(),
             pending_triggers: self.triggers.max_capacity() - self.triggers.capacity(),
             trigger_overflow: self.overflow.load(Ordering::Acquire),
             last_outcome: run.last_outcome.clone(),
@@ -457,6 +465,7 @@ impl CheckoutCoordinator {
         // A first-index poll belongs to a caller that holds a lease, so a
         // cancelled coordinator has no gate waiter left to orphan.
         abort(&self.gate_task);
+        abort(&self.job_task);
         // 2. The watch registration, so no event can reach a dead loop.
         let released = std::mem::replace(
             &mut *lock(&self.watch),
@@ -578,7 +587,26 @@ impl CheckoutCoordinator {
             })
             .await;
         drop(permit);
-        self.record(trigger, &result).await;
+        let meaningful_job = self.record(trigger, &result).await;
+        let gate_claimed = match &gate {
+            Some(gate) if gate.outcome().await.is_none() => gate.claim_poll().await,
+            _ => false,
+        };
+        // Replace old completion evidence before running clears, so a newly
+        // uploaded job can never briefly inherit the prior job's green state.
+        let observer = meaningful_job
+            .as_ref()
+            .or_else(|| {
+                gate_claimed
+                    .then(|| result.as_ref().ok().map(|outcome| &outcome.job_id))
+                    .flatten()
+            })
+            .map(|job| self.progress.observe_job(job.clone()));
+        if observer.is_some()
+            && let Some(previous) = lock(&self.job_task).take()
+        {
+            previous.abort();
+        }
         drop(progress);
         let retry_needed = match &result {
             Ok(outcome) => !outcome.failed.is_empty(),
@@ -590,14 +618,23 @@ impl CheckoutCoordinator {
         // the caller would then wait for a result nothing produces. `gate` was
         // read before the run, so a gate installed during a run is reported by
         // the run that gate queued.
-        if let Some(gate) = gate {
+        if gate_claimed && let Some(gate) = gate {
             self.finish_gate(
                 gate,
                 reconciler,
                 client,
                 result.map(|outcome| outcome.job_id),
-            )
-            .await;
+                observer,
+            );
+        } else if let (Some(job_id), Some(observer)) = (meaningful_job, observer) {
+            let reconciler = reconciler.clone();
+            let handle = tokio::spawn(async move {
+                let result = reconciler.await_job(client, job_id, observer.clone()).await;
+                observer.finished(&result);
+            });
+            if let Some(previous) = lock(&self.job_task).replace(handle) {
+                previous.abort();
+            }
         }
         let status = self.status().await.to_string();
         debug!(%status, trigger = trigger.as_str(), "reconcile finished");
@@ -606,15 +643,28 @@ impl CheckoutCoordinator {
 
     /// Record what a reconcile did, for status and for the search footer.
     ///
-    /// A startup run always records its job: it is the one `sync_status`
-    /// reports until a later sync pushes something. A periodic or watch run
-    /// records only when it changed something, so an idle checkout keeps
-    /// pointing at the last meaningful job.
-    async fn record(&self, trigger: Trigger, result: &Result<SyncOutcome, String>) {
+    /// Startup, changed content, a new binding, and local-failure recovery
+    /// record a job for observation. A successful no-op retains the last
+    /// meaningful job and does not add a server poll.
+    async fn record(
+        &self,
+        trigger: Trigger,
+        result: &Result<SyncOutcome, String>,
+    ) -> Option<String> {
+        let binding_changed = match result {
+            Ok(outcome) => {
+                self.codebase_id.lock().await.as_deref() != Some(outcome.codebase_id.as_str())
+            }
+            Err(_) => false,
+        };
         let mut state = self.run.lock().await;
         match result {
             Ok(outcome) => {
                 let changed = outcome.uploaded > 0 || outcome.to_delete > 0;
+                let observe = trigger == Trigger::Startup
+                    || changed
+                    || binding_changed
+                    || state.last_error.is_some();
                 if trigger == Trigger::Startup {
                     info!(
                         codebase = %outcome.codebase_id,
@@ -648,10 +698,11 @@ impl CheckoutCoordinator {
                 }
                 drop(state);
                 *self.codebase_id.lock().await = Some(outcome.codebase_id.clone());
-                if trigger == Trigger::Startup || changed {
+                if observe {
                     *self.last_job.lock().await = Some(LastJob {
                         job_id: outcome.job_id.clone(),
                     });
+                    return Some(outcome.job_id.clone());
                 }
             }
             Err(reason) => {
@@ -659,6 +710,7 @@ impl CheckoutCoordinator {
                 state.last_error = Some(reason.clone());
             }
         }
+        None
     }
 
     /// Hand a run's result to the first-index gate, if it is still waiting for
@@ -673,16 +725,14 @@ impl CheckoutCoordinator {
     /// replace the tracked handle and let the poll that finished last decide
     /// the result. The claim is taken before the task is spawned, so the
     /// handle this call records always belongs to the poll that reports.
-    async fn finish_gate(
+    fn finish_gate(
         self: &Arc<Self>,
         gate: Arc<InitialIndexGate>,
         reconciler: &Arc<dyn Reconciler>,
         client: Client,
         job: Result<String, String>,
+        observer: Option<JobObserver>,
     ) {
-        if !gate.claim_poll().await {
-            return;
-        }
         let reconciler = reconciler.clone();
         let handle = tokio::spawn(async move {
             if gate.outcome().await.is_some() {
@@ -690,12 +740,21 @@ impl CheckoutCoordinator {
                 return;
             }
             let result = match job {
-                Ok(job_id) => reconciler.await_job(client, job_id).await,
+                Ok(job_id) => {
+                    let observer = observer
+                        .as_ref()
+                        .expect("a successful first-index run owns an observer");
+                    let result = reconciler.await_job(client, job_id, observer.clone()).await;
+                    observer.finished(&result);
+                    result
+                }
                 Err(reason) => Err(format!("initial scan/upload failed: {reason}")),
             };
             gate.finish(result).await;
         });
-        *lock(&self.gate_task) = Some(handle);
+        if let Some(previous) = lock(&self.gate_task).replace(handle) {
+            previous.abort();
+        }
     }
 }
 
@@ -704,7 +763,7 @@ impl Drop for CheckoutCoordinator {
         // Reaching here means the loop's weak handle is dead, so it cannot run
         // again. Abort anyway: it may be parked in a reconcile that would
         // otherwise keep scanning a checkout nothing is serving.
-        for slot in [&mut self.task, &mut self.gate_task] {
+        for slot in [&mut self.task, &mut self.gate_task, &mut self.job_task] {
             if let Some(task) = slot
                 .get_mut()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -843,39 +902,6 @@ fn is_interesting(event: &Event, policy: &mut SourcePolicy) -> bool {
                 .event_is_relevant(path, path.is_dir(), &blocking::Cancellation::default())
                 .unwrap_or(true)
         })
-}
-
-/// Poll one embedding job to a terminal state.
-async fn wait_for_initial_job(client: &Client, job_id: &str) -> Result<(), String> {
-    loop {
-        let job = client
-            .get::<client::api::JobStatus>(&format!("/v1/jobs/{job_id}"))
-            .await
-            .map_err(|e| format!("poll initial index job {job_id}: {e}"))?;
-        if let Some(result) = initial_job_result(job_id, &job) {
-            return result;
-        }
-        tokio::time::sleep(JOB_POLL_EVERY).await;
-    }
-}
-
-/// A first index is ready only when embedding finished with nothing failed.
-/// Retrieval must never run against a partial first index.
-pub(crate) fn initial_job_result(
-    job_id: &str,
-    job: &client::api::JobStatus,
-) -> Option<Result<(), String>> {
-    if let Some(error) = &job.error {
-        return Some(Err(format!("embedding job {job_id} failed: {error}")));
-    }
-    job.completed_at.as_ref()?;
-    if job.files_failed > 0 {
-        return Some(Err(format!(
-            "embedding job {job_id} completed with {} failed file(s)",
-            job.files_failed
-        )));
-    }
-    Some(Ok(()))
 }
 
 /// A poisoned coordinator lock means a previous holder panicked while holding a

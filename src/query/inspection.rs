@@ -3,8 +3,8 @@
 use std::fmt::Write;
 
 use super::render::{
-    local_path, markdown_cell, markdown_code, render_fenced, render_files, render_hits,
-    render_projects, render_tree, truncation_note,
+    local_path, markdown_cell, markdown_code, render_fenced, render_files, render_projects,
+    render_tree, truncation_note,
 };
 use super::{Client, ToolError, api, bound_codebase, urlencode};
 use crate::engine::CoordinatorStatus;
@@ -46,7 +46,7 @@ pub(super) async fn fetch_files_page(
 /// but the endpoints now page, so fetch `pageSize`-row windows until the total
 /// is covered (or `cap` rows, a safety bound on pathological codebases). Returns
 /// the rows plus the reported `total` so the caller can note truncation.
-async fn fetch_all_pages<T: serde::de::DeserializeOwned>(
+pub(super) async fn fetch_all_pages<T: serde::de::DeserializeOwned>(
     client: &Client,
     base_path: &str,
     cap: usize,
@@ -661,26 +661,45 @@ pub(super) fn human_bytes(bytes: i64) -> String {
 }
 
 /// The detected project graph for the codebase.
-pub async fn list_projects(client: &Client) -> Result<String, ToolError> {
+pub async fn list_projects(
+    client: &Client,
+    presentation: super::QueryPresentation,
+) -> Result<super::QueryOutput, ToolError> {
     let cb = bound_codebase(client, "list_projects")?;
     match client
         .get::<api::ProjectGraph>(&format!("/v1/codebases/{cb}/projects"))
         .await
     {
-        Ok(graph) => Ok(render_projects(&graph)),
+        Ok(graph) => Ok(super::graph_output(
+            client,
+            render_projects(&graph),
+            super::display::GraphInput::Projects(&graph),
+            presentation,
+        )),
         Err(e) => Err(ToolError::from_client("list_projects", &e)),
     }
 }
 
 /// File→file import edges across the codebase.
-pub async fn imports(client: &Client) -> Result<String, ToolError> {
+pub async fn imports(
+    client: &Client,
+    presentation: super::QueryPresentation,
+) -> Result<super::QueryOutput, ToolError> {
     let cb = bound_codebase(client, "imports")?;
     let path = format!("/v1/codebases/{cb}/graph/imports");
     let (edges, total) = fetch_all_pages::<api::ImportEdge>(client, &path, GRAPH_LIST_CAP)
         .await
         .map_err(|e| ToolError::from_client("imports", &e))?;
     if edges.is_empty() {
-        return Ok("(no import edges)".into());
+        return Ok(super::graph_output(
+            client,
+            "(no import edges)".into(),
+            super::display::GraphInput::Imports {
+                edges: &edges,
+                total,
+            },
+            presentation,
+        ));
     }
     let root = client.local_root();
     let mut out = String::from("| From | To | Import |\n| --- | --- | --- |\n");
@@ -695,18 +714,37 @@ pub async fn imports(client: &Client) -> Result<String, ToolError> {
         .expect("writing to a String cannot fail");
     }
     truncation_note(&mut out, edges.len(), total);
-    Ok(out)
+    Ok(super::graph_output(
+        client,
+        out,
+        super::display::GraphInput::Imports {
+            edges: &edges,
+            total,
+        },
+        presentation,
+    ))
 }
 
 /// Reference→definition symbol bindings across the codebase.
-pub async fn symbol_edges(client: &Client) -> Result<String, ToolError> {
+pub async fn symbol_edges(
+    client: &Client,
+    presentation: super::QueryPresentation,
+) -> Result<super::QueryOutput, ToolError> {
     let cb = bound_codebase(client, "symbol_edges")?;
     let path = format!("/v1/codebases/{cb}/graph/symbol-edges");
     let (edges, total) = fetch_all_pages::<api::SymbolEdge>(client, &path, GRAPH_LIST_CAP)
         .await
         .map_err(|e| ToolError::from_client("symbol_edges", &e))?;
     if edges.is_empty() {
-        return Ok("(no symbol bindings)".into());
+        return Ok(super::graph_output(
+            client,
+            "(no symbol bindings)".into(),
+            super::display::GraphInput::SymbolEdges {
+                edges: &edges,
+                total,
+            },
+            presentation,
+        ));
     }
     let root = client.local_root();
     let mut out = String::from("| From | Name | To | Moniker |\n| --- | --- | --- | --- |\n");
@@ -722,19 +760,38 @@ pub async fn symbol_edges(client: &Client) -> Result<String, ToolError> {
         .expect("writing to a String cannot fail");
     }
     truncation_note(&mut out, edges.len(), total);
-    Ok(out)
+    Ok(super::graph_output(
+        client,
+        out,
+        super::display::GraphInput::SymbolEdges {
+            edges: &edges,
+            total,
+        },
+        presentation,
+    ))
 }
 
 /// Cross-codebase links — this codebase's imports resolved into other
 /// codebases the caller can see.
-pub async fn external_links(client: &Client) -> Result<String, ToolError> {
+pub async fn external_links(
+    client: &Client,
+    presentation: super::QueryPresentation,
+) -> Result<super::QueryOutput, ToolError> {
     let cb = bound_codebase(client, "external_links")?;
     let path = format!("/v1/codebases/{cb}/graph/external-links");
     let (links, total) = fetch_all_pages::<api::ExternalLink>(client, &path, GRAPH_LIST_CAP)
         .await
         .map_err(|e| ToolError::from_client("external_links", &e))?;
     if links.is_empty() {
-        return Ok("(no cross-codebase links)".into());
+        return Ok(super::graph_output(
+            client,
+            "(no cross-codebase links)".into(),
+            super::display::GraphInput::ExternalLinks {
+                links: &links,
+                total,
+            },
+            presentation,
+        ));
     }
     // Only `from_file` is local — `target_file` lives in the linked codebase,
     // so it stays relative (we have no root for it here).
@@ -759,7 +816,15 @@ pub async fn external_links(client: &Client) -> Result<String, ToolError> {
     truncation_note(&mut out, links.len(), total);
     let mut rendered = String::new();
     render_fenced(&mut rendered, &out, None);
-    Ok(rendered)
+    Ok(super::graph_output(
+        client,
+        rendered,
+        super::display::GraphInput::ExternalLinks {
+            links: &links,
+            total,
+        },
+        presentation,
+    ))
 }
 
 /// The symbol at `path:line[:column]` (1-based). With a column, the identifier
@@ -769,7 +834,8 @@ pub async fn symbol_at_position(
     path: &str,
     line: u32,
     column: Option<u32>,
-) -> Result<String, ToolError> {
+    presentation: super::QueryPresentation,
+) -> Result<super::QueryOutput, ToolError> {
     let cb = bound_codebase(client, "symbol_at_position")?;
     let mut url = format!(
         "/v1/codebases/{cb}/graph/symbol-at-position?path={}&line={line}",
@@ -783,8 +849,17 @@ pub async fn symbol_at_position(
         None => format!("{path}:{line}"),
     };
     match client.get_maybe::<api::SearchHit>(&url).await {
-        Ok(Some(hit)) => Ok(render_hits(&[hit], "", client.local_root(), false)),
-        Ok(None) => Ok(format!("(no symbol at {at})")),
+        Ok(Some(hit)) => Ok(super::lookup_output(
+            client,
+            &at,
+            std::slice::from_ref(&hit),
+            "",
+            presentation,
+        )),
+        Ok(None) => Ok(super::QueryOutput::new(
+            format!("(no symbol at {at})"),
+            None,
+        )),
         Err(e) => Err(ToolError::from_client("symbol_at_position", &e)),
     }
 }

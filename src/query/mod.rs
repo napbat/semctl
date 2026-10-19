@@ -16,11 +16,13 @@ mod advanced;
 mod display;
 mod error;
 mod inspection;
+mod overview;
 mod render;
 mod source;
 
 pub use display::{QueryOutput, QueryPresentation};
 pub use error::{FailureKind, ToolError};
+pub use overview::overview;
 
 #[cfg(test)]
 use inspection::human_bytes;
@@ -188,7 +190,12 @@ fn bound_codebase<'a>(client: &'a Client, op: &'static str) -> Result<&'a str, T
 /// One-shot symbol neighbourhood (#4): the definition of `symbol` plus its
 /// direct callers and callees. The server's `/graph/trace` endpoint composes and
 /// classifies the neighbourhood next to the graph; the client renders it.
-pub async fn trace(client: &Client, symbol: &str, depth: u32) -> Result<String, ToolError> {
+pub async fn trace(
+    client: &Client,
+    symbol: &str,
+    depth: u32,
+    presentation: QueryPresentation,
+) -> Result<QueryOutput, ToolError> {
     let cb = bound_codebase(client, "trace")?;
     let url = format!(
         "/v1/codebases/{cb}/graph/trace?symbol={}&depth={depth}",
@@ -199,7 +206,10 @@ pub async fn trace(client: &Client, symbol: &str, depth: u32) -> Result<String, 
         .await
         .map_err(|e| ToolError::from_client("trace", &e))?;
     if t.definition.is_empty() {
-        return Ok(near_miss(client, symbol, "definition").await);
+        return Ok(QueryOutput::new(
+            near_miss(client, symbol, "definition").await,
+            None,
+        ));
     }
     let root = client.local_root();
 
@@ -210,11 +220,20 @@ pub async fn trace(client: &Client, symbol: &str, depth: u32) -> Result<String, 
     out.push_str(&render_compact(&t.callers, "  (none)", root));
     write!(out, "\n## Callees ({})\n\n", t.callees.len()).expect("writing to a String cannot fail");
     out.push_str(&render_compact(&t.callees, "  (none)", root));
-    Ok(out)
+    Ok(graph_output(
+        client,
+        out,
+        display::GraphInput::Trace { symbol, result: &t },
+        presentation,
+    ))
 }
 
 /// Symbol-graph: definitions of `symbol` in the codebase.
-pub async fn find_definition(client: &Client, symbol: &str) -> Result<String, ToolError> {
+pub async fn find_definition(
+    client: &Client,
+    symbol: &str,
+    presentation: QueryPresentation,
+) -> Result<QueryOutput, ToolError> {
     let cb = bound_codebase(client, "find_definition")?;
     let path = format!(
         "/v1/codebases/{cb}/graph/definitions?symbol={}",
@@ -225,9 +244,12 @@ pub async fn find_definition(client: &Client, symbol: &str) -> Result<String, To
         .await
         .map_err(|e| ToolError::from_client("find_definition", &e))?;
     if hits.is_empty() {
-        return Ok(near_miss(client, symbol, "definition").await);
+        return Ok(QueryOutput::new(
+            near_miss(client, symbol, "definition").await,
+            None,
+        ));
     }
-    Ok(render_hits(&hits, "", client.local_root(), false))
+    Ok(lookup_output(client, symbol, &hits, "", presentation))
 }
 
 /// Symbol-graph: references to `symbol` in the codebase.
@@ -235,7 +257,8 @@ pub async fn find_references(
     client: &Client,
     symbol: &str,
     namespace: Option<&str>,
-) -> Result<String, ToolError> {
+    presentation: QueryPresentation,
+) -> Result<QueryOutput, ToolError> {
     let cb = bound_codebase(client, "find_references")?;
     let mut path = format!(
         "/v1/codebases/{cb}/graph/references?symbol={}",
@@ -250,14 +273,21 @@ pub async fn find_references(
         .await
         .map_err(|e| ToolError::from_client("find_references", &e))?;
     if hits.is_empty() {
-        return Ok(near_miss(client, symbol, "references").await);
+        return Ok(QueryOutput::new(
+            near_miss(client, symbol, "references").await,
+            None,
+        ));
     }
-    Ok(render_hits(&hits, "", client.local_root(), false))
+    Ok(lookup_output(client, symbol, &hits, "", presentation))
 }
 
 /// Graph: incoming callers of `symbol` — the definitions that call it (the
 /// inverse `calls` edge).
-pub async fn who_calls(client: &Client, symbol: &str) -> Result<String, ToolError> {
+pub async fn who_calls(
+    client: &Client,
+    symbol: &str,
+    presentation: QueryPresentation,
+) -> Result<QueryOutput, ToolError> {
     let cb = bound_codebase(client, "who_calls")?;
     let path = format!(
         "/v1/codebases/{cb}/graph/who-calls?symbol={}",
@@ -267,17 +297,22 @@ pub async fn who_calls(client: &Client, symbol: &str) -> Result<String, ToolErro
         .get::<Vec<api::SearchHit>>(&path)
         .await
         .map_err(|e| ToolError::from_client("who_calls", &e))?;
-    Ok(render_hits(
+    Ok(lookup_output(
+        client,
+        symbol,
         &hits,
         &format!("nothing calls `{symbol}`"),
-        client.local_root(),
-        false,
+        presentation,
     ))
 }
 
 /// Graph: the types implementing `symbol` (a trait/interface) — the reverse
 /// `implements` edge.
-pub async fn implementations_of(client: &Client, symbol: &str) -> Result<String, ToolError> {
+pub async fn implementations_of(
+    client: &Client,
+    symbol: &str,
+    presentation: QueryPresentation,
+) -> Result<QueryOutput, ToolError> {
     let cb = bound_codebase(client, "implementations_of")?;
     let path = format!(
         "/v1/codebases/{cb}/graph/implementations?symbol={}",
@@ -287,17 +322,23 @@ pub async fn implementations_of(client: &Client, symbol: &str) -> Result<String,
         .get::<Vec<api::SearchHit>>(&path)
         .await
         .map_err(|e| ToolError::from_client("implementations_of", &e))?;
-    Ok(render_hits(
+    Ok(lookup_output(
+        client,
+        symbol,
         &hits,
         &format!("no implementations of `{symbol}`"),
-        client.local_root(),
-        false,
+        presentation,
     ))
 }
 
 /// Graph: a shortest call chain from `from` to `to` — the chunks along one path
 /// of `calls` edges, in order.
-pub async fn call_path(client: &Client, from: &str, to: &str) -> Result<String, ToolError> {
+pub async fn call_path(
+    client: &Client,
+    from: &str,
+    to: &str,
+    presentation: QueryPresentation,
+) -> Result<QueryOutput, ToolError> {
     let cb = bound_codebase(client, "call_path")?;
     let path = format!(
         "/v1/codebases/{cb}/graph/call-path?from={}&to={}",
@@ -308,18 +349,32 @@ pub async fn call_path(client: &Client, from: &str, to: &str) -> Result<String, 
         .get::<Vec<api::SearchHit>>(&path)
         .await
         .map_err(|e| ToolError::from_client("call_path", &e))?;
-    Ok(render_hits(
+    let text = render_hits(
         &hits,
         &format!("no call path from `{from}` to `{to}`"),
         client.local_root(),
         false,
+    );
+    Ok(graph_output(
+        client,
+        text,
+        display::GraphInput::CallPath {
+            from,
+            to,
+            hits: &hits,
+        },
+        presentation,
     ))
 }
 
 /// Flow: the external boundaries a value entering from `from` flows out to
 /// (forward, inter-procedural value flow). Boundaries are the un-indexed callees
 /// the corpus crosses.
-pub async fn reaches(client: &Client, from: &str) -> Result<String, ToolError> {
+pub async fn reaches(
+    client: &Client,
+    from: &str,
+    presentation: QueryPresentation,
+) -> Result<QueryOutput, ToolError> {
     let cb = bound_codebase(client, "reaches")?;
     let path = format!(
         "/v1/codebases/{cb}/graph/flow/reaches?from={}",
@@ -329,30 +384,56 @@ pub async fn reaches(client: &Client, from: &str) -> Result<String, ToolError> {
         .get::<Vec<String>>(&path)
         .await
         .map_err(|e| ToolError::from_client("reaches", &e))?;
-    Ok(render_boundaries(
+    let text = render_boundaries(
         &boundaries,
         &format!("no boundary flow reached from `{from}`"),
+    );
+    Ok(graph_output(
+        client,
+        text,
+        display::GraphInput::Boundaries {
+            boundary: from,
+            targets: &boundaries,
+            incoming: false,
+        },
+        presentation,
     ))
 }
 
 /// Flow: the external boundaries whose entering value reaches `to` (backward,
 /// inter-procedural value flow) — the dual of [`reaches`].
-pub async fn flows_into(client: &Client, to: &str) -> Result<String, ToolError> {
+pub async fn flows_into(
+    client: &Client,
+    to: &str,
+    presentation: QueryPresentation,
+) -> Result<QueryOutput, ToolError> {
     let cb = bound_codebase(client, "flows_into")?;
     let path = format!("/v1/codebases/{cb}/graph/flow/into?to={}", urlencode(to));
     let boundaries = client
         .get::<Vec<String>>(&path)
         .await
         .map_err(|e| ToolError::from_client("flows_into", &e))?;
-    Ok(render_boundaries(
-        &boundaries,
-        &format!("nothing flows into `{to}`"),
+    let text = render_boundaries(&boundaries, &format!("nothing flows into `{to}`"));
+    Ok(graph_output(
+        client,
+        text,
+        display::GraphInput::Boundaries {
+            boundary: to,
+            targets: &boundaries,
+            incoming: true,
+        },
+        presentation,
     ))
 }
 
 /// Flow: the function chunks a value flows through from boundary `from` to
 /// boundary `to` — the inter-procedural flow witness.
-pub async fn flows_between(client: &Client, from: &str, to: &str) -> Result<String, ToolError> {
+pub async fn flows_between(
+    client: &Client,
+    from: &str,
+    to: &str,
+    presentation: QueryPresentation,
+) -> Result<QueryOutput, ToolError> {
     let cb = bound_codebase(client, "flows_between")?;
     let path = format!(
         "/v1/codebases/{cb}/graph/flow/between?from={}&to={}",
@@ -363,11 +444,21 @@ pub async fn flows_between(client: &Client, from: &str, to: &str) -> Result<Stri
         .get::<Vec<api::SearchHit>>(&path)
         .await
         .map_err(|e| ToolError::from_client("flows_between", &e))?;
-    Ok(render_hits(
+    let text = render_hits(
         &hits,
         &format!("no value flow from `{from}` to `{to}`"),
         client.local_root(),
         false,
+    );
+    Ok(graph_output(
+        client,
+        text,
+        display::GraphInput::FlowPath {
+            from,
+            to,
+            hits: &hits,
+        },
+        presentation,
     ))
 }
 
@@ -441,7 +532,8 @@ pub async fn file_outline(
     max_depth: Option<u32>,
     kinds: &[String],
     include_body: bool,
-) -> Result<String, ToolError> {
+    presentation: QueryPresentation,
+) -> Result<QueryOutput, ToolError> {
     let cb = bound_codebase(client, "file_outline")?;
     let mut url = format!(
         "/v1/codebases/{cb}/graph/outline?path={}&includeBody={include_body}",
@@ -457,13 +549,17 @@ pub async fn file_outline(
         .get::<api::FileOutline>(&url)
         .await
         .map_err(|e| ToolError::from_client("file_outline", &e))?;
-    if outline.entries.is_empty() {
-        return Ok(format!(
-            "{} is indexed but has no chunks",
-            markdown_code(path)
-        ));
-    }
-    Ok(render_outline(&outline, client.local_root()))
+    let text = if outline.entries.is_empty() {
+        format!("{} is indexed but has no chunks", markdown_code(path))
+    } else {
+        render_outline(&outline, client.local_root())
+    };
+    Ok(graph_output(
+        client,
+        text,
+        display::GraphInput::Outline(&outline),
+        presentation,
+    ))
 }
 
 /// Chunks overlapping an inclusive line range in a file — "grow context around
@@ -474,7 +570,8 @@ pub async fn expand_chunk(
     path: &str,
     line_start: u32,
     line_end: u32,
-) -> Result<String, ToolError> {
+    presentation: QueryPresentation,
+) -> Result<QueryOutput, ToolError> {
     let cb = bound_codebase(client, "expand_chunk")?;
     let url = format!(
         "/v1/codebases/{cb}/graph/expand?path={}&lineStart={line_start}&lineEnd={line_end}",
@@ -484,12 +581,43 @@ pub async fn expand_chunk(
         .get::<Vec<api::SearchHit>>(&url)
         .await
         .map_err(|e| ToolError::from_client("expand_chunk", &e))?;
-    Ok(render_hits(
+    Ok(lookup_output(
+        client,
+        path,
         &hits,
         &format!("no indexed chunks overlap {path}:{line_start}-{line_end}"),
-        client.local_root(),
-        false,
+        presentation,
     ))
+}
+
+fn lookup_output(
+    client: &Client,
+    symbol: &str,
+    hits: &[api::SearchHit],
+    empty: &str,
+    presentation: QueryPresentation,
+) -> QueryOutput {
+    let text = render_hits(hits, empty, client.local_root(), false);
+    let display = if presentation == QueryPresentation::Inspector {
+        display::lookup(client, symbol, hits)
+    } else {
+        None
+    };
+    QueryOutput::new(text, display)
+}
+
+fn graph_output(
+    client: &Client,
+    text: String,
+    input: display::GraphInput<'_>,
+    presentation: QueryPresentation,
+) -> QueryOutput {
+    let display = if presentation == QueryPresentation::Inspector {
+        display::project_graph(client, input)
+    } else {
+        None
+    };
+    QueryOutput::new(text, display)
 }
 
 /// On an exact symbol-lookup miss, suggest near matches by name so the caller

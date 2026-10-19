@@ -11,6 +11,11 @@ use crate::engine::CoordinatorStatus;
 use super::render::{HitContext, strip_verbatim_prefix};
 use super::source::HitSource;
 
+mod graph;
+mod overview;
+pub(super) use graph::{GraphInput, project_graph};
+pub(super) use overview::project_overview;
+
 const MAX_DISPLAY_BYTES: usize = 32 * 1024;
 const MAX_DISPLAY_HITS: usize = 32;
 
@@ -22,7 +27,7 @@ pub enum QueryPresentation {
 }
 
 /// One owner for model-facing text and its optional bounded presentation data.
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct QueryOutput {
     pub text: String,
     pub(crate) display: Option<Value>,
@@ -40,6 +45,7 @@ impl QueryOutput {
             let mut limit = BoundedWriter {
                 inner: io::sink(),
                 written: 0,
+                max: MAX_DISPLAY_BYTES,
             };
             if serde_json::to_writer(&mut limit, &display).is_ok() {
                 self.display = Some(display);
@@ -115,6 +121,10 @@ enum Data<'a> {
     Batch {
         symbols: Vec<Symbol<'a>>,
     },
+    Graph {
+        #[serde(flatten)]
+        graph: graph::Graph<'a>,
+    },
     Status {
         coordinator: Option<&'a CoordinatorStatus>,
         catalog: Option<Catalog>,
@@ -134,6 +144,12 @@ struct Hit<'a> {
     path: Option<&'a str>,
     symbol: Option<&'a str>,
     qualified_name: Option<&'a str>,
+    enclosing_symbol: Option<&'a str>,
+    is_write: Option<bool>,
+    reference_namespace: Option<&'a str>,
+    reference_kind: Option<&'a str>,
+    external_target: Option<&'a str>,
+    project: Option<&'a str>,
     language: Option<&'a str>,
     kind: Option<&'a str>,
     score: Option<f64>,
@@ -186,6 +202,12 @@ impl<'a> Hit<'a> {
             path: hit.path.as_deref(),
             symbol: hit.symbol.as_deref(),
             qualified_name: hit.qualified_symbol.as_deref(),
+            enclosing_symbol: hit.enclosing_symbol.as_deref(),
+            is_write: hit.is_write,
+            reference_namespace: hit.reference_namespace.as_deref(),
+            reference_kind: hit.reference_kind.as_deref(),
+            external_target: hit.external_target.as_deref(),
+            project: None,
             language: hit.language.as_deref(),
             kind: (!hit.kind.is_empty()).then_some(hit.kind.as_str()),
             score: hit.score.is_finite().then_some(hit.score),
@@ -202,6 +224,46 @@ impl<'a> Hit<'a> {
             focus_byte: hit.focus_byte,
             codebase_id: hit.codebase_id.as_deref(),
             binding,
+        }
+    }
+
+    fn graph(hit: &'a api::SearchHit) -> Self {
+        Self {
+            score: None,
+            ..Self::new(hit, None)
+        }
+    }
+
+    fn symbol_search(hit: &'a api::SymbolSearchHit) -> Self {
+        Self {
+            path: Some(&hit.path),
+            symbol: Some(&hit.name),
+            qualified_name: Some(&hit.qualified_name),
+            enclosing_symbol: None,
+            is_write: None,
+            reference_namespace: None,
+            reference_kind: None,
+            external_target: None,
+            project: hit.project.as_deref(),
+            language: Some(&hit.language),
+            kind: Some(&hit.kind),
+            score: Some(f64::from(hit.score)),
+            start_line: Some(hit.line_start),
+            end_line: Some(hit.line_end),
+            start_byte: Some(hit.byte_start),
+            end_byte: Some(hit.byte_end),
+            snippet: None,
+            snippet_start_line: None,
+            snippet_end_line: None,
+            snippet_start_byte: None,
+            snippet_end_byte: None,
+            focus_line: None,
+            focus_byte: None,
+            codebase_id: Some(&hit.codebase_id),
+            binding: Binding {
+                state: "not-probed",
+                reason: None,
+            },
         }
     }
 }
@@ -240,11 +302,12 @@ struct Job<'a> {
 struct BoundedWriter<W> {
     inner: W,
     written: usize,
+    max: usize,
 }
 
 impl<W: Write> Write for BoundedWriter<W> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if bytes.len() > MAX_DISPLAY_BYTES.saturating_sub(self.written) {
+        if bytes.len() > self.max.saturating_sub(self.written) {
             return Err(io::Error::other("display exceeds byte limit"));
         }
         let written = self.inner.write(bytes)?;
@@ -261,9 +324,36 @@ fn bounded(display: &Display<'_>) -> Option<Value> {
     let mut bytes = BoundedWriter {
         inner: Vec::new(),
         written: 0,
+        max: MAX_DISPLAY_BYTES,
     };
     serde_json::to_writer(&mut bytes, display).ok()?;
     serde_json::from_slice(&bytes.inner).ok()
+}
+
+// String byte counts reject oversized input before allocating hit vectors or
+// scanning strings for JSON escaping. The bounded writer enforces the exact cap.
+fn search_hit_bytes(hit: &api::SearchHit) -> usize {
+    [
+        hit.path.as_deref(),
+        hit.symbol.as_deref(),
+        hit.qualified_symbol.as_deref(),
+        hit.enclosing_symbol.as_deref(),
+        hit.reference_namespace.as_deref(),
+        hit.reference_kind.as_deref(),
+        hit.external_target.as_deref(),
+        hit.language.as_deref(),
+        hit.codebase_id.as_deref(),
+        Some(hit.kind.as_str()),
+        Some(hit.snippet.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .fold(0usize, |total, text| total.saturating_add(text.len()))
+}
+
+fn selected_copy(client: &Client, codebase: Option<&str>) -> bool {
+    let selected = client.codebase_raw();
+    selected.is_some() && codebase.is_none_or(|id| Some(id) == selected)
 }
 
 pub(super) fn search(
@@ -273,9 +363,10 @@ pub(super) fn search(
     sources: &[HitSource],
     context: HitContext<'_>,
 ) -> Option<Value> {
-    if query.len() > MAX_DISPLAY_BYTES
-        || hits.len() > MAX_DISPLAY_HITS
-        || hits.iter().any(|hit| hit.snippet.len() > MAX_DISPLAY_BYTES)
+    if hits.len() > MAX_DISPLAY_HITS
+        || hits.iter().fold(query.len(), |total, hit| {
+            total.saturating_add(search_hit_bytes(hit))
+        }) > MAX_DISPLAY_BYTES
     {
         return None;
     }
@@ -292,6 +383,72 @@ pub(super) fn search(
                 .enumerate()
                 .map(|(index, hit)| Hit::new(hit, sources.get(index)))
                 .collect(),
+        },
+    })
+}
+
+pub(super) fn lookup(client: &Client, symbol: &str, hits: &[api::SearchHit]) -> Option<Value> {
+    if hits.is_empty()
+        || hits.len() > MAX_DISPLAY_HITS
+        || hits.iter().fold(symbol.len(), |total, hit| {
+            total.saturating_add(search_hit_bytes(hit))
+        }) > MAX_DISPLAY_BYTES
+    {
+        return None;
+    }
+    bounded(&Display {
+        version: 1,
+        identity: Identity::new(
+            client,
+            hits.iter()
+                .all(|hit| selected_copy(client, hit.codebase_id.as_deref())),
+        ),
+        data: Data::Batch {
+            symbols: vec![Symbol {
+                symbol,
+                hits: hits.iter().map(Hit::graph).collect(),
+            }],
+        },
+    })
+}
+
+pub(super) fn symbol_search(
+    client: &Client,
+    query: &str,
+    hits: &[api::SymbolSearchHit],
+) -> Option<Value> {
+    if hits.is_empty() || hits.len() > MAX_DISPLAY_HITS {
+        return None;
+    }
+    let bytes = hits.iter().fold(query.len(), |total, hit| {
+        [
+            Some(hit.codebase_id.as_str()),
+            Some(hit.path.as_str()),
+            Some(hit.name.as_str()),
+            Some(hit.qualified_name.as_str()),
+            Some(hit.kind.as_str()),
+            hit.project.as_deref(),
+            Some(hit.language.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        .fold(total, |total, text| total.saturating_add(text.len()))
+    });
+    if bytes > MAX_DISPLAY_BYTES {
+        return None;
+    }
+    bounded(&Display {
+        version: 1,
+        identity: Identity::new(
+            client,
+            hits.iter()
+                .all(|hit| selected_copy(client, Some(&hit.codebase_id))),
+        ),
+        data: Data::Batch {
+            symbols: vec![Symbol {
+                symbol: query,
+                hits: hits.iter().map(Hit::symbol_search).collect(),
+            }],
         },
     })
 }
@@ -341,22 +498,21 @@ pub(super) fn batch(client: &Client, symbols: &[api::SymbolHits]) -> Option<Valu
     {
         return None;
     }
-    if symbols.iter().any(|symbol| {
-        symbol.symbol.len() > MAX_DISPLAY_BYTES
-            || symbol
-                .hits
-                .iter()
-                .any(|hit| hit.snippet.len() > MAX_DISPLAY_BYTES)
-    }) {
+    let bytes = symbols.iter().fold(0usize, |total, symbol| {
+        symbol
+            .hits
+            .iter()
+            .fold(total.saturating_add(symbol.symbol.len()), |total, hit| {
+                total.saturating_add(search_hit_bytes(hit))
+            })
+    });
+    if bytes > MAX_DISPLAY_BYTES {
         return None;
     }
-    let selected = client.codebase_raw();
-    let local = selected.is_some()
-        && symbols.iter().flat_map(|symbol| &symbol.hits).all(|hit| {
-            hit.codebase_id
-                .as_deref()
-                .is_none_or(|id| Some(id) == selected)
-        });
+    let local = symbols
+        .iter()
+        .flat_map(|symbol| &symbol.hits)
+        .all(|hit| selected_copy(client, hit.codebase_id.as_deref()));
     bounded(&Display {
         version: 1,
         identity: Identity::new(client, local),
@@ -365,7 +521,7 @@ pub(super) fn batch(client: &Client, symbols: &[api::SymbolHits]) -> Option<Valu
                 .iter()
                 .map(|symbol| Symbol {
                     symbol: &symbol.symbol,
-                    hits: symbol.hits.iter().map(|hit| Hit::new(hit, None)).collect(),
+                    hits: symbol.hits.iter().map(Hit::graph).collect(),
                 })
                 .collect(),
         },
@@ -415,316 +571,4 @@ pub(super) fn status(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn hit(codebase: Option<&str>, snippet: &str) -> api::SearchHit {
-        serde_json::from_value(serde_json::json!({
-            "domainId": "code", "id": "hit", "score": 2.0,
-            "path": "src/lib.rs", "codebaseId": codebase,
-            "lineStart": 8, "lineEnd": 9, "byteStart": 40, "byteEnd": 60,
-            "snippet": snippet, "focusLine": 9, "focusByte": 44,
-            "snippetLineStart": 8, "snippetLineEnd": 9,
-            "snippetByteStart": 40, "snippetByteEnd": 60
-        }))
-        .unwrap()
-    }
-
-    fn content() -> api::FileContent {
-        serde_json::from_value(serde_json::json!({
-            "path": "src/lib.rs", "contentHash": "pinned", "content": "",
-            "encoding": "utf-8", "isBinary": false, "size": 60,
-            "byteStart": 40, "byteEnd": 60, "lineStart": 8,
-            "lineEnd": 9, "truncated": true
-        }))
-        .unwrap()
-    }
-
-    #[tokio::test]
-    async fn search_query_round_trips_exactly_without_extra_reads_or_plain_metadata() {
-        use crate::client::stub::{Reply, Stub};
-        use crate::query::{QueryPresentation, SearchOpts};
-
-        let query = "  exact \"query\" \\\\ <tag>&[]\r\n\t\x1b[31m café 雪  ";
-        for response in [
-            "[]",
-            r#"[{"domainId":"code","id":"hit","score":1.0,"path":"src/lib.rs","snippet":"fn sample() {}"}]"#,
-        ] {
-            for presentation in [QueryPresentation::Plain, QueryPresentation::Inspector] {
-                let stub = Stub::serve(vec![Reply::ok(response)]).await;
-                let client = Client::for_test_server(&stub.url).with_codebase("A".into());
-                let output = crate::query::search(
-                    &client,
-                    query,
-                    8,
-                    &[],
-                    &SearchOpts::default(),
-                    presentation,
-                )
-                .await
-                .unwrap();
-                match presentation {
-                    QueryPresentation::Inspector => {
-                        let wire = serde_json::to_vec(&output.display.unwrap()).unwrap();
-                        let display: Value = serde_json::from_slice(&wire).unwrap();
-                        assert_eq!(display["query"].as_str(), Some(query));
-                        assert_eq!(display["kind"], "search");
-                    }
-                    QueryPresentation::Plain => assert!(output.display.is_none()),
-                }
-                assert_eq!(stub.requests(), 1);
-            }
-        }
-    }
-
-    #[test]
-    fn search_query_counts_toward_the_whole_serialized_display_cap() {
-        let client = Client::for_test("A", None);
-        let scope = HitContext::search(None, Some("A"), true);
-        let hits = [hit(Some("A"), "source")];
-        let empty = search(&client, "", &hits, &[], scope).unwrap();
-        let overhead = serde_json::to_vec(&empty).unwrap().len();
-        let exact = "x".repeat(MAX_DISPLAY_BYTES - overhead);
-        let display = search(&client, &exact, &hits, &[], scope).unwrap();
-        assert_eq!(display["query"].as_str(), Some(exact.as_str()));
-        assert_eq!(
-            serde_json::to_vec(&display).unwrap().len(),
-            MAX_DISPLAY_BYTES
-        );
-        assert!(search(&client, &(exact + "x"), &hits, &[], scope).is_none());
-        assert!(search(&client, &"x".repeat(MAX_DISPLAY_BYTES + 1), &[], &[], scope).is_none());
-        assert!(
-            search(
-                &client,
-                &"\n".repeat(MAX_DISPLAY_BYTES / 2),
-                &hits,
-                &[],
-                scope
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn late_index_warning_obeys_the_encoded_cap_without_losing_native_text() {
-        let client = Client::for_test("A", None);
-        let scope = HitContext::search(None, Some("A"), true);
-        let warning = "stale \"snapshot\"\n雪";
-        let mut empty = QueryOutput::new(String::new(), search(&client, "", &[], &[], scope));
-        empty.set_index_warning(Some(warning.into()));
-        let overhead = serde_json::to_vec(empty.display.as_ref().unwrap())
-            .unwrap()
-            .len();
-        for extra in [0, 1] {
-            let query = "x".repeat(MAX_DISPLAY_BYTES - overhead + extra);
-            let mut output = QueryOutput::new(
-                "complete native result".into(),
-                search(&client, &query, &[], &[], scope),
-            );
-            assert!(output.display.is_some());
-            output.set_index_warning(Some(warning.into()));
-            if extra == 0 {
-                let display = output.display.as_ref().unwrap();
-                assert_eq!(display["indexWarning"], warning);
-                assert_eq!(
-                    serde_json::to_vec(display).unwrap().len(),
-                    MAX_DISPLAY_BYTES
-                );
-            } else {
-                assert!(output.display.is_none());
-            }
-            assert_eq!(output.text, "complete native result");
-        }
-    }
-
-    #[test]
-    fn byte_and_hit_caps_are_independent_and_all_or_nothing() {
-        let client = Client::for_test("A", None);
-        let scope = HitContext::search(None, Some("A"), true);
-        let hits: Vec<_> = (0..MAX_DISPLAY_HITS).map(|_| hit(Some("A"), "")).collect();
-        assert_eq!(
-            search(&client, "query", &hits, &[], scope).unwrap()["hits"]
-                .as_array()
-                .unwrap()
-                .len(),
-            32
-        );
-        let too_many: Vec<_> = (0..=MAX_DISPLAY_HITS).map(|_| hit(Some("A"), "")).collect();
-        assert!(search(&client, "query", &too_many, &[], scope).is_none());
-        assert!(
-            search(
-                &client,
-                "query",
-                &[hit(Some("A"), &"x".repeat(MAX_DISPLAY_BYTES))],
-                &[],
-                scope
-            )
-            .is_none()
-        );
-
-        let content = content();
-        let empty = source(&client, &content, "", Some("rs"), "content-plane").unwrap();
-        let overhead = serde_json::to_vec(&empty).unwrap().len();
-        let exact = "x".repeat(MAX_DISPLAY_BYTES - overhead);
-        let display = source(&client, &content, &exact, Some("rs"), "content-plane").unwrap();
-        assert_eq!(
-            serde_json::to_vec(&display).unwrap().len(),
-            MAX_DISPLAY_BYTES
-        );
-        assert!(
-            source(
-                &client,
-                &content,
-                &(exact + "x"),
-                Some("rs"),
-                "content-plane"
-            )
-            .is_none()
-        );
-        // Escaped and multibyte text count as serialized bytes, not characters.
-        assert!(
-            source(
-                &client,
-                &content,
-                &"\n".repeat(MAX_DISPLAY_BYTES / 2),
-                None,
-                "content-plane"
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn search_preserves_coordinates_and_binding_without_cross_copy_roots() {
-        let root = tempfile::tempdir().unwrap();
-        let client = Client::for_test("A", Some(root.path().to_path_buf()));
-        let scope = HitContext::search(client.local_root(), Some("A"), true);
-        let hits = [hit(Some("A"), "first\nsecond")];
-        let bound = search(&client, "query", &hits, &[HitSource::Bound], scope).unwrap();
-        assert!(bound["identity"]["localRoot"].is_string());
-        assert_eq!(bound["hits"][0]["binding"]["state"], "bound");
-        assert_eq!(bound["hits"][0]["startLine"], 8);
-        assert_eq!(bound["hits"][0]["focusLine"], 9);
-        assert_eq!(bound["hits"][0]["snippetStartByte"], 40);
-        let states = [
-            (HitSource::ChangedLocal, "changed-local"),
-            (HitSource::IndexedRangeMismatch, "range-mismatch"),
-            (
-                HitSource::Unverified("probe budget exhausted".into()),
-                "unverified",
-            ),
-        ];
-        for (state, expected) in states {
-            let display = search(&client, "query", &hits, &[state], scope).unwrap();
-            assert_eq!(display["hits"][0]["binding"]["state"], expected);
-            assert!(display["hits"][0]["binding"]["reason"].is_string());
-        }
-        let mixed = [hit(Some("A"), ""), hit(Some("B"), "")];
-        assert!(
-            search(&client, "query", &mixed, &[], scope).unwrap()["identity"]["localRoot"]
-                .is_null()
-        );
-        let legacy = [hit(None, "")];
-        let broad = HitContext::search(client.local_root(), Some("A"), false);
-        assert!(
-            search(&client, "query", &legacy, &[], broad).unwrap()["identity"]["localRoot"]
-                .is_null()
-        );
-        let canonical = client.for_canonical();
-        let display = search(
-            &canonical,
-            "query",
-            &hits,
-            &[],
-            HitContext::search(None, Some("A"), true),
-        )
-        .unwrap();
-        assert_eq!(display["identity"]["copy"], "canonical");
-        assert!(display["identity"]["localRoot"].is_null());
-        let content = content();
-        assert!(source(&client, &content, "canonical bytes", None, "content-plane").unwrap()["identity"]["localRoot"].is_null());
-        let local = source(
-            &client,
-            &content,
-            "verified bytes\r\n",
-            Some("rs"),
-            "verified-local",
-        )
-        .unwrap();
-        assert_eq!(local["text"], "verified bytes\r\n");
-        assert_eq!(local["contentHash"], "pinned");
-        assert_eq!(local["byteStart"], 40);
-        assert!(local["identity"]["localRoot"].is_string());
-        let mut incomplete = hit(Some("A"), "");
-        incomplete.line_start = None;
-        incomplete.snippet_line_start = None;
-        incomplete.score = f64::NAN;
-        let display = search(&client, "query", &[incomplete], &[], scope).unwrap();
-        assert!(display["hits"][0]["startLine"].is_null());
-        assert!(display["hits"][0]["snippetStartLine"].is_null());
-        assert!(display["hits"][0]["score"].is_null());
-    }
-
-    #[test]
-    fn batch_retains_misses_order_and_aggregate_bound_without_probing() {
-        let client = Client::for_test("A", None);
-        let mut symbols = vec![
-            api::SymbolHits {
-                symbol: "missing".into(),
-                hits: vec![],
-            },
-            api::SymbolHits {
-                symbol: "found".into(),
-                hits: (0..32).map(|_| hit(Some("A"), "")).collect(),
-            },
-        ];
-        let display = batch(&client, &symbols).unwrap();
-        assert_eq!(display["symbols"][0]["symbol"], "missing");
-        assert_eq!(display["symbols"][0]["hits"], serde_json::json!([]));
-        assert_eq!(
-            display["symbols"][1]["hits"][0]["binding"]["state"],
-            "not-probed"
-        );
-        symbols.push(api::SymbolHits {
-            symbol: "overflow".into(),
-            hits: vec![hit(Some("A"), "")],
-        });
-        assert!(batch(&client, &symbols).is_none());
-    }
-
-    #[test]
-    fn status_preserves_unknown_counters_failures_and_snapshot_copy_identity() {
-        let root = tempfile::tempdir().unwrap();
-        let client = Client::for_test("A", Some(root.path().to_path_buf()));
-        let coordinator: CoordinatorStatus = serde_json::from_value(serde_json::json!({
-            "root": root.path(), "codebase_id": "A", "leases": 1, "watcher": "active",
-            "last_job_id": "job", "running": false, "pending_triggers": 0,
-            "trigger_overflow": false, "last_outcome": null, "last_error": "upload failed",
-            "first_index": null, "sync_progress": null
-        }))
-        .unwrap();
-        let job = Ok(serde_json::from_value::<api::JobStatus>(serde_json::json!({
-            "filesEmbedded": 7, "filesFailed": 2, "error": "embedding failed"
-        }))
-        .unwrap());
-        let totals = Ok((100, 4096));
-        let display = status(&client, Some(&coordinator), &totals, Some(("job", &job))).unwrap();
-        assert_eq!(display["coordinator"]["last_error"], "upload failed");
-        assert_eq!(display["catalog"]["files"], 100);
-        assert_eq!(display["job"]["filesEmbedded"], 7);
-        assert_eq!(display["job"]["filesFailed"], 2);
-        assert!(display["job"].get("filesToEmbed").is_none());
-        assert!(display["job"].get("filesDeleted").is_none());
-        assert!(display["job"].get("chunkCount").is_none());
-        let canonical = status(&client.for_canonical(), Some(&coordinator), &totals, None).unwrap();
-        assert!(canonical["coordinator"].is_null());
-        assert!(canonical["identity"]["localRoot"].is_null());
-        let failed_totals = Err(anyhow::anyhow!("catalog unavailable"));
-        let failed_job = Err(anyhow::anyhow!("job unavailable"));
-        let display = status(&client, None, &failed_totals, Some(("job", &failed_job))).unwrap();
-        assert!(display["catalog"].is_null());
-        assert!(display["job"].is_null());
-        assert_eq!(display["catalogError"], "catalog unavailable");
-        assert_eq!(display["jobError"], "job unavailable");
-    }
-}
+mod tests;

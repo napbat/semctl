@@ -263,7 +263,8 @@ pub struct SymbolSearchOptions<'a> {
 pub async fn search_symbols(
     client: &Client,
     options: &SymbolSearchOptions<'_>,
-) -> Result<String, ToolError> {
+    presentation: super::QueryPresentation,
+) -> Result<super::QueryOutput, ToolError> {
     let cb = bound_codebase(client, "search_symbols")?;
     let mut url = format!(
         "/v1/codebases/{cb}/graph/symbols?query={}&mode={}&limit={}",
@@ -284,7 +285,10 @@ pub async fn search_symbols(
         }
     }
     match client.get::<Vec<api::SymbolSearchHit>>(&url).await {
-        Ok(hits) if hits.is_empty() => Ok(format!("no symbols match `{}`", options.query)),
+        Ok(hits) if hits.is_empty() => Ok(super::QueryOutput::new(
+            format!("no symbols match `{}`", options.query),
+            None,
+        )),
         Ok(hits) => {
             let mut out = String::new();
             for hit in &hits {
@@ -302,7 +306,14 @@ pub async fn search_symbols(
                 )
                 .expect("writing to a String cannot fail");
             }
-            Ok(out)
+            Ok(super::QueryOutput::new(
+                out,
+                if presentation == super::QueryPresentation::Inspector {
+                    super::display::symbol_search(client, options.query, &hits)
+                } else {
+                    None
+                },
+            ))
         }
         Err(error) => Err(ToolError::from_client("search_symbols", &error)),
     }
@@ -313,7 +324,8 @@ pub async fn type_hierarchy(
     symbol: &str,
     direction: &str,
     depth: u32,
-) -> Result<String, ToolError> {
+    presentation: super::QueryPresentation,
+) -> Result<super::QueryOutput, ToolError> {
     let cb = bound_codebase(client, "type_hierarchy")?;
     let url = format!(
         "/v1/codebases/{cb}/graph/type-hierarchy?symbol={}&direction={}&depth={}",
@@ -322,7 +334,15 @@ pub async fn type_hierarchy(
         depth.clamp(1, 16)
     );
     match client.get::<api::TypeHierarchy>(&url).await {
-        Ok(hierarchy) => Ok(render_type_hierarchy(client, &hierarchy)),
+        Ok(hierarchy) => Ok(super::graph_output(
+            client,
+            render_type_hierarchy(client, &hierarchy),
+            super::display::GraphInput::Types {
+                symbol,
+                hierarchy: &hierarchy,
+            },
+            presentation,
+        )),
         Err(error) => Err(ToolError::from_client("type_hierarchy", &error)),
     }
 }
@@ -332,7 +352,8 @@ pub async fn call_graph(
     symbol: &str,
     depth: u32,
     direction: &str,
-) -> Result<String, ToolError> {
+    presentation: super::QueryPresentation,
+) -> Result<super::QueryOutput, ToolError> {
     let cb = bound_codebase(client, "call_graph")?;
     let url = format!(
         "/v1/codebases/{cb}/graph/call-graph?symbol={}&depth={}&direction={}",
@@ -341,7 +362,10 @@ pub async fn call_graph(
         urlencode(direction)
     );
     match client.get::<api::CallGraph>(&url).await {
-        Ok(graph) if graph.nodes.is_empty() => Ok(format!("no call graph for `{symbol}`")),
+        Ok(graph) if graph.nodes.is_empty() => Ok(super::QueryOutput::new(
+            format!("no call graph for `{symbol}`"),
+            None,
+        )),
         Ok(graph) => {
             let mut out = format!("## Nodes ({})\n\n", graph.nodes.len());
             out.push_str(&render_hits(&graph.nodes, "", client.local_root(), false));
@@ -359,28 +383,52 @@ pub async fn call_graph(
                 )
                 .expect("writing to a String cannot fail");
             }
-            Ok(out)
+            Ok(super::graph_output(
+                client,
+                out,
+                super::display::GraphInput::CallGraph {
+                    symbol,
+                    graph: &graph,
+                },
+                presentation,
+            ))
         }
         Err(error) => Err(ToolError::from_client("call_graph", &error)),
     }
 }
 
-pub async fn cycles(client: &Client) -> Result<String, ToolError> {
-    graph_clusters(client, "cycles", "cycles").await
+pub async fn cycles(
+    client: &Client,
+    presentation: super::QueryPresentation,
+) -> Result<super::QueryOutput, ToolError> {
+    graph_clusters(client, "cycles", "cycles", presentation).await
 }
 
-pub async fn duplicates(client: &Client) -> Result<String, ToolError> {
-    graph_clusters(client, "duplicates", "duplicate groups").await
+pub async fn duplicates(
+    client: &Client,
+    presentation: super::QueryPresentation,
+) -> Result<super::QueryOutput, ToolError> {
+    graph_clusters(client, "duplicates", "duplicate groups", presentation).await
 }
 
-pub async fn unused(client: &Client, page: u32, page_size: u32) -> Result<String, ToolError> {
+pub async fn unused(
+    client: &Client,
+    page: u32,
+    page_size: u32,
+    presentation: super::QueryPresentation,
+) -> Result<super::QueryOutput, ToolError> {
     let cb = bound_codebase(client, "unused")?;
     let url = format!(
         "/v1/codebases/{cb}/graph/unused?page={page}&pageSize={}",
         page_size.clamp(1, 500)
     );
     match client.get_page::<api::UnusedDefinition>(&url).await {
-        Ok(result) if result.items.is_empty() => Ok("no unused definitions".into()),
+        Ok(result) if result.items.is_empty() => Ok(super::graph_output(
+            client,
+            "no unused definitions".into(),
+            super::display::GraphInput::Unused { page: &result },
+            presentation,
+        )),
         Ok(result) => {
             let mut out = String::new();
             for item in &result.items {
@@ -406,7 +454,12 @@ pub async fn unused(client: &Client, page: u32, page_size: u32) -> Result<String
             .expect("writing to a String cannot fail");
             let mut rendered = String::new();
             render_fenced(&mut rendered, &out, None);
-            Ok(rendered)
+            Ok(super::graph_output(
+                client,
+                rendered,
+                super::display::GraphInput::Unused { page: &result },
+                presentation,
+            ))
         }
         Err(error) => Err(ToolError::from_client("unused", &error)),
     }
@@ -537,11 +590,20 @@ async fn graph_clusters(
     client: &Client,
     endpoint: &'static str,
     label: &str,
-) -> Result<String, ToolError> {
+    presentation: super::QueryPresentation,
+) -> Result<super::QueryOutput, ToolError> {
     let cb = bound_codebase(client, endpoint)?;
     let url = format!("/v1/codebases/{cb}/graph/{endpoint}");
     match client.get::<Vec<api::GraphCluster>>(&url).await {
-        Ok(groups) if groups.is_empty() => Ok(format!("no {label}")),
+        Ok(groups) if groups.is_empty() => Ok(super::graph_output(
+            client,
+            format!("no {label}"),
+            super::display::GraphInput::Clusters {
+                label,
+                clusters: &groups,
+            },
+            presentation,
+        )),
         Ok(groups) => {
             let mut out = String::new();
             for group in &groups {
@@ -572,7 +634,15 @@ async fn graph_clusters(
             }
             let mut rendered = String::new();
             render_fenced(&mut rendered, &out, None);
-            Ok(rendered)
+            Ok(super::graph_output(
+                client,
+                rendered,
+                super::display::GraphInput::Clusters {
+                    label,
+                    clusters: &groups,
+                },
+                presentation,
+            ))
         }
         Err(error) => Err(ToolError::from_client(endpoint, &error)),
     }
@@ -587,12 +657,66 @@ fn edit_url(client: &Client, operation: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{current_context, describe_copies, read_source, verified_local_window};
+    use super::{
+        SymbolSearchOptions, current_context, describe_copies, read_source, search_symbols,
+        verified_local_window,
+    };
     use crate::client::Client;
     use crate::client::stub::{Reply, Stub};
+    use crate::query::QueryPresentation;
     use crate::query::render::{
         markdown_cell, render_fenced, render_outline, source_language_hint,
     };
+
+    #[tokio::test]
+    async fn symbol_search_inspector_preserves_native_results_and_uses_one_request() {
+        let query = "  run \"quoted\"\n雪  ";
+        let options = SymbolSearchOptions {
+            query,
+            mode: "exact",
+            kinds: &[],
+            path_prefix: None,
+            project: None,
+            language: None,
+            limit: 50,
+        };
+        for count in [0, 1, 33] {
+            let hit = serde_json::json!({
+                "codebaseId": "A", "path": "src/lib.rs",
+                "lineStart": 8, "lineEnd": 9, "byteStart": 40, "byteEnd": 60,
+                "name": "run", "qualifiedName": "crate::run",
+                "kind": "function", "project": "app", "language": "rust", "score": 7
+            });
+            let body = serde_json::Value::Array(vec![hit; count]).to_string();
+            let mut outputs = Vec::new();
+            for presentation in [QueryPresentation::Plain, QueryPresentation::Inspector] {
+                let stub = Stub::serve(vec![Reply::ok(&body)]).await;
+                let client = Client::for_test_server(&stub.url).with_codebase("A".into());
+                let output = search_symbols(&client, &options, presentation)
+                    .await
+                    .unwrap();
+                if presentation == QueryPresentation::Inspector && count == 1 {
+                    let display = output.display.as_ref().unwrap();
+                    assert_eq!(display["kind"], "batch");
+                    assert_eq!(display["symbols"][0]["symbol"], query);
+                    assert_eq!(display["symbols"][0]["hits"][0]["score"], 7.0);
+                    assert_eq!(display["symbols"][0]["hits"][0]["project"], "app");
+                } else {
+                    assert!(output.display.is_none());
+                }
+                assert_eq!(stub.requests(), 1);
+                assert_eq!(
+                    stub.request_lines(),
+                    [format!(
+                        "GET /v1/codebases/A/graph/symbols?query={}&mode=exact&limit=50 HTTP/1.1",
+                        crate::query::urlencode(query)
+                    )]
+                );
+                outputs.push(output.text);
+            }
+            assert_eq!(outputs[0], outputs[1]);
+        }
+    }
 
     const COPIES: &str = r#"[
         {"id":"canonical","sourceId":"vcs-source","isCanonical":true,"revision":"canonical-rev","files":99},

@@ -4,17 +4,22 @@
 //! status caller reads the latest one. The slot is a `watch` channel because
 //! publishing and reading never wait and never poison, so the callback cannot
 //! stall an upload and a status call cannot stall a reconcile.
+//! Embedding snapshots use one short lock and wake this same channel.
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::watch;
 
 use crate::sync::SyncProgress;
 
+use super::embedding::EmbeddingSlot;
+
 /// One coordinator's progress slot.
 pub(crate) struct ProgressSlot {
     latest: watch::Sender<Option<SyncProgress>>,
     running: AtomicBool,
+    pub(super) embedding: Mutex<EmbeddingSlot>,
 }
 
 impl ProgressSlot {
@@ -22,6 +27,7 @@ impl ProgressSlot {
         Self {
             latest: watch::Sender::new(None),
             running: AtomicBool::new(false),
+            embedding: Mutex::new(EmbeddingSlot::default()),
         }
     }
 

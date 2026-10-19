@@ -152,6 +152,7 @@ fn checkout(
         first_index,
         sync_progress,
         retry_after_secs: None,
+        embedding: None,
     }
 }
 

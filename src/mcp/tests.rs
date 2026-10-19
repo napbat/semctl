@@ -452,7 +452,12 @@ async fn a_local_sync_failure_overrides_cached_successful_job_freshness() {
             Box::pin(async { Err("gateway unavailable".to_string()) })
         }
 
-        fn await_job(&self, _client: client::Client, _job_id: String) -> JobAwaited {
+        fn await_job(
+            &self,
+            _client: client::Client,
+            _job_id: String,
+            _observer: crate::engine::coordinator::JobObserver,
+        ) -> JobAwaited {
             Box::pin(std::future::pending())
         }
     }

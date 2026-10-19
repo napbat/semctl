@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use super::WatcherState;
+use super::embedding::EmbeddingStatus;
 use crate::mcp::readiness::FirstIndexPhase;
 use crate::sync::SyncProgress;
 
@@ -39,6 +40,9 @@ pub(crate) struct CoordinatorStatus {
     /// so the wire shape and the engine cannot drift apart.
     #[serde(default)]
     pub(crate) sync_progress: Option<SyncProgress>,
+    /// Current meaningful embedding-job evidence. Missing on older producers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) embedding: Option<EmbeddingStatus>,
 }
 
 impl std::fmt::Display for CoordinatorStatus {

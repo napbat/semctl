@@ -1,8 +1,9 @@
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { createSemctlHookInvoker } from "./hook-process";
-import { installInspector } from "./inspector";
-import { installSyncStatus } from "./status";
+import { installInspector, readDisplay, SemctlInspector } from "./inspector";
+import { createGraphOverview } from "./overview";
+import { installSyncStatus, readStatusUpdate } from "./status";
 
 export { extractAdditionalContext } from "./hook-process";
 
@@ -139,6 +140,11 @@ function ompMcpTools(pi: ExtensionAPI): OmpMcpTools {
 
 export function createSemctxExtension(invoker: HookInvoker = createSemctlHookInvoker()) {
 	return function semctxExtension(pi: ExtensionAPI): void {
+		const overview = createGraphOverview(pi, {
+			readDisplay, readStatusUpdate,
+			createInspector: (display, requestRender, rawText, presentation) => new SemctlInspector(display, requestRender,
+				() => [{ k: "text", p: { text: rawText.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "") } }], rawText, "body", presentation ?? "inline"),
+		});
 		const instanceId = `${process.pid}-${Date.now().toString(36)}`;
 		let promptGeneration = 0;
 		let sessionGeneration = 0;
@@ -167,6 +173,7 @@ export function createSemctxExtension(invoker: HookInvoker = createSemctlHookInv
 			preparingPrompt = undefined;
 		};
 		const sendOrientation = async (source: SessionSource, ctx: ExtensionContext) => {
+			if (source !== "compact") overview.reset();
 			resetTurnState();
 			const generation = sessionGeneration;
 			const context = await safeInvoke(
@@ -222,6 +229,7 @@ export function createSemctxExtension(invoker: HookInvoker = createSemctlHookInv
 		});
 
 		pi.on("tool_call", async (event, ctx) => {
+			overview.observe(event, ctx);
 			const generation = sessionGeneration;
 			const call = hookToolCall(event.toolName, event.input, ctx.cwd);
 			if (call === undefined) return undefined;
@@ -242,11 +250,14 @@ export function createSemctxExtension(invoker: HookInvoker = createSemctlHookInv
 				: { additionalContext: context };
 		});
 		pi.on("session_shutdown", () => {
+			overview.reset();
 			resetTurnState();
 			invoker.shutdown();
 		});
+		pi.on("tool_result", (event, ctx) => overview.observe(event, ctx));
+		pi.on("mcp_notification", (event, ctx) => overview.observe(event, ctx));
 		installInspector(pi);
-		installSyncStatus(pi);
+		installSyncStatus(pi, (ctx, mode) => mode === "live" ? overview.togglePopup(ctx) : overview.open(ctx));
 	};
 }
 

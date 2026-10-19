@@ -134,13 +134,37 @@ or guarantee that the file stays unchanged. Changed bytes, mismatched ranges,
 and unavailable verification stay distinct. Use local Read/Grep for current
 locations when binding is not established. Verification does not start a reindex.
 
-The semctl OMP adapter adds one replace-in-place native inspector above the editor
-through the existing extension APIs. It reads bounded, typed
-`_meta.semctlDisplay` metadata rather than parsing Markdown or changing
-model-facing content. The original MCP transcript, errors, approvals, and
-cancellation remain intact. The inspector requires no OMP modification or extra
-source fetches. It does not automatically combine calls or establish token
-savings. See the [plugin documentation](plugins/semctx/README.md) for limits.
+The semctl OMP adapter presents search, reference, source, and graph results in
+native tool cards. The native tool header opens the complete result. Match chips
+use Read-style icons, path links, spacing, and independent previews. Scored
+matches use small native relevance bars; unscored matches reserve no bar space.
+Hover shows rank, score, or the verification diagnostic. The fixed-width
+composer shows one native progress circle for producer-backed sync and embedding
+counts. Select it for status, or use `/semctl` and `/semctl details`.
+`/semctl graph` opens the native OMP/Tern graph surface. The default overview
+includes indexed files, directories, projects, imports, and resolved symbol
+bindings. Native dots support individual hover and selection. Group and node
+controls expose supplied relationships and metadata without a model turn.
+Concept colors remain consistent across match chips and graph views. Colors
+identify evidence-backed groups, not similarity. Tern owns transitions and
+reduced-motion behavior. The graph does not use SVG images or a web viewer.
+`/semctl graph live` toggles a native live overview popup. The popup shows a
+compact project map, observed request counts, and producer-backed progress.
+Typing, refreshing, and closing preserve the composer draft and focus.
+The popup requires an OMP build with non-modal overlay support.
+Graph-based feed results expose compact diagrams inside the native disclosure.
+Match lists offer a separate `Graph` control that groups supplied matches by
+file and codebase.
+The adapter reads bounded, typed `_meta.semctlDisplay`
+metadata. It does not parse Markdown or change model-facing content.
+The original MCP transcript, errors, approvals, and cancellation remain intact.
+Inline cards require the host's rendering-only extension API. Native graphs
+also require OMP's scoped stylesheet transport and Tern's native elements.
+Older hosts retain their original MCP cards or native node controls.
+A cached overview supplies shared concept colors.
+Presentation makes no extra source fetches. It does not automatically combine
+calls or establish token savings. See the
+[plugin documentation](plugins/semctx/README.md) for limits.
 
 Every read-only MCP tool call ends within one deadline. The default is 25
 seconds, below the 30 seconds after which Oh My Pi ends an MCP request. Set
@@ -376,7 +400,9 @@ configured semctx server. When trusted Claude/Codex hooks or the native Oh My Pi
 extension are enabled, retrieval-shaped user prompts are also sent to `semctl
 hook` for a bounded, best-effort candidate search. The OMP extension runs
 in-process but delegates retrieval, authentication, and nudge state to the
-`semctl` subprocess; it does not make network requests itself. Set
+`semctl` subprocess. Graph views are native OMP/Tern components, with no graph
+HTTP listener, browser launcher, or viewer asset route. The subprocess owns
+requests to the configured server. Set
 `SEMCTX_HOOK_DISABLE=1` to disable all hook behavior or
 `SEMCTX_NUDGE_DISABLE=1` to disable only shell-search reminders.
 
