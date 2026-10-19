@@ -26,17 +26,21 @@ export function subscribeConcepts<T extends object>(owner: T, repaint: (owner: T
 	finalizedOwners.register(owner, entry, entry);
 	return () => { listeners.delete(entry); finalizedOwners.unregister(entry); };
 }
-function changed(): void {
-	revision++;
+/** Repaint category cues without changing evidence/grouping revisions (for profile palette changes). */
+export function notifyColorObservers(): void {
 	for (const entry of listeners) {
 		const owner = entry.owner.deref();
 		if (owner) entry.repaint(owner); else listeners.delete(entry);
 	}
 }
+function changed(): void {
+	revision++;
+	notifyColorObservers();
+}
 
 /** Replace one codebase's complete evidence; unsupported files receive no assignment. */
 export function setConceptSnapshot(display: Display): void {
-	if (!validatedOverviews.has(display) || display.kind !== "graph" || display.truncated ||
+	if (!validatedOverviews.has(display) || display.kind !== "graph" || display.truncated || display.loading ||
 		display.identity.copy !== "checkout" || !display.identity.localRoot || !display.identity.codebaseId) return;
 	const codebaseId = display.identity.codebaseId;
 	const files = new Map<string, string>();

@@ -116,6 +116,9 @@ impl Client {
 
             let status = resp.status();
             if let Some(delay) = loading_retry_delay(status, resp.headers()) {
+                if !self.wait_for_loading {
+                    return Ok((resp, url));
+                }
                 let usable = usable_until(self.deadline, Instant::now());
                 if delay > LOADING_RETRY_BUDGET.saturating_sub(started.elapsed())
                     || !allows_wait(usable, delay)

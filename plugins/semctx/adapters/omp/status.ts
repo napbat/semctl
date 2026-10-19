@@ -1,6 +1,9 @@
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import type { DescribeContext, NativeNode, NativeScroll, NativeUiEvent } from "@oh-my-pi/pi-tui";
+import type { Component, DescribeContext, NativeNode, NativeScroll, NativeUiEvent } from "@oh-my-pi/pi-tui";
+import { NativeSurface } from "./native-surface";
+import { progressTooltip } from "./status-tooltip";
+import { nativeElement, supportsElements } from "./native-elements";
 
 const STATUS_KEY = "semctl.sync";
 const METHOD = "notifications/semctl/sync_status";
@@ -18,8 +21,11 @@ export interface StatusUpdate {
 	indicator: Indicator | null;
 	summary?: string;
 	details?: string;
+	diagnostic?: string;
 	/** A newer delivery was observed while this older completed job was retained. */
 	unresolvedJob?: string;
+	/** A changed embedding observation can change the catalog's per-file state. */
+	graphRevision?: string;
 }
 
 function checkoutRoot(value: unknown): string | undefined {
@@ -61,6 +67,8 @@ export function readStatusUpdate(params: unknown, previous?: StatusUpdate): Stat
 			job_id: evidence.job_id, state: String(evidence.state), files_embedded: evidence.files_embedded,
 			files_to_embed: evidence.files_to_embed, files_failed: evidence.files_failed, error: evidence.error,
 		} : undefined;
+	const graphRevision = job ? JSON.stringify([status.codebase_id, job.job_id, job.state,
+		job.files_embedded, job.files_to_embed, job.files_failed]) : undefined;
 	const jobFailed = job !== undefined && (job.state === "failed" || (count(job.files_failed) && job.files_failed > 0) ||
 		(job.state !== "unavailable" && typeof job.error === "string"));
 	// A full circle requires terminal completion, not just a completed file counter.
@@ -122,7 +130,9 @@ export function readStatusUpdate(params: unknown, previous?: StatusUpdate): Stat
 			...(typeof job?.error === "string" ? [`\nEmbedding diagnostic:\n${job.error}`] : []),
 			`\nNext: ${next}`,
 		].join("\n").replace(/\r\n?/g, "\n").replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, " ");
-		return { root, indicator, unresolvedJob, summary, details: `${summary}\n\nProducer snapshot\n${json}` };
+		const diagnostic = [...new Set([gateError, snapshot.last_error, object(watcher) ? watcher.unavailable : undefined, job?.error]
+			.filter((value): value is string => typeof value === "string" && value.length > 0))].join("\n") || undefined;
+		return { root, indicator, unresolvedJob, graphRevision, summary, diagnostic, details: `${summary}\n\nProducer snapshot\n${json}` };
 	};
 	const active = (text: string, progress?: number): StatusUpdate => update({
 		text, progress, tone: failed || jobFailed ? "warning" : "accent", symbol: "status.running",
@@ -181,8 +191,81 @@ export function readStatusUpdate(params: unknown, previous?: StatusUpdate): Stat
 export function installSyncStatus(pi: ExtensionAPI, openGraph?: (ctx: ExtensionContext, mode: "overview" | "live") => Promise<void>): void {
 	const observed = new Map<string, StatusUpdate>();
 	let activationContext: ExtensionContext | undefined;
-	const onActivate = async () => {
-		if (activationContext) await statusCommand.handler("status", activationContext);
+	let mounted = false;
+	let requestRender: (() => void) | undefined;
+	let visibleIndicator: Indicator | undefined;
+	let visibleDiagnostic: string | undefined;
+	let nativeNode: NativeNode | undefined;
+	let nativePresentation: number | undefined;
+	let plainRows: readonly string[] | undefined;
+	let nativeSurface: NativeSurface | undefined;
+	const widget: Component = {
+		invalidate() { plainRows = undefined; },
+		render(width) {
+			if (!visibleIndicator || width < 1) return [];
+			if (!plainRows) {
+				const indicator = visibleIndicator;
+				const mark = indicator.progress !== undefined && indicator.tone !== "warning" && indicator.tone !== "error"
+					? ["○", "◔", "◑", "◕", "●"][indicator.progress === 1 ? 4 : Math.floor(indicator.progress * 4)]
+					: { "status.running": "◌", "status.pending": "◌", "status.info": "○",
+						"status.warning": "!", "status.error": "×", "status.success": "●" }[indicator.symbol];
+				plainRows = [`${mark} semctl`];
+			}
+			return width >= 8 ? plainRows : [plainRows[0].slice(0, width)];
+		},
+		describe(cx) {
+			nativeSurface?.prepare(cx);
+			if (!cx.supports("meter")) return null;
+			const styled = supportsElements(cx) && cx.feature("styles");
+			const presentation = styled ? cx.reduceMotion ? 2 : 1 : 0;
+			if (!nativeNode || nativePresentation !== presentation) {
+				nativePresentation = presentation;
+				const indicator = visibleIndicator;
+				const state = indicator?.tone === "error" ? "error" : indicator?.tone === "warning" ? "warning"
+					: indicator?.symbol === "status.running" ? "active" : indicator?.symbol === "status.pending" ? "pending"
+					: indicator?.symbol === "status.success" ? "ready" : "idle";
+				const props = {
+					role: "semctl.sync", hidden: !indicator, shrink: 0,
+					actions: { click: "status", menu: ["status", "details", ...(openGraph ? ["graph", "live"] : [])] },
+					title: progressTooltip(indicator?.text ?? "No status for this checkout", indicator?.progress,
+						visibleDiagnostic, "Open semctl status for the full diagnostic"),
+					aria: `semctl: ${indicator?.text ?? "snapshot unavailable"}`,
+				} as const;
+				// Native keys and fixed slots persist across phases. Unknown is never a fabricated fraction.
+				const children: NativeNode[] = [
+					{ k: "meter", key: "progress", p: {
+						role: "semctl.sync.progress", style: "ring", size: "sm", value: indicator?.progress ?? null,
+						tone: indicator?.tone ?? "muted", shrink: 0,
+						...(!styled ? { min: { w: "2ch", h: "1lines" }, max: { w: "2ch", h: "1lines" } } as const : {}),
+					} },
+					{ k: "text", key: "label", p: {
+						text: "semctl", wrap: "none", shrink: 0,
+						...(!styled ? { min: { w: "6ch" }, max: { w: "6ch" } } as const : {}),
+					} },
+				];
+				nativeNode = { k: "col", p: { role: "semctl.sync.anchor", gap: "none" }, c: [
+					styled ? nativeElement({ k: "el", key: "semctl", p: { ...props, tag: "button", class: "semctl-sync",
+						attrs: { "data-state": state, "data-motion": cx.reduceMotion ? "reduced" : "full" },
+					}, c: children }) : { k: "row", key: "semctl", p: { ...props, gap: "xs", align: "center", wrap: false,
+						min: { w: "9ch", h: "1lines" }, max: { w: "9ch", h: "1lines" },
+					}, c: children },
+				] };
+			}
+			return nativeNode;
+		},
+		handleNativeEvent(event) {
+			if (event.type !== "action" || !activationContext || !visibleIndicator) return;
+			if (event.act === "status" || event.act === "details") void statusCommand.handler(event.act, activationContext);
+			else if (openGraph && (event.act === "graph" || event.act === "live")) {
+				void openGraph(activationContext, event.act === "live" ? "live" : "overview");
+			}
+		},
+		dispose() {
+			nativeSurface?.dispose();
+			nativeSurface = undefined;
+			mounted = false;
+			requestRender = undefined;
+		},
 	};
 	const missingSnapshot = (root: string): StatusUpdate => ({
 		root, indicator: { text: "snapshot unavailable", tone: "muted", symbol: "status.info" },
@@ -201,24 +284,26 @@ export function installSyncStatus(pi: ExtensionAPI, openGraph?: (ctx: ExtensionC
 		return selected;
 	};
 	const show = (ctx: ExtensionContext) => {
-		if (!ctx.hasUI || typeof ctx.ui.setStatus !== "function") return;
-		const indicator = selectedStatus(ctx)?.indicator;
+		if (!ctx.hasUI || typeof ctx.ui.setWidget !== "function") return;
+		const selected = selectedStatus(ctx), indicator = selected?.indicator ?? undefined;
 		activationContext = ctx;
-		// Native hosts render exact progress. Text-only terminals keep one compact glyph.
-		const mark = indicator?.progress !== undefined && indicator.tone !== "warning" && indicator.tone !== "error"
-			? ["○", "◔", "◑", "◕", "●"][indicator.progress === 1 ? 4 : Math.floor(indicator.progress * 4)]
-			: indicator ? ctx.ui.theme.symbol(indicator.symbol) : "";
-		ctx.ui.setStatus(STATUS_KEY, indicator ? ctx.ui.theme.fg(indicator.tone, `${mark} semctl`) : undefined,
-			indicator ? {
-				label: "semctl",
-				progress: indicator.progress,
-				progressMotion: "brief",
-				icon: { "status.info": "info", "status.warning": "warn", "status.error": "x-circle",
-					"status.pending": "clock", "status.success": "check", "status.running": "sync" }[indicator.symbol],
-				tone: indicator.tone,
-				title: `${indicator.text}\nOpen status and project overview`,
-				onActivate,
-			} : undefined);
+		const changed = indicator?.text !== visibleIndicator?.text || indicator?.tone !== visibleIndicator?.tone ||
+			indicator?.symbol !== visibleIndicator?.symbol || indicator?.progress !== visibleIndicator?.progress || selected?.diagnostic !== visibleDiagnostic;
+		visibleIndicator = indicator;
+		visibleDiagnostic = selected?.diagnostic;
+		if (changed) { nativeNode = undefined; plainRows = undefined; }
+		// setWidget replaces and disposes its old component. Mount once, then update
+		// this persistent component in place; notifications never remount it.
+		if (!mounted) {
+			mounted = true;
+			ctx.ui.setWidget(STATUS_KEY, tui => {
+				nativeSurface = new NativeSurface(tui);
+				requestRender = () => tui.requestRender();
+				// Replacement may dispose the old widget again before this factory runs.
+				mounted = true;
+				return widget;
+			}, { placement: "aboveEditor" });
+		} else if (changed) requestRender?.();
 	};
 	const statusCommand = {
 		description: "Inspect semctl status, diagnostics, and project relationships",
@@ -238,36 +323,46 @@ export function installSyncStatus(pi: ExtensionAPI, openGraph?: (ctx: ExtensionC
 				if (typeof ctx.ui.notify === "function") ctx.ui.notify(details, "info");
 				return;
 			}
-			// Fullscreen places the native body in the host's main scroller, not its non-scrolling editor dock.
 			const next = await ctx.ui.custom<"graph" | "live" | undefined>((tui, _theme, keys, done) => {
+				const nativeSurface = new NativeSurface(tui);
 				const body = new pi.pi.Text(details, 0, 0);
 				const heading = new pi.pi.Text(command === "details" ? "semctl details" : "semctl status", 0, 0);
 				const hint = new pi.pi.Text(`↑/↓ scroll · PgUp/PgDn page · Enter/Esc close${openGraph ? " · G graph" : ""}`, 0, 0);
 				let offset = 0, scroll: NativeScroll = { by: "start", n: 0 };
-				const height = () => Math.max(1, Math.min(24, tui.terminal.rows - 6));
+				const height = () => Math.max(1, Math.min(18, Math.floor(tui.terminal.rows * 0.8) - 4));
 				return {
+					nativeOverlay: {
+						role: "omp.overlay.semctl-status", size: "md",
+						head: command === "details" ? "semctl details" : "semctl status",
+					},
+					dispose() { nativeSurface.dispose(); },
 					invalidate() { body.invalidate(); heading.invalidate(); hint.invalidate(); },
 					render(width: number) {
 						const rows = body.render(width), size = height();
 						offset = Math.max(0, Math.min(offset, rows.length - size));
 						return [...heading.render(width), ...rows.slice(offset, offset + size), ...hint.render(width)];
 					},
-					describe(_cx: DescribeContext): NativeNode {
+					describe(cx: DescribeContext): NativeNode {
+						nativeSurface.prepare(cx);
 						return { k: "col", p: { gap: "sm" }, c: [
 							{ k: "row", p: { gap: "sm" }, c: [
-								{ k: "text", p: { spans: [{ t: command === "details" ? "semctl details" : "semctl status", s: "strong" }] } },
 								{ k: "spacer", p: { grow: 1 } },
 								...(openGraph ? [
 									{ k: "text" as const, key: "graph", p: { spans: [{ t: "Project graph", s: "accent" }],
-										actions: { click: "graph" }, aria: "Open semctl project and relationship overview" } },
+										actions: { click: "graph" }, title: "Open project overview", aria: "Open semctl project and relationship overview" } },
 									{ k: "text" as const, key: "live", p: { spans: [{ t: "Live popup", s: "accent" }],
-										actions: { click: "live" }, aria: "Toggle the native live graph popup" } },
+										actions: { click: "live" }, title: "Toggle live overview", aria: "Toggle the native live graph popup" } },
 								] : []),
 								{ k: "text", key: "close", p: { spans: [{ t: "Close", s: "accent" }],
-									actions: { click: "close" }, aria: "Close semctl status" } },
+									actions: { click: "close" }, title: "Close status", aria: "Close semctl status" } },
 							] },
-							{ k: "col", key: "snapshot", scroll, c: [body] },
-							hint,
+							{ k: "col", key: "snapshot", p: { role: "semctl.status.snapshot", max: { h: "18lines" } }, scroll, c: [
+								{ k: "text", key: "snapshot-text", p: { text: details, wrap: "word" } },
+							] },
+							{ k: "text", key: "hint", p: {
+								spans: [{ t: `↑/↓ scroll · PgUp/PgDn page · Enter/Esc close${openGraph ? " · G graph" : ""}`, s: "muted" }],
+								wrap: "word",
+							} },
 						] };
 					},
 					handleNativeEvent(event: NativeUiEvent) {
@@ -290,7 +385,7 @@ export function installSyncStatus(pi: ExtensionAPI, openGraph?: (ctx: ExtensionC
 						tui.requestRender();
 					},
 				};
-			}, { overlay: true, overlayOptions: { fullscreen: true } });
+			}, { overlay: true, overlayOptions: { width: "80%", maxHeight: "80%", anchor: "center" } });
 			if (next === "graph") await openGraph?.(ctx, "overview");
 			else if (next === "live") await openGraph?.(ctx, "live");
 		},
@@ -334,6 +429,11 @@ export function installSyncStatus(pi: ExtensionAPI, openGraph?: (ctx: ExtensionC
 	pi.on("session_shutdown", (_event, ctx) => {
 		observed.clear();
 		activationContext = undefined;
-		if (ctx.hasUI && typeof ctx.ui.setStatus === "function") ctx.ui.setStatus(STATUS_KEY, undefined);
+		visibleIndicator = undefined;
+		nativeNode = undefined;
+		plainRows = undefined;
+		if (mounted && ctx.hasUI && typeof ctx.ui.setWidget === "function") ctx.ui.setWidget(STATUS_KEY, undefined);
+		mounted = false;
+		requestRender = undefined;
 	});
 }

@@ -14,6 +14,10 @@ describe("shared match indicators", () => {
 			expect(strengths(scores.map(score => ({ score })))).toEqual(scores.map(() => null));
 		}
 		expect(strengths([])).toEqual([]);
+		const title = scoreTitle(0, null, 0);
+		expect(title).toContain("Score 0");
+		expect(title).toContain("unavailable");
+		expect(title).toContain("not confidence");
 	});
 	test("keeps exact raw scores and diagnostic reasons available to tooltip consumers", () => {
 		const score = 0.127403;
@@ -23,5 +27,8 @@ describe("shared match indicators", () => {
 			expect(verificationTitle({ state, reason })).toContain(reason);
 			expect(verificationTitle({ state, reason: null })).not.toContain("null");
 		}
+		const titles = ["bound", "changed-local", "range-mismatch", "unverified", "not-probed"]
+			.map(state => verificationTitle({ state, reason: null }));
+		expect(new Set(titles).size).toBe(titles.length);
 	});
 });

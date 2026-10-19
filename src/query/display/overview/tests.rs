@@ -2,6 +2,31 @@ use serde_json::{Value, json};
 
 use super::*;
 
+fn project_overview(
+    client: &Client,
+    tree: &[api::FileTreeNode],
+    projects: &api::ProjectGraph,
+    imports: &[api::ImportEdge],
+    imports_total: u32,
+    references: &[api::SymbolEdge],
+    references_total: u32,
+) -> Result<Value, ToolError> {
+    super::project_overview(
+        client,
+        OverviewInput {
+            tree,
+            projects,
+            imports,
+            imports_total,
+            references,
+            references_total,
+            files: &[],
+            caveats: Vec::new(),
+            loading: false,
+        },
+    )
+}
+
 fn projects() -> api::ProjectGraph {
     serde_json::from_value(json!({"projects":[{"kind":"cargo","name":"library","root":"src","configFile":null,"fileCount":2}],
         "groups":[{"kind":"workspace","name":"workspace","root":".","children":["src"]}]})).unwrap()
@@ -188,7 +213,7 @@ fn oversized_nodes_edges_or_bytes_fail_instead_of_returning_partial_success() {
 }
 
 #[test]
-fn corrupt_tree_missing_import_endpoints_and_incomplete_import_pages_are_errors() {
+fn corrupt_tree_metadata_is_fatal_but_missing_endpoints_and_incomplete_pages_are_partial() {
     let client = Client::for_test("A", None);
     for bad in [
         json!([{"name":"bad.rs","path":"../bad.rs","isDirectory":false}]),
@@ -205,18 +230,17 @@ fn corrupt_tree_missing_import_endpoints_and_incomplete_import_pages_are_errors(
         to: "missing.rs".into(),
         import_path: "missing".into(),
     };
+    let value = project_overview(&client, &tree(), &projects(), &[import], 1, &[], 0).unwrap();
+    assert_eq!(value["truncated"], true);
     assert!(
-        project_overview(&client, &tree(), &projects(), &[import], 1, &[], 0)
-            .unwrap_err()
-            .summary()
-            .contains("absent")
+        value["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|edge| edge["kind"] != "import")
     );
-    assert!(
-        project_overview(&client, &tree(), &projects(), &[], 1, &[], 0)
-            .unwrap_err()
-            .summary()
-            .contains("incomplete")
-    );
+    let value = project_overview(&client, &tree(), &projects(), &[], 1, &[], 0).unwrap();
+    assert_eq!(value["truncated"], true);
 }
 
 #[test]
@@ -289,16 +313,11 @@ fn reference_bindings_preserve_exact_names_monikers_parallel_duplicates_and_self
 }
 
 #[test]
-fn references_require_complete_catalog_scoped_and_bounded_evidence() {
+fn references_require_valid_paths_and_bounded_evidence_but_allow_incomplete_layers() {
     let client = Client::for_test("A", None);
-    assert!(
-        project_overview(&client, &tree(), &projects(), &[], 0, &[], 1)
-            .unwrap_err()
-            .summary()
-            .contains("symbol bindings are incomplete")
-    );
+    let value = project_overview(&client, &tree(), &projects(), &[], 0, &[], 1).unwrap();
+    assert_eq!(value["truncated"], true);
     for (from, to, name, moniker) in [
-        ("src/main.rs", "missing.rs", "run", "missing.rs#1"),
         ("src/main.rs", "src", "run", "src#1"),
         ("../outside.rs", "src/lib.rs", "run", "src/lib.rs#1"),
         ("src/main.rs", "src/lib.rs", "", "src/lib.rs#1"),
@@ -325,4 +344,85 @@ fn references_require_complete_catalog_scoped_and_bounded_evidence() {
             .summary()
             .contains("evidence")
     );
+}
+
+#[test]
+fn catalog_races_preserve_known_files_and_connect_only_exact_existing_endpoints() {
+    let client = Client::for_test("A", None);
+    let files: Vec<api::CodebaseFile> = serde_json::from_value(json!([
+        {"path":"src/main.rs","size":12,"status":"Pending"},
+        {"path":"src/lib.rs","size":10,"status":"Failed"},
+        {"path":"new.rs","size":4,"status":"Embedded"},
+        {"path":"future.rs","size":4,"status":"NewBackendState"}
+    ]))
+    .unwrap();
+    let imports: Vec<api::ImportEdge> = serde_json::from_value(json!([
+        {"from":"new.rs","to":"src/main.rs","importPath":"verified"},
+        {"from":"missing.rs","to":"src/main.rs","importPath":"unavailable"}
+    ]))
+    .unwrap();
+    let value = super::project_overview(
+        &client,
+        OverviewInput {
+            tree: &tree(),
+            projects: &projects(),
+            imports: &imports,
+            imports_total: 2,
+            references: &[],
+            references_total: 0,
+            files: &files,
+            caveats: Vec::new(),
+            loading: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(node(&value, "file", "src/main.rs")["indexing"], "pending");
+    assert_eq!(node(&value, "file", "src/lib.rs")["indexing"], "failed");
+    assert_eq!(node(&value, "file", "new.rs")["indexing"], "ready");
+    assert_eq!(node(&value, "file", "future.rs")["indexing"], "unknown");
+    assert!(node(&value, "file", "README.md").get("indexing").is_none());
+    assert_eq!(value["truncated"], true);
+    assert!(linked(
+        &value,
+        node(&value, "file", "new.rs"),
+        node(&value, "file", "src/main.rs"),
+        "imports · verified"
+    ));
+    assert!(
+        value["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|node| node["path"] != "missing.rs")
+    );
+    assert_eq!(
+        value["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|edge| edge["kind"] == "import")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn stale_reference_endpoints_do_not_hide_other_exact_bindings() {
+    let client = Client::for_test("A", None);
+    let references: Vec<api::SymbolEdge> = serde_json::from_value(json!([
+        {"fromFile":"src/main.rs","toFile":"missing.rs","name":"stale","moniker":"missing.rs#1"},
+        {"fromFile":"src/main.rs","toFile":"src/lib.rs","name":"kept","moniker":"src/lib.rs#2"}
+    ]))
+    .unwrap();
+    let value = project_overview(&client, &tree(), &projects(), &[], 0, &references, 2).unwrap();
+    assert_eq!(value["truncated"], true);
+    let references: Vec<_> = value["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|edge| edge["kind"] == "reference")
+        .collect();
+    assert_eq!(references.len(), 1);
+    assert_eq!(references[0]["symbol"], "kept");
+    assert_eq!(references[0]["moniker"], "src/lib.rs#2");
 }

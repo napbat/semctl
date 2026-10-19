@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { DescribeContext, NativeNode } from "@oh-my-pi/pi-tui";
 import type { ToolRenderer, ToolRenderResult } from "@oh-my-pi/pi-tui/tools";
 import { SemctlInspector, createInspectorRenderer, readDisplay, snippetWindow, type Display, type Hit } from "./inspector";
@@ -85,13 +86,12 @@ describe("bounded semctl display carrier", () => {
 	});
 	test("retains raw nullable and zero line coordinates but never invents numbering or focus", () => {
 		expect(readDisplay(search([match({ path: null, codebaseId: null, startLine: 0 })]), "search_codebase")).toBeDefined();
-		expect(snippetWindow(match())).toEqual({ start: 10, end: 11, focus: 10 });
+		expect(snippetWindow(match())).toMatchObject({ start: 10, end: 11, focus: 10 });
 		expect(snippetWindow(match({ snippetStartLine: 0 }))).toBeUndefined();
 		expect(snippetWindow(match({ snippetEndLine: null }))).toBeUndefined();
 		expect(snippetWindow(match({ snippet: "one line" }))).toBeUndefined();
 		expect(snippetWindow(match({ focusLine: 999 }))?.focus).toBeUndefined();
 		expect(snippetWindow(match({ focusByte: 999 }))?.focus).toBeUndefined();
-		expect(snippetWindow(match({ binding: { state: "changed-local", reason: "changed" } }))?.focus).toBeUndefined();
 	});
 	test("normalizes only nonnegative query-relative scales, preserving ties and raw scores", () => {
 		const values = (scores: (number | null)[]) => strengths(scores.map(score => match({ score })));
@@ -235,20 +235,24 @@ describe("per-card native renderer", () => {
 			expect(described.filter(node => node.key !== "verification").every(node => !node.p?.title?.includes(reason))).toBe(true);
 		}
 	});
-	test("compact results expose index warnings and never hide an unknown warning state", () => {
+	test("compact freshness diagnostics remain hoverable and accessible without repeating warning prose", () => {
 		const warning = "The latest indexing job failed; results may be stale.";
 		const value = result({ ...search(), indexWarning: warning });
 		const view = component(renderer(), value);
-		expect(nodes(view.describe(native)).find(n => n.p?.title === warning)?.p?.tone).toBe("warning");
-		expect(nodes(view.describe({ ...native, supports: k => k !== "icon" })).some(n =>
-			n.k === "text" && n.p?.tone === "warning" && n.p?.title === warning)).toBe(true);
+		for (const cx of [native, { ...native, supports: (kind: string) => kind !== "icon" }]) {
+			const described = nodes(view.describe(cx));
+			const diagnostic = described.find(node => node.key === "index-warning");
+			expect(diagnostic?.p).toMatchObject({ title: warning, tone: "warning" });
+			expect(diagnostic?.p?.aria).toContain(warning);
+			expect(described.map(textContent).join("\n")).not.toContain(warning);
+		}
 		for (const indexWarning of [undefined, 42, {}]) {
 			const unknown = result(search(), { mcpMeta: { semctlDisplay: { ...search(), indexWarning } } });
 			expect(renderer().describeResult!(unknown, compact)).toBe(nativeFallback);
 		}
 	});
 	test("concurrent cards retain independent query and open matches across repaint and full-result expansion", () => {
-		const older = renderer(), newer = renderer();
+		const older = renderer(), newer = older;
 		const query = "  exact \"quoted\" \\\\ query\nsecond line 中";
 		const first = result(search([match(), match({ path: "other.ts" })], query));
 		const second = result(search([match({ path: "new.ts" })], "different query"));
@@ -263,6 +267,25 @@ describe("per-card native renderer", () => {
 		expect(nodes(a.describe(native)).find(n => n.k === "code")?.p?.path).toBe("other.ts");
 		expect(component(older, first)).toBe(a);
 		expect(JSON.stringify(first)).toBe(before);
+	});
+	test("compact previews retain rank and restore late source selections when expanded", () => {
+		const r = renderer();
+		const value = result(search(Array.from({ length: 32 }, (_, i) => match({ path: `src/${i}.ts`, score: 32 - i }))));
+		const view = component(r, value);
+		const visible = () => nodes(view.describe(native)).filter(node => /^match-\d+$/.test(node.key ?? "") && !node.p?.hidden);
+		const initial = visible().map(node => node.key);
+		expect(initial.length).toBeLessThan(32);
+		expect(initial).toEqual(Array.from({ length: initial.length }, (_, i) => `match-${i}`));
+		expect(visible().flatMap(nodes).filter(node => node.k === "meter").map(node => node.p?.value)).toEqual(initial.map((_, i) => (32 - i) / 32));
+		component(r, value, { ...compact, expanded: true });
+		activate(view, "hit-31");
+		expect(visible().map(node => node.key)).toEqual(Array.from({ length: 32 }, (_, i) => `match-${i}`));
+		expect(visible().flatMap(nodes).find(node => node.k === "code")?.p?.path).toBe("src/31.ts");
+		component(r, value);
+		expect(visible().map(node => node.key)).toEqual(initial);
+		expect(visible().flatMap(nodes).some(node => node.k === "code")).toBe(false);
+		component(r, value, { ...compact, expanded: true });
+		expect(visible().flatMap(nodes).find(node => node.k === "code")?.p?.path).toBe("src/31.ts");
 	});
 	test("invalid carriers, wrong origins, failures, cancellation and partial results retain native output", () => {
 		const r = renderer();
@@ -296,8 +319,7 @@ describe("per-card native renderer", () => {
 			roots: ["main"], caveats: [], truncated: false };
 		const value = result(display, { mcpToolName: "call_graph" });
 		const first = createInspectorRenderer("semctx", "call_graph")({ requestRender: () => {}, fallback });
-		const second = createInspectorRenderer("semctx", "call_graph")({ requestRender: () => {}, fallback });
-		const a = component(first, value), b = component(second, value);
+		const a = component(first, value), b = component(first, result(display, { mcpToolName: "call_graph" }));
 		const body = (view: SemctlInspector) => nodes(view.describe(native)).flatMap(node => node.c ?? []).find(child => child instanceof GraphInspector);
 		const graph = body(a);
 		if (!(graph instanceof GraphInspector)) throw new Error("Missing graph-first preview");
@@ -455,13 +477,11 @@ describe("native provenance presentation", () => {
 		const view = component(r, response);
 		expect(r.describeResult!(response, compact)?.tool?.target).toBe("main");
 		expect(nodes(view.describe(native)).some(n => n.k === "meter")).toBe(false);
-		expect(nodes(view.describe(native)).some(n => textContent(n).includes("app.update"))).toBe(true);
 		activate(view, "hit-0");
 		activate(view, "match-details-0");
 		const details = nodes(view.describe(native)).map(textContent).join("\n");
-		for (const fact of ["write", "value", "assignment", "external.main", "app.main"]) expect(details).toContain(fact);
+		for (const fact of ["write", "value", "assignment", "external.main", "app.main", "app.update"]) expect(details).toContain(fact);
 		expect(new Set(hrefs(view.describe(native))).size).toBe(1);
-		expect(nodes(view.describe(native)).find(node => node.k === "code")?.p?.marks).toBeUndefined();
 		expect(component(r, response, { ...compact, expanded: true })).toBe(view);
 	});
 	test("top-level tool expansion preserves independently opened late matches", () => {
@@ -495,16 +515,20 @@ describe("native provenance presentation", () => {
 		expect(icons[3].p?.title).toContain("Probe unavailable");
 		expect(icons[4].p?.title).toContain("Batch does not probe sources");
 	});
-	test("expanded sources mark only bound focus while file navigation remains available for changed checkout files", () => {
+	test("indexed preview focus does not turn changed checkout navigation into a trusted source jump", () => {
 		const view = new SemctlInspector(search([match(), match({ path: "src/other.ts", score: 1, binding: { state: "changed-local", reason: "changed" } })]), () => {});
 		activate(view, "hit-0");
-		let described = nodes(view.describe(native));
-		expect(described.find(n => n.k === "code")?.p).toMatchObject({ start: 10, numbers: true, marks: [{ line: 10, tone: "accent" }] });
-		view.handleNativeEvent({ type: "action", key: "hit-1", act: "hit:1", mods: [] });
-		described = nodes(view.describe(native));
-		expect(described.find(n => n.k === "code" && n.p?.path === "src/other.ts")?.p).toMatchObject({ marks: undefined });
-		expect(described.filter(n => n.k === "text" && n.p?.href)).toHaveLength(2);
-		for (const href of hrefs(view.describe(native))) expect(new URL(href).hash).toBe("");
+		activate(view, "hit-1");
+		const described = nodes(view.describe(native));
+		for (const path of ["src/main.ts", "src/other.ts"]) {
+			expect(described.find(n => n.k === "code" && n.p?.path === path)?.p).toMatchObject({
+				start: 10, numbers: true, marks: [{ line: 10, tone: "accent" }],
+			});
+		}
+		const links = hrefs(view.describe(native));
+		expect(links).toHaveLength(2);
+		for (const href of links) expect(new URL(href).hash).toBe("");
+		expect(described.find(n => n.key === "verification" && n.p?.tone === "warning")?.p?.title).toContain("changed");
 	});
 	test("never opens canonical, relative-root, outside-root or mismatched-codebase paths", () => {
 		for (const payload of [search([match({ path: "../secret.ts" })]), search([match({ codebaseId: "another" })]),
@@ -537,6 +561,22 @@ describe("native provenance presentation", () => {
 		activate(view, "hit-0");
 		expect(hrefs(view.describe(native))).toEqual(links);
 	});
+	test("match chips retain complete returned paths and line ranges without changing file targets", () => {
+		for (const paths of [
+			["src/left/shared/main.ts", "src/right/shared/main.ts", "src/unique.ts", "src/left/shared/main.ts"],
+			["src\\left\\shared\\main.ts", "src\\right\\shared\\main.ts", "src\\unique.ts", "src\\left\\shared\\main.ts"],
+		]) {
+			const payload = search(paths.map(path => match({ path })));
+			const view = new SemctlInspector(payload, () => {});
+			const described = view.describe(native);
+			const filenames = nodes(described).filter(node => node.p?.role === "semctl.match.path");
+			expect(filenames.map(textContent)).toEqual(paths.map(path => `${path}:10–11`));
+			expect(hrefs(described)).toHaveLength(paths.length);
+			for (const [index, href] of hrefs(described).entries()) {
+				expect(fileURLToPath(href)).toBe(resolve(payload.identity.localRoot!, paths[index]));
+			}
+		}
+	});
 	test("no chip or expanded preview links unsafe paths or foreign codebases", () => {
 		for (const hit of [
 			match({ path: "../private.ts" }), match({ path: "/private.ts" }), match({ path: "https://example.invalid/a.ts" }),
@@ -549,7 +589,7 @@ describe("native provenance presentation", () => {
 			expect(hrefs(view.describe(native))).toEqual([]);
 		}
 	});
-	test("unprobed and changed source bindings allow file-only navigation without verified focus claims", () => {
+	test("unprobed checkout links stay file-only while returned snippets retain reported match focus", () => {
 		for (const state of ["not-probed", "changed-local", "range-mismatch", "unverified"] as const) {
 			const hit = match({ score: null, binding: { state, reason: `Diagnostic for ${state}` } });
 			const view = new SemctlInspector(search([hit]), () => {});
@@ -566,8 +606,33 @@ describe("native provenance presentation", () => {
 			activate(view, "hit-0");
 			const expanded = view.describe(native);
 			expect(new Set(hrefs(expanded))).toEqual(new Set(links));
-			expect(nodes(expanded).find(node => node.k === "code")?.p?.marks).toBeUndefined();
-			expect(snippetWindow(hit)?.focus).toBeUndefined();
+			expect(nodes(expanded).find(node => node.k === "code")?.p?.marks).toEqual([{ line: 10, tone: "accent" }]);
+		}
+	});
+	test("source range highlighting clips to the returned snippet and preserves context", () => {
+		const snippet = "before\nfirst match\nsecond match\nafter\nlast";
+		const view = new SemctlInspector(search([match({ snippet, snippetStartLine: 10, snippetEndLine: 14,
+			startLine: 11, endLine: 12, focusLine: null, focusByte: null,
+			binding: { state: "not-probed", reason: null } })]), () => {});
+		activate(view, "hit-0");
+		expect(nodes(view.describe(native)).find(node => node.k === "code")?.p).toMatchObject({
+			text: snippet, start: 10, marks: [{ line: 11, tone: "accent" }, { line: 12, tone: "accent" }],
+		});
+		for (const range of [[5, 11], [13, 20]] as const) {
+			const hit = match({ snippet, snippetStartLine: 10, snippetEndLine: 14,
+				startLine: range[0], endLine: range[1], focusLine: null, focusByte: null });
+			expect(snippetWindow(hit)?.mark).toEqual([Math.max(10, range[0]), Math.min(14, range[1])]);
+		}
+	});
+	test("invalid or absent match coordinates never create source highlights", () => {
+		for (const overrides of [
+			{ focusLine: 99 }, { focusByte: 999 }, { snippetStartLine: 0 },
+			{ snippetEndLine: 99 }, { focusLine: null, startLine: null },
+			{ focusLine: null, startLine: 99, endLine: 100 },
+		]) {
+			const view = new SemctlInspector(search([match(overrides)]), () => {});
+			activate(view, "hit-0");
+			expect(nodes(view.describe(native)).find(node => node.k === "code")?.p?.marks).toBeUndefined();
 		}
 	});
 	test("native tool expansion exposes the full typed read_source while folding restores the bounded preview", () => {

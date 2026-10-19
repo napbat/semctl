@@ -7,7 +7,7 @@ import {
 	extractAdditionalContext,
 	type HookInvoker,
 	type SemctlHookInput,
-} from "./index";
+} from "./extension";
 
 type Handler = (event: Record<string, unknown>, ctx: TestContext) => unknown | Promise<unknown>;
 

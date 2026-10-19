@@ -1,5 +1,5 @@
 import type { ReadableStream, ReadableStreamDefaultReader } from "node:stream/web";
-import type { HookInvoker } from "./index";
+import type { HookInvoker } from "./extension";
 
 const MAX_HOOK_OUTPUT_BYTES = 64 * 1024;
 

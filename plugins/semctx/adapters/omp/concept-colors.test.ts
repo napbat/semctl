@@ -48,11 +48,20 @@ describe("shared evidence-backed concept colors", () => {
 		setConceptSnapshot(raw); expect(lookupConcept("concept-local", "src/a.ts")).toBeUndefined();
 		const ordinary = readDisplay(raw, "imports")!;
 		setConceptSnapshot(ordinary); expect(lookupConcept("concept-local", "src/a.ts")).toBeUndefined();
-		for (const value of [{ ...overview(), truncated: true }, { ...overview(), identity: { ...overview().identity, copy: "canonical" as const, localRoot: null } }]) {
+		for (const value of [{ ...overview(), truncated: true }, { ...overview(), loading: true },
+			{ ...overview(), identity: { ...overview().identity, copy: "canonical" as const, localRoot: null } }]) {
 			setConceptSnapshot(validated(value)); expect(lookupConcept("concept-local", "src/a.ts")).toBeUndefined();
 		}
 		const imports = overview(); imports.edges = [{ from: "a", to: "b", kind: "import", label: "imports" }];
 		setConceptSnapshot(validated(imports)); expect(lookupConcept("concept-local", "src/a.ts")).toBeUndefined();
+	});
+	test("an incomplete refresh preserves the last complete codebase palette", () => {
+		setConceptSnapshot(validated());
+		const color = lookupConcept("concept-local", "src/a.ts"), revision = conceptRevision();
+		setConceptSnapshot(validated({ ...overview("concept-local", "replacement"), loading: true }));
+		expect(lookupConcept("concept-local", "src/a.ts")).toBe(color);
+		expect(lookupConcept("concept-local", "replacement/a.ts")).toBeUndefined();
+		expect(conceptRevision()).toBe(revision);
 	});
 	test("keeps keys and palette stable across transport order and unrelated ordinal shifts", () => {
 		const original = overview(); setConceptSnapshot(validated(original));

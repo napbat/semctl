@@ -15,7 +15,10 @@ export interface GraphActivity {
 	operations: string[];
 	targets: string[];
 	recent?: readonly GraphReceipt[];
-	producer: null | { text: string; tone: TspTone; progress?: number; details?: string };
+	producer: null | {
+		text: string; tone: TspTone; progress?: number; details?: string; diagnostic?: string;
+		symbol?: "status.running" | "status.info" | "status.warning" | "status.error" | "status.pending" | "status.success";
+	};
 	requests?: { sent: number; received: number; failed: number };
 }
 

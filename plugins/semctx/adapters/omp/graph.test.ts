@@ -1,9 +1,17 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import type { Component, DescribeContext, NativeNode } from "@oh-my-pi/pi-tui";
-import type { Hit } from "./inspector";
+import { readDisplay, SemctlInspector, type Hit } from "./inspector";
 import { GraphInspector, graphRelations, readGraph, type GraphData } from "./graph";
+import { asNativeElement } from "./native-elements";
+import { conceptRevision, resetConcepts } from "./concept-colors";
+import { lookupGraphColor, setGraphColorMode } from "./graph-colors";
+import { nativeGraphLayout } from "./graph-native-layout";
+import { conceptClass } from "./native-concepts";
+import { DEFAULT_GRAPH_APPEARANCE, type GraphAppearance } from "./graph-appearance";
 
-const native: DescribeContext = { cols: 80, dark: true, reduceMotion: false, stylesheets: true, supports: () => true, feature: () => false };
+afterEach(() => { resetConcepts(); setGraphColorMode("concepts"); });
+
+const native: DescribeContext = { cols: 80, dark: true, reduceMotion: false, supports: () => true, feature: () => false };
 function graph(): GraphData {
 	return { kind: "graph", title: "Relationships", query: "A", nodes: ["A", "B", "C", "D", "isolated"].map(id => ({ id, label: id, detail: `Details ${id}`, hit: null })),
 		edges: [{ from: "A", to: "B", label: "calls" }, { from: "A", to: "C", label: "calls" },
@@ -55,6 +63,33 @@ describe("bounded graph carrier", () => {
 		expect(readGraph({ ...data, nodes: [{ ...data.nodes[0], hit: { actual: true } }], edges: [] }, value => { checked++; return !!value; })).toBe(true);
 		expect(checked).toBe(1);
 	});
+	test("validates optional per-node catalog states without rejecting legacy graphs", () => {
+		const data = graph(), base = data.nodes[0];
+		for (const indexing of ["pending", "processing", "ready", "failed", "unknown"]) {
+			expect(readGraph({ ...data, nodes: [{ ...base, indexing }], edges: [] }, () => false)).toBe(true);
+		}
+		for (const fields of [
+			{ indexing: null }, { indexing: 2 }, { indexing: "queued" }, { indexing: {} },
+			{ indexingError: "orphan error" }, { indexing: "ready", indexingError: "contradiction" },
+			{ indexing: "failed", indexingError: null }, { indexing: "failed", indexingError: "" },
+			{ indexing: "failed", indexingError: " \n" }, { indexing: "failed", indexingError: "x".repeat(4097) },
+			{ indexing: "failed", indexingError: "unsafe\u001b[31m" },
+		]) expect(readGraph({ ...data, nodes: [{ ...base, ...fields }], edges: [] }, () => false)).toBe(false);
+		const carrier = { ...data, version: 1, identity: { codebaseId: "test", name: null, localRoot: null, copy: "canonical" },
+			nodes: [{ ...base, indexing: "failed", indexingError: "Backend unavailable\nRetry scheduled" }], edges: [] };
+		expect(readDisplay(carrier, "trace")?.kind).toBe("graph");
+		expect(readDisplay({ ...carrier, nodes: [{ ...base, indexing: "invented" }] }, "trace")).toBeUndefined();
+		expect(readGraph({ ...data }, () => false)).toBe(true);
+		expect(readGraph({ ...data, nodes: [{ ...base, indexing: "failed", indexingError: "x".repeat(4096) }], edges: [] }, () => false)).toBe(true);
+	});
+	test("accepts optional typed layer loading metadata and rejects non-boolean states", () => {
+		const data = graph();
+		for (const loading of [true, false]) expect(readGraph({ ...data, loading }, () => false)).toBe(true);
+		for (const loading of [null, "true", 1, {}]) expect(readGraph({ ...data, loading }, () => false)).toBe(false);
+		const view = new GraphInspector({ ...data, loading: true }, () => {}, () => ({} as Component));
+		expect(content(view.describe(native))).toContain("Relationship layers loading");
+		expect(nodes(view.describe(native)).some(node => node.key === "quick-0")).toBe(true);
+	});
 	test("accepts exact structural bounds and rejects overflow, rather than silently dropping relationships", () => {
 		const data = graph();
 		const bounded = { ...data, nodes: Array.from({ length: 64 }, (_, i) => ({ id: String(i), label: String(i), detail: null, hit: null })),
@@ -68,12 +103,11 @@ describe("bounded graph carrier", () => {
 describe("native graph navigation", () => {
 	test("hosts without native graph elements retain names, hover details and relationship selection", () => {
 		const view = new GraphInspector(graph(), () => {}, () => ({} as Component));
-		const fallback: DescribeContext = { ...native, supports: kind => kind !== "el" && kind !== "tree" && kind !== "section" };
+		const fallback: DescribeContext = { ...native, supports: kind => String(kind) !== "el" && kind !== "tree" && kind !== "section" };
 		const root = view.describe(fallback);
-		expect(nodes(root).some(node => node.k === "image" || node.k === "el")).toBe(false);
-		const first = nodes(root).find(node => node.key === "node-0");
-		expect(first?.p?.title).toContain("Details A");
+		expect(nodes(root).some(node => node.k === "image" || asNativeElement(node) !== undefined)).toBe(false);
 		action(view, "node:0");
+		expect(content(view.describe(fallback))).toContain("Details A");
 		action(view, "edge:0");
 		expect(content(view.describe(fallback))).toContain("A → B · calls");
 	});
@@ -150,10 +184,10 @@ describe("native graph navigation", () => {
 		view.setActivity(["app.main"]);
 		tree = nodes(view.describe(native)).find(n => n.key === "node-0");
 		if (!tree || tree.k !== "tree") throw new Error("Missing active tree");
-		expect(tree.p?.nodes[0].label).toEqual([{ t: "◇ A", s: "accent", fx: "pulse" }]);
+		expect(tree.p?.nodes[0].label).toEqual([{ t: "◇ A", s: "success", fx: "pulse" }]);
 		const reduced = nodes(view.describe({ ...native, reduceMotion: true })).find(n => n.key === "node-0");
 		if (!reduced || reduced.k !== "tree") throw new Error("Missing reduced-motion tree");
-		expect(reduced.p?.nodes[0].label).toEqual([{ t: "◇ A", s: "accent", fx: undefined }]);
+		expect(reduced.p?.nodes[0].label).toEqual([{ t: "◇ A", s: "success", fx: undefined }]);
 		const before = changes;
 		view.setActivity(["app.main"]);
 		expect(changes).toBe(before);
@@ -161,6 +195,72 @@ describe("native graph navigation", () => {
 		tree = nodes(view.describe(native)).find(n => n.key === "node-0");
 		if (!tree || tree.k !== "tree") throw new Error("Missing inactive tree");
 		expect(typeof tree.p?.nodes[0].label).toBe("string");
+	});
+	test("keeps mixed catalog states visible in node navigation and selected details without tool activity", () => {
+		const data = graph();
+		data.nodes[0].indexing = "pending";
+		data.nodes[1].indexing = "failed"; data.nodes[1].indexingError = "Embedding provider rejected this file";
+		data.nodes[2].indexing = "ready"; data.nodes[3].indexing = "unknown";
+		const view = new GraphInspector(data, () => {}, () => ({} as Component));
+		view.handleNativeEvent({ type: "toggle", key: "graph-nodes", collapsed: false });
+		const rendered = view.describe(native);
+		expect(nodes(rendered).find(node => node.key === "node-1")?.p?.title).toContain("Embedding provider rejected this file");
+		expect(content(rendered)).toContain("pending");
+		expect(content(rendered)).toContain("failed");
+		action(view, "node:1");
+		expect(content(view.describe(native))).toContain("Embedding failed.");
+		view.setActivity([]);
+		expect(content(view.describe(native))).toContain("Embedding provider rejected this file");
+		action(view, "node:4");
+		expect(content(view.describe(native))).not.toContain("Embedding failed.");
+	});
+	test("node and group hover errors remain complete and selected details keep full descriptions", () => {
+		const diagnostic = `Provider unavailable\n${"Exact failure reason. ".repeat(100)}`;
+		for (const category of ["file", "group"] as const) {
+			const data = graph();
+			data.nodes[0] = { ...data.nodes[0], label: "src/main.ts", path: "src/main.ts", category,
+				detail: "Full selected description", indexing: "failed", indexingError: diagnostic };
+			const view = new GraphInspector(data, () => {}, () => ({} as Component));
+			const title = nodes(view.describe(native)).find(node => node.key === "quick-0")?.p?.title!;
+			expect(title.split("\n").filter(line => line === "src/main.ts")).toHaveLength(1);
+			expect(title).toContain(diagnostic);
+			expect(title).not.toContain(data.nodes[0].detail!);
+			action(view, "node:0");
+			const selected = content(view.describe(native));
+			expect(selected).toContain(diagnostic);
+			expect(selected).toContain(data.nodes[0].detail!);
+		}
+	});
+	test("group hover previews account for omitted members and exploration retains every source", () => {
+		const data = graph();
+		data.nodes = Array.from({ length: 96 }, (_, index) => ({ id: String(index), label: `File ${index}`,
+			category: "file", path: `src/file-${index}.ts`, detail: `Selected file ${index}`, hit: null }));
+		data.roots = ["0"]; data.edges = [];
+		const view = new GraphInspector(data, () => {}, () => ({} as Component), null, undefined, "body", "overview");
+		const group = nodes(view.describe(native)).find(node => node.key === "group-0")!;
+		expect(group.p?.title?.match(/src\/file-\d+\.ts/g)).toHaveLength(3);
+		expect(group.p?.title).toContain("+93");
+		expect(group.p?.title).not.toContain("src/file-95.ts");
+		action(view, "group:0");
+		view.handleNativeEvent({ type: "toggle", key: "graph-nodes", collapsed: false });
+		action(view, "more-nodes"); action(view, "more-nodes");
+		const expanded = nodes(view.describe(native));
+		expect(expanded.some(node => node.p?.title?.includes("src/file-95.ts"))).toBe(true);
+		action(view, "node:95");
+		expect(content(view.describe(native))).toContain("Selected file 95");
+	});
+	test("later reference evidence remains selectable with its complete directed binding", () => {
+		const data = graph();
+		data.nodes = ["A", "B"].map(id => ({ id, label: id, detail: null, hit: null, category: "file", path: `src/${id}.ts` }));
+		data.edges = Array.from({ length: 12 }, (_, index) => ({ from: "A", to: "B", label: "references", kind: "reference",
+			symbol: `run${index}`, moniker: `local::run${index}` }));
+		const view = new GraphInspector(data, () => {}, () => ({} as Component));
+		action(view, "node:0");
+		action(view, "more-related");
+		action(view, "edge:11");
+		const root = view.describe(native), last = data.edges[11];
+		expect(content(root)).toContain(`A → B · references · ${last.symbol}`);
+		expect(nodes(root).some(node => node.p?.title === last.moniker)).toBe(true);
 	});
 	test("a same-named external target cannot inherit local request activity", () => {
 		const data = graph();
@@ -207,7 +307,7 @@ describe("native graph navigation", () => {
 		action(view, group.p!.actions!.click!);
 		view.handleNativeEvent({ type: "toggle", key: "graph-nodes", collapsed: false });
 		const scoped = nodes(view.describe(cx));
-		expect(scoped.find(node => node.key === "node-1")?.p?.title).toContain("Selected file 0");
+		expect(scoped.find(node => node.key === "node-1")?.p?.title).toContain("module-0/0.ts");
 		expect(scoped.some(node => node.key === "node-2")).toBe(false);
 		action(view, "node:1");
 		expect(content(view.describe(cx))).toContain("Selected file 0");
@@ -219,6 +319,73 @@ describe("native graph navigation", () => {
 		action(view, "overview");
 		expect(nodes(view.describe(cx)).some(node => node.key === "selection")).toBe(false);
 		expect(nodes(view.describe(cx)).some(node => node.p?.actions?.click === "group:0")).toBe(true);
+	});
+	test("appearance edits retain drilldown, exact selected source and relationship navigation", () => {
+		const data = graph(); let previews = 0;
+		data.nodes = Array.from({ length: 96 }, (_, index) => ({ id: String(index), label: `File ${index}`,
+			category: "file", path: `module-${index % 30}/${index}.ts`, detail: `Selected file ${index}`, hit: null }));
+		data.nodes[0].hit = hit({ symbol: "sourceZero", path: "module-0/0.ts" });
+		data.roots = ["0"]; data.edges = [{ from: "0", to: "1", label: "exact cross-group import", kind: "import" }];
+		const view = new GraphInspector(data, () => {}, () => {
+			previews++;
+			return { render: () => ["Source zero"], describe: () => ({ k: "text", p: { text: "Source zero" } }) };
+		}, "appearance-scope", undefined, "body", "overview");
+		const cx: DescribeContext = { ...native, feature: feature => feature === "styles" };
+		let appearance: Readonly<GraphAppearance> = DEFAULT_GRAPH_APPEARANCE;
+		view.setAppearance(appearance);
+		view.describe(cx);
+		action(view, "group:0"); action(view, "node:0");
+		const scope = content(nodes(view.describe(cx)).find(node => node.key === "graph-scope")!);
+		expect(previews).toBe(1);
+		for (const patch of [{ layout: "radial" }, { detail: "calm" }, { color: "neutral" }, { labels: "hover" }, { links: "clear" }, { motion: "off" }] as const) {
+			appearance = { ...appearance, ...patch };
+			view.setAppearance(appearance);
+			const root = view.describe(cx), diagram = nodes(root).map(asNativeElement).find(node => node?.key === "graph-preview");
+			expect(content(nodes(root).find(node => node.key === "graph-scope")!)).toBe(scope);
+			expect(content(root)).toContain("Selected file 0");
+			expect(nodes(root).some(node => node.key === "preview-0")).toBe(true);
+			expect(diagram?.p.attrs?.["data-layout"]).toBe(appearance.layout);
+			expect(diagram?.p.attrs?.["data-motion"]).toBe(appearance.motion === "off" ? "reduced" : "full");
+		}
+		expect(previews).toBe(1);
+		action(view, "edge:0");
+		expect(content(view.describe(cx))).toContain("File 0 → File 1 · exact cross-group import");
+		expect(content(nodes(view.describe(cx)).find(node => node.key === "graph-scope")!)).toContain("module-1");
+	});
+	test("project detail budgets change only the summary drawing and keep every exact node reachable", () => {
+		const data = graph();
+		data.nodes = Array.from({ length: 96 }, (_, index) => ({ id: String(index), label: `File ${index}`,
+			category: "file", path: `module-${index % 30}/${index}.ts`, detail: `Exact node ${index}`, hit: null }));
+		data.roots = ["0"]; data.edges = [];
+		const view = new GraphInspector(data, () => {}, () => { throw new Error("No source supplied"); }, "detail-budget", undefined, "body", "overview");
+		const cx: DescribeContext = { ...native, feature: feature => feature === "styles" };
+		view.setAppearance({ ...DEFAULT_GRAPH_APPEARANCE, detail: "calm" });
+		const calm = nodes(view.describe(cx)).map(asNativeElement).filter(node => node?.p.attrs?.["data-node"] !== undefined);
+		view.setAppearance({ ...DEFAULT_GRAPH_APPEARANCE, detail: "detailed" });
+		const detailed = nodes(view.describe(cx)).map(asNativeElement).filter(node => node?.p.attrs?.["data-node"] !== undefined);
+		expect(calm).toHaveLength(12);
+		expect(detailed).toHaveLength(24);
+		view.handleNativeEvent({ type: "toggle", key: "graph-nodes", collapsed: false });
+		action(view, "more-nodes"); action(view, "more-nodes");
+		expect(nodes(view.describe(cx)).some(node => node.key === "node-95")).toBe(true);
+		action(view, "node:95");
+		expect(content(view.describe(cx))).toContain("Exact node 95");
+	});
+	test("motion off suppresses observed node pulses and inspector forwarding retains the selection", () => {
+		const data = graph(), display = { ...data, version: 1 as const,
+			identity: { codebaseId: "appearance-forwarding", name: null, localRoot: null, copy: "canonical" as const } };
+		const view = new SemctlInspector(display, () => {});
+		view.move(1);
+		view.setActivity(["A"]);
+		view.setAppearance({ ...DEFAULT_GRAPH_APPEARANCE, motion: "off", layout: "radial" });
+		const root = view.describe(native);
+		const nested = root?.c?.find(child => child instanceof GraphInspector);
+		if (!(nested instanceof GraphInspector)) throw new Error("No forwarded graph inspector");
+		nested.handleNativeEvent({ type: "toggle", key: "graph-nodes", collapsed: false });
+		const body = nested.describe(native), tree = nodes(body).find(node => node.key === "node-0");
+		if (!tree || tree.k !== "tree") throw new Error("No observed node tree");
+		expect(tree.p?.nodes[0].label).toEqual([{ t: "◇ A", s: "success", fx: undefined }]);
+		expect(content(body)).toContain("Details A");
 	});
 	test("selected relationship pagination keeps later parallel links selectable", () => {
 		const data = graph();
@@ -239,4 +406,47 @@ describe("native graph navigation", () => {
 		}
 		expect(content(view.describe(native))).toContain("A → B · relation 24");
 	});
+});
+
+test("existing graph results repaint shared structural cues on profile changes without moving geometry or creating previews", () => {
+	const data = graph(), codebase = "retained-tool-graph";
+	for (const node of data.nodes) { node.category = "file"; node.path = `src/${node.id}.ts`; }
+	data.nodes[0].indexing = "failed"; data.nodes[0].indexingError = "Provider unavailable";
+	let renders = 0;
+	const view = new GraphInspector(data, () => renders++, () => { throw new Error("Color changes must not request source"); }, codebase);
+	const cx = { ...native, feature: (name: string) => name === "styles" }, geometry = nativeGraphLayout(data, "inline"), revision = conceptRevision();
+	const shared = view.describe(cx), color = lookupGraphColor(codebase, data.nodes[0], "concepts");
+	if (!color) throw new Error("No source category");
+	const cue = nodes(shared).map(asNativeElement).find(node => node?.key === "graph-color-cue");
+	expect(cue?.p.class).toContain(conceptClass(color, true)); expect(cue?.p.title).toContain("Code structure:");
+	expect(cue?.p.title).not.toContain("Inferred concept:");
+	const before = renders;
+	setGraphColorMode("neutral");
+	const neutral = view.describe(cx);
+	expect(renders).toBeGreaterThan(before); expect(conceptRevision()).toBe(revision);
+	expect(nodes(neutral).map(asNativeElement).some(node => node?.key === "graph-color-cue")).toBe(false);
+	expect(content(neutral)).toContain("failed");
+	expect(nativeGraphLayout(data, "inline")).toBe(geometry);
+	setGraphColorMode("structure");
+	expect(nodes(view.describe(cx)).map(asNativeElement).find(node => node?.key === "graph-color-cue")?.p.class).toContain(conceptClass(color, true));
+});
+
+test("aggregate graph controls use the same shared palette and retain drawing positions through palette-only updates", () => {
+	const data = graph(), codebase = "aggregate-palette";
+	data.nodes = Array.from({ length: 96 }, (_, index) => ({ id: String(index), label: `File ${index}`, detail: null, hit: null,
+		category: "file", path: `pkg${index % 4}/file${index}.ts` }));
+	data.roots = ["0"]; data.edges = data.nodes.slice(1).map((node, index) => ({ from: String(index), to: node.id, label: "imports" }));
+	const view = new GraphInspector(data, () => {}, () => { throw new Error("No source selection"); }, codebase, undefined, "body", "overview");
+	const cx = { ...native, feature: (name: string) => name === "styles" };
+	const before = view.describe(cx), revision = conceptRevision();
+	const positions = nodes(before).map(asNativeElement).filter(node => node?.p.attrs?.["data-node"] !== undefined).map(node => [node?.p.attrs?.["data-node"], node?.p.class?.match(/sg-x\d+ sg-y\d+ sg-fx\d+ sg-fy\d+/)?.[0]]);
+	const cue = nodes(before).map(asNativeElement).find(node => node?.key === "group-cue-0");
+	expect(cue?.p.title).toContain("Code structure:");
+	setGraphColorMode("neutral");
+	expect(nodes(view.describe(cx)).map(asNativeElement).some(node => node?.key?.startsWith("group-cue-"))).toBe(false);
+	setGraphColorMode("structure");
+	const after = view.describe(cx);
+	expect(conceptRevision()).toBe(revision);
+	expect(nodes(after).map(asNativeElement).filter(node => node?.p.attrs?.["data-node"] !== undefined).map(node => [node?.p.attrs?.["data-node"], node?.p.class?.match(/sg-x\d+ sg-y\d+ sg-fx\d+ sg-fy\d+/)?.[0]])).toEqual(positions);
+	expect(nodes(after).map(asNativeElement).find(node => node?.key === "group-cue-0")?.p.class).toBe(cue?.p.class);
 });

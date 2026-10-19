@@ -135,32 +135,52 @@ and unavailable verification stay distinct. Use local Read/Grep for current
 locations when binding is not established. Verification does not start a reindex.
 
 The semctl OMP adapter presents search, reference, source, and graph results in
-native tool cards. The native tool header opens the complete result. Match chips
+native tool cards. Compact results show the first six matches.
+The native tool header opens the complete result. Match chips
 use Read-style icons, path links, spacing, and independent previews. Scored
 matches use small native relevance bars; unscored matches reserve no bar space.
-Hover shows rank, score, or the verification diagnostic. The fixed-width
-composer shows one native progress circle for producer-backed sync and embedding
-counts. Select it for status, or use `/semctl` and `/semctl details`.
-`/semctl graph` opens the native OMP/Tern graph surface. The default overview
+Hover shows rank, score, or the verification diagnostic. A fixed-size composer
+indicator sits above the native composer controls. It shows one native progress
+circle for producer-backed sync and embedding counts. Unknown active work uses
+subtle motion that respects reduced-motion mode. Select the indicator for status,
+or use `/semctl` and `/semctl details`.
+`/semctl graph` opens a native OMP/Tern popup card. The default overview
 includes indexed files, directories, projects, imports, and resolved symbol
 bindings. Native dots support individual hover and selection. Group and node
 controls expose supplied relationships and metadata without a model turn.
-Concept colors remain consistent across match chips and graph views. Colors
-identify evidence-backed groups, not similarity. Tern owns transitions and
-reduced-motion behavior. The graph does not use SVG images or a web viewer.
+The compact toolbar uses native icons. Grouped analysis tabs and diagnostics
+share a stable viewing area. Switching views preserves the selected node.
+Shared graph colors identify the same source consistently across graph views.
+Validated concepts also color match chips. Source-directory colors fill gaps
+without claiming semantic similarity. Tern owns transitions and reduced-motion
+behavior. The graph does not use SVG images or a web viewer.
 `/semctl graph live` toggles a native live overview popup. The popup shows a
 compact project map, observed request counts, and producer-backed progress.
+Its footer keeps a fixed progress circle and percentage. Phase changes stay in
+tooltips. A small warning badge shows current problems without replacing the circle.
+Available structure stays visible while embeddings or relationship layers are
+incomplete. File-state rings use catalog evidence; aggregate progress does not
+invent per-file activity. A failed refresh retains the last available map.
 Typing, refreshing, and closing preserve the composer draft and focus.
-The popup requires an OMP build with non-modal overlay support.
+The popup uses the extension APIs in stock OMP. No OMP patch is required.
+The appearance icon opens compact native controls for layout, colors, detail,
+labels, link contrast, and motion. Force, Radial, Layers, and Components provide
+different views of the recorded topology. Changes update the live popup and
+project page immediately. Color choices apply to all graph views.
+Preferences are saved per OMP profile. System reduced motion always takes priority.
 Graph-based feed results expose compact diagrams inside the native disclosure.
-Match lists offer a separate `Graph` control that groups supplied matches by
-file and codebase.
+Match lists offer a graph icon that groups supplied matches by file and codebase.
+Result chips wrap into compact rows and retain file directories.
+Linked filenames open the checkout file. Tooltips use compact identity, score,
+and state summaries; existing details retain the complete evidence.
+Expanded snippets highlight reported match locations without asserting that
+the current checkout matches the indexed source.
 The adapter reads bounded, typed `_meta.semctlDisplay`
 metadata. It does not parse Markdown or change model-facing content.
 The original MCP transcript, errors, approvals, and cancellation remain intact.
-Inline cards require the host's rendering-only extension API. Native graphs
-also require OMP's scoped stylesheet transport and Tern's native elements.
-Older hosts retain their original MCP cards or native node controls.
+The extension adapts the native presentation hooks on OMP's existing MCP tools.
+Tern supplies native elements and surface-scoped styles. Plain terminals retain
+the stock MCP output and compact text status.
 A cached overview supplies shared concept colors.
 Presentation makes no extra source fetches. It does not automatically combine
 calls or establish token savings. See the

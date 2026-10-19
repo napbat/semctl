@@ -1,18 +1,20 @@
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
-import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import type { Component, DescribeContext, NativeNode, NativeUiEvent } from "@oh-my-pi/pi-tui";
 import { nativeConceptCue } from "./native-concepts";
 import type { NativeChild } from "@oh-my-pi/pi-tui/native/node";
-import type { ToolRendererFactory } from "@oh-my-pi/pi-tui/tools";
+import type { RenderResultContextOptions, ToolRenderer, ToolRenderResult } from "@oh-my-pi/pi-tui/tools";
 import { GraphInspector, readGraph, type GraphData } from "./graph";
 import { strengths } from "./graph-data/matches.js";
 import { matchScoreIndicator, matchVerificationIcon } from "./match-indicators";
 import { resultGraph } from "./result-graph";
 import { acceptConceptOverview, conceptRevision, lookupConcept, subscribeConcepts } from "./concept-colors";
+import { nativeElement, supportsElements } from "./native-elements";
+import type { GraphAppearance } from "./graph-appearance";
 
 const MAX_BYTES = 32 * 1024;
 const MAX_HITS = 32;
+const COMPACT_MATCHES = 6;
 const OPERATIONS: Record<string, Display["kind"]> = {
 	search_codebase: "search", read_source: "source", batch_lookup: "batch", sync_status: "status",
 	find_definition: "batch", find_references: "batch", who_calls: "batch", implementations_of: "batch",
@@ -30,7 +32,7 @@ const TITLES: Record<string, string> = {
 };
 // Raw, unsanitized MCP identities, not a prefix-based ownership test.
 // Claude/agent-plugin discovery namespaces `${plugin}:${server}`; native OMP packages keep the raw server name.
-const SERVERS: Record<string, string> = { semctx: "mcp__semctx_", "semctx:semctx": "mcp__semctx_semctx_" };
+const SERVERS = new Set(["semctx", "semctx:semctx"]);
 
 type Obj = Record<string, unknown>;
 interface Identity { codebaseId: string | null; name: string | null; localRoot: string | null; copy: "checkout" | "canonical" }
@@ -150,15 +152,19 @@ const text = (s: string, p: Record<string, unknown> = {}): Extract<NativeNode, {
 });
 
 function lineCount(s: string): number { return s.length === 0 ? 0 : s.split("\n").length - (s.endsWith("\n") ? 1 : 0); }
-export function snippetWindow(h: Hit): { start: number; end: number; focus?: number } | undefined {
+/** Marks describe the returned snippet, never a verified jump into the current checkout. */
+export function snippetWindow(h: Hit): { start: number; end: number; focus?: number; mark?: readonly [number, number] } | undefined {
 	if (h.snippet === null || h.snippetStartLine === null || h.snippetStartLine < 1 || h.snippetEndLine === null ||
 		lineCount(h.snippet) !== h.snippetEndLine - h.snippetStartLine + 1) return undefined;
-	return { start: h.snippetStartLine, end: h.snippetEndLine,
-		focus: h.binding.state === "bound" && h.focusLine !== null && h.focusLine >= h.snippetStartLine && h.focusLine <= h.snippetEndLine &&
-			(h.focusByte === null || h.snippetStartByte === null || h.snippetEndByte === null ||
-				(h.focusByte >= h.snippetStartByte && h.focusByte < h.snippetEndByte)) ? h.focusLine : undefined };
+	const focus = h.focusLine !== null && h.focusLine >= h.snippetStartLine && h.focusLine <= h.snippetEndLine &&
+		(h.focusByte === null || h.snippetStartByte === null || h.snippetEndByte === null ||
+			(h.focusByte >= h.snippetStartByte && h.focusByte < h.snippetEndByte)) ? h.focusLine : undefined;
+	const range = h.focusLine === null && h.startLine !== null && h.startLine > 0 && h.endLine !== null && h.endLine >= h.startLine
+		? [Math.max(h.startLine, h.snippetStartLine), Math.min(h.endLine, h.snippetEndLine)] as const : undefined;
+	return { start: h.snippetStartLine, end: h.snippetEndLine, focus,
+		mark: focus !== undefined ? [focus, focus] : range && range[0] <= range[1] ? range : undefined };
 }
-const UNVERIFIED_FILE_LINK = "Opens the current checkout file. The indexed location remains unverified; this is not a trusted source jump.";
+const UNVERIFIED_FILE_LINK = "Open current checkout file · indexed location unverified";
 function sourceLink(id: Identity, h: Hit): string | undefined {
 	if (id.copy !== "checkout" || id.localRoot === null || !path.isAbsolute(id.localRoot) || !h.path ||
 		!id.codebaseId || h.codebaseId !== id.codebaseId || path.isAbsolute(h.path) || /^[a-z][a-z0-9+.-]*:/i.test(h.path)) return undefined;
@@ -179,7 +185,7 @@ export class SemctlInspector implements Component {
 	private readonly supplementaryGraph: boolean;
 	private comparisonHits?: readonly Hit[];
 	private readonly hits: Hit[];
-	private rowsCache: { mask: number; narrow: boolean; dark: boolean; revision: number; comparison: readonly Hit[]; nodes: NativeNode[] } | undefined;
+	private rowsCache: { mask: number; dark: boolean; revision: number; comparison: readonly Hit[]; nodes: NativeNode[] } | undefined;
 	private static repaintConcepts(owner: SemctlInspector): void { owner.requestRender(); }
 	constructor(
 		readonly display: Display,
@@ -207,6 +213,7 @@ export class SemctlInspector implements Component {
 	invalidate(): void { this.rowsCache = undefined; this.graph?.invalidate(); }
 	move(delta: number): void { this.graph?.move(delta); }
 	setActivity(targets: readonly string[]): void { this.graph?.setActivity(targets); }
+	setAppearance(appearance: Readonly<GraphAppearance>): void { this.graph?.setAppearance(appearance); }
 	handleNativeEvent(event: NativeUiEvent): void {
 		if (event.type === "toggle" && event.key !== "") {
 			const key = event.key.slice(event.key.lastIndexOf("/") + 1);
@@ -231,15 +238,12 @@ export class SemctlInspector implements Component {
 		if (!cx.supports("section")) return children;
 		return [{ k: "section", key, p: { head, collapsible: true, collapsed: !this.expandedSections.has(key) }, c: children }];
 	}
-	private preview(d: Display, h: Hit, cx: DescribeContext): NativeNode[] {
+	private preview(h: Hit, cx: DescribeContext): NativeNode[] {
 		const w = snippetWindow(h);
-		const href = sourceLink(d.identity, h);
-		const out: NativeNode[] = href ? [{ k: "row", p: { gap: "sm", align: "center" }, c: [
-			text("Open file", { href, actions: { click: "open" }, tone: "accent", shrink: 0,
-				title: h.binding.state === "bound" ? "Open the current checkout file" : UNVERIFIED_FILE_LINK }),
-		] }] : [];
+		const out: NativeNode[] = [];
 		if (h.snippet) out.push(...this.sourceNodes(h.snippet, { path: h.path ?? undefined, language: h.language ?? undefined,
-			start: w?.start, focus: w?.focus, limit: this.expandedResult() ? Math.max(12, lineCount(h.snippet)) : 12 }, cx));
+			start: w?.start, focus: w?.focus ?? w?.mark?.[0], mark: w?.mark,
+			limit: this.expandedResult() ? Math.max(12, lineCount(h.snippet)) : 12 }, cx));
 		else out.push(text("No source preview in this result.", { tone: "muted" }));
 		return out;
 	}
@@ -262,7 +266,7 @@ export class SemctlInspector implements Component {
 			: items.map(item => text(`${item.k}: ${item.v}`));
 		return this.section(`match-details-${index}`, "Details", details, cx);
 	}
-	private sourceNodes(source: string, info: { path?: string; language?: string; start?: number; focus?: number; limit: number }, cx: DescribeContext): NativeNode[] {
+	private sourceNodes(source: string, info: { path?: string; language?: string; start?: number; focus?: number; mark?: readonly [number, number]; limit: number }, cx: DescribeContext): NativeNode[] {
 		// The host owns full-result expansion; each open match keeps a bounded source window.
 		const lines = source.match(/[^\n]*\n|[^\n]+$/g) ?? [];
 		const focusIndex = info.start !== undefined && info.focus !== undefined ? info.focus - info.start : 0;
@@ -271,63 +275,64 @@ export class SemctlInspector implements Component {
 		// A final line terminator is not another source line. Preserve intentional blank lines.
 		const shown = lines.slice(offset, offset + info.limit).join("").replace(/\r?\n$/, "");
 		const start = info.start !== undefined ? info.start + offset : undefined;
-		const focus = start !== undefined && info.focus !== undefined && info.focus >= start &&
-			info.focus < start + Math.min(info.limit, lines.length) ? info.focus : undefined;
+		const marks: { line: number; tone: "accent" }[] = [];
+		if (start !== undefined && info.mark) {
+			const end = Math.min(info.mark[1], start + Math.min(info.limit, lines.length - offset) - 1);
+			for (let line = Math.max(start, info.mark[0]); line <= end; line++) marks.push({ line, tone: "accent" });
+		}
 		const result: NativeNode[] = [cx.supports("code") ? {
 			k: "code", key: "source", p: { text: clean(shown), path: info.path, lang: info.language, start,
-				numbers: start !== undefined, wrap: false, marks: focus !== undefined ? [{ line: focus, tone: "accent" }] : undefined },
+				numbers: start !== undefined, wrap: false, marks: marks.length ? marks : undefined },
 		} : { k: "text", p: { text: clean(shown), wrap: "none" } }];
 		if (lines.length > info.limit) result.push(text(`${info.limit} of ${lines.length} lines · expand tool for full result`, { tone: "muted" }));
 		return result;
 	}
 	private hitRows(d: Display, rows: Hit[], cx: DescribeContext): NativeNode[] {
-		const narrow = cx.cols < 72;
 		const compared = this.comparisonHits ?? rows;
-		let mask = (Number(cx.stylesheets === true && cx.feature("styles")) << ROW_CAPABILITIES.length) |
+		let mask = (Number(cx.feature("styles")) << ROW_CAPABILITIES.length) |
 			(Number(cx.reduceMotion) << (ROW_CAPABILITIES.length + 1)) | (Number(this.expandedResult()) << (ROW_CAPABILITIES.length + 2));
-		for (const [index, kind] of ROW_CAPABILITIES.entries()) if (cx.supports(kind)) mask |= 1 << index;
+		for (const [index, kind] of ROW_CAPABILITIES.entries()) if (kind === "el" ? supportsElements(cx) : cx.supports(kind)) mask |= 1 << index;
 		const revision = conceptRevision(), cached = this.rowsCache;
-		if (cached && cached.mask === mask && cached.narrow === narrow && cached.dark === cx.dark && cached.revision === revision && cached.comparison === compared) return cached.nodes;
+		if (cached && cached.mask === mask && cached.dark === cx.dark && cached.revision === revision && cached.comparison === compared) return cached.nodes;
 		const scales = strengths(compared);
 		const result = rows.map((h, i): NativeNode => {
 			const expanded = this.expandedHits.has(i);
 			const rank = this.comparisonHits ? compared.indexOf(h) : i;
 			const strength = scales[rank];
 			const indicator = matchScoreIndicator(h, rank, strength ?? null, cx, `hit:${i}`);
-			const tip = `${location(h)} · ${h.qualifiedName ?? h.symbol ?? h.kind ?? "Symbol unavailable"}${h.enclosingSymbol ? ` in ${h.enclosingSymbol}` : ""}\n${expanded ? "Collapse" : "Expand"} source.`;
-			const file = label(h.path ?? "Path unavailable").replace(/\\/g, "/");
+			const tip = `${h.qualifiedName ?? h.symbol ?? h.kind ?? "Symbol unavailable"}${h.enclosingSymbol ? `\nIn ${h.enclosingSymbol}` : ""}\n${expanded ? "Collapse" : "Expand"} source`;
+			const file = label(h.path ?? "Path unavailable");
 			const symbol = h.symbol ?? h.qualifiedName ?? h.kind ?? "—";
 			const concept = lookupConcept(h.codebaseId ?? d.identity.codebaseId, h.path);
 			const cue = concept && nativeConceptCue(concept, cx, expanded);
 			const context = h.enclosingSymbol ? `${symbol} in ${h.enclosingSymbol}` : symbol;
-			const cut = file.lastIndexOf("/") + 1, href = sourceLink(d.identity, h);
-			const fields = [
-				{ k: "text" as const, p: { spans: [
-					{ t: file.slice(0, cut), s: "dim" },
-					{ t: file.slice(cut), s: "strong", ...(href ? { href } : {}) },
-					{ t: label(location(h).slice((h.path ?? "Path unavailable").length)), s: "muted" },
-				], grow: 3, basis: 0, min: { w: 0 }, wrap: "none" as const, truncate: "middle" as const,
-					title: `${location(h)}${href && h.binding.state !== "bound" ? `\n${UNVERIFIED_FILE_LINK}` : ""}` } },
-				text(context, { grow: 2, basis: 0, min: { w: 0 }, wrap: "none", truncate: "end",
-					title: [context, h.qualifiedName, typeof h.isWrite === "boolean" ? (h.isWrite ? "Write" : "Read") : null,
-						h.referenceNamespace, h.referenceKind, h.externalTarget, h.project].filter(Boolean).join("\n") }),
-			];
-			const chip: NativeNode = { k: "row", key: `hit-${i}`, p: { role: "omp.tool.file", gap: "sm", align: "center", wrap: false, mark: expanded ? "pick" : undefined, actions: { click: `hit:${i}` }, title: tip, aria: `${expanded ? "Collapse" : "Expand"} match ${i + 1}: ${location(h)}.` }, c: [
-				cue ? { ...cue, p: { ...cue.p, actions: { click: `hit:${i}` } } } : text(expanded ? "▾" : "▸", { tone: "muted", wrap: "none", shrink: 0 }),
+			const cut = Math.max(file.lastIndexOf("/"), file.lastIndexOf("\\")) + 1, href = sourceLink(d.identity, h);
+			const filename: NativeNode = { k: "text", p: { role: "semctl.match.path", spans: [
+				{ t: file.slice(0, cut), s: "dim" },
+				{ t: file.slice(cut), s: "strong", ...(href ? { href } : {}) },
+				{ t: label(location(h).slice((h.path ?? "Path unavailable").length)), s: "muted" },
+			], shrink: 1, min: { w: 0 }, wrap: "none", truncate: "middle",
+				title: `${location(h)}${href ? `\n${h.binding.state === "bound" ? "Open checkout file" : UNVERIFIED_FILE_LINK}` : ""}` } };
+			const chip: NativeNode = { k: "row", key: `hit-${i}`, p: { role: "omp.tool.chip", gap: "xs", align: "center", wrap: false, mark: expanded ? "pick" : undefined, max: { w: 1 }, actions: { click: `hit:${i}` }, title: tip, aria: `${expanded ? "Collapse" : "Expand"} match ${i + 1}: ${location(h)}. ${label(context)}` }, c: [
+				cue ? nativeElement({ ...cue, k: "el", p: { ...cue.p, actions: { click: `hit:${i}` } } }) : text(expanded ? "▾" : "▸", { tone: "muted", wrap: "none", shrink: 0 }),
 				...(cx.supports("icon") ? [{ k: "icon" as const, key: "file-icon", p: { name: "file", shrink: 0, aria: file } }] : []),
-				fields[0],
+				filename,
 				...(indicator ? [indicator] : []),
-				...(!narrow ? fields.slice(1) : []),
 				matchVerificationIcon(h, cx, `hit:${i}`),
 			] };
-			return { k: "col", key: `match-${i}`, c: [
+			return { k: "col", key: `match-${i}`, p: { role: expanded ? "semctl.match.expanded" : "semctl.match",
+				basis: expanded ? undefined : "content", grow: 0, shrink: 1, min: { w: 0 }, max: { w: 1 },
+				hidden: !this.expandedResult() && i >= COMPACT_MATCHES }, c: [
 				chip,
-				...(expanded ? [{ k: "col" as const, key: "preview", p: { gap: "xs" as const }, c: [
-					...this.preview(d, h, cx), ...this.matchDetails(d, h, i, cx),
+				...(expanded ? [{ k: "col" as const, key: "preview", p: { role: "semctl.match.preview", gap: "xs" as const }, c: [
+					text(context, { tone: "muted", wrap: "none", truncate: "end", title: [
+						h.qualifiedName ?? h.symbol, h.enclosingSymbol ? `In ${h.enclosingSymbol}` : null, h.project ? `Project: ${h.project}` : null,
+					].filter(Boolean).join("\n") }),
+					...this.preview(h, cx), ...this.matchDetails(d, h, i, cx),
 				] }] : []),
 			] };
 		});
-		this.rowsCache = { mask, narrow, dark: cx.dark, revision, comparison: compared, nodes: result };
+		this.rowsCache = { mask, dark: cx.dark, revision, comparison: compared, nodes: result };
 		return result;
 	}
 	describe(cx: DescribeContext): NativeNode | null {
@@ -338,22 +343,31 @@ export class SemctlInspector implements Component {
 		const d = this.display;
 		const id = d.identity;
 		const displayName = id.name ?? (id.localRoot !== null && path.isAbsolute(id.localRoot) ? path.basename(id.localRoot) || "checkout" : "Codebase");
-		const identity = text(`${id.copy} · ${displayName}`, { tone: "muted", title: `Codebase ID: ${id.codebaseId ?? "unbound"}\nCopy: ${id.copy}\nLocal root: ${id.localRoot ?? "none"}` });
-		children.push(this.supplementaryGraph ? {
-			k: "row", p: { gap: "md", align: "center" }, c: [{ ...identity, p: { ...identity.p, grow: 1, min: { w: 0 }, truncate: "end", wrap: "none" } }, {
-				...text(`${this.expandedSections.has("graph") ? "▾" : "▸"} Graph`, { tone: "accent", shrink: 0, wrap: "none",
-					actions: { click: "graph" }, title: "Group returned matches by file. These links show locations, not calls or dependencies.",
-					aria: this.expandedSections.has("graph") ? "Hide result graph" : "Show result graph" }),
-				key: "graph-control",
-			}],
+		const identity = text(`${id.copy} · ${displayName}`, { tone: "muted", title: `Codebase: ${id.codebaseId ?? "unbound"}${id.localRoot ? `\nCheckout: ${id.localRoot}` : ""}` });
+		const freshness = d.kind === "search" && d.indexWarning ? {
+			role: "semctl.index-warning", tone: "warning" as const, shrink: 0, title: d.indexWarning, aria: `Index warning: ${d.indexWarning}`,
+		} : undefined;
+		const warning: NativeNode | undefined = freshness ? cx.supports("icon")
+			? { k: "icon", key: "index-warning", p: { name: "warn", ...freshness } }
+			: { ...text("!", freshness), key: "index-warning" } : undefined;
+		const graphOpen = this.expandedSections.has("graph");
+		const graphAction = { actions: { click: "graph" }, title: `${graphOpen ? "Hide" : "Show"} result graph\nFile membership, not calls or dependencies.`,
+			aria: graphOpen ? "Hide result graph" : "Show result graph", shrink: 0 };
+		const graphControl: NativeNode = supportsElements(cx) && cx.feature("styles")
+			? nativeElement({ k: "el", key: "graph-control", p: { tag: "button", class: "semctl-icon-action", ...graphAction,
+				attrs: { "aria-pressed": graphOpen, "aria-expanded": graphOpen } }, c: [cx.supports("icon") ? { k: "icon", p: { name: "diagram" } } : text("Graph")] })
+			: cx.supports("icon") ? { k: "icon", key: "graph-control", p: { name: "diagram", ...graphAction } }
+				: { ...text("Graph", { ...graphAction, tone: "accent" }), key: "graph-control" };
+		children.push(this.supplementaryGraph || warning ? {
+			k: "row", p: { gap: "sm", align: "center" }, c: [
+				{ ...identity, p: { ...identity.p, grow: 1, min: { w: 0 }, truncate: "end", wrap: "none" } },
+				...(warning ? [warning] : []), ...(this.supplementaryGraph ? [graphControl] : []),
+			],
 		} : identity);
 		if (d.kind === "graph") return { k: "col", p: { gap: "sm" }, c: [identity, this.graph!] };
 		if (this.supplementaryGraph && this.expandedSections.has("graph")) children.push({
 			k: "col", key: "result-graph", p: { gap: "xs" }, c: [text("Matches by file", { tone: "muted" }), this.graph!],
 		});
-		if (d.kind === "search" && d.indexWarning) {
-			children.push(text(d.indexWarning, { tone: "warning", title: d.indexWarning, aria: `Index warning: ${d.indexWarning}` }));
-		}
 		if (d.kind === "search" || d.kind === "batch") {
 			const rows = this.hits;
 			const rendered = this.hitRows(d, rows, cx);
@@ -365,17 +379,20 @@ export class SemctlInspector implements Component {
 				let offset = 0;
 				for (const [index, s] of d.symbols.entries()) {
 					if (d.symbols.length > 1 || s.hits.length === 0) {
-						entries.push({ ...text(`${s.symbol} · ${s.hits.length ? `${s.hits.length} matches` : "no match"}`, { tone: "muted", wrap: "none", truncate: "end" }),
+						entries.push({ ...text(`${s.symbol} · ${s.hits.length ? `${s.hits.length} matches` : "no match"}`, {
+							role: "semctl.batch.heading", basis: "100%", tone: "muted", wrap: "none", truncate: "end",
+							hidden: !this.expandedResult() && (s.hits.length ? offset : index) >= COMPACT_MATCHES,
+						}),
 							key: `${s.hits.length ? "batch-group" : "batch-miss"}-${index}` });
 					}
 					entries.push(...rendered.slice(offset, offset + s.hits.length)); offset += s.hits.length;
 				}
 			} else entries.push(...rendered);
-			// The native tool header owns whole-result expansion and clamps this complete body.
-			// Individual matches retain their independent source/details disclosures.
-			children.push(...entries);
+			// Keep stable match nodes and selection while the native tool header
+			// switches between the compact preview and the complete result.
+			children.push({ k: "row", key: "matches", p: { role: "semctl.matches", gap: "xs", wrap: true, align: "start" }, c: entries });
 		} else if (d.kind === "source") {
-			const header = text(`${d.path} · ${d.sourceOrigin} · bytes ${d.byteStart}–${d.byteEnd}/${d.fileSize}${d.truncated ? " · truncated" : ""}${d.binary ? " · binary" : ""}`, { title: `Content hash ${d.contentHash} · ${d.encoding}` });
+			const header = text(`${d.path} · ${d.sourceOrigin} · bytes ${d.byteStart}–${d.byteEnd}/${d.fileSize}${d.truncated ? " · truncated" : ""}${d.binary ? " · binary" : ""}`, { title: `Hash: ${d.contentHash}\nEncoding: ${d.encoding}` });
 			const concept = lookupConcept(id.codebaseId, d.path), cue = concept && nativeConceptCue(concept, cx);
 			children.push(cue ? { k: "row", p: { gap: "sm", align: "center" }, c: [cue, header] } : header);
 			const numbered = d.lineStart !== null && d.lineStart > 0 && d.lineEnd !== null && lineCount(d.text) === d.lineEnd - d.lineStart + 1;
@@ -404,11 +421,16 @@ export class SemctlInspector implements Component {
 	}
 }
 
-/** One renderer instance belongs to one native tool card, including xd:// calls. */
-export function createInspectorRenderer(server: string, operation: string): ToolRendererFactory {
-	return ({ requestRender, fallback }) => {
-		let view: SemctlInspector | undefined;
-		let expanded = false;
+/** One tool can render many retained cards. MCP details own each response's local UI state. */
+export function createInspectorRenderer(server: string, operation: string) {
+	return ({ requestRender, fallback }: { requestRender(): void; fallback: ToolRenderer }): ToolRenderer => {
+		interface State {
+			view?: SemctlInspector;
+			result: ToolRenderResult;
+			options: RenderResultContextOptions;
+			args?: unknown;
+		}
+		const states = new WeakMap<object, State>();
 		return {
 			...fallback,
 			mergeCallAndResult: true,
@@ -419,17 +441,21 @@ export function createInspectorRenderer(server: string, operation: string): Tool
 			},
 			describeResult(result, options, args) {
 				const details = result.details;
-				const display = !result.isError && object(details) && details.isError !== true &&
-					details.serverName === server && details.mcpToolName === operation && object(details.mcpMeta)
-					? readDisplay(details.mcpMeta.semctlDisplay, operation) : undefined;
-				if (!display || options.isPartial || options.cancelled) {
+				if (result.isError || !object(details) || details.isError === true || details.serverName !== server ||
+					details.mcpToolName !== operation || !object(details.mcpMeta) || options.isPartial || options.cancelled) {
 					return fallback.describeResult?.(result, options, args);
 				}
-				expanded = options.expanded;
-				if (view?.display !== display) {
-					view = new SemctlInspector(display, requestRender,
-						() => fallback.describeResult?.(result, options, args)?.body ?? [],
-						result.content.filter(block => block.type === "text").map(block => block.text ?? "").join("\n\n"), "header", "inline", () => expanded);
+				const display = readDisplay(details.mcpMeta.semctlDisplay, operation);
+				if (!display) return fallback.describeResult?.(result, options, args);
+				let state = states.get(details);
+				if (!state) { state = { result, options, args }; states.set(details, state); }
+				else { state.result = result; state.options = options; state.args = args; }
+				const current = state;
+				if (current.view?.display !== display) {
+					current.view = new SemctlInspector(display, requestRender,
+						() => fallback.describeResult?.(current.result, current.options, current.args)?.body ?? [],
+						result.content.filter(block => block.type === "text").map(block => block.text ?? "").join("\n\n"),
+						"header", "inline", () => current.options.expanded);
 				}
 				const count = display.kind === "search" ? display.hits.length :
 					display.kind === "batch" ? display.symbols.reduce((sum, s) => sum + s.hits.length, 0) : undefined;
@@ -441,22 +467,19 @@ export function createInspectorRenderer(server: string, operation: string): Tool
 						targetKind: display.kind === "source" || operation === "expand_chunk" ? "path" :
 							display.kind === "search" || operation === "search_symbols" ? "query" : "text",
 						meta: display.kind === "graph" ? [`${display.nodes.length} nodes`, `${display.edges.length} links`,
-							...(display.truncated ? ["partial"] : [])] : count === undefined ? undefined : [`${count} ${count === 1 ? "match" : "matches"}`] },
-					body: [view],
+							...(display.truncated ? ["partial"] : [])] : count === undefined ? undefined : [
+								`${!options.expanded && count > COMPACT_MATCHES ? `${COMPACT_MATCHES} of ` : ""}${count} ${count === 1 ? "match" : "matches"}`,
+							] },
+					body: [current.view],
 					inline: true,
-					preview: "none",
+					preview: "children",
 				};
 			},
 		};
 	};
 }
 
-/** Older hosts keep their normal MCP cards; never mount a replacement result widget. */
-export function installInspector(pi: ExtensionAPI): void {
-	if (typeof pi.registerToolRenderer !== "function") return;
-	for (const [server, prefix] of Object.entries(SERVERS)) {
-		for (const operation of Object.keys(OPERATIONS)) {
-			pi.registerToolRenderer(`${prefix}${operation}`, createInspectorRenderer(server, operation));
-		}
-	}
+/** Match raw MCP identities. Similar names from other servers never acquire semctl rendering. */
+export function supportsInspector(server: string, operation: string): boolean {
+	return SERVERS.has(server) && Object.hasOwn(OPERATIONS, operation);
 }

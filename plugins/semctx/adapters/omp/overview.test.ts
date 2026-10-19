@@ -1,10 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import * as path from "node:path";
 import type { ExecOptions, ExecResult, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import type { Component, DescribeContext, NativeNode, NativeUiEvent } from "@oh-my-pi/pi-tui";
+import type { Component, DescribeContext, NativeNode, NativeUiEvent, TUI } from "@oh-my-pi/pi-tui";
 import { readDisplay, SemctlInspector, type Display } from "./inspector";
 import { readStatusUpdate } from "./status";
 import { GRAPH_OPERATIONS, GraphRequest, createGraphOverview, graphArguments, type GraphOverviewDependencies } from "./overview";
+import { GraphAppearanceStore } from "./graph-appearance";
 
 const cwd = path.resolve("graph-overview-checkout");
 const native: DescribeContext = { cols: 88, dark: true, reduceMotion: false, supports: () => true, feature: () => false };
@@ -118,6 +119,50 @@ describe("read-only graph requests", () => {
 		expect(request.state.error).toBeUndefined();
 		expect(request.state.text).toBe("recovered");
 	});
+	test("retains the same graph through refresh failure but never reuses it for another request", async () => {
+		const host = pendingExecutor(), overview = GRAPH_OPERATIONS[0];
+		const request = new GraphRequest(host.exec, { ...deps, readDisplay }, () => {});
+		const initial = request.run(overview, [], cwd, () => cwd);
+		host.pending[0].response.resolve(result(JSON.stringify({ text: "Available structure", display: indexedOverview(2) })));
+		await initial;
+		const display = request.state.display;
+		expect(display?.kind).toBe("graph");
+		const opened = new GraphRequest(host.exec, { ...deps, readDisplay }, () => {}, request);
+		const refresh = opened.run(overview, [], cwd, () => cwd);
+		expect(opened.state.display).toBe(display);
+		host.pending[1].response.resolve(result("", { code: 1, stderr: "Graph layer is loading" }));
+		await refresh;
+		expect(opened.state.display).toBe(display);
+		expect(opened.state.text).toBe("Available structure");
+		expect(opened.state.error).toContain("Graph layer is loading");
+		const different = opened.run(projects, [], cwd, () => cwd);
+		expect(opened.state.display).toBeUndefined();
+		host.pending[2].response.resolve(result("", { code: 1, stderr: "Project graph unavailable" }));
+		await different;
+		expect(opened.state.display).toBeUndefined();
+	});
+	test("retained request caches never cross symbol arguments or checkout identities", async () => {
+		const host = pendingExecutor(), trace = GRAPH_OPERATIONS.find(operation => operation.id === "trace")!;
+		const request = new GraphRequest(host.exec, { ...deps, readDisplay }, () => {});
+		const first = request.run(trace, ["First"], cwd, () => cwd);
+		host.pending[0].response.resolve(result(JSON.stringify({ text: "First symbol graph", display: indexedOverview(2) })));
+		await first;
+		expect(request.state.display).toBeDefined();
+		const cached = new GraphRequest(host.exec, { ...deps, readDisplay }, () => {}, request);
+		const changedArgument = cached.run(trace, ["Second"], cwd, () => cwd);
+		expect(cached.state.display).toBeUndefined();
+		host.pending[1].response.resolve(result("", { code: 1, stderr: "Second symbol unavailable" }));
+		await changedArgument;
+		expect(cached.state.display).toBeUndefined();
+		expect(cached.state.text).not.toContain("First symbol graph");
+		const otherRoot = path.resolve("isolated-graph-checkout");
+		const changedRoot = request.run(trace, ["First"], otherRoot, () => otherRoot);
+		expect(request.state.display).toBeUndefined();
+		host.pending[2].response.resolve(result("", { code: 1, stderr: "Other checkout unavailable" }));
+		await changedRoot;
+		expect(request.state.display).toBeUndefined();
+		expect(request.state.text).not.toContain("First symbol graph");
+	});
 });
 
 type View = Omit<Component, "describe" | "handleInput" | "handleNativeEvent"> & { describe(cx: DescribeContext): NativeNode; handleInput(data: string): void; handleNativeEvent(event: NativeUiEvent): void };
@@ -125,11 +170,20 @@ function harness(extra: Partial<GraphOverviewDependencies> = {}) {
 	const host = pendingExecutor();
 	const views: View[] = [], answers: (string | undefined)[] = [], prompts: string[] = [], notifications: string[] = [];
 	let renders = 0;
+	let widget: Component | undefined;
+	const tui = { terminal: { rows: 24 }, requestRender: () => renders++ } as unknown as TUI;
 	const ctx = { cwd, hasUI: true, ui: {
 		custom(factory: (tui: unknown, theme: unknown, keys: unknown, done: (value: string | undefined) => void) => View) {
 			const pending = Promise.withResolvers<string | undefined>();
-			views.push(factory({ terminal: { rows: 24 }, hasModalOverlay: () => false, requestRender: () => renders++ }, {}, { matches: (data: string, action: string) => data === action }, pending.resolve));
+			views.push(factory(tui, {}, { matches: (data: string, action: string) => data === action }, pending.resolve));
 			return pending.promise;
+		},
+		setWidget(_key: string, factory: ((tui: TUI) => Component) | undefined) {
+			widget?.dispose?.();
+			widget = factory?.(tui);
+			const root = widget?.describe?.(native);
+			const content = root?.c?.find(child => !("k" in child) && child.handleNativeEvent);
+			if (content) views.push(content as View);
 		},
 		input: async (title: string) => { prompts.push(title); return answers.shift(); },
 		notify: (message: string) => notifications.push(message),
@@ -141,14 +195,16 @@ function harness(extra: Partial<GraphOverviewDependencies> = {}) {
 async function settle(): Promise<void> { await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); }
 function action(view: View, act: string): void { view.handleNativeEvent({ type: "action", key: "", act, mods: [] }); }
 
-describe("native fullscreen overview", () => {
+describe("native overview popup", () => {
 	test("defaults to complete indexed overview, shows configured CLI evidence and cancels immediately on Escape", async () => {
 		const h = harness(); const open = h.overview.open(h.ctx);
 		expect(h.pending[0].args).toEqual(["graph", "--json", "overview", "--"]);
-		expect(content(h.views[0].describe(native))).toContain("configured semctl CLI");
-		expect(content(h.views[0].describe(native))).toContain(cwd);
-		expect(nodes(h.views[0].describe(native)).some(n => n.k === "spinner")).toBe(true);
-		expect(nodes(h.views[0].describe({ ...native, reduceMotion: true })).some(n => n.k === "spinner")).toBe(false);
+		const body = h.views[0].describe(native), toolbar = nodes(body).find(node => node.key === "toolbar");
+		expect(toolbar && nodes(toolbar).some(node => node.p?.title?.includes(`configured semctl CLI · ${cwd}`))).toBe(true);
+		expect(content(body)).not.toContain(cwd);
+		expect(nodes(body).find(node => node.key === "activity")).toBeDefined();
+		expect(nodes(body).some(node => node.k === "spinner")).toBe(false);
+		expect(nodes(h.views[0].describe({ ...native, reduceMotion: true })).find(node => node.key === "activity")).toBeDefined();
 		h.views[0].handleInput("tui.select.cancel");
 		await open;
 		expect(h.pending[0].options?.signal?.aborted).toBe(true);
@@ -167,15 +223,95 @@ describe("native fullscreen overview", () => {
 		h.overview.reset(); await open;
 		expect(h.pending[1].options?.signal?.aborted).toBe(true);
 	});
-	test("all analysis families are selectable native items, not inert labels", async () => {
+	test("groups every analysis into a compact chooser and keeps the map request alive on Escape", async () => {
 		const h = harness(); const open = h.overview.open(h.ctx);
 		action(h.views[0], "analyses");
-		const items = nodes(h.views[0].describe(native)).filter(n => n.k === "item");
-		expect(items.map(n => n.key)).toEqual(GRAPH_OPERATIONS.map(op => op.id));
-		for (const family of ["overview", "projects", "trace", "call-graph", "call-path", "reaches", "flows-into", "flows-between", "type-hierarchy", "cycles", "duplicates", "unused", "imports", "symbol-edges", "external-links", "outline"]) expect(items.some(n => n.key === family)).toBe(true);
-		h.views[0].handleInput("tui.select.cancel"); // Close chooser, not the overview.
+		const initial = nodes(h.views[0].describe(native)).filter(node => node.k === "item");
+		expect(initial.map(node => node.key)).toEqual(["overview", "projects", "imports", "symbol-edges", "external-links"]);
+		const tabs = nodes(h.views[0].describe(native)).find(node => node.k === "tabs");
+		if (!tabs || tabs.k !== "tabs") throw new Error("Missing analysis tabs");
+		const reachable: string[] = [];
+		for (const group of tabs.p!.items) {
+			h.views[0].handleNativeEvent({ type: "select", key: "analysis-groups", item: group.id });
+			const items = nodes(h.views[0].describe(native)).filter(node => node.k === "item");
+			expect(items.length).toBeLessThanOrEqual(7);
+			reachable.push(...items.flatMap(node => node.key ? [node.key] : []));
+		}
+		expect(reachable.sort()).toEqual(GRAPH_OPERATIONS.map(operation => operation.id).sort());
+		h.views[0].handleInput("tui.select.cancel");
 		expect(h.pending[0].options?.signal?.aborted).toBe(false);
+		expect(nodes(h.views[0].describe(native)).some(node => node.key === "chooser")).toBe(false);
 		h.views[0].handleInput("tui.select.cancel"); await open;
+	});
+	test("keyboard group navigation runs the selected analysis and retains argument prompts", async () => {
+		const h = harness(); const open = h.overview.open(h.ctx);
+		h.answers.push("start", "finish");
+		h.views[0].handleInput("a");
+		h.views[0].handleInput("\x1b[C");
+		h.views[0].handleInput("\x1b[C");
+		expect(nodes(h.views[0].describe(native)).filter(node => node.k === "item").map(node => node.key)).toEqual(["call-graph", "call-path", "cycles"]);
+		h.views[0].handleInput("tui.select.down");
+		h.views[0].handleInput("tui.select.confirm");
+		await settle();
+		expect(h.prompts).toEqual(["Shortest call path · From symbol", "Shortest call path · To symbol"]);
+		expect(h.pending[1].args).toEqual(["graph", "--json", "call-path", "--", "start", "finish"]);
+		h.overview.reset(); await open;
+	});
+	test("appearance popup and refresh retain the existing inspector and selected node without extra requests", async () => {
+		const appearance = new GraphAppearanceStore(); let inspectors = 0;
+		const h = harness({ appearance, readDisplay, createInspector: (display, render, raw, presentation) => {
+			inspectors++;
+			return new SemctlInspector(display, render, undefined, raw, "body", presentation);
+		} });
+		const open = h.overview.open(h.ctx), display = indexedOverview(2);
+		h.pending[0].response.resolve(result(JSON.stringify({ text: "Complete original graph",
+			display: { ...display, nodes: display.nodes.map(node => ({ ...node, detail: `Selected file ${node.id}` })) } })));
+		await settle();
+		h.views[0].describe(native);
+		h.views[0].handleInput("tui.select.down");
+		expect(content(h.views[0].describe(native))).toContain("Selected file 0");
+		action(h.views[0], "info");
+		expect(content(h.views[0].describe(native))).not.toContain("Selected file 0");
+		h.views[0].handleInput("tui.select.down");
+		h.views[0].handleInput("tui.select.cancel");
+		expect(content(h.views[0].describe(native))).toContain("Selected file 0");
+		expect(h.pending).toHaveLength(1);
+		action(h.views[0], "appearance");
+		expect(h.views).toHaveLength(2);
+		action(h.views[1], "appearance:layout:radial");
+		action(h.views[1], "appearance:motion:off");
+		action(h.views[1], "appearance:color:neutral");
+		expect(appearance.state.value.layout).toBe("radial");
+		expect(content(h.views[0].describe(native))).toContain("Selected file 0");
+		expect(inspectors).toBe(1);
+		expect(h.pending).toHaveLength(1);
+		action(h.views[1], "close");
+		action(h.views[0], "refresh");
+		expect(content(h.views[0].describe(native))).toContain("Selected file 0");
+		h.pending[1].response.resolve(result("", { code: 1, stderr: "Refresh unavailable" }));
+		await settle();
+		const retained = h.views[0].describe(native);
+		expect(content(retained)).toContain("Selected file 0");
+		expect(nodes(retained).some(node => node.p?.title?.includes("Refresh unavailable"))).toBe(true);
+		expect(inspectors).toBe(1);
+		h.overview.reset(); await open;
+		const before = appearance.state.value;
+		action(h.views[1], "appearance:layout:layers");
+		expect(appearance.state.value).toBe(before);
+	});
+	test("provenance and original producer diagnostics stay out of the map until requested", async () => {
+		const h = harness({ readDisplay, readStatusUpdate: params => params && typeof params === "object" && "root" in params
+			? { root: String(params.root), indicator: { text: "Producer is ready", tone: "success", symbol: "status.success" }, details: "Raw producer job identity" } : undefined });
+		const open = h.overview.open(h.ctx);
+		h.pending[0].response.resolve(result(JSON.stringify({ text: "Complete original graph", display: indexedOverview(2) }))); await settle();
+		h.overview.observe({ server: "semctx", method: "notifications/semctl/sync_status", params: { root: cwd } }, h.ctx);
+		expect(content(h.views[0].describe(native))).not.toContain("Raw producer job identity");
+		expect(content(h.views[0].describe(native))).not.toContain("configured semctl CLI");
+		h.views[0].handleInput("i");
+		expect(content(h.views[0].describe(native))).toContain("configured semctl CLI");
+		h.views[0].handleNativeEvent({ type: "toggle", key: "producer", collapsed: false });
+		expect(content(h.views[0].describe(native))).toContain("Raw producer job identity");
+		h.overview.reset(); await open;
 	});
 	test("correlates only actual semctx requests and scoped producer snapshots; reduced motion never invents activity", async () => {
 		const h = harness({ readStatusUpdate: params => {
@@ -186,17 +322,18 @@ describe("native fullscreen overview", () => {
 		h.pending[0].response.resolve(result(JSON.stringify({ text: "Projects complete" })));
 		await settle();
 		h.overview.observe({ type: "tool_call", toolName: "mcp__other_trace", toolCallId: "not-semctx" }, h.ctx);
-		expect(content(h.views[0].describe(native))).not.toContain("Observed semctx requests");
+		expect(nodes(h.views[0].describe(native)).filter(node => node.p?.role === "semctl.live.traffic")).toEqual([]);
 		h.overview.observe({ type: "tool_call", toolName: "write", input: { path: "xd://mcp__semctx_call_graph" }, toolCallId: "call" }, h.ctx);
-		expect(content(h.views[0].describe(native))).toContain("Observed semctx requests: call_graph");
+		expect(nodes(h.views[0].describe(native)).some(node => node.p?.title?.includes("call_graph"))).toBe(true);
 		h.overview.observe({ type: "tool_result", toolCallId: "other" }, h.ctx);
-		expect(content(h.views[0].describe(native))).toContain("Observed semctx requests: call_graph");
+		expect(nodes(h.views[0].describe(native)).some(node => node.p?.title?.includes("call_graph"))).toBe(true);
 		h.overview.observe({ type: "tool_result", toolCallId: "call" }, h.ctx);
-		expect(content(h.views[0].describe(native))).not.toContain("Observed semctx requests");
+		expect(nodes(h.views[0].describe(native)).some(node => node.p?.title?.includes("call_graph"))).toBe(false);
 		h.overview.observe({ server: "semctx", method: "notifications/semctl/sync_status", params: { root: path.resolve("unrelated"), text: "private other checkout" } }, h.ctx);
 		expect(content(h.views[0].describe(native))).not.toContain("private other checkout");
 		h.overview.observe({ server: "semctx", method: "notifications/semctl/sync_status", params: { root: cwd, text: "7 files embedded, job running" } }, h.ctx);
-		expect(content(h.views[0].describe(native))).toContain("Last producer observation: 7 files embedded, job running");
+		expect(content(h.views[0].describe(native))).toContain("7 files embedded, job running");
+		expect(content(h.views[0].describe(native))).not.toContain("Last producer observation:");
 		expect(nodes(h.views[0].describe(native)).some(n => n.k === "spinner")).toBe(false);
 		expect(h.pending).toHaveLength(1);
 		h.overview.reset(); await open;
@@ -216,6 +353,10 @@ describe("native fullscreen overview", () => {
 	test("native errors stay visible and page scrolling and read-only refresh work", async () => {
 		const h = harness(); const open = h.overview.open(h.ctx);
 		h.pending[0].response.resolve(result("", { code: 1, stderr: "graph service unavailable" })); await settle();
+		const failed = h.views[0].describe(native);
+		expect(nodes(failed).some(node => node.p?.title?.includes("graph service unavailable"))).toBe(true);
+		expect(content(failed)).not.toContain("graph service unavailable");
+		action(h.views[0], "info");
 		expect(content(h.views[0].describe(native))).toContain("graph service unavailable");
 		h.views[0].handleInput("tui.select.pageDown");
 		expect(nodes(h.views[0].describe(native)).find(n => n.key === "body")?.scroll?.by).toBe("page-down");
@@ -231,7 +372,7 @@ describe("native fullscreen overview", () => {
 		const open = h.overview.open(h.ctx);
 		h.pending[0].response.resolve(result(JSON.stringify({ text: "Complete projects", display }))); await settle();
 		const highlighted = () => nodes(h.views[0].describe(native)).some(n =>
-			n.k === "text" && n.p?.spans?.some(span => span.t === "run" && span.s === "accent"));
+			n.p?.title?.startsWith("run\n") && n.p.title.includes("Active request target"));
 		h.overview.observe({ type: "tool_call", toolName: "mcp__semctx_trace", input: { symbol: "run" }, toolCallId: "unscoped" }, h.ctx);
 		expect(highlighted()).toBe(false);
 		h.overview.observe({ type: "tool_result", toolCallId: "unscoped" }, h.ctx);
@@ -264,6 +405,7 @@ describe("native fullscreen overview", () => {
 				expect(content(body)).not.toContain("diagnostic-job");
 			}
 		}
+		action(h.views[0], "info");
 		h.views[0].handleNativeEvent({ type: "toggle", key: "producer", collapsed: false });
 		expect(content(h.views[0].describe(native))).toContain("diagnostic-job");
 		h.overview.reset(); await open;
@@ -326,6 +468,84 @@ describe("native live graph popup", () => {
 		expect(h.pending).toHaveLength(1);
 		h.overview.reset();
 	});
+	test("reopening retries a failed startup read instead of caching the failure forever", async () => {
+		const h = harness({ readDisplay });
+		const startup = h.overview.warm(h.ctx);
+		h.pending[0].response.resolve(result("", { code: 1, stderr: "Graph layer is loading" }));
+		await startup;
+		await h.overview.togglePopup(h.ctx);
+		expect(h.pending).toHaveLength(2);
+		h.pending[1].response.resolve(result(JSON.stringify({ text: "Available files", display: indexedOverview(2) })));
+		await settle();
+		expect(content(h.views[0].describe(native))).toContain("2 files");
+		expect(content(h.views[0].describe(native))).not.toContain("Map refresh failed");
+		h.overview.reset();
+	});
+	test("embedding changes refresh an open map before completion and coalesce overlapping observations", async () => {
+		const h = harness({ readDisplay, readStatusUpdate });
+		await h.overview.togglePopup(h.ctx);
+		h.pending[0].response.resolve(result(JSON.stringify({ text: "Available files", display: indexedOverview(2) })));
+		await settle();
+		const status = { root: cwd, codebase_id: "A", running: false, pending_triggers: 0, last_error: null,
+			first_index: { embedding: { job_id: "current" } }, sync_progress: null, watcher: "active", last_job_id: "current",
+			embedding: { job_id: "current", state: "running", files_embedded: 0, files_to_embed: 2, files_failed: 0, error: null } };
+		const observe = (value: Record<string, unknown>) => h.overview.observe({
+			server: "semctx", method: "notifications/semctl/sync_status", params: { version: 1, status: value },
+		}, h.ctx);
+		observe(status);
+		expect(h.pending).toHaveLength(2);
+		expect(content(h.views[0].describe(native))).toContain("2 files");
+		observe({ ...status, running: true, sync_progress: { scanning: { root: cwd } } });
+		const failed = { ...status, embedding: { ...status.embedding, state: "failed", files_failed: 2 } };
+		observe(failed);
+		observe(failed);
+		expect(h.pending).toHaveLength(2);
+		h.pending[1].response.resolve(result(JSON.stringify({ text: "Previous structure", display: indexedOverview(2) })));
+		await settle();
+		expect(h.pending).toHaveLength(3);
+		h.pending[2].response.resolve(result(JSON.stringify({ text: "Updated structure", display: indexedOverview(3) })));
+		await settle();
+		expect(content(h.views[0].describe(native))).toContain("3 files");
+		observe(failed);
+		observe({ ...failed, root: path.resolve("another-checkout") });
+		expect(h.pending).toHaveLength(3);
+		h.overview.reset();
+	});
+	test("loading layers refresh only while the popup is open and stop after recovery or failure", async () => {
+		const scheduled: { callback: () => void; cancelled: boolean }[] = [];
+		const h = harness({ readDisplay, scheduleRefresh(callback) {
+			const timer = { callback, cancelled: false }; scheduled.push(timer);
+			return () => { timer.cancelled = true; };
+		} });
+		await h.overview.togglePopup(h.ctx);
+		const loading = { ...indexedOverview(2), loading: true, truncated: true };
+		h.pending[0].response.resolve(result(JSON.stringify({ text: "Links restoring", display: loading })));
+		await settle();
+		expect(content(h.views[0].describe(native))).toContain("2 files");
+		expect(scheduled).toHaveLength(1);
+		scheduled[0].callback();
+		expect(h.pending).toHaveLength(2);
+		h.pending[1].response.resolve(result(JSON.stringify({ text: "Links ready", display: indexedOverview(2) })));
+		await settle();
+		expect(scheduled).toHaveLength(1);
+		action(h.views[0], "refresh");
+		h.pending[2].response.resolve(result(JSON.stringify({ text: "Links restoring again", display: loading })));
+		await settle();
+		expect(scheduled).toHaveLength(2);
+		action(h.views[0], "close");
+		expect(scheduled[1].cancelled).toBe(true);
+		scheduled[1].callback();
+		expect(h.pending).toHaveLength(3);
+		await h.overview.togglePopup(h.ctx);
+		expect(scheduled).toHaveLength(3);
+		scheduled[2].callback();
+		h.pending[3].response.resolve(result("", { code: 1, stderr: "Permission denied" }));
+		await settle();
+		expect(scheduled).toHaveLength(3);
+		expect(content(h.views[1].describe(native))).toContain("2 files");
+		expect(nodes(h.views[1].describe(native)).some(node => node.p?.title?.includes("Permission denied"))).toBe(true);
+		h.overview.reset();
+	});
 });
 
 describe("native observation engine", () => {
@@ -361,7 +581,7 @@ describe("native observation engine", () => {
 		};
 		try {
 			expect(observe({ running: true, sync_progress: { uploading: { uploaded_files: 3, total_files: 3 } } })).toEqual([0.99]);
-			expect(observe({})).toEqual([]);
+			expect(observe({})).toEqual([null]);
 			expect(observe({ last_job_id: "new", embedding: { ...job, job_id: "new", state: "running", files_embedded: 0, files_to_embed: 5 } })).toEqual([0]);
 			expect(observe({ last_job_id: "new", embedding: { ...job, job_id: "new", files_embedded: 5, files_to_embed: 5 } })).toEqual([1]);
 		} finally { h.overview.reset(); }
@@ -387,6 +607,38 @@ describe("native observation engine", () => {
 		expect(h.pending[2].options?.signal?.aborted).toBe(true);
 		h.pending[0].response.resolve(result(JSON.stringify({ text: "late catalog" })));
 		await catalog;
+	});
+	test("appearance edits preserve the live selection without fetching and stop accepting input after reset", async () => {
+		const appearance = new GraphAppearanceStore();
+		const h = harness({ readDisplay, appearance, appearanceKey: (data, key) => data === key });
+		await h.overview.togglePopup(h.ctx);
+		const live = h.views[0];
+		h.pending[0].response.resolve(result(JSON.stringify({ text: "Available graph", display: indexedOverview(32) })));
+		await h.overview.warm(h.ctx);
+		live.handleNativeEvent({ type: "toggle", key: "groups", collapsed: false });
+		const group = nodes(live.describe(native)).find(node => node.p?.actions?.click?.startsWith("group:"));
+		if (!group?.p?.actions?.click) throw new Error("Missing selectable live graph group");
+		action(live, group.p.actions.click);
+		action(live, "appearance");
+		await settle();
+		const settings = h.views[1];
+		settings.handleInput("right");
+		await appearance.flush();
+		expect(appearance.state.value.layout).toBe("radial");
+		expect(h.pending).toHaveLength(1);
+		expect(nodes(live.describe(native)).some(node => node.p?.actions?.click === "clear-group")).toBe(true);
+		settings.handleInput("tui.select.cancel");
+		await settle();
+		expect(nodes(live.describe(native)).some(node => node.p?.actions?.click === "clear-group")).toBe(true);
+		action(live, "appearance");
+		await settle();
+		const reopened = h.views[2], before = appearance.state.value;
+		expect(reopened).toBeDefined();
+		h.overview.reset();
+		reopened.handleInput("right");
+		await appearance.flush();
+		expect(appearance.state.value).toBe(before);
+		expect(h.pending).toHaveLength(1);
 	});
 	test("unrelated events and repeated unchanged producer observations do not rerender or run graph work", async () => {
 		const h = harness({ readStatusUpdate: params => params && typeof params === "object" && "root" in params
@@ -492,17 +744,4 @@ describe("explicit local overview display budgets", () => {
 		expect(readDisplay({ ...directory, edges: [edge] }, "overview", true)).toBeUndefined();
 		expect(readDisplay(indexedOverview(2), "imports")).toBeDefined();
 	});
-});
-
-test("a legacy host cannot turn the live popup into a keyboard-blocking overlay", async () => {
-	const h = harness();
-	const legacy = { ...h.ctx, ui: { ...h.ctx.ui, custom: ((factory, ...args) => h.ctx.ui.custom((tui, ...rest) =>
-		factory(new Proxy(tui, { get: (target, key) => key === "hasModalOverlay" ? undefined : Reflect.get(target, key) }), ...rest), ...args)) as ExtensionContext["ui"]["custom"] } };
-	await h.overview.togglePopup(legacy);
-	expect(h.views).toHaveLength(0);
-	expect(h.pending).toHaveLength(0);
-	await h.overview.togglePopup(h.ctx);
-	expect(h.views).toHaveLength(1);
-	expect(h.pending).toHaveLength(1);
-	h.overview.reset();
 });

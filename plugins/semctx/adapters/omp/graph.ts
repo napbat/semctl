@@ -1,21 +1,26 @@
 import type { Component, DescribeContext, NativeNode, NativeUiEvent } from "@oh-my-pi/pi-tui";
-import { nativeConceptCue } from "./native-concepts";
+import { nativeGraphColorCue } from "./native-concepts";
 import type { Hit } from "./inspector";
-import { graphPreview } from "./graph-preview";
-import { conceptRevision, lookupConcept, subscribeConcepts } from "./concept-colors";
+import { graphNodeTitle, graphPreview } from "./graph-preview";
+import { conceptRevision, subscribeConcepts } from "./concept-colors";
+import { graphColorRevision, graphGroupColor, lookupGraphColor } from "./graph-colors";
 import { strengths } from "./graph-data/matches.js";
 import { matchScoreIndicator, matchVerificationIcon } from "./match-indicators";
 import { graphWindow, projectSummary, type GraphGroup, type ProjectSummary } from "./graph-projection";
+import { supportsElements } from "./native-elements";
+import { indexingSummary, indexingText, type GraphIndexing } from "./graph-indexing";
+import type { GraphAppearance } from "./graph-appearance";
 
 export interface GraphData {
 	kind: "graph";
 	title: string;
 	query: string | null;
-	nodes: { id: string; label: string; detail: string | null; hit: Hit | null; category?: "file" | "directory" | "project" | "group"; path?: string; project?: string }[];
+	nodes: { id: string; label: string; detail: string | null; hit: Hit | null; category?: "file" | "directory" | "project" | "group"; path?: string; project?: string; indexing?: GraphIndexing; indexingError?: string }[];
 	edges: { from: string; to: string; label: string; kind?: "containment" | "association" | "import" | "reference"; symbol?: string; moniker?: string }[];
 	roots: string[];
 	caveats: string[];
 	truncated: boolean;
+	loading?: boolean;
 }
 const object = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
 const clean = (s: string) => s.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
@@ -28,6 +33,7 @@ export function readGraph(value: Record<string, unknown>, validateHit: (v: unkno
 		!Array.isArray(value.nodes) || value.nodes.length > maxNodes || !Array.isArray(value.edges) || value.edges.length > maxEdges ||
 		!Array.isArray(value.roots) || value.roots.length > maxNodes || !Array.isArray(value.caveats) ||
 		!value.caveats.every(v => typeof v === "string") || typeof value.truncated !== "boolean") return false;
+	if (value.loading !== undefined && typeof value.loading !== "boolean") return false;
 	const ids = new Set<string>();
 	const files = new Set<string>();
 	for (const n of value.nodes) {
@@ -38,6 +44,9 @@ export function readGraph(value: Record<string, unknown>, validateHit: (v: unkno
 			(n.path !== "" && n.path.split("/").some(part => part === "" || part === "." || part === "..")))) return false;
 		if (n.project !== undefined && (typeof n.project !== "string" || n.project.length > 4096 || /[\\:\u0000-\u001f\u007f-\u009f]/.test(n.project) ||
 			(n.project !== "" && n.project.split("/").some(part => part === "" || part === "." || part === "..")))) return false;
+		if (n.indexing !== undefined && (typeof n.indexing !== "string" || !["pending", "processing", "ready", "failed", "unknown"].includes(n.indexing))) return false;
+		if (n.indexingError !== undefined && (n.indexing !== "failed" || typeof n.indexingError !== "string" || !n.indexingError.trim() ||
+			n.indexingError.length > 4096 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/.test(n.indexingError))) return false;
 		ids.add(n.id);
 		if (n.category === "file" && typeof n.path === "string" && n.path.length > 0) files.add(n.id);
 	}
@@ -87,6 +96,7 @@ export class GraphInspector implements Component {
 	private readonly relations: Map<string, GraphRelation[]>;
 	private shownNodes = 32;
 	private conceptCacheRevision = -1;
+	private colorCacheRevision = -1;
 	private conceptCacheDark: boolean | undefined;
 	private readonly conceptCues = new Map<string, NativeNode>();
 	private activity = new Set<string>();
@@ -99,6 +109,8 @@ export class GraphInspector implements Component {
 	private readonly nodeOrder: Map<string, number>;
 	private readonly aggregate: boolean;
 	private projection?: ProjectSummary;
+	private appearance?: Readonly<GraphAppearance>;
+	private projectionDetail?: GraphAppearance["detail"];
 	private scope?: GraphGroup;
 	private scopeDrawing?: GraphData;
 	private focusDrawing?: GraphData;
@@ -128,6 +140,13 @@ export class GraphInspector implements Component {
 		subscribeConcepts(this, owner => owner.requestRender());
 	}
 	invalidate(): void { this.quickCache = undefined; this.rowCache = undefined; this.previewComponent?.invalidate?.(); }
+	setAppearance(appearance: Readonly<GraphAppearance>): void {
+		if (this.appearance === appearance) return;
+		this.appearance = appearance;
+		this.conceptCues.clear(); this.groupCues.clear(); this.treeCache.clear();
+		this.quickCache = undefined; this.rowCache = undefined;
+		this.requestRender();
+	}
 	setActivity(targets: readonly string[]): void {
 		const next = new Set(targets.filter(target => target.length > 0));
 		if (next.size === this.activity.size && [...next].every(target => this.activity.has(target))) return;
@@ -143,7 +162,7 @@ export class GraphInspector implements Component {
 			.some(value => typeof value === "string" && this.activity.has(value));
 	}
 	private treeLabel(node: GraphData["nodes"][number], label: string, cx: DescribeContext): string | readonly { t: string; s: string; fx?: "pulse" }[] {
-		return this.active(node) ? [{ t: clean(label), s: "accent", fx: cx.reduceMotion ? undefined : "pulse" }] : clean(label);
+		return this.active(node) ? [{ t: clean(label), s: "success", fx: cx.reduceMotion ? undefined : "pulse" }] : clean(label);
 	}
 	private visibleNodes(): GraphData["nodes"] { return this.scope?.members ?? this.ordered; }
 	private clearSelection(): void {
@@ -167,7 +186,7 @@ export class GraphInspector implements Component {
 			for (const id of this.activeIds) { const group = this.projection.groupOf.get(id); if (group) active.add(group); }
 		}
 		return graphPreview(drawing, cx, { codebaseId: this.codebaseId, activeIds: active,
-			selected: this.selected, size: this.presentation === "overview" ? "overview" : "inline", nodeAction: this.diagramAction });
+			selected: this.selected, size: this.presentation === "overview" ? "overview" : "inline", nodeAction: this.diagramAction, appearance: this.appearance });
 	}
 	private groupControls(cx: DescribeContext): NativeNode[] {
 		if (!this.projection) return [];
@@ -175,20 +194,25 @@ export class GraphInspector implements Component {
 			text("Overview", { tone: "accent", actions: { click: "overview" }, aria: "Return to project overview" }),
 			text("›", { tone: "muted" }), text(this.scope.label, { grow: 1, truncate: "end", wrap: "none", title: this.scope.label }),
 			text(`${this.scope.members.length} nodes`, { tone: "muted" }),
+			...(indexingSummary(this.scope.indexing) ? [text(indexingSummary(this.scope.indexing)!, { tone: "muted" })] : []),
 		] }];
 		const rows: NativeNode[] = this.projection.allGroups.slice(0, this.shownGroups).map((group, index) => {
 			const active = this.activeIds.size > 0 && group.members.some(node => this.activeIds.has(node.id));
-			const concept = lookupConcept(this.codebaseId, group.path), action = `group:${index}`;
+			const action = `group:${index}`;
+			const preview = group.members.slice(0, 3).map(node => node.hit?.path ?? node.path ?? node.label), more = group.members.length - preview.length;
 			let cue = this.groupCues.get(group.id);
-			if (!cue && concept) {
-				cue = nativeConceptCue(concept, cx, undefined, `group-cue-${index}`);
+			if (!cue && supportsElements(cx) && cx.feature("styles")) {
+				const color = graphGroupColor(this.codebaseId, group.members, this.appearance?.color);
+				if (color) cue = nativeGraphColorCue(color, cx, undefined, `group-cue-${index}`);
 				if (cue) this.groupCues.set(group.id, cue);
 			}
 			return { k: "row", key: `group-${index}`, p: { gap: "sm", align: "center", actions: { click: action },
-				title: `${group.label}\n${group.members.length} indexed nodes · ${group.internal} internal links\n${group.members.slice(0, 8).map(node => node.path ?? node.label).join("\n")}`,
-				aria: `Explore ${clean(group.label)}` }, c: [...(cue ? [cue] : []),
-				{ k: "text", p: { grow: 1, wrap: "none", truncate: "end", spans: [{ t: clean(group.label), s: active ? "accent" : "",
+				title: clean([group.label, `${group.members.length} indexed nodes · ${group.internal} internal links`, indexingSummary(group.indexing),
+					...preview, ...(more ? [`+${more} more nodes`] : []), ...(active ? ["Active request target in group"] : []), "Select to explore group"].filter(Boolean).join("\n")),
+				aria: `Explore ${clean(group.label)}${active ? ", active request target" : ""}${indexingSummary(group.indexing) ? `, ${indexingSummary(group.indexing)}` : ""}` }, c: [...(cue ? [cue] : []),
+				{ k: "text", p: { grow: 1, wrap: "none", truncate: "end", spans: [{ t: clean(group.label), s: active ? "success" : "",
 					fx: active && !cx.reduceMotion ? "pulse" : undefined }] } }, text(`${group.members.length}`, { tone: "muted" }),
+				...(indexingSummary(group.indexing) ? [text(indexingSummary(group.indexing)!, { tone: group.indexing.failed ? "error" : "muted", wrap: "none", truncate: "end" })] : []),
 			] };
 		});
 		if (this.shownGroups < this.projection.allGroups.length) rows.push(text(`${this.projection.allGroups.length - this.shownGroups} more groups`, {
@@ -197,24 +221,25 @@ export class GraphInspector implements Component {
 		return [{ k: "col", key: "project-groups", p: { gap: "sm", max: { w: "100ch" } }, c: rows }];
 	}
 	private conceptCue(node: GraphData["nodes"][number], cx: DescribeContext): NativeNode | undefined {
-		if (!cx.supports("el") || cx.stylesheets !== true || !cx.feature("styles")) return undefined;
-		const concept = lookupConcept(node.hit?.codebaseId ?? this.codebaseId, node.hit?.path ?? node.path);
-		if (!concept) return undefined;
+		if (!supportsElements(cx) || !cx.feature("styles")) return undefined;
 		let cue = this.conceptCues.get(node.id);
 		if (!cue) {
-			cue = nativeConceptCue(concept, cx);
+			const color = lookupGraphColor(this.codebaseId, node, this.appearance?.color);
+			if (!color) return undefined;
+			cue = nativeGraphColorCue(color, cx);
 			if (!cue) return undefined;
 			this.conceptCues.set(node.id, cue);
 		}
 		return cue;
 	}
 	private nodeTitle(node: GraphData["nodes"][number]): string {
-		const concept = lookupConcept(node.hit?.codebaseId ?? this.codebaseId, node.hit?.path ?? node.path);
-		return clean([node.label, node.hit?.path ?? node.path, node.detail, concept ? `${concept.label} · ${concept.reason}` : null,
-			`${this.relations.get(node.id)!.length} incident relationships`].filter(Boolean).join("\n"));
+		const color = lookupGraphColor(this.codebaseId, node, this.appearance?.color);
+		return `${graphNodeTitle(node, color, this.active(node))}\n${this.relations.get(node.id)!.length} incident relationships · select for details`;
 	}
 	private nodeIndicators(node: GraphData["nodes"][number], index: number, cx: DescribeContext): NativeNode[] {
 		const cue = this.conceptCue(node, cx), result = cue ? [cue] : [];
+		if (node.indexing !== undefined) result.push(text(node.indexing, { tone: node.indexing === "failed" ? "error" : node.indexing === "processing" ? "accent" : "muted",
+			title: indexingText(node), aria: indexingText(node), shrink: 0 }));
 		if (node.hit) {
 			const rank = this.ranks.get(node.hit)!;
 			const score = matchScoreIndicator(node.hit, rank.index, rank.strength, cx, `node:${index}`);
@@ -326,16 +351,20 @@ export class GraphInspector implements Component {
 		return cx.supports("section") ? [{ k: "section", key, p: { head: clean(title), collapsible: true, collapsed: !this.expanded.has(key) }, c: children }] : children;
 	}
 	describe(cx: DescribeContext): NativeNode {
+		if (this.appearance?.motion === "off" && !cx.reduceMotion) cx = { ...cx, reduceMotion: true };
 		const d = this.data;
-		const revision = conceptRevision(), drawingSupported = cx.supports("el") && cx.stylesheets === true && cx.feature("styles"),
+		const revision = conceptRevision(), colorRevision = graphColorRevision(), drawingSupported = supportsElements(cx) && cx.feature("styles"),
 			mask = Number(drawingSupported) | (Number(cx.supports("meter")) << 1) | (Number(cx.supports("icon")) << 2) | (Number(cx.reduceMotion) << 3);
-		if (this.aggregate && this.conceptCacheRevision !== revision) {
-			this.projection = projectSummary(d, this.codebaseId);
-			this.scope = this.projection.allGroups.find(group => group.id === this.scope?.id) ?? this.projection.groups.find(group => group.id === this.scope?.id);
+		if (this.aggregate && (this.conceptCacheRevision !== revision || this.projectionDetail !== this.appearance?.detail)) {
+			this.projection = projectSummary(d, this.codebaseId, this.appearance?.detail);
+			this.projectionDetail = this.appearance?.detail;
+			// A display-only budget change must not replace the user's drilled-down membership.
+			this.scope = this.projection.allGroups.find(group => group.id === this.scope?.id) ??
+				this.projection.groups.find(group => group.id === this.scope?.id) ?? this.scope;
 			this.scopeDrawing = this.scope ? graphWindow(d, this.scope.members) : undefined;
 		}
-		if (this.conceptCacheRevision !== revision || this.conceptCacheDark !== cx.dark || this.indicatorMask !== mask) {
-			this.conceptCacheRevision = revision; this.conceptCacheDark = cx.dark; this.indicatorMask = mask;
+		if (this.conceptCacheRevision !== revision || this.colorCacheRevision !== colorRevision || this.conceptCacheDark !== cx.dark || this.indicatorMask !== mask) {
+			this.conceptCacheRevision = revision; this.colorCacheRevision = colorRevision; this.conceptCacheDark = cx.dark; this.indicatorMask = mask;
 			this.conceptCues.clear(); this.groupCues.clear(); this.treeCache.clear(); this.quickCache = undefined; this.rowCache = undefined;
 		}
 		const rootIds = new Set(d.roots), members = this.visibleNodes();
@@ -345,13 +374,14 @@ export class GraphInspector implements Component {
 				gap: "sm", mark: n.id === this.selected ? "pick" : undefined, actions: { click: `node:${i}` },
 				aria: `Inspect ${clean(n.label)}${rootIds.has(n.id) ? ", graph root" : ""}`, title: this.nodeTitle(n),
 			}, c: [...this.nodeIndicators(n, i, cx), text(rootIds.has(n.id) ? "◇" : "·", { tone: "muted", shrink: 0 }),
-				this.active(n) ? { k: "text", p: { spans: [{ t: clean(n.label), s: "accent", fx: cx.reduceMotion ? undefined : "pulse" }] } } : text(n.label, { grow: 1, truncate: "end", wrap: "none" })] };
+				this.active(n) ? { k: "text", p: { spans: [{ t: clean(n.label), s: "success", fx: cx.reduceMotion ? undefined : "pulse" }] } } : text(n.label, { grow: 1, truncate: "end", wrap: "none" })] };
 		});
 		const out: NativeNode[] = [], summary: NativeNode[] = [];
 		if (this.summary === "body") summary.push(text(`${d.nodes.length} nodes · ${d.edges.length} relationships`, {
 			tone: "muted", title: "Arrows show edge direction. Shared nodes and cycles remain links.",
 		}));
 		if (d.truncated) summary.push(text("Partial graph", { tone: "warning", title: "The graph is truncated. The original result retains all returned data." }));
+		if (d.loading) summary.push(text("Relationship layers loading", { tone: "muted", title: "Available nodes remain usable." }));
 		if (d.caveats.length) {
 			const title = clean(d.caveats.join("\n")), tone = d.truncated ? "warning" as const : "muted" as const;
 			summary.push(cx.supports("icon") ? { k: "icon", key: "graph-notes", p: { name: "info", tone, title, aria: title } }
@@ -363,7 +393,7 @@ export class GraphInspector implements Component {
 		const diagram = this.diagram(cx);
 		if (diagram) out.push(diagram);
 		else if (d.nodes.length) out.push(text("Native graph drawing unavailable · use node navigation below.", {
-			tone: "muted", title: "Graph drawing requires OMP and Tern with native elements and scoped stylesheets.",
+			tone: "muted", title: "Graph drawing requires Tern native elements and surface styles.",
 		}));
 		const drawing = this.focusDrawing ?? this.scopeDrawing ?? this.projection?.graph;
 		if (diagram && drawing) out.push(text(`${drawing.nodes.length} ${drawing === this.projection?.graph ? "group summaries" : "nodes"} · ${drawing.edges.length} routes drawn`, {
@@ -376,7 +406,7 @@ export class GraphInspector implements Component {
 				gap: "sm", max: { w: "28ch" }, mark: this.selected === node.id ? "pick" : undefined,
 				actions: { click: `node:${index}` }, title: this.nodeTitle(node), aria: `Inspect ${clean(node.label)}`,
 			}, c: [...this.nodeIndicators(node, index, cx), {
-				k: "text", p: { spans: [{ t: clean(node.hit?.symbol ?? node.label), s: this.selected === node.id || this.active(node) ? "accent" : "muted",
+				k: "text", p: { spans: [{ t: clean(node.hit?.symbol ?? node.label), s: this.active(node) ? "success" : this.selected === node.id ? "accent" : "muted",
 					fx: this.active(node) && !cx.reduceMotion ? "pulse" : undefined }], truncate: "end", wrap: "none" },
 			}] };
 		});
@@ -395,6 +425,7 @@ export class GraphInspector implements Component {
 				out.push(text(`${this.nodeById.get(e.from)!.label} → ${this.nodeById.get(e.to)!.label} · ${this.relation.label}`, { tone: "accent", title: e.moniker }));
 			}
 			if (selected.detail) out.push(text(selected.detail, { tone: "muted" }));
+			if (selected.indexing !== undefined) out.push(text(indexingText(selected)!, { tone: selected.indexing === "failed" ? "error" : "muted" }));
 			const relations = this.relations.get(selected.id)!, visible = relations.slice(0, this.shownRelations);
 			if (cx.supports("tree") && relations.length) out.push({ k: "tree", key: "relationships", p: { nodes: [{ id: "selected", label: `${relations.length} incident relationships`, open: true,
 				children: visible.map(r => ({ id: `edge-${r.index}`, label: this.treeLabel(r.node, `${r.direction === "outgoing" ? "→" : r.direction === "incoming" ? "←" : "↻"} ${r.label} · ${r.node.label}`, cx) })) }] } });
@@ -411,7 +442,7 @@ export class GraphInspector implements Component {
 	}
 	render(width: number): readonly string[] {
 		return [this.data.title, ...this.data.caveats, ...(this.data.truncated ? ["Graph preview truncated"] : []),
-			...this.ordered.map(n => `${n.id === this.selected ? ">" : "·"} ${n.label}`),
+			...this.ordered.map(n => `${n.id === this.selected ? ">" : "·"} ${n.label}${n.indexing ? ` · embedding ${n.indexing}` : ""}`),
 			...this.data.edges.map(e => `${this.nodeById.get(e.from)!.label} → ${this.nodeById.get(e.to)!.label} · ${edgeLabel(e)}`)]
 			.flatMap(s => clean(s).split(/\r?\n/)).map(s => s.slice(0, Math.max(0, width)));
 	}

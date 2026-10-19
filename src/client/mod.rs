@@ -92,6 +92,8 @@ pub struct Client {
     /// owner keeps, such as a coordinator, never does: see
     /// [`Self::with_deadline`].
     deadline: Option<Instant>,
+    /// Snapshot views use available layers without waiting for graph restores.
+    wait_for_loading: bool,
 }
 
 impl Client {
@@ -148,6 +150,7 @@ impl Client {
             capabilities: Arc::new(tokio::sync::OnceCell::new()),
             remote_permits,
             deadline: None,
+            wait_for_loading: true,
         }
     }
 
@@ -255,6 +258,14 @@ impl Client {
     /// Effective resource-server base URL. Contains no credentials.
     pub fn server_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// Read the currently available snapshot. Other retry and auth policy stays
+    /// unchanged; typed loading responses reach the caller without a wait.
+    pub(crate) fn available_snapshot(&self) -> Self {
+        let mut client = self.clone();
+        client.wait_for_loading = false;
+        client
     }
 
     /// The same client, authorized differently. Tests use it to build the two
@@ -575,12 +586,15 @@ async fn read_envelope<T: DeserializeOwned>(
         .text()
         .await
         .with_context(|| format!("{method} {url}: read body"))?;
+    if !status.is_success() {
+        return Err(envelope_failure(method, url, status, retry_after, &body));
+    }
     // Not the envelope: attribute it to whatever answered instead of blaming
     // the parser. See `gateway_error`.
     let Ok(envelope) = serde_json::from_str::<ApiEnvelope<T>>(&body) else {
-        return Err(gateway_error(method, url, status, retry_after, &body));
+        return Err(envelope_failure(method, url, status, retry_after, &body));
     };
-    if !status.is_success() || !envelope.success {
+    if !envelope.success {
         let errors = envelope.errors.as_deref().unwrap_or_default();
         return Err(ApiFailure::from_errors(method, url, status, retry_after, errors).into());
     }
@@ -596,6 +610,30 @@ struct ApiEnvelope<T> {
     data: Option<T>,
     #[serde(default)]
     errors: Option<Vec<serde_json::Value>>,
+}
+
+/// Failed responses use the common API envelope, even when the requested
+/// success shape is a page or its payload cannot deserialize as `T`.
+fn envelope_failure(
+    method: &str,
+    url: &str,
+    status: reqwest::StatusCode,
+    retry_after: Option<Duration>,
+    body: &str,
+) -> anyhow::Error {
+    if let Ok(envelope) = serde_json::from_str::<ApiEnvelope<serde::de::IgnoredAny>>(body)
+        && (!status.is_success() || !envelope.success)
+    {
+        return ApiFailure::from_errors(
+            method,
+            url,
+            status,
+            retry_after,
+            envelope.errors.as_deref().unwrap_or_default(),
+        )
+        .into();
+    }
+    gateway_error(method, url, status, retry_after, body)
 }
 
 /// Unwrap a flat paginated envelope (`PaginatedApiResponse<T>` —
@@ -614,10 +652,13 @@ async fn unwrap_page<T: DeserializeOwned>(
         .text()
         .await
         .with_context(|| format!("{method} {url}: read body"))?;
+    if !status.is_success() {
+        return Err(envelope_failure(method, url, status, retry_after, &body));
+    }
     let Ok(env) = serde_json::from_str::<PageEnvelope<T>>(&body) else {
-        return Err(gateway_error(method, url, status, retry_after, &body));
+        return Err(envelope_failure(method, url, status, retry_after, &body));
     };
-    if !status.is_success() || !env.success {
+    if !env.success {
         let errors = env.errors.as_deref().unwrap_or_default();
         return Err(ApiFailure::from_errors(method, url, status, retry_after, errors).into());
     }

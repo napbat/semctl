@@ -80,6 +80,8 @@ pub(super) struct Graph<'a> {
     pub(super) roots: Vec<String>,
     pub(super) caveats: Vec<String>,
     pub(super) truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) loading: Option<bool>,
     #[serde(skip)]
     invalid: bool,
 }
@@ -96,6 +98,10 @@ pub(super) struct Node<'a> {
     pub(super) path: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) project: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) indexing: Option<&'static str>,
+    #[serde(rename = "indexingError", skip_serializing_if = "Option::is_none")]
+    pub(super) indexing_error: Option<&'a str>,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -130,6 +136,7 @@ impl<'a> Graph<'a> {
             roots: Vec::new(),
             caveats: Vec::new(),
             truncated: false,
+            loading: None,
             invalid: false,
         }
     }
@@ -191,6 +198,8 @@ impl<'a> Graph<'a> {
             category: None,
             path: None,
             project: None,
+            indexing: None,
+            indexing_error: None,
         });
         true
     }

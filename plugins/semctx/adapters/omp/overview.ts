@@ -1,11 +1,15 @@
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import type { Component, DescribeContext, NativeNode, NativeScroll, NativeUiEvent } from "@oh-my-pi/pi-tui";
+import type { Component, DescribeContext, NativeNode, NativeUiEvent } from "@oh-my-pi/pi-tui";
 import type { StatusUpdate } from "./status";
 import type { Display } from "./inspector";
 import { GraphActivityTracker, type GraphActivity } from "./graph-activity";
 import { resetConcepts, setConceptSnapshot } from "./concept-colors";
 import { LiveGraphPopup, type LiveGraphState } from "./live-graph";
+import { NativeSurface } from "./native-surface";
+import { GraphAppearanceStore } from "./graph-appearance";
+import { GraphAppearancePanel, type GraphAppearanceKeyMatcher } from "./graph-appearance-panel";
+import { GraphPage } from "./graph-page";
 
 interface Operation { id: string; label: string; operation: string; fields: readonly string[] }
 export const GRAPH_OPERATIONS: readonly Operation[] = [
@@ -50,8 +54,6 @@ export function graphArguments(id: string, values: unknown): { operation: Operat
 	return { operation, args };
 }
 const object = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
-const clean = (s: string) => s.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
-const text = (s: string, p: Record<string, unknown> = {}): NativeNode => ({ k: "text", p: { text: clean(s), wrap: "word", ...p } });
 
 /** Match native Windows extended paths without accepting relative or control-bearing checkout identities. */
 export function graphRoot(value: string): string | undefined {
@@ -69,6 +71,9 @@ export interface GraphOverviewDependencies {
 	readDisplay(value: unknown, operation: string, localOverview?: boolean): Display | undefined;
 	createInspector(display: Display, requestRender: () => void, rawText: string, presentation?: "overview"): Component;
 	readStatusUpdate?(params: unknown, previous?: StatusUpdate): StatusUpdate | undefined;
+	scheduleRefresh?(callback: () => void, delay: number): () => void;
+	appearance?: GraphAppearanceStore;
+	appearanceKey?: GraphAppearanceKeyMatcher;
 }
 export interface GraphRequestState { loading: boolean; text: string; error?: string; display?: Display }
 
@@ -77,8 +82,14 @@ export class GraphRequest {
 	state: GraphRequestState = { loading: false, text: "" };
 	private controller: AbortController | undefined;
 	private generation = 0;
+	private requestKey: string | undefined;
 	constructor(private readonly exec: ExtensionAPI["exec"], private readonly dependencies: GraphOverviewDependencies,
-		private readonly changed: () => void) {}
+		private readonly changed: () => void, cached?: GraphRequest) {
+		if (cached?.state.display) {
+			this.state = { ...cached.state, loading: false };
+			this.requestKey = cached.requestKey;
+		}
+	}
 	cancel(): void {
 		this.generation++;
 		this.controller?.abort();
@@ -90,12 +101,18 @@ export class GraphRequest {
 		const root = graphRoot(cwd), generation = this.generation;
 		const controller = new AbortController();
 		this.controller = controller;
+		const previous = this.state;
+		let retained: GraphRequestState | undefined;
 		this.state = { loading: true, text: "" };
-		this.changed();
 		const current = () => !controller.signal.aborted && this.generation === generation && graphRoot(currentCwd()) === root;
 		try {
 			if (!root) throw new Error("Current checkout is not an absolute local path.");
 			({ operation, args } = graphArguments(operation.id, args));
+			const key = JSON.stringify([root, operation.id, args]);
+			if (key === this.requestKey && previous.display) retained = previous;
+			this.requestKey = key;
+			this.state = { loading: true, text: retained?.text ?? "", ...(retained?.display ? { display: retained.display } : {}) };
+			this.changed();
 			const result = await this.exec("semctl", ["graph", "--json", operation.id, "--", ...args], { cwd, signal: controller.signal, timeout: 60_000 });
 			if (!current()) return;
 			if (result.killed || result.code !== 0) throw new Error([result.stderr.trim(), result.stdout.trim()].filter(Boolean).join("\n") || `semctl exited with code ${result.code}${result.killed ? " (cancelled or timed out)" : ""}`);
@@ -114,7 +131,8 @@ export class GraphRequest {
 			}
 		} catch (error) {
 			if (!current()) return;
-			this.state = { loading: false, text: "", error: error instanceof Error ? error.message : String(error) };
+			this.state = { loading: false, text: retained?.text ?? "", ...(retained?.display ? { display: retained.display } : {}),
+				error: [error instanceof Error ? error.message : String(error), ...(retained ? ["Showing the last available graph for this request."] : [])].join("\n") };
 		} finally {
 			if (current()) { this.controller = undefined; this.changed(); }
 		}
@@ -123,17 +141,69 @@ export class GraphRequest {
 
 /** Native views share one request engine. Activity comes only from observed tool and producer events. */
 export function createGraphOverview(pi: ExtensionAPI, dependencies: GraphOverviewDependencies) {
+	const appearance = dependencies.appearance ?? new GraphAppearanceStore();
+	let closeAppearance: (() => void) | undefined;
+	const showAppearance = async (ctx: ExtensionContext): Promise<void> => {
+		if (closeAppearance || typeof ctx.ui.custom !== "function") return;
+		let ownedClose: (() => void) | undefined;
+		try {
+			await ctx.ui.custom<undefined>((tui, _theme, keys, done) => {
+				const surface = new NativeSurface(tui);
+				let panel: GraphAppearancePanel | undefined, disposed = false;
+				const dispose = () => {
+					if (disposed) return;
+					disposed = true; panel?.dispose(); surface.dispose();
+					if (closeAppearance === close) closeAppearance = undefined;
+				};
+				const close = () => { if (!disposed) { dispose(); done(undefined); } };
+				closeAppearance = close;
+				ownedClose = close;
+				panel = new GraphAppearancePanel(appearance, () => tui.requestRender(), close, (data, key) => {
+					if (key === "left" || key === "right") return dependencies.appearanceKey?.(data, key) ?? false;
+					const action = { up: "tui.select.up", down: "tui.select.down", enter: "tui.select.confirm", escape: "tui.select.cancel" } as const;
+					return keys.matches(data, action[key]);
+				});
+				const view = panel;
+				return {
+					nativeOverlay: view.nativeOverlay,
+					// Keep keyboard ownership without blurring the graph being adjusted.
+					nativeSheet: (cx: DescribeContext) => cx.supports("overlay"),
+					describe(cx: DescribeContext): NativeNode {
+						surface.prepare(cx);
+						const body = view.describe(cx);
+						return cx.supports("overlay") ? { k: "overlay", key: "appearance",
+							p: { ...view.nativeOverlay, modal: false, anchor: "center" }, c: [body] } : body;
+					},
+					render: (width: number) => view.render(width),
+					handleInput: (data: string) => view.handleInput(data),
+					handleNativeEvent: (event: NativeUiEvent) => view.handleNativeEvent(event),
+					dispose,
+				};
+			}, { overlay: true, overlayOptions: { width: 48, maxHeight: "85%" } });
+		} catch (error) {
+			ownedClose?.();
+			ctx.ui.notify?.(error instanceof Error ? error.message : "Graph appearance popup failed.", "error");
+		}
+	};
 	let generation = 0;
 	let live: { root: string; request: GraphRequest; render: (kind?: "state" | "activity") => void; close: () => void } | undefined;
 	let observedCwd: string | undefined;
 	let popupGeneration = 0;
 	let popup: { root: string; close(): void; render(kind: "state" | "activity"): void } | undefined;
 	let catalog: { root: string; request: GraphRequest; settled: boolean; queued: boolean; pending?: Promise<void>; last?: GraphRequestState } | undefined;
+	let cancelLoadingRefresh: (() => void) | undefined;
+	const stopLoadingRefresh = () => { cancelLoadingRefresh?.(); cancelLoadingRefresh = undefined; };
+	const scheduleRefresh = dependencies.scheduleRefresh ?? ((callback: () => void, delay: number) => {
+		const timer = setTimeout(callback, delay);
+		return () => clearTimeout(timer);
+	});
 	const renderActivity = () => { live?.render("activity"); popup?.render("activity"); };
 	const tracker = new GraphActivityTracker(graphRoot, dependencies.readDisplay, renderActivity);
 	const statuses = new Map<string, StatusUpdate>();
 	const reset = () => {
 		generation++;
+		closeAppearance?.();
+		stopLoadingRefresh();
 		popupGeneration++;
 		popup?.close(); popup = undefined;
 		catalog?.request.cancel(); catalog = undefined;
@@ -151,14 +221,25 @@ export function createGraphOverview(pi: ExtensionAPI, dependencies: GraphOvervie
 		return {
 			...tracker.snapshot(root, state.display),
 			producer: producer ? { text: producer.text.length <= 4096 ? producer.text.replace(/[\r\n\t]+/g, " ") : "Producer observation exceeds the interactive text limit.", tone: producer.tone,
-				details: details && details.length > 128 * 1024 ? "Producer details exceed the interactive text limit." : details,
+				symbol: producer.symbol, details: details && details.length > 128 * 1024 ? "Producer details exceed the interactive text limit." : details,
+				diagnostic: observation?.diagnostic,
 				progress: typeof producer.progress === "number" && Number.isFinite(producer.progress) ? Math.max(0, Math.min(1, producer.progress)) : undefined } : null,
 		};
+	};
+	const refreshLoadingLayers = (ctx: ExtensionContext, entry: NonNullable<typeof catalog>) => {
+		stopLoadingRefresh();
+		const state = entry.request.state;
+		if (!popup || popup.root !== entry.root || state.error || state.display?.kind !== "graph" || !state.display.loading) return;
+		cancelLoadingRefresh = scheduleRefresh(() => {
+			cancelLoadingRefresh = undefined;
+			if (catalog === entry && popup?.root === entry.root && graphRoot(ctx.cwd) === entry.root) void warm(ctx, true);
+		}, 10_000);
 	};
 	const warm = (ctx: ExtensionContext, refresh = false): Promise<void> => {
 		const root = graphRoot(ctx.cwd);
 		if (!ctx.hasUI || !root || typeof pi.exec !== "function" || (observedCwd !== undefined && observedCwd !== root)) return Promise.resolve();
 		if (catalog?.root !== root) {
+			stopLoadingRefresh();
 			catalog?.request.cancel();
 			const entry: NonNullable<typeof catalog> = {
 				root, settled: false, queued: false,
@@ -172,11 +253,16 @@ export function createGraphOverview(pi: ExtensionAPI, dependencies: GraphOvervie
 		}
 		const entry = catalog;
 		if (entry.pending) { entry.queued ||= refresh; return entry.pending; }
-		if (entry.settled && !refresh) return Promise.resolve();
+		if (entry.settled && !refresh && !entry.request.state.error) {
+			refreshLoadingLayers(ctx, entry);
+			return Promise.resolve();
+		}
+		stopLoadingRefresh();
 		entry.pending = entry.request.run(GRAPH_OPERATIONS[0], [], ctx.cwd, () => observedCwd ?? ctx.cwd).finally(() => {
 			if (catalog !== entry) return;
 			entry.pending = undefined; entry.settled = true;
 			if (entry.queued) { entry.queued = false; void warm(ctx, true); }
+			else refreshLoadingLayers(ctx, entry);
 		});
 		return entry.pending;
 	};
@@ -205,9 +291,11 @@ export function createGraphOverview(pi: ExtensionAPI, dependencies: GraphOvervie
 					const root = graphRoot(update.root);
 					if (root && within(root, observedCwd ?? "")) {
 						const key = `${event.server}\0${root}`, prior = statuses.get(key);
-						if (catalog && update.indicator?.tone === "success" && prior?.indicator?.tone !== "success") void warm(ctx, true);
+						const jobChanged = update.graphRevision !== undefined && update.graphRevision !== prior?.graphRevision;
+						if (catalog && (update.indicator?.tone === "success" && prior?.indicator?.tone !== "success" || popup && jobChanged)) void warm(ctx, true);
 						changed = prior?.indicator?.text !== update.indicator?.text || prior?.indicator?.tone !== update.indicator?.tone ||
-							prior?.indicator?.progress !== update.indicator?.progress || prior?.summary !== update.summary || prior?.details !== update.details;
+							prior?.indicator?.symbol !== update.indicator?.symbol || prior?.indicator?.progress !== update.indicator?.progress ||
+							prior?.summary !== update.summary || prior?.details !== update.details;
 						if (update.indicator) statuses.set(key, update); else statuses.delete(key);
 						if (statuses.size > 32) statuses.delete(statuses.keys().next().value!);
 					}
@@ -223,8 +311,8 @@ export function createGraphOverview(pi: ExtensionAPI, dependencies: GraphOvervie
 			if (!ctx.hasUI) return;
 			if (popup) { popup.close(); return; }
 			const root = graphRoot(ctx.cwd);
-			if (!root || typeof pi.exec !== "function" || typeof ctx.ui.custom !== "function") {
-				ctx.ui.notify?.("The live graph popup requires a local checkout, command execution, and custom UI support.", "info"); return;
+			if (!root || typeof pi.exec !== "function" || typeof ctx.ui.setWidget !== "function") {
+				ctx.ui.notify?.("The live graph popup requires a local checkout, command execution, and extension widgets.", "info"); return;
 			}
 			if (observedCwd !== undefined && observedCwd !== root) reset();
 			observedCwd = root;
@@ -234,32 +322,50 @@ export function createGraphOverview(pi: ExtensionAPI, dependencies: GraphOvervie
 				const entry = catalog?.root === root ? catalog : undefined;
 				const state = entry?.request.state ?? { loading: true, text: "" };
 				const request = state.display || !entry?.last ? state : { ...state, text: entry.last.text, display: entry.last.display };
-				return { request, activity: activity(root, request) };
+				return { request, activity: activity(root, request), appearance: appearance.state.value, appearanceError: appearance.state.error };
 			};
-			let view: LiveGraphPopup | undefined, complete: (() => void) | undefined;
-			const close = () => {
+			let view: LiveGraphPopup | undefined, surface: NativeSurface | undefined, closed = false;
+			let unsubscribeAppearance: (() => void) | undefined;
+			const dispose = () => {
+				if (closed) return;
+				closed = true;
+				unsubscribeAppearance?.();
 				view?.dispose();
-				if (owner === popupGeneration) { popup = undefined; popupGeneration++; if (!live) tracker.clearReceipts(); }
-				complete?.();
+				surface?.dispose();
+				if (owner === popupGeneration) { closeAppearance?.(); stopLoadingRefresh(); popup = undefined; popupGeneration++; if (!live) tracker.clearReceipts(); }
 			};
-			popup = { root, close, render: () => view?.update(snapshot()) };
+			const close = () => {
+				if (closed) return;
+				const ownsWidget = owner === popupGeneration;
+				dispose();
+				if (ownsWidget) ctx.ui.setWidget("semctl.live", undefined);
+			};
+			popup = { root, close, render: () => { if (!closed) view?.update(snapshot()); } };
+			unsubscribeAppearance = appearance.subscribe(() => { if (current() && !closed) view?.update(snapshot()); });
+			void appearance.load();
 			try {
-				void ctx.ui.custom<void>((tui, _theme, _keys, done) => {
-					if (typeof tui.hasModalOverlay !== "function") throw new Error("The live graph popup requires an OMP build with non-modal overlay support. Use /semctl graph for the overview.");
-					void warm(ctx);
-					complete = () => done(undefined);
+				ctx.ui.setWidget("semctl.live", tui => {
+					surface = new NativeSurface(tui);
 					view = new LiveGraphPopup(snapshot(), () => tui.requestRender(), {
 						close,
 						refresh: () => { if (current()) void warm(ctx, true); },
 						expand: () => { if (current()) void this.open(ctx); },
+						appearance: () => { if (current()) void showAppearance(ctx); },
 					});
-					if (!current()) close();
-					return view;
-				}, { overlay: true, overlayOptions: { nonModal: true, anchor: "top-center", width: 44 } }).catch(error => {
-					if (!current()) return;
-					close();
-					ctx.ui.notify?.(error instanceof Error ? error.message : "Live graph popup failed.", "error");
-				});
+					void warm(ctx);
+					if (!current()) dispose();
+					return {
+						render: width => closed ? [] : view!.render(width),
+						describe(cx) {
+							surface?.prepare(cx);
+							return { k: "overlay", key: "semctl-live", p: {
+								role: "omp.overlay.semctl-live", modal: false, size: "sm", anchor: "top", hidden: closed,
+								min: { w: 0 }, max: { w: "40ch" },
+							}, c: view ? [view] : [] };
+						},
+						dispose,
+					};
+				}, { placement: "aboveEditor" });
 			} catch (error) {
 				if (!current()) return;
 				close();
@@ -275,6 +381,7 @@ export function createGraphOverview(pi: ExtensionAPI, dependencies: GraphOvervie
 			}
 			const root = graphRoot(ctx.cwd);
 			if (!root) { notify("Graph overview requires an absolute local checkout path."); return; }
+			closeAppearance?.();
 			if (observedCwd !== undefined && observedCwd !== root) reset();
 			live?.request.cancel(); live?.close();
 			const owner = ++generation;
@@ -283,98 +390,47 @@ export function createGraphOverview(pi: ExtensionAPI, dependencies: GraphOvervie
 			while (owner === generation && graphRoot(ctx.cwd) === root) {
 				let currentRequest: GraphRequest | undefined;
 				const choice = await ctx.ui.custom<string | undefined>((tui, _theme, keys, done) => {
-					let menu = false, selectedMenu = GRAPH_OPERATIONS.indexOf(operation), scroll: NativeScroll = { by: "start", n: 0 }, offset = 0;
-					let inspector: Component | undefined, lastDisplay: Display | undefined;
-					const expanded = new Set<string>();
-					const request = new GraphRequest(pi.exec.bind(pi), dependencies, () => tui.requestRender());
+					const surface = new NativeSurface(tui);
+					let page: GraphPage | undefined, disposed = false;
+					const request = new GraphRequest(pi.exec.bind(pi), dependencies, () => tui.requestRender(),
+						operation.id === "overview" && catalog?.root === root ? catalog.request : undefined);
 					currentRequest = request;
-					const close = (next?: string) => {
+					const dispose = () => {
+						if (disposed) return;
+						disposed = true;
+						page?.dispose();
 						request.cancel();
+						surface.dispose();
+					};
+					const close = (next?: string) => {
+						closeAppearance?.();
+						dispose();
 						if (live?.request === request) live = undefined;
 						if (!popup) tracker.clearReceipts();
 						done(next);
 					};
+					page = new GraphPage({
+						operation, operations: GRAPH_OPERATIONS, cwd: ctx.cwd, state: () => request.state,
+						activity: () => activity(root, request.state), appearance, appearanceKey: dependencies.appearanceKey,
+						createInspector: dependencies.createInspector, requestRender: () => tui.requestRender(),
+						height: () => Math.max(1, tui.terminal.rows - 7),
+						matches: (data, key) => keys.matches(data, `tui.select.${key}`),
+						close, refresh: () => { void request.run(operation, args, ctx.cwd, () => observedCwd ?? ctx.cwd); },
+						showAppearance: () => { void showAppearance(ctx); },
+					});
+					const view = page;
 					live = { root, request, render: () => tui.requestRender(), close: () => close() };
 					void request.run(operation, args, ctx.cwd, () => observedCwd ?? ctx.cwd);
-					const currentActivity = () => activity(root, request.state);
-					const height = () => Math.max(1, tui.terminal.rows - 7);
-					const fallbackRows = (width: number) => {
-						const state = request.state;
-						return ["semctl graph · " + operation.label, ctx.cwd, ...(menu ? GRAPH_OPERATIONS.map((op, i) => `${i === selectedMenu ? ">" : " "} ${op.label}`) : []),
-							...(state.loading ? ["Reading configured semctl CLI…"] : []), ...(state.error ? [state.error] : []), ...clean(state.text).split(/\r?\n/)]
-							.flatMap(line => clean(line).split(/\r?\n/))
-							.flatMap(line => line.length ? Array.from({ length: Math.ceil(line.length / Math.max(1, width)) }, (_, i) => line.slice(i * width, (i + 1) * width)) : [""]);
-					};
 					return {
-						invalidate() { inspector?.invalidate?.(); },
-						render(width: number) { const rows = fallbackRows(width); offset = Math.max(0, Math.min(offset, rows.length - height())); return rows.slice(offset, offset + height()); },
-						describe(cx: DescribeContext): NativeNode {
-							const state = request.state;
-							if (state.display !== lastDisplay) { lastDisplay = state.display; inspector = state.display ? dependencies.createInspector(state.display, () => tui.requestRender(), state.text, "overview") : undefined; }
-							if (inspector && "setActivity" in inspector && typeof inspector.setActivity === "function") {
-								inspector.setActivity(currentActivity().targets);
-							}
-							const observed = currentActivity(), active = observed.operations, status = observed.producer;
-							const children: NativeNode[] = [
-								{ k: "row", p: { gap: "sm", wrap: true }, c: [text(`semctl graph · ${operation.label}`, { grow: 1 }),
-									text("Analyses", { actions: { click: "analyses" }, tone: "accent", aria: "Choose graph analysis" }),
-									text("Refresh", { actions: { click: "refresh" }, tone: "accent", aria: "Read graph again from CLI" }),
-									text("Close", { actions: { click: "close" }, aria: "Close graph overview" })] },
-								text(`Read-only · configured semctl CLI · ${ctx.cwd}`, { tone: "muted" }),
-							];
-							if (menu) children.push(cx.supports("list") ? { k: "list", key: "analyses", p: { selected: GRAPH_OPERATIONS[selectedMenu].id },
-								c: GRAPH_OPERATIONS.map(op => ({ k: "item", key: op.id, p: { label: op.label } })) } : { k: "col", c: GRAPH_OPERATIONS.map(op => text(op.label, { actions: { click: `choose:${op.id}` } })) });
-							if (state.loading || active.length) children.push({ k: "row", p: { gap: "sm" }, c: [
-								...(!cx.reduceMotion && cx.supports("spinner") ? [{ k: "spinner" as const }] : []),
-								text([...(state.loading ? [`Reading ${operation.label}…`] : []), ...(active.length ? [`Observed semctx requests: ${active.join(", ")}`] : [])].join(" · "), { tone: "accent" }),
-							] });
-							if (status) children.push({ k: "row", p: { gap: "sm", align: "center" }, c: [
-								text(`Last producer observation: ${status.text}`, { tone: status.tone, grow: 1, wrap: "none", truncate: "end", title: status.text }),
-								...(status.progress !== undefined && cx.supports("meter") ? [{ k: "meter" as const, p: { value: status.progress, style: "ring" as const, size: "sm" as const, tone: status.tone, aria: "Producer-reported progress" } }] : []),
-							] });
-							if (state.error) children.push(text(state.error, { tone: "error", aria: "Graph request error" }));
-							children.push({ k: "col", key: "body", scroll, c: inspector ? [inspector] : [text(state.text || (state.loading ? "Waiting for CLI result." : "No result text returned."))] });
-							if (inspector) children.push(cx.supports("section") ? { k: "section", key: "original", p: { head: "Original CLI result", collapsible: true, collapsed: !expanded.has("original") }, c: [text(state.text)] } : text(state.text));
-							if (status?.details) children.push(cx.supports("section") ? { k: "section", key: "producer", p: { head: "Producer details", collapsible: true, collapsed: !expanded.has("producer") }, c: [text(status.details)] } : text(status.details));
-							children.push(text("↑/↓ select nodes · PgUp/PgDn scroll · A analyses · R refresh · Esc close", { tone: "muted" }));
-							return { k: "col", p: { gap: "sm" }, c: children };
-						},
-						handleNativeEvent(event: NativeUiEvent) {
-							if (event.type === "toggle") {
-								const key = event.key.slice(event.key.lastIndexOf("/") + 1);
-								if (key === "original" || key === "producer") {
-									if (event.collapsed) expanded.delete(key); else expanded.add(key);
-									tui.requestRender();
-								} else inspector?.handleNativeEvent?.(event);
-							}
-							else if (event.type === "select" && menu) { const i = GRAPH_OPERATIONS.findIndex(op => op.id === event.item); if (i >= 0) { selectedMenu = i; tui.requestRender(); } }
-							else if (event.type === "activate" && menu && GRAPH_OPERATIONS.some(op => op.id === event.item)) close(event.item);
-							else if (event.type === "action") {
-								if (event.act === "close") close();
-								else if (event.act === "analyses") { menu = !menu; tui.requestRender(); }
-								else if (event.act === "refresh") void request.run(operation, args, ctx.cwd, () => observedCwd ?? ctx.cwd);
-								else if (event.act.startsWith("choose:") && GRAPH_OPERATIONS.some(op => op.id === event.act.slice(7))) close(event.act.slice(7));
-								else inspector?.handleNativeEvent?.(event);
-							}
-							else inspector?.handleNativeEvent?.(event);
-						},
-						handleInput(data: string) {
-							if (keys.matches(data, "tui.select.cancel")) { if (menu) { menu = false; tui.requestRender(); } else close(); return; }
-							if (data === "a" || data === "A") { menu = !menu; tui.requestRender(); return; }
-							if ((data === "r" || data === "R") && !menu) { void request.run(operation, args, ctx.cwd, () => observedCwd ?? ctx.cwd); return; }
-							if (menu && keys.matches(data, "tui.select.confirm")) { close(GRAPH_OPERATIONS[selectedMenu].id); return; }
-							if (keys.matches(data, "tui.select.up") || keys.matches(data, "tui.select.down")) {
-								const delta = keys.matches(data, "tui.select.up") ? -1 : 1;
-								if (menu) selectedMenu = Math.max(0, Math.min(GRAPH_OPERATIONS.length - 1, selectedMenu + delta));
-								else if (inspector && "move" in inspector && typeof inspector.move === "function") inspector.move(delta);
-								else { offset += delta; scroll = { by: delta > 0 ? "line-down" : "line-up", n: scroll.n + 1 }; }
-							} else if (keys.matches(data, "tui.select.pageUp") || keys.matches(data, "tui.select.pageDown")) {
-								const down = keys.matches(data, "tui.select.pageDown"); offset += down ? height() : -height(); scroll = { by: down ? "page-down" : "page-up", n: scroll.n + 1 };
-							} else return;
-							tui.requestRender();
-						},
+						nativeOverlay: view.nativeOverlay,
+						dispose,
+						invalidate: () => view.invalidate(),
+						render: (width: number) => view.render(width),
+						describe(cx: DescribeContext): NativeNode { surface.prepare(cx); return view.describe(cx); },
+						handleNativeEvent: (event: NativeUiEvent) => view.handleNativeEvent(event),
+						handleInput: (data: string) => view.handleInput(data),
 					};
-				}, { overlay: true, overlayOptions: { fullscreen: true } });
+				}, { overlay: true, overlayOptions: { width: "88%", maxHeight: "90%" } });
 				currentRequest?.cancel();
 				if (owner !== generation) return;
 				live = undefined;

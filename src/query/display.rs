@@ -14,7 +14,7 @@ use super::source::HitSource;
 mod graph;
 mod overview;
 pub(super) use graph::{GraphInput, project_graph};
-pub(super) use overview::project_overview;
+pub(super) use overview::{OverviewInput, project_overview};
 
 const MAX_DISPLAY_BYTES: usize = 32 * 1024;
 const MAX_DISPLAY_HITS: usize = 32;

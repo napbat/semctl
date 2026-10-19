@@ -64,6 +64,8 @@ fn add_node<'a>(
         category,
         path: Some(path),
         project: None,
+        indexing: None,
+        indexing_error: None,
     });
     Ok(index)
 }
@@ -167,6 +169,54 @@ fn project_catalog<'a>(
         }
     }
     Ok(Catalog { paths, files })
+}
+
+fn project_file_status<'a>(
+    graph: &mut Graph<'a>,
+    catalog: &mut Catalog<'a>,
+    files: &'a [api::CodebaseFile],
+) -> Result<(), ToolError> {
+    let mut seen = std::collections::HashSet::new();
+    for file in files {
+        let path = relative(&file.path, false)?;
+        if file.size < 0 || !seen.insert(path) {
+            return Err(invalid(
+                "Backend file catalog contains invalid sizes or duplicate paths.",
+            ));
+        }
+        let index = match catalog.paths.get(path) {
+            Some(&(_, true)) => {
+                return Err(invalid(
+                    "Backend file catalog identifies a directory as a file.",
+                ));
+            }
+            Some(&(index, false)) => index,
+            None => {
+                let label = path
+                    .rsplit('/')
+                    .next()
+                    .expect("validated relative paths have a name");
+                let index = add_node(graph, label, Some("file"), path, None)?;
+                catalog.paths.insert(path, (index, false));
+                catalog.files.push((path, index));
+                // The flat catalog proves the file identity, but not a missing
+                // tree snapshot's containment. Do not invent directory nodes.
+                graph.roots.push(graph.nodes[index].id.clone());
+                graph.truncated = true;
+                index
+            }
+        };
+        graph.nodes[index].indexing = file.status.as_ref().map(api::CatalogFileStatus::indexing);
+    }
+    if files.iter().any(|file| {
+        file.status
+            .as_ref()
+            .is_some_and(|status| matches!(status.indexing(), "pending" | "processing" | "failed"))
+    }) {
+        graph.truncated = true;
+        graph.caveats.push("Per-file catalog evidence reports pending, processing, or failed indexing. Available structural relationships remain visible; embedding completion is not required.".into());
+    }
+    Ok(())
 }
 
 fn project_build_units<'a>(
@@ -299,18 +349,23 @@ fn connect_imports(
     for import in imports {
         let from = relative(&import.from, false)?;
         let to = relative(&import.to, false)?;
-        let (Some(&(from, false)), Some(&(to, false))) =
-            (catalog.paths.get(from), catalog.paths.get(to))
-        else {
-            return Err(invalid(
-                "Resolved import endpoints are absent from the indexed file catalog or identify directories. Refresh the index before reopening the overview.",
-            ));
-        };
+        if [from, to]
+            .iter()
+            .any(|path| catalog.paths.get(path).is_some_and(|entry| entry.1))
+        {
+            return Err(invalid("Resolved import endpoints identify directories."));
+        }
         if import.import_path.len() > 4096 || import.import_path.chars().any(char::is_control) {
             return Err(invalid(
                 "Backend import metadata exceeds the local overview limit.",
             ));
         }
+        let (Some(&(from, false)), Some(&(to, false))) =
+            (catalog.paths.get(from), catalog.paths.get(to))
+        else {
+            graph.truncated = true;
+            continue;
+        };
         add_edge(
             graph,
             from,
@@ -334,13 +389,14 @@ fn connect_references(
     for reference in references {
         let from = relative(&reference.from_file, false)?;
         let to = relative(&reference.to_file, false)?;
-        let (Some(&(from, false)), Some(&(to, false))) =
-            (catalog.paths.get(from), catalog.paths.get(to))
-        else {
+        if [from, to]
+            .iter()
+            .any(|path| catalog.paths.get(path).is_some_and(|entry| entry.1))
+        {
             return Err(invalid(
-                "Resolved symbol-binding endpoints are absent from the indexed file catalog or identify directories. Refresh the index before reopening the overview.",
+                "Resolved symbol-binding endpoints identify directories.",
             ));
-        };
+        }
         if [&reference.name, &reference.moniker].iter().any(|value| {
             value.is_empty() || value.len() > 4096 || value.chars().any(char::is_control)
         }) {
@@ -348,6 +404,12 @@ fn connect_references(
                 "Backend symbol-binding evidence is empty, invalid, or exceeds the local overview metadata limit.",
             ));
         }
+        let (Some(&(from, false)), Some(&(to, false))) =
+            (catalog.paths.get(from), catalog.paths.get(to))
+        else {
+            graph.truncated = true;
+            continue;
+        };
         let edge = add_edge(graph, from, to, EdgeKind::Reference, "references".into())?;
         edge.symbol = Some(reference.name.clone());
         edge.moniker = Some(reference.moniker.clone());
@@ -355,25 +417,39 @@ fn connect_references(
     Ok(())
 }
 
+/// Available backend layers and their explicit incompleteness evidence.
+pub(in crate::query) struct OverviewInput<'a> {
+    pub tree: &'a [api::FileTreeNode],
+    pub projects: &'a api::ProjectGraph,
+    pub imports: &'a [api::ImportEdge],
+    pub imports_total: u32,
+    pub references: &'a [api::SymbolEdge],
+    pub references_total: u32,
+    pub files: &'a [api::CodebaseFile],
+    pub caveats: Vec<String>,
+    pub loading: bool,
+}
+
 /// Every catalog file is retained, even when it has no resolved imports or project.
 /// Hash lookups plus ancestor walks avoid a files × projects or nodes × edges scan.
 pub(in crate::query) fn project_overview(
     client: &Client,
-    tree: &[api::FileTreeNode],
-    projects: &api::ProjectGraph,
-    imports: &[api::ImportEdge],
-    total: u32,
-    references: &[api::SymbolEdge],
-    references_total: u32,
+    input: OverviewInput<'_>,
 ) -> Result<Value, ToolError> {
-    if imports.len() != total as usize {
+    let OverviewInput {
+        tree,
+        projects,
+        imports,
+        imports_total,
+        references,
+        references_total,
+        files,
+        caveats,
+        loading,
+    } = input;
+    if imports.len() > imports_total as usize || references.len() > references_total as usize {
         return Err(invalid(
-            "Resolved imports are incomplete or exceed the local overview limit. No partial overview was returned.",
-        ));
-    }
-    if references.len() != references_total as usize {
-        return Err(invalid(
-            "Resolved symbol bindings are incomplete or exceed the local overview limit. No partial overview was returned.",
+            "Backend overview relationship counts are inconsistent.",
         ));
     }
     if tree.len() > MAX_OVERVIEW_NODES
@@ -388,12 +464,25 @@ pub(in crate::query) fn project_overview(
         ));
     }
     let mut graph = Graph::new("Indexed project overview", None);
-    let catalog = project_catalog(&mut graph, tree)?;
+    graph.loading = loading.then_some(true);
+    graph.truncated = !caveats.is_empty()
+        || imports.len() != imports_total as usize
+        || references.len() != references_total as usize;
+    graph.caveats = caveats;
+    let mut catalog = project_catalog(&mut graph, tree)?;
+    project_file_status(&mut graph, &mut catalog, files)?;
     let project_roots = project_build_units(&mut graph, projects, &catalog)?;
     connect_project_files(&mut graph, &catalog.files, &project_roots)?;
+    let before_imports = graph.edges.len();
     connect_imports(&mut graph, &catalog, imports)?;
+    let import_count = graph.edges.len() - before_imports;
+    let before_references = graph.edges.len();
     connect_references(&mut graph, &catalog, references)?;
-    graph.caveats.push(format!("Complete indexed structure: {} files, {} directories, {} projects, {} groups, {} resolved file imports, {} resolved symbol bindings.", catalog.files.len(), catalog.paths.len() - catalog.files.len(), projects.projects.len(), projects.groups.len(), imports.len(), references.len()));
+    let reference_count = graph.edges.len() - before_references;
+    if graph.truncated {
+        graph.caveats.push("Partial indexed structure: indexing is incomplete or some structural data is unavailable. The specific caveats and reported relationship counts describe what is available. Only catalog-backed endpoints are connected; no missing links are inferred.".into());
+    }
+    graph.caveats.push(format!("Available indexed structure: {} files, {} directories, {} projects, {} groups, {import_count} of {imports_total} resolved file imports, {reference_count} of {references_total} resolved symbol bindings.", catalog.files.len(), catalog.paths.len() - catalog.files.len(), projects.projects.len(), projects.groups.len()));
     graph.caveats.push("Containment describes indexed paths. Project association uses nearest reported project roots, not compiler inclusion or verified semantic binding. Reference edges preserve backend-resolved symbol names and monikers; these and file imports provide structural evidence for inferred functional communities, not embedding similarity or every runtime relationship.".into());
     let display = Display {
         version: 1,

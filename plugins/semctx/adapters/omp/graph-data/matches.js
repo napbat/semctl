@@ -10,9 +10,9 @@ export const SCORE_WIDTH_PX = 40;
 export const SCORE_WIDTH_CH = 6;
 export const SCORE_HEIGHT_PX = 4;
 export function scoreTitle(score, strength, index) {
-	return `Rank ${index + 1} · Score ${score}\n${strength === null ? "Relative strength unavailable" : "Relative to this result's highest score"}; not confidence.`;
+	return `Rank ${index + 1} · Score ${score}\n${strength === null ? "Relative strength unavailable" : "Bar: relative to highest result score"} · not confidence.`;
 }
 const bindingLabels = { bound: "Source bytes verified", "changed-local": "Local changes", "range-mismatch": "Range mismatch", unverified: "Unverified source", "not-probed": "Source not checked" };
 export function verificationTitle(binding) {
-	return `${bindingLabels[binding.state] ?? binding.state}${binding.reason ? `: ${binding.reason}` : ""}\nBinding checks bytes and coordinates, not semantic symbol or focus identity.`;
+	return `${bindingLabels[binding.state] ?? binding.state}${binding.reason ? `\n${binding.reason}` : ""}${binding.state === "bound" ? "\nSymbol and focus identity not checked." : ""}`;
 }
