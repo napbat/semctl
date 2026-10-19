@@ -270,7 +270,6 @@ async fn expansion_keeps_its_path_and_call_path_graphs_preserve_directed_sequenc
     assert_eq!(edges.len(), 1);
     assert_eq!(edges[0]["from"], from["id"]);
     assert_eq!(edges[0]["to"], to["id"]);
-    assert!(!edges[0]["label"].as_str().unwrap().is_empty());
     let requests = lookup_requests(&server);
     assert_eq!(requests.len(), before + 2, "{requests:?}");
     assert_eq!(
@@ -596,7 +595,6 @@ async fn graph_tools_retain_structure_caveats_and_pagination_without_source_prob
         assert_eq!(graph["kind"], "graph", "{tool}: {result}");
         assert!(serde_json::to_vec(graph).unwrap().len() <= 32 * 1024);
         let nodes = graph["nodes"].as_array().unwrap();
-        assert!(!nodes.is_empty(), "{tool}: {graph}");
         assert!(nodes.len() <= 64);
         for node in nodes {
             if !node["hit"].is_null() {

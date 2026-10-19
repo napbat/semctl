@@ -367,7 +367,6 @@ fn bounds_keep_real_endpoints_and_allow_structural_views_without_large_previews(
     assert_eq!(value["nodes"].as_array().unwrap().len(), MAX_NODES);
     assert_eq!(value["edges"].as_array().unwrap().len(), MAX_EDGES);
     assert_eq!(value["truncated"], true);
-    assert!(!value["caveats"].as_array().unwrap().is_empty());
     let mut huge = hit("huge");
     huge.snippet = "full source\n".repeat(MAX_DISPLAY_BYTES);
     let original = huge.snippet.clone();

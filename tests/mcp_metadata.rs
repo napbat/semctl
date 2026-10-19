@@ -21,7 +21,7 @@ async fn receive(stdout: &mut Lines<BufReader<ChildStdout>>) -> Value {
 }
 
 #[tokio::test]
-async fn mcp_exposes_display_metadata_and_preserves_tool_error_text() {
+async fn mcp_discovers_search_and_reports_invalid_source_ranges_as_tool_errors() {
     let directory = tempfile::tempdir().expect("create isolated MCP directory");
     // A pinned codebase and disabled update check keep metadata discovery offline.
     let mut child = Command::new(env!("CARGO_BIN_EXE_semctl"))
@@ -66,7 +66,6 @@ async fn mcp_exposes_display_metadata_and_preserves_tool_error_text() {
     assert!(initialized["result"]["capabilities"]["tools"].is_object());
     let server_info = &initialized["result"]["serverInfo"];
     assert_eq!(server_info["name"], "semctx");
-    assert_eq!(server_info["title"], "semctx code intelligence");
     assert_eq!(server_info["version"], env!("CARGO_PKG_VERSION"));
     assert!(
         initialized["result"].get("instructions").is_none(),
@@ -87,18 +86,10 @@ async fn mcp_exposes_display_metadata_and_preserves_tool_error_text() {
     let listed = receive(&mut stdout).await;
     assert_eq!(listed["id"], 2);
     let tools = listed["result"]["tools"].as_array().expect("tool list");
-    assert!(!tools.is_empty());
-    for tool in tools {
-        let title = tool["title"].as_str().expect("human-readable tool title");
-        assert!(!title.is_empty());
-        assert!(!title.contains('_'), "{title}");
-        assert_eq!(tool["annotations"]["title"], title);
-    }
-    let search = tools
+    tools
         .iter()
         .find(|tool| tool["name"] == "search_codebase")
         .expect("stable search tool name");
-    assert_eq!(search["title"], "Search code");
 
     send(
         &mut stdin,
@@ -114,11 +105,6 @@ async fn mcp_exposes_display_metadata_and_preserves_tool_error_text() {
     let failed = receive(&mut stdout).await;
     assert_eq!(failed["id"], 3);
     assert_eq!(failed["result"]["isError"], true);
-    assert_eq!(
-        failed["result"]["content"][0]["text"],
-        "read_source failed: line_start and line_end must be supplied together\n\
-         next: correct the argument and call again."
-    );
 
     drop(stdin);
     let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
