@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { resolve } from "node:path";
 import type { DescribeContext, NativeNode } from "@oh-my-pi/pi-tui";
 import type { ToolRenderer, ToolRenderResult } from "@oh-my-pi/pi-tui/tools";
 import { SemctlInspector, createInspectorRenderer, readDisplay, snippetWindow, type Display, type Hit } from "./inspector";
@@ -14,7 +15,7 @@ function match(overrides: Partial<Hit> = {}): Hit {
 		codebaseId: "cb", binding: { state: "bound", reason: null }, ...overrides };
 }
 function search(rows: Hit[] = [match()], query = "find main"): Extract<Display, { kind: "search" }> {
-	return { version: 1, kind: "search", query, identity: { codebaseId: "cb", name: null, localRoot: "D:/repo", copy: "checkout" }, hits: rows, indexWarning: null };
+	return { version: 1, kind: "search", query, identity: { codebaseId: "cb", name: null, localRoot: resolve("/repo"), copy: "checkout" }, hits: rows, indexWarning: null };
 }
 const native: DescribeContext = { cols: 100, dark: true, reduceMotion: false, supports: () => true, feature: () => false };
 function nodes(root: NativeNode | null): NativeNode[] {
