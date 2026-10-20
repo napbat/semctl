@@ -31,15 +31,24 @@ struct CountingReconciler {
     runs: AtomicUsize,
     /// How many embedding-job polls this reconciler was asked for.
     polls: AtomicUsize,
+    active_polls: Arc<AtomicUsize>,
+    changed: AtomicBool,
     started: mpsc::UnboundedSender<()>,
     /// Each run takes one permit. A test that adds none holds the run open.
     release: Arc<Semaphore>,
-    /// Each job poll takes one permit, so a test can hold a first index open.
+    /// Each job poll takes one permit, so a test can hold embedding open.
     finish_polls: Arc<Semaphore>,
     /// The milestone each run publishes before it waits for its release.
     milestone: Option<SyncProgress>,
     /// How each run ends: `None` succeeds, and `Some` fails with the reason.
     failure: Option<String>,
+}
+
+struct ActivePoll(Arc<AtomicUsize>);
+impl Drop for ActivePoll {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl CountingReconciler {
@@ -60,6 +69,8 @@ impl CountingReconciler {
         let reconciler = Arc::new(Self {
             runs: AtomicUsize::new(0),
             polls: AtomicUsize::new(0),
+            active_polls: Arc::new(AtomicUsize::new(0)),
+            changed: AtomicBool::new(false),
             started,
             release: release.clone(),
             finish_polls: finish_polls.clone(),
@@ -124,7 +135,8 @@ impl Runs {
 
 impl Reconciler for CountingReconciler {
     fn reconcile(&self, run: super::ReconcileRun) -> Reconciled {
-        self.runs.fetch_add(1, Ordering::AcqRel);
+        let attempt = self.runs.fetch_add(1, Ordering::AcqRel) + 1;
+        let changed = self.changed.load(Ordering::Acquire);
         let _ = self.started.send(());
         let release = self.release.clone();
         let milestone = self.milestone.clone();
@@ -143,18 +155,30 @@ impl Reconciler for CountingReconciler {
             }
             Ok(SyncOutcome {
                 codebase_id: "codebase".to_string(),
-                job_id: "job".to_string(),
-                uploaded: 0,
+                job_id: if changed {
+                    format!("job-{attempt}")
+                } else {
+                    "job".to_string()
+                },
+                uploaded: usize::from(changed),
                 to_delete: 0,
                 failed: Vec::new(),
             })
         })
     }
 
-    fn await_job(&self, _client: Client, _job_id: String) -> super::JobAwaited {
+    fn await_job(
+        &self,
+        _client: Client,
+        _job_id: String,
+        _observer: super::JobObserver,
+    ) -> super::JobAwaited {
         self.polls.fetch_add(1, Ordering::AcqRel);
         let finish = self.finish_polls.clone();
+        self.active_polls.fetch_add(1, Ordering::AcqRel);
+        let active = ActivePoll(self.active_polls.clone());
         Box::pin(async move {
+            let _active = active;
             // Only a closed semaphore fails, and no test closes one.
             if let Ok(permit) = finish.acquire().await {
                 permit.forget();
@@ -379,11 +403,18 @@ fn uploading(uploaded_files: usize, total_files: usize) -> SyncProgress {
     }
 }
 
-/// Poll the coordinator's status until its sync progress is `expected`.
+/// Wait for a published progress change, without polling the coordinator.
 async fn wait_for_progress(coordinator: &CheckoutCoordinator, expected: Option<SyncProgress>) {
+    let mut changes = coordinator.subscribe_status();
     tokio::time::timeout(Duration::from_secs(5), async {
-        while coordinator.status().await.sync_progress != expected {
-            tokio::task::yield_now().await;
+        loop {
+            if coordinator.status().await.sync_progress == expected {
+                return;
+            }
+            changes
+                .changed()
+                .await
+                .expect("the coordinator owns its publisher");
         }
     })
     .await
@@ -412,6 +443,7 @@ async fn status_shows_the_running_reconciles_progress_until_it_ends() {
 
     runs.release(1);
     wait_for_progress(&coordinator, None).await;
+    assert!(!coordinator.status().await.running);
     assert!(
         coordinator
             .status()
@@ -427,26 +459,40 @@ async fn status_shows_the_running_reconciles_progress_until_it_ends() {
 async fn a_failed_reconcile_clears_its_progress() {
     let (reconciler, mut runs) = CountingReconciler::reporting(uploading(3, 10), Some("boom"));
     let (coordinator, task) = coordinator(reconciler).await;
+    coordinator
+        .record(
+            Trigger::Startup,
+            &Ok(SyncOutcome {
+                codebase_id: "codebase".into(),
+                job_id: "previous-success".into(),
+                uploaded: 1,
+                to_delete: 0,
+                failed: Vec::new(),
+            }),
+        )
+        .await;
     task.spawn();
 
     coordinator.trigger(Trigger::Explicit);
     runs.next_start().await;
     wait_for_progress(&coordinator, Some(uploading(3, 10))).await;
+    let mut changes = coordinator.subscribe_status();
+    let recording = coordinator.run.lock().await;
     runs.release(1);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), changes.changed())
+            .await
+            .is_err(),
+        "clearing progress must wait until this attempt's outcome is recorded",
+    );
+    drop(recording);
 
-    // The error is recorded after the progress is cleared, so the status that
-    // shows the error must show no progress.
-    let status = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let status = coordinator.status().await;
-            if status.last_error.is_some() {
-                return status;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("a failed run records its error");
+    // The first cleared milestone must already carry this attempt's error,
+    // even though the retained server job belongs to an earlier success.
+    wait_for_progress(&coordinator, None).await;
+    let status = coordinator.status().await;
+    assert!(!status.running);
+    assert_eq!(status.last_job_id.as_deref(), Some("previous-success"));
     assert_eq!(status.last_error.as_deref(), Some("boom"));
     assert_eq!(status.sync_progress, None);
 }
@@ -465,6 +511,7 @@ async fn a_cancelled_reconcile_clears_its_progress() {
     coordinator.cancel();
 
     wait_for_progress(&coordinator, None).await;
+    assert!(!coordinator.status().await.running);
 }
 
 /// The daemon status crosses the process boundary. A daemon that predates the
@@ -485,6 +532,7 @@ fn a_status_from_an_older_daemon_decodes_without_the_newer_fields() {
     assert_eq!(status.first_index, None);
     assert_eq!(status.sync_progress, None);
     assert_eq!(status.retry_after_secs, None);
+    assert_eq!(status.embedding, None);
 }
 
 #[test]
@@ -741,10 +789,10 @@ async fn private_scratch_events_are_never_relevant() {
 
 fn job(completed: bool, failed: i64, error: Option<&str>) -> api::JobStatus {
     api::JobStatus {
-        files_to_embed: 3,
-        files_to_delete: 0,
+        files_to_embed: Some(3),
+        files_to_delete: Some(0),
         files_embedded: if completed { 3 - failed } else { 1 },
-        files_deleted: 0,
+        files_deleted: Some(0),
         files_failed: failed,
         chunk_count: completed.then_some(12),
         error: error.map(str::to_string),
@@ -770,4 +818,114 @@ fn first_index_requires_terminal_success() {
             .expect_err("a job error must fail the gate")
             .contains("worker died")
     );
+}
+
+async fn wait_for_embedding(
+    coordinator: &CheckoutCoordinator,
+    job_id: &str,
+    state: super::embedding::EmbeddingState,
+) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if coordinator
+                .status()
+                .await
+                .embedding
+                .as_ref()
+                .is_some_and(|job| job.job_id == job_id && job.state == state)
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the current embedding job must reach the expected state");
+}
+
+async fn wait_for_active_polls(reconciler: &CountingReconciler, expected: usize) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while reconciler.active_polls.load(Ordering::Acquire) != expected {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("owned job observers must start or cancel");
+}
+
+#[tokio::test]
+async fn later_embedding_jobs_do_not_block_reconcile_and_superseded_polls_are_cancelled() {
+    use super::embedding::EmbeddingState;
+    let (reconciler, mut runs) = CountingReconciler::new();
+    reconciler.changed.store(true, Ordering::Release);
+    let (coordinator, task) = build(reconciler.clone(), None, Some(0)).await;
+    task.spawn();
+    coordinator.trigger(Trigger::Startup);
+    runs.next_start().await;
+    runs.release(1);
+    wait_for_embedding(&coordinator, "job-1", EmbeddingState::Queued).await;
+    wait_for_active_polls(&reconciler, 1).await;
+    runs.release_polls(1);
+    wait_for_embedding(&coordinator, "job-1", EmbeddingState::Completed).await;
+
+    coordinator.trigger(Trigger::Explicit);
+    runs.next_start().await;
+    assert!(coordinator.status().await.running);
+    runs.release(1);
+    wait_for_embedding(&coordinator, "job-2", EmbeddingState::Queued).await;
+    wait_for_active_polls(&reconciler, 1).await;
+    // The next local run remains responsive while job-2 is held open.
+    coordinator.trigger(Trigger::Explicit);
+    runs.next_start().await;
+    runs.release(1);
+    wait_for_embedding(&coordinator, "job-3", EmbeddingState::Queued).await;
+    wait_for_active_polls(&reconciler, 1).await;
+    assert_eq!(reconciler.polls(), 3);
+
+    drop(coordinator);
+    wait_for_active_polls(&reconciler, 0).await;
+}
+
+#[tokio::test]
+async fn the_historical_first_gate_cannot_complete_a_newer_meaningful_job() {
+    use super::embedding::EmbeddingState;
+    let (reconciler, mut runs) = CountingReconciler::new();
+    reconciler.changed.store(true, Ordering::Release);
+    let gate = Arc::new(InitialIndexGate::pending());
+    let (coordinator, task) = build(reconciler.clone(), Some(gate.clone()), Some(0)).await;
+    gate.register_codebase("codebase".to_string()).await;
+    task.spawn();
+    coordinator.trigger(Trigger::Startup);
+    runs.next_start().await;
+    runs.release(1);
+    wait_for_active_polls(&reconciler, 1).await;
+
+    coordinator.trigger(Trigger::Explicit);
+    runs.next_start().await;
+    runs.release(1);
+    wait_for_embedding(&coordinator, "job-2", EmbeddingState::Queued).await;
+    wait_for_active_polls(&reconciler, 2).await;
+    // Semaphore waiters are FIFO: the first gate's older job finishes first.
+    runs.release_polls(1);
+    wait_for_phase(&coordinator, FirstIndexPhase::Ready).await;
+    wait_for_embedding(&coordinator, "job-2", EmbeddingState::Queued).await;
+    runs.release_polls(1);
+    wait_for_embedding(&coordinator, "job-2", EmbeddingState::Completed).await;
+}
+
+#[tokio::test]
+async fn explicit_coordinator_cancellation_stops_the_current_job_observer() {
+    let (reconciler, mut runs) = CountingReconciler::new();
+    let (coordinator, task) = build(reconciler.clone(), None, Some(0)).await;
+    task.spawn();
+    coordinator.trigger(Trigger::Startup);
+    runs.next_start().await;
+    runs.release(1);
+    wait_for_active_polls(&reconciler, 1).await;
+    coordinator.cancel();
+    wait_for_active_polls(&reconciler, 0).await;
+    assert!(matches!(
+        coordinator.status().await.watcher,
+        super::WatcherState::Unavailable(_)
+    ));
 }

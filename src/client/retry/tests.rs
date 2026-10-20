@@ -86,6 +86,21 @@ fn only_gateway_statuses_are_retried() {
 }
 
 #[tokio::test]
+async fn available_snapshot_returns_typed_loading_without_changing_the_original_client() {
+    let stub = Stub::serve(vec![Reply::loading("5")]).await;
+    let original = client(&stub);
+    let snapshot = original.available_snapshot();
+    assert!(original.wait_for_loading);
+    assert!(!snapshot.wait_for_loading);
+    let error = tokio::time::timeout(Duration::from_secs(2), snapshot.get::<Probe>("/v1/probe"))
+        .await
+        .expect("snapshot reads do not wait for loading retries")
+        .unwrap_err();
+    assert!(failure(&error).is_loading());
+    assert_eq!(stub.requests(), 1);
+}
+
+#[tokio::test]
 async fn a_loading_answer_that_outlasts_the_deadline_returns_retryable_before_it() {
     let stub = Stub::serve(vec![Reply::loading("1")]).await;
     let client = within(client(&stub), 3.0);

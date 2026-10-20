@@ -8,33 +8,37 @@
 //! `/v1/codebases/{id}/…` paths from it. `search` / `list_domains` don't need
 //! a codebase.
 
-use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
-use std::path::Path;
 
 use crate::client::{Client, api};
 
 mod advanced;
+mod display;
 mod error;
 mod inspection;
+mod overview;
 mod render;
+mod source;
 
+pub use display::{QueryOutput, QueryPresentation};
 pub use error::{FailureKind, ToolError};
+pub use overview::overview;
 
 #[cfg(test)]
 use inspection::human_bytes;
-use inspection::{FILES_PAGE_MAX, fetch_files_page};
 pub use inspection::{
     batch_lookup, external_links, file_tree, imports, list_domains, list_files, list_projects,
     symbol_at_position, symbol_edges, sync_status,
 };
+pub(crate) use source::{HitSource, hit_sources};
 
 pub use advanced::*;
 
 pub use render::render_projects;
+pub(crate) use render::render_source_diagnostic;
 use render::{
-    HitContext, hit_location, local_path, render_boundaries, render_compact, render_hits,
-    render_hits_inner,
+    HitContext, hit_location, local_path, markdown_code, render_boundaries, render_compact,
+    render_hits, render_hits_inner, render_outline,
 };
 
 /// Map the user's `--prefer` value to the server's `SearchPreference` enum name
@@ -94,14 +98,15 @@ impl SearchOpts {
 
 /// Cross-domain search, scoped to the launched codebase when one is set. The
 /// server applies the kind filter, ranking bias, and symbol granularity; the
-/// client sends the options, annotates local staleness, and renders.
+/// client sends the options, checks source binding, and renders.
 pub async fn search(
     client: &Client,
     query: &str,
     top_k: u32,
     domains: &[String],
     opts: &SearchOpts,
-) -> Result<String, ToolError> {
+    presentation: QueryPresentation,
+) -> Result<QueryOutput, ToolError> {
     let scope = opts.normalized_scope()?;
     let body = api::SearchRequestBody {
         query,
@@ -129,25 +134,40 @@ pub async fn search(
         .post_read::<_, Vec<api::SearchHit>>("/v1/search", &body)
         .await
         .map_err(|e| ToolError::from_client("search_codebase", &e))?;
-    if hits.is_empty() {
-        return Ok("no results".to_string());
-    }
+    let hits = std::sync::Arc::new(hits);
 
-    // Staleness is the one shaping the client owns — only it has the local bytes.
+    // Only exact source bytes and coordinates can bind an indexed hit locally.
     let context = HitContext::search(
         client.local_root(),
         client.codebase_raw(),
         opts.scope.is_none() && opts.codebase_ids.is_empty() && client.codebase_raw().is_some(),
     );
-    let stale = stale_paths_in_context(client, &hits, context).await;
-    Ok(render_hits_inner(
+    if hits.is_empty() {
+        return Ok(QueryOutput::new(
+            format!("**Search** {}\n\nno results", markdown_code(query)),
+            if presentation == QueryPresentation::Inspector {
+                display::search(client, query, &hits, &[], context)
+            } else {
+                None
+            },
+        ));
+    }
+    let sources = source::hit_sources_in_context(client, &hits, context).await;
+    let mut text = format!("**Search** {}\n\n", markdown_code(query));
+    text.push_str(&render_hits_inner(
         &hits,
         "no results",
         context,
         true,
-        &stale,
+        &sources,
         opts.expand,
-    ))
+    ));
+    let display = if presentation == QueryPresentation::Inspector {
+        display::search(client, query, &hits, &sources, context)
+    } else {
+        None
+    };
+    Ok(QueryOutput::new(text, display))
 }
 
 fn normalize_scope(scope: &str) -> Option<&'static str> {
@@ -160,106 +180,6 @@ fn normalize_scope(scope: &str) -> Option<&'static str> {
     }
 }
 
-/// The set of hit paths whose local file no longer matches what the index
-/// holds — best-effort. Empty (no annotations) when there's no local checkout
-/// to compare against, or anything goes wrong: a missing staleness flag must
-/// never be mistaken for "fresh", but a spurious one is worse, so we only flag
-/// a genuine hash mismatch (or a file that's gone). Only the hits' own paths
-/// are hashed, not the whole tree.
-pub(crate) async fn stale_paths(client: &Client, hits: &[api::SearchHit]) -> HashSet<String> {
-    let context = HitContext::search(client.local_root(), client.codebase_raw(), true);
-    stale_paths_in_context(client, hits, context).await
-}
-
-async fn stale_paths_in_context(
-    client: &Client,
-    hits: &[api::SearchHit],
-    context: HitContext<'_>,
-) -> HashSet<String> {
-    let Some(root) = client.local_root() else {
-        // Server-pulled codebase with no local bytes — staleness is a
-        // local-edit concern, so there's nothing to compare.
-        return HashSet::new();
-    };
-    let paths: HashSet<String> = hits
-        .iter()
-        .filter(|hit| context.root_for(hit).is_some())
-        .filter_map(|hit| hit.path.clone())
-        .collect();
-    if paths.is_empty() {
-        return HashSet::new();
-    }
-    let Ok(catalog) = catalog_hashes(client).await else {
-        return HashSet::new();
-    };
-    let root = root.to_path_buf();
-    // Hashing local content can block on storage. A failed freshness check only
-    // omits annotations; it never authorizes an edit or changes indexed state.
-    tokio::task::spawn_blocking(move || {
-        let mut stale = HashSet::new();
-        for rel in paths {
-            // Only decide when the catalog has a recorded hash for this path; an
-            // unknown path (not yet catalogued) isn't flagged, to avoid noise.
-            let Some(Some(indexed)) = catalog.get(&rel) else {
-                continue;
-            };
-            let local = std::fs::canonicalize(root.join(&rel))
-                .ok()
-                .filter(|path| path.starts_with(&root))
-                .and_then(|path| local_blake3(&path));
-            if is_stale(indexed, local.as_deref()) {
-                stale.insert(rel);
-            }
-        }
-        stale
-    })
-    .await
-    .unwrap_or_default()
-}
-
-/// Whether a hit is stale: its `local` hash differs from the `indexed` one, or
-/// the local file is gone/unreadable (`None`) while the index still references
-/// it. A matching hash is fresh. Pure — the decision the staleness sweep makes.
-fn is_stale(indexed: &str, local: Option<&str>) -> bool {
-    match local {
-        Some(local) => local != indexed,
-        None => true,
-    }
-}
-
-/// The MCP server pages a normal repo's catalog in a single request; cap the
-/// walk so a pathological catalog can't turn one search into many round-trips.
-const STALENESS_MAX_PAGES: u32 = 5;
-
-/// Build a `codebase-relative path -> indexed content hash` map from the file
-/// catalog. Best-effort and bounded by [`STALENESS_MAX_PAGES`].
-async fn catalog_hashes(client: &Client) -> anyhow::Result<HashMap<String, Option<String>>> {
-    let cb = client.codebase()?;
-    let mut map = HashMap::new();
-    let mut page = 0u32;
-    loop {
-        let p = fetch_files_page(client, cb, page, FILES_PAGE_MAX).await?;
-        let total = p.total;
-        for f in p.items {
-            map.insert(f.path, f.content_hash);
-        }
-        page += 1;
-        if page * FILES_PAGE_MAX >= total || page >= STALENESS_MAX_PAGES {
-            break;
-        }
-    }
-    Ok(map)
-}
-
-/// Blake3 hex of a local file's UTF-8 content — matching exactly what the sync
-/// manifest hashes (see `crate::sync::sync_with_progress`), so the digest is
-/// comparable to the catalog's `content_hash`. `None` if the file can't be read
-/// as UTF-8.
-fn local_blake3(path: &Path) -> Option<String> {
-    let content = std::fs::read_to_string(path).ok()?;
-    Some(blake3::hash(content.as_bytes()).to_hex().to_string())
-}
-
 /// The codebase of `client`, or the `op` failure that says why none is bound.
 fn bound_codebase<'a>(client: &'a Client, op: &'static str) -> Result<&'a str, ToolError> {
     client
@@ -270,7 +190,12 @@ fn bound_codebase<'a>(client: &'a Client, op: &'static str) -> Result<&'a str, T
 /// One-shot symbol neighbourhood (#4): the definition of `symbol` plus its
 /// direct callers and callees. The server's `/graph/trace` endpoint composes and
 /// classifies the neighbourhood next to the graph; the client renders it.
-pub async fn trace(client: &Client, symbol: &str, depth: u32) -> Result<String, ToolError> {
+pub async fn trace(
+    client: &Client,
+    symbol: &str,
+    depth: u32,
+    presentation: QueryPresentation,
+) -> Result<QueryOutput, ToolError> {
     let cb = bound_codebase(client, "trace")?;
     let url = format!(
         "/v1/codebases/{cb}/graph/trace?symbol={}&depth={depth}",
@@ -281,22 +206,34 @@ pub async fn trace(client: &Client, symbol: &str, depth: u32) -> Result<String, 
         .await
         .map_err(|e| ToolError::from_client("trace", &e))?;
     if t.definition.is_empty() {
-        return Ok(near_miss(client, symbol, "definition").await);
+        return Ok(QueryOutput::new(
+            near_miss(client, symbol, "definition").await,
+            None,
+        ));
     }
     let root = client.local_root();
 
-    let mut out = format!("definition of `{symbol}`:\n");
+    let mut out = format!("## Definition of {}\n\n", markdown_code(symbol));
     out.push_str(&render_hits(&t.definition, "", root, false));
 
-    write!(out, "\ncallers ({}):\n", t.callers.len()).expect("writing to a String cannot fail");
+    write!(out, "\n## Callers ({})\n\n", t.callers.len()).expect("writing to a String cannot fail");
     out.push_str(&render_compact(&t.callers, "  (none)", root));
-    write!(out, "\ncallees ({}):\n", t.callees.len()).expect("writing to a String cannot fail");
+    write!(out, "\n## Callees ({})\n\n", t.callees.len()).expect("writing to a String cannot fail");
     out.push_str(&render_compact(&t.callees, "  (none)", root));
-    Ok(out)
+    Ok(graph_output(
+        client,
+        out,
+        display::GraphInput::Trace { symbol, result: &t },
+        presentation,
+    ))
 }
 
 /// Symbol-graph: definitions of `symbol` in the codebase.
-pub async fn find_definition(client: &Client, symbol: &str) -> Result<String, ToolError> {
+pub async fn find_definition(
+    client: &Client,
+    symbol: &str,
+    presentation: QueryPresentation,
+) -> Result<QueryOutput, ToolError> {
     let cb = bound_codebase(client, "find_definition")?;
     let path = format!(
         "/v1/codebases/{cb}/graph/definitions?symbol={}",
@@ -307,9 +244,12 @@ pub async fn find_definition(client: &Client, symbol: &str) -> Result<String, To
         .await
         .map_err(|e| ToolError::from_client("find_definition", &e))?;
     if hits.is_empty() {
-        return Ok(near_miss(client, symbol, "definition").await);
+        return Ok(QueryOutput::new(
+            near_miss(client, symbol, "definition").await,
+            None,
+        ));
     }
-    Ok(render_hits(&hits, "", client.local_root(), false))
+    Ok(lookup_output(client, symbol, &hits, "", presentation))
 }
 
 /// Symbol-graph: references to `symbol` in the codebase.
@@ -317,7 +257,8 @@ pub async fn find_references(
     client: &Client,
     symbol: &str,
     namespace: Option<&str>,
-) -> Result<String, ToolError> {
+    presentation: QueryPresentation,
+) -> Result<QueryOutput, ToolError> {
     let cb = bound_codebase(client, "find_references")?;
     let mut path = format!(
         "/v1/codebases/{cb}/graph/references?symbol={}",
@@ -332,14 +273,21 @@ pub async fn find_references(
         .await
         .map_err(|e| ToolError::from_client("find_references", &e))?;
     if hits.is_empty() {
-        return Ok(near_miss(client, symbol, "references").await);
+        return Ok(QueryOutput::new(
+            near_miss(client, symbol, "references").await,
+            None,
+        ));
     }
-    Ok(render_hits(&hits, "", client.local_root(), false))
+    Ok(lookup_output(client, symbol, &hits, "", presentation))
 }
 
 /// Graph: incoming callers of `symbol` — the definitions that call it (the
 /// inverse `calls` edge).
-pub async fn who_calls(client: &Client, symbol: &str) -> Result<String, ToolError> {
+pub async fn who_calls(
+    client: &Client,
+    symbol: &str,
+    presentation: QueryPresentation,
+) -> Result<QueryOutput, ToolError> {
     let cb = bound_codebase(client, "who_calls")?;
     let path = format!(
         "/v1/codebases/{cb}/graph/who-calls?symbol={}",
@@ -349,17 +297,22 @@ pub async fn who_calls(client: &Client, symbol: &str) -> Result<String, ToolErro
         .get::<Vec<api::SearchHit>>(&path)
         .await
         .map_err(|e| ToolError::from_client("who_calls", &e))?;
-    Ok(render_hits(
+    Ok(lookup_output(
+        client,
+        symbol,
         &hits,
         &format!("nothing calls `{symbol}`"),
-        client.local_root(),
-        false,
+        presentation,
     ))
 }
 
 /// Graph: the types implementing `symbol` (a trait/interface) — the reverse
 /// `implements` edge.
-pub async fn implementations_of(client: &Client, symbol: &str) -> Result<String, ToolError> {
+pub async fn implementations_of(
+    client: &Client,
+    symbol: &str,
+    presentation: QueryPresentation,
+) -> Result<QueryOutput, ToolError> {
     let cb = bound_codebase(client, "implementations_of")?;
     let path = format!(
         "/v1/codebases/{cb}/graph/implementations?symbol={}",
@@ -369,17 +322,23 @@ pub async fn implementations_of(client: &Client, symbol: &str) -> Result<String,
         .get::<Vec<api::SearchHit>>(&path)
         .await
         .map_err(|e| ToolError::from_client("implementations_of", &e))?;
-    Ok(render_hits(
+    Ok(lookup_output(
+        client,
+        symbol,
         &hits,
         &format!("no implementations of `{symbol}`"),
-        client.local_root(),
-        false,
+        presentation,
     ))
 }
 
 /// Graph: a shortest call chain from `from` to `to` — the chunks along one path
 /// of `calls` edges, in order.
-pub async fn call_path(client: &Client, from: &str, to: &str) -> Result<String, ToolError> {
+pub async fn call_path(
+    client: &Client,
+    from: &str,
+    to: &str,
+    presentation: QueryPresentation,
+) -> Result<QueryOutput, ToolError> {
     let cb = bound_codebase(client, "call_path")?;
     let path = format!(
         "/v1/codebases/{cb}/graph/call-path?from={}&to={}",
@@ -390,18 +349,32 @@ pub async fn call_path(client: &Client, from: &str, to: &str) -> Result<String, 
         .get::<Vec<api::SearchHit>>(&path)
         .await
         .map_err(|e| ToolError::from_client("call_path", &e))?;
-    Ok(render_hits(
+    let text = render_hits(
         &hits,
         &format!("no call path from `{from}` to `{to}`"),
         client.local_root(),
         false,
+    );
+    Ok(graph_output(
+        client,
+        text,
+        display::GraphInput::CallPath {
+            from,
+            to,
+            hits: &hits,
+        },
+        presentation,
     ))
 }
 
 /// Flow: the external boundaries a value entering from `from` flows out to
 /// (forward, inter-procedural value flow). Boundaries are the un-indexed callees
 /// the corpus crosses.
-pub async fn reaches(client: &Client, from: &str) -> Result<String, ToolError> {
+pub async fn reaches(
+    client: &Client,
+    from: &str,
+    presentation: QueryPresentation,
+) -> Result<QueryOutput, ToolError> {
     let cb = bound_codebase(client, "reaches")?;
     let path = format!(
         "/v1/codebases/{cb}/graph/flow/reaches?from={}",
@@ -411,30 +384,56 @@ pub async fn reaches(client: &Client, from: &str) -> Result<String, ToolError> {
         .get::<Vec<String>>(&path)
         .await
         .map_err(|e| ToolError::from_client("reaches", &e))?;
-    Ok(render_boundaries(
+    let text = render_boundaries(
         &boundaries,
         &format!("no boundary flow reached from `{from}`"),
+    );
+    Ok(graph_output(
+        client,
+        text,
+        display::GraphInput::Boundaries {
+            boundary: from,
+            targets: &boundaries,
+            incoming: false,
+        },
+        presentation,
     ))
 }
 
 /// Flow: the external boundaries whose entering value reaches `to` (backward,
 /// inter-procedural value flow) — the dual of [`reaches`].
-pub async fn flows_into(client: &Client, to: &str) -> Result<String, ToolError> {
+pub async fn flows_into(
+    client: &Client,
+    to: &str,
+    presentation: QueryPresentation,
+) -> Result<QueryOutput, ToolError> {
     let cb = bound_codebase(client, "flows_into")?;
     let path = format!("/v1/codebases/{cb}/graph/flow/into?to={}", urlencode(to));
     let boundaries = client
         .get::<Vec<String>>(&path)
         .await
         .map_err(|e| ToolError::from_client("flows_into", &e))?;
-    Ok(render_boundaries(
-        &boundaries,
-        &format!("nothing flows into `{to}`"),
+    let text = render_boundaries(&boundaries, &format!("nothing flows into `{to}`"));
+    Ok(graph_output(
+        client,
+        text,
+        display::GraphInput::Boundaries {
+            boundary: to,
+            targets: &boundaries,
+            incoming: true,
+        },
+        presentation,
     ))
 }
 
 /// Flow: the function chunks a value flows through from boundary `from` to
 /// boundary `to` — the inter-procedural flow witness.
-pub async fn flows_between(client: &Client, from: &str, to: &str) -> Result<String, ToolError> {
+pub async fn flows_between(
+    client: &Client,
+    from: &str,
+    to: &str,
+    presentation: QueryPresentation,
+) -> Result<QueryOutput, ToolError> {
     let cb = bound_codebase(client, "flows_between")?;
     let path = format!(
         "/v1/codebases/{cb}/graph/flow/between?from={}&to={}",
@@ -445,11 +444,21 @@ pub async fn flows_between(client: &Client, from: &str, to: &str) -> Result<Stri
         .get::<Vec<api::SearchHit>>(&path)
         .await
         .map_err(|e| ToolError::from_client("flows_between", &e))?;
-    Ok(render_hits(
+    let text = render_hits(
         &hits,
         &format!("no value flow from `{from}` to `{to}`"),
         client.local_root(),
         false,
+    );
+    Ok(graph_output(
+        client,
+        text,
+        display::GraphInput::FlowPath {
+            from,
+            to,
+            hits: &hits,
+        },
+        presentation,
     ))
 }
 
@@ -523,7 +532,8 @@ pub async fn file_outline(
     max_depth: Option<u32>,
     kinds: &[String],
     include_body: bool,
-) -> Result<String, ToolError> {
+    presentation: QueryPresentation,
+) -> Result<QueryOutput, ToolError> {
     let cb = bound_codebase(client, "file_outline")?;
     let mut url = format!(
         "/v1/codebases/{cb}/graph/outline?path={}&includeBody={include_body}",
@@ -539,34 +549,17 @@ pub async fn file_outline(
         .get::<api::FileOutline>(&url)
         .await
         .map_err(|e| ToolError::from_client("file_outline", &e))?;
-    if outline.entries.is_empty() {
-        return Ok(format!("{path} is indexed but has no chunks"));
-    }
-    let local = local_path(client.local_root(), &outline.path);
-    let mut out = format!("{local}\n");
-    for e in &outline.entries {
-        let sym = e
-            .qualified_symbol
-            .as_deref()
-            .or(e.symbol.as_deref())
-            .unwrap_or("-");
-        let symbol_kind = e.symbol_kind.as_deref().unwrap_or(&e.kind);
-        writeln!(
-            out,
-            "  {}{}-{}  {} {sym}",
-            "  ".repeat(e.depth as usize),
-            e.line_start,
-            e.line_end,
-            symbol_kind
-        )
-        .expect("writing to a String cannot fail");
-        if let Some(body) = &e.body {
-            for line in body.lines() {
-                writeln!(out, "      {line}").expect("writing to a String cannot fail");
-            }
-        }
-    }
-    Ok(out)
+    let text = if outline.entries.is_empty() {
+        format!("{} is indexed but has no chunks", markdown_code(path))
+    } else {
+        render_outline(&outline, client.local_root())
+    };
+    Ok(graph_output(
+        client,
+        text,
+        display::GraphInput::Outline(&outline),
+        presentation,
+    ))
 }
 
 /// Chunks overlapping an inclusive line range in a file — "grow context around
@@ -577,7 +570,8 @@ pub async fn expand_chunk(
     path: &str,
     line_start: u32,
     line_end: u32,
-) -> Result<String, ToolError> {
+    presentation: QueryPresentation,
+) -> Result<QueryOutput, ToolError> {
     let cb = bound_codebase(client, "expand_chunk")?;
     let url = format!(
         "/v1/codebases/{cb}/graph/expand?path={}&lineStart={line_start}&lineEnd={line_end}",
@@ -587,12 +581,43 @@ pub async fn expand_chunk(
         .get::<Vec<api::SearchHit>>(&url)
         .await
         .map_err(|e| ToolError::from_client("expand_chunk", &e))?;
-    Ok(render_hits(
+    Ok(lookup_output(
+        client,
+        path,
         &hits,
         &format!("no indexed chunks overlap {path}:{line_start}-{line_end}"),
-        client.local_root(),
-        false,
+        presentation,
     ))
+}
+
+fn lookup_output(
+    client: &Client,
+    symbol: &str,
+    hits: &[api::SearchHit],
+    empty: &str,
+    presentation: QueryPresentation,
+) -> QueryOutput {
+    let text = render_hits(hits, empty, client.local_root(), false);
+    let display = if presentation == QueryPresentation::Inspector {
+        display::lookup(client, symbol, hits)
+    } else {
+        None
+    };
+    QueryOutput::new(text, display)
+}
+
+fn graph_output(
+    client: &Client,
+    text: String,
+    input: display::GraphInput<'_>,
+    presentation: QueryPresentation,
+) -> QueryOutput {
+    let display = if presentation == QueryPresentation::Inspector {
+        display::project_graph(client, input)
+    } else {
+        None
+    };
+    QueryOutput::new(text, display)
 }
 
 /// On an exact symbol-lookup miss, suggest near matches by name so the caller
@@ -666,10 +691,7 @@ fn urlencode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        SearchOpts, bound_codebase, human_bytes, is_stale, local_blake3, normalize_prefer,
-        single_file_target,
-    };
+    use super::{SearchOpts, bound_codebase, human_bytes, normalize_prefer, single_file_target};
     use crate::client::{Client, api};
 
     fn at(path: &str) -> api::GrepMatch {
@@ -745,27 +767,5 @@ mod tests {
         assert_eq!(normalize_prefer("docs"), Some("Docs"));
         assert_eq!(normalize_prefer("doc"), Some("Docs"));
         assert_eq!(normalize_prefer("nonsense"), None);
-    }
-
-    #[test]
-    fn is_stale_decisions() {
-        assert!(!is_stale("abc", Some("abc")), "unchanged → fresh");
-        assert!(is_stale("abc", Some("xyz")), "different hash → stale");
-        assert!(is_stale("abc", None), "gone/unreadable → stale");
-    }
-
-    #[test]
-    fn local_blake3_matches_manifest_hashing() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("f.rs");
-        std::fs::write(&p, "fn main() {}\n").unwrap();
-
-        // Must equal exactly what `crate::sync::sync_with_progress` writes to
-        // the manifest.
-        let want = blake3::hash("fn main() {}\n".as_bytes())
-            .to_hex()
-            .to_string();
-        assert_eq!(local_blake3(&p).as_deref(), Some(want.as_str()));
-        assert!(local_blake3(&dir.path().join("missing.rs")).is_none());
     }
 }

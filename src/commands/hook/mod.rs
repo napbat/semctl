@@ -59,6 +59,15 @@ use scope::{SearchScope, search_scope};
 #[derive(Debug, Args)]
 pub struct HookArgs {}
 
+/// OMP reports the mounted MCP identity. Missing fields retain legacy behavior.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum OmpMcpTools {
+    Native,
+    Marketplace,
+    Unavailable,
+}
+
 /// The subset of the hook stdin payload we use. Every field defaults, so the
 /// varying event shapes never fail the parse.
 ///
@@ -75,10 +84,11 @@ struct HookInput {
     prompt: String,
     #[serde(default)]
     cwd: String,
-    // Host-specific adapter identity. Absent for Claude/Codex; OMP sends
-    // `"omp"` so guidance uses its marketplace-namespaced MCP tool names.
+    // Host-specific adapter identity. OMP also reports its live MCP namespace.
     #[serde(default)]
     host: String,
+    #[serde(default)]
+    omp_mcp_tools: Option<OmpMcpTools>,
     // PreToolUse: the tool being called and its arguments.
     #[serde(default, alias = "toolName")]
     tool_name: String,
@@ -118,9 +128,17 @@ impl HookInput {
         self.prompt_id.is_empty() && !self.turn_id.is_empty()
     }
 
+    fn has_semctx_tools(&self) -> bool {
+        !self.host.eq_ignore_ascii_case("omp")
+            || self.omp_mcp_tools != Some(OmpMcpTools::Unavailable)
+    }
+
     fn tool_name_style(&self) -> message::ToolNameStyle {
         if self.host.eq_ignore_ascii_case("omp") {
-            message::ToolNameStyle::OmpMarketplace
+            match self.omp_mcp_tools {
+                Some(OmpMcpTools::Native) => message::ToolNameStyle::OmpNative,
+                _ => message::ToolNameStyle::OmpMarketplace,
+            }
         } else if self.is_codex() {
             message::ToolNameStyle::CodexPlugin
         } else {
@@ -191,6 +209,9 @@ fn resets_segment(event: &str, source: &str) -> bool {
 /// prompts. Direct graph/tool requests and prompts that can rely on supplied
 /// context remain model-routed, avoiding a generic search before a precise call.
 async fn user_prompt_context(cli: &Cli, input: &HookInput) -> Option<String> {
+    if !input.has_semctx_tools() {
+        return None;
+    }
     let top_k = env_parse::<usize>("SEMCTX_HOOK_TOP_K").unwrap_or(5);
     if top_k == 0 {
         return None;
@@ -218,10 +239,11 @@ async fn user_prompt_context(cli: &Cli, input: &HookInput) -> Option<String> {
     };
     let search = async {
         let hits: Vec<api::SearchHit> = client.post("/v1/search", &body).await.ok()?;
-        let stale = crate::query::stale_paths(&client, &hits).await;
-        Some((hits, stale))
+        let hits = std::sync::Arc::new(hits);
+        let sources = crate::query::hit_sources(&client, &hits).await;
+        Some((hits, sources))
     };
-    let (hits, stale) =
+    let (hits, sources) =
         match tokio::time::timeout(Duration::from_secs(HOOK_SEARCH_TIMEOUT_SECS), search).await {
             Ok(Some(result)) => result,
             Ok(None) => {
@@ -234,9 +256,10 @@ async fn user_prompt_context(cli: &Cli, input: &HookInput) -> Option<String> {
             }
         };
     let min_score = env_parse::<f32>("SEMCTX_HOOK_MIN_SCORE");
-    let hits: Vec<&api::SearchHit> = hits
+    let hits: Vec<(&api::SearchHit, &crate::query::HitSource)> = hits
         .iter()
-        .filter(|h| min_score.is_none_or(|m| h.score >= f64::from(m)))
+        .zip(&sources)
+        .filter(|(h, _)| min_score.is_none_or(|m| h.score >= f64::from(m)))
         .take(top_k)
         .collect();
     if hits.is_empty() {
@@ -244,23 +267,21 @@ async fn user_prompt_context(cli: &Cli, input: &HookInput) -> Option<String> {
     }
 
     let mut out = String::from(
-        "semctl — candidate locations from the current index for this prompt. \
+        "semctl — candidate locations from indexed evidence for this prompt. \
          Use them when additional repository evidence is needed. Existing fresh \
          context may already support the task; read a known local path directly \
          when current working-tree bytes matter:\n",
     );
-    for h in hits {
+    for (h, source) in &hits {
         let loc = match (h.line_start, h.line_end) {
             (Some(s), Some(e)) => format!(":{s}-{e}"),
             (Some(s), None) => format!(":{s}"),
             _ => String::new(),
         };
         let path = h.path.as_deref().unwrap_or("(no path)");
-        let freshness = if stale.contains(path) {
-            "  ⚠ stale; read the local file"
-        } else {
-            ""
-        };
+        let freshness = source.warning().map_or_else(String::new, |warning| {
+            format!("  [source verification: {warning}]")
+        });
         let sym = h
             .symbol
             .as_deref()
@@ -273,6 +294,13 @@ async fn user_prompt_context(cli: &Cli, input: &HookInput) -> Option<String> {
             .unwrap_or_default();
         writeln!(out, "- {path}{loc}{sym}{lang}  ({:.3}){freshness}", h.score)
             .expect("writing to a String cannot fail");
+    }
+    for (h, source) in hits {
+        crate::query::render_source_diagnostic(
+            &mut out,
+            h.path.as_deref().unwrap_or("(no path)"),
+            source,
+        );
     }
     Some(out)
 }
@@ -397,6 +425,9 @@ async fn session_start_context(
     input: &HookInput,
     store: &state::Store,
 ) -> Option<String> {
+    if !input.has_semctx_tools() {
+        return None;
+    }
     let (orientation, update) = tokio::join!(
         session_orientation_context(cli, input),
         session_update_context(cli, input, store)
@@ -632,6 +663,9 @@ async fn pretooluse_nudge(cli: &Cli, input: &HookInput) -> (Option<String>, trac
         record_semctx_compliance(&input.session_id, turn);
         return (None, ToolOutcome::SemctxUse);
     }
+    if !input.has_semctx_tools() {
+        return (None, ToolOutcome::Unavailable);
+    }
 
     // Eligibility — local, no network. Non-search calls bail here cheaply.
     let Some(call) = sniffer::eligible_search(&input.tool_name, &input.tool_input) else {
@@ -712,11 +746,13 @@ async fn pretooluse_nudge(cli: &Cli, input: &HookInput) -> (Option<String>, trac
 const SEMCTX_CODEX_TOOL_PREFIX: &str = "mcp__semctx__";
 const SEMCTX_CLAUDE_PLUGIN_TOOL_PREFIX: &str = "mcp__plugin_semctx_semctx__";
 const SEMCTX_OMP_TOOL_PREFIX: &str = "mcp__semctx_semctx_";
+const SEMCTX_OMP_NATIVE_TOOL_PREFIX: &str = "mcp__semctx_";
 
 fn is_semctx_tool_name(tool_name: &str) -> bool {
     tool_name.starts_with(SEMCTX_CODEX_TOOL_PREFIX)
         || tool_name.starts_with(SEMCTX_CLAUDE_PLUGIN_TOOL_PREFIX)
         || tool_name.starts_with(SEMCTX_OMP_TOOL_PREFIX)
+        || tool_name.starts_with(SEMCTX_OMP_NATIVE_TOOL_PREFIX)
 }
 
 fn record_semctx_compliance(session_id: &str, prompt_id: &str) {

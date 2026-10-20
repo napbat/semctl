@@ -65,10 +65,61 @@ fn parses_omp_host_and_selects_marketplace_tool_names() {
     let input: HookInput = serde_json::from_str(raw).expect("OMP payload parses");
     assert_eq!(input.host, "omp");
     assert_eq!(input.turn_key(), "p1");
+    assert!(input.has_semctx_tools());
     assert_eq!(
         input.tool_name_style(),
         message::ToolNameStyle::OmpMarketplace
     );
+}
+
+#[test]
+fn omp_registry_selector_chooses_validated_tool_names() {
+    for (selector, expected) in [
+        ("native", message::ToolNameStyle::OmpNative),
+        ("marketplace", message::ToolNameStyle::OmpMarketplace),
+    ] {
+        let input: HookInput = serde_json::from_value(serde_json::json!({
+            "host": "omp",
+            "omp_mcp_tools": selector,
+        }))
+        .unwrap();
+        assert!(input.has_semctx_tools());
+        assert_eq!(input.tool_name_style(), expected);
+    }
+    assert!(
+        serde_json::from_value::<HookInput>(serde_json::json!({
+            "host": "omp",
+            "omp_mcp_tools": "mcp__injected_",
+        }))
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn omp_without_mounted_tools_suppresses_lifecycle_and_search_guidance() {
+    use clap::Parser;
+
+    let cli = Cli::parse_from(["semctl", "hook"]);
+    let input: HookInput = serde_json::from_value(serde_json::json!({
+        "host": "omp",
+        "omp_mcp_tools": "unavailable",
+        "hook_event_name": "SessionStart",
+        "session_id": "no-mounted-tools",
+        "prompt_id": "p1",
+        "prompt": "where does authentication happen",
+        "tool_name": "Grep",
+        "tool_input": {"pattern": "authentication"},
+    }))
+    .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let store = state::Store::with_dir(directory.path().to_path_buf());
+    assert!(!input.has_semctx_tools());
+    assert!(session_start_context(&cli, &input, &store).await.is_none());
+    assert!(user_prompt_context(&cli, &input).await.is_none());
+    let (context, outcome) = pretooluse_nudge(&cli, &input).await;
+    assert!(context.is_none());
+    assert_eq!(outcome, trace::ToolOutcome::Unavailable);
+    assert!(!store.load(&input.session_id).server_instructions_emitted);
 }
 
 #[test]
@@ -89,6 +140,7 @@ fn recognizes_each_hosts_semctx_tool_namespace() {
         "mcp__plugin_semctx_semctx__search_codebase"
     ));
     assert!(is_semctx_tool_name("mcp__semctx_semctx_find_definition"));
+    assert!(is_semctx_tool_name("mcp__semctx_find_definition"));
     assert!(!is_semctx_tool_name("Grep"));
     assert!(!is_semctx_tool_name("mcp__other__search_codebase"));
 }

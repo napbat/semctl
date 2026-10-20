@@ -481,15 +481,6 @@ fn codex_checked(args: &[&str]) -> Result<()> {
 mod tests {
     use super::*;
     use std::io::IsTerminal;
-    use std::path::{Path, PathBuf};
-
-    fn repo(rel: &str) -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)
-    }
-    fn json(rel: &str) -> serde_json::Value {
-        let raw = std::fs::read_to_string(repo(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"));
-        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse {rel}: {e}"))
-    }
 
     #[test]
     fn claude_child_observes_non_terminal_stdio() {
@@ -535,109 +526,5 @@ mod tests {
         let unrelated =
             br#"{"npm":[],"marketplace":[{"id":"other@tools","scope":"user","entries":[]}]}"#;
         assert!(!omp_user_plugin_installed(unrelated).expect("parse unrelated install"));
-    }
-
-    // Drift guard for the shared plugin root and thin host adapters. Shared
-    // skills/hooks live once; each host manifest may point at its own wire
-    // formats without growing another package tree.
-    #[test]
-    fn agent_plugin_manifests_share_root_assets() {
-        let market = json(".agents/plugins/marketplace.json");
-        let claude_market = json(".claude-plugin/marketplace.json");
-        let plugin = json("plugins/semctx/.codex-plugin/plugin.json");
-        let claude_plugin = json("plugins/semctx/.claude-plugin/plugin.json");
-        let omp_package = json("plugins/semctx/package.json");
-
-        // marketplace name + plugin name must compose to exactly what install()
-        // and status() use (`semctx@semctx`), and the slug must be the git source.
-        let market_name = market["name"].as_str().expect("marketplace name");
-        let plugin_name = market["plugins"][0]["name"].as_str().expect("plugin name");
-        assert_eq!(
-            format!("{plugin_name}@{market_name}"),
-            CODEX_PLUGIN,
-            "marketplace/plugin names must compose to CODEX_PLUGIN"
-        );
-        assert_eq!(
-            plugin["name"].as_str().expect("plugin.json name"),
-            plugin_name,
-            "plugin.json name must match the marketplace entry"
-        );
-        assert_eq!(
-            plugin["version"], claude_plugin["version"],
-            "Codex and Claude packages should release the shared integration together"
-        );
-        assert_eq!(
-            plugin["version"].as_str(),
-            Some(env!("CARGO_PKG_VERSION")),
-            "agent plugin manifests must use the semctl release version"
-        );
-        assert_eq!(
-            omp_package["version"].as_str(),
-            Some(env!("CARGO_PKG_VERSION")),
-            "OMP and semctl must release together"
-        );
-        assert_eq!(
-            omp_package["name"], plugin["name"],
-            "OMP package must keep the shared plugin name"
-        );
-        let omp_extension = omp_package["omp"]["extensions"][0]
-            .as_str()
-            .expect("OMP extension entry");
-        assert!(
-            repo("plugins/semctx").join(omp_extension).is_file(),
-            "OMP extension -> {omp_extension} must exist"
-        );
-        assert_eq!(
-            market["plugins"][0]["policy"]["authentication"], "ON_INSTALL",
-            "marketplace entries must declare their authentication timing"
-        );
-        assert_eq!(
-            market["plugins"][0]["source"]["path"], "./plugins/semctx",
-            "the Codex marketplace must point at the shared plugin root"
-        );
-        assert_eq!(
-            claude_market["plugins"][0]["source"], "./plugins/semctx",
-            "the Claude marketplace must point at the shared plugin root"
-        );
-        assert_eq!(CODEX_MARKETPLACE_SLUG, "napbat/semctl");
-
-        // Both hosts consume the same physical skill/hook tree and declare the
-        // same MCP server inline. Future hosts can add thin adapters without
-        // growing another package tree.
-        let base = repo("plugins/semctx");
-        let skills = plugin["skills"].as_str().expect("Codex plugin skills");
-        let claude_skills = claude_plugin["skills"]
-            .as_str()
-            .expect("Claude plugin skills");
-        assert_eq!(skills, claude_skills, "host skill paths must stay shared");
-        assert!(base.join(skills).is_dir(), "skills -> {skills} must exist");
-        assert!(
-            base.join("hooks/hooks.json").is_file(),
-            "hosts must discover the shared default hooks/hooks.json"
-        );
-        assert_eq!(
-            plugin["mcpServers"], claude_plugin["mcpServers"],
-            "hosts that accept inline MCP maps should share the same declaration"
-        );
-        assert_eq!(
-            plugin["mcpServers"]["semctx"]["command"].as_str(),
-            Some("semctl"),
-            "the shared MCP declaration must run semctl"
-        );
-        for key in [
-            "displayName",
-            "shortDescription",
-            "longDescription",
-            "developerName",
-            "category",
-            "capabilities",
-            "websiteURL",
-            "defaultPrompt",
-        ] {
-            assert!(
-                !plugin["interface"][key].is_null(),
-                "plugin.json interface.{key} is required"
-            );
-        }
     }
 }

@@ -50,10 +50,12 @@ after explicit opt-in. That first-ever index runs in the background:
 catalog, and graph tools never serve a partial index. They wait at most 5
 seconds, then fail with a "still running" error. Call `sync_status` every 60
 seconds to follow the first-index phase (registering, syncing, embedding,
-ready, or failed), and use local Read/Grep meanwhile. While the phase is
-syncing, the `current sync:` line shows how many files the upload has sent. If
-the phase is failed, call `index_codebase` for the same path to retry. Later
-re-syncs do not block use of the last complete index.
+ready, or failed), and use local Read/Grep meanwhile. Status reports the latest
+local scan/upload step when available, without a fixed line layout. Missing
+server counters are unknown; named reported counts are not a processed/total
+ratio. If the phase is failed, inspect and correct the reported cause, then call
+`index_codebase` for the same path to retry. Later re-syncs do not block use of
+the last complete index.
 
 ## Rules
 
@@ -93,12 +95,19 @@ re-syncs do not block use of the last complete index.
 - A tool fails → the error ends with a `next:` line. Follow it. Retry once only
   when it says the call is retryable. Otherwise use local Read/Grep for that
   request. Do not repeat the same failing call in a loop.
-- A hit flagged `⚠ stale (edited since indexed)`, or a freshness footer →
-  `Read` that file for current bytes. The MCP server auto-syncs edits
-  (filesystem watcher + periodic re-sync); do not tell the user to run
-  `semctx index` while a known local checkout is active. If only a codebase id
-  is known, pass its indexed local path as the codebase selector to activate
-  watching.
+- Source binding checks a local byte snapshot against the ready content-plane
+  full-file hash, then checks exact snippet bytes and supplied byte/line
+  coordinates in that snapshot. It does not verify semantic symbol/focus
+  identity or guarantee that the file stays unchanged. Changed local bytes,
+  mismatched ranges, and unavailable verification remain distinct. Native
+  diagnostics stay visible. Use host Read/Grep for current bytes and locations
+  when binding is not established; check `sync_status` for background work or
+  failures. Verification does not request a reindex. The MCP server auto-syncs
+  active checkouts through the filesystem watcher and periodic reconciliation;
+  do not tell the user to run `semctx index` while a known local checkout is
+  active. If only a codebase id is known, pass its indexed local path as the
+  codebase selector to activate watching. Inspect reported watcher and retry
+  state rather than assuming that a watcher is active or a failure is retryable.
 - A tool reports that semctl is not logged in → answer the immediate
   question with host tools, and end your reply with one line telling the user
   semctl is logged out and `semctl auth login` restores it (tools recover on

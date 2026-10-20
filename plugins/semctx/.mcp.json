@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "semctx": {
+      "type": "stdio",
+      "command": "semctl",
+      "args": ["mcp"]
+    }
+  }
+}

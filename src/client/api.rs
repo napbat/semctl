@@ -206,14 +206,15 @@ pub struct Page<T> {
     pub size: u32,
 }
 
-/// A `GET /v1/codebases/{id}/files` row — the catalog's per-file record.
-/// (`status` is an enum the server serializes as a number, so it's left off
-/// here; path + size are all the listing needs.)
+/// One `GET /v1/codebases/{id}/files` catalog row.
+/// Deployed servers report named statuses; older servers may send numeric enums.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodebaseFile {
     pub path: String,
     pub size: i64,
+    #[serde(default)]
+    pub status: Option<CatalogFileStatus>,
     /// Blake3 hex of the file's indexed content — the same hash the sync
     /// manifest sends (see [`ManifestEntry::hash`]). Compared against a
     /// freshly-hashed local file to flag results that lag a local edit.
@@ -223,6 +224,30 @@ pub struct CodebaseFile {
     /// (the staleness check keys on `content_hash`).
     #[serde(default)]
     pub embedded_at: Option<String>,
+}
+
+/// Per-file catalog evidence. Unknown names and undocumented numeric values are
+/// retained as unknown, never inferred from an aggregate sync job.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum CatalogFileStatus {
+    Name(String),
+    Number(i64),
+}
+
+impl CatalogFileStatus {
+    pub(crate) fn indexing(&self) -> &'static str {
+        // Verified against the deployed catalog API, not enum ordinals.
+        match self {
+            Self::Name(name) => match name.as_str() {
+                "Pending" => "pending",
+                "Embedded" => "ready",
+                "Failed" => "failed",
+                _ => "unknown",
+            },
+            Self::Number(_) => "unknown",
+        }
+    }
 }
 
 /// `GET /v1/codebases/{id}/graph/trace` — a symbol's definition plus its
@@ -698,13 +723,14 @@ pub struct SyncContentRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JobStatus {
+    /// The server may omit plan/deletion counters. Absence is unknown, not zero.
     #[serde(default)]
-    pub files_to_embed: i64,
+    pub files_to_embed: Option<i64>,
     #[serde(default)]
-    pub files_to_delete: i64,
+    pub files_to_delete: Option<i64>,
     pub files_embedded: i64,
     #[serde(default)]
-    pub files_deleted: i64,
+    pub files_deleted: Option<i64>,
     pub files_failed: i64,
     #[serde(default)]
     pub chunk_count: Option<i64>,
@@ -836,5 +862,25 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].slug, "napbat");
+    }
+
+    #[test]
+    fn catalog_status_uses_verified_names_and_keeps_legacy_or_future_values_unknown() {
+        for (status, expected) in [
+            (serde_json::json!("Pending"), "pending"),
+            (serde_json::json!("Embedded"), "ready"),
+            (serde_json::json!("Failed"), "failed"),
+            (serde_json::json!("NewBackendState"), "unknown"),
+            (serde_json::json!(0), "unknown"),
+            (serde_json::json!(999), "unknown"),
+        ] {
+            let file: CodebaseFile = serde_json::from_value(serde_json::json!({
+                "path":"a.rs", "size":1, "status":status
+            }))
+            .unwrap();
+            assert_eq!(file.status.unwrap().indexing(), expected);
+        }
+        let file: CodebaseFile = serde_json::from_str(r#"{"path":"a.rs","size":1}"#).unwrap();
+        assert!(file.status.is_none());
     }
 }

@@ -43,27 +43,6 @@ const STEADY_POLL_EVERY: std::time::Duration = std::time::Duration::from_millis(
 /// without turning the status poll into terminal spam.
 const PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 
-#[derive(Debug, PartialEq, Eq)]
-struct JobProgress {
-    processed: i64,
-    total: i64,
-    embedded: i64,
-    deleted: i64,
-    failed: i64,
-}
-
-impl From<&api::JobStatus> for JobProgress {
-    fn from(job: &api::JobStatus) -> Self {
-        Self {
-            processed: job.files_embedded + job.files_deleted + job.files_failed,
-            total: job.files_to_embed + job.files_to_delete,
-            embedded: job.files_embedded,
-            deleted: job.files_deleted,
-            failed: job.files_failed,
-        }
-    }
-}
-
 /// A completed embed job is successful only when the worker reported neither a
 /// job-level error nor failed files. Keeping this separate from the upload
 /// result is deliberate: the catalog sync has already succeeded at this point.
@@ -160,7 +139,7 @@ async fn wait_for_job(client: &Client, job_id: &str) -> Result<()> {
             info!(
                 embedded = job.files_embedded,
                 failed = job.files_failed,
-                chunks = job.chunk_count.unwrap_or(0),
+                chunks = ?job.chunk_count,
                 "indexed",
             );
             return Ok(());
@@ -176,7 +155,7 @@ async fn wait_for_job(client: &Client, job_id: &str) -> Result<()> {
 
         let now = std::time::Instant::now();
         if now >= next_progress {
-            let progress = JobProgress::from(&job);
+            // Worker counters are independent reports, not a completion ratio.
             let phase = if job.started_at.is_some() {
                 "embedding"
             } else {
@@ -185,12 +164,12 @@ async fn wait_for_job(client: &Client, job_id: &str) -> Result<()> {
             info!(
                 %job_id,
                 elapsed_secs = start.elapsed().as_secs(),
-                embedded = progress.embedded,
-                deleted = progress.deleted,
-                failed = progress.failed,
-                "{phase}: {}/{} processed",
-                progress.processed,
-                progress.total,
+                embedded = job.files_embedded,
+                deleted = ?job.files_deleted,
+                failed = job.files_failed,
+                planned_embed = ?job.files_to_embed,
+                planned_delete = ?job.files_to_delete,
+                "{phase}: reported file counts (None means unknown)",
             );
             next_progress = now + PROGRESS_EVERY;
         }
@@ -201,7 +180,7 @@ async fn wait_for_job(client: &Client, job_id: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{JobProgress, api, poll_interval, terminal_result};
+    use super::{api, poll_interval, terminal_result};
 
     #[test]
     fn polling_is_responsive_for_fast_jobs_then_backs_off() {
@@ -221,10 +200,10 @@ mod tests {
 
     fn job(completed: bool, failed: i64, error: Option<&str>) -> api::JobStatus {
         api::JobStatus {
-            files_to_embed: 12,
-            files_to_delete: 3,
+            files_to_embed: Some(12),
+            files_to_delete: Some(3),
             files_embedded: 7,
-            files_deleted: 2,
+            files_deleted: Some(2),
             files_failed: failed,
             chunk_count: Some(21),
             error: error.map(str::to_owned),
@@ -255,9 +234,14 @@ mod tests {
     }
 
     #[test]
-    fn progress_counts_failed_files_as_processed() {
-        let progress = JobProgress::from(&job(false, 3, None));
-        assert_eq!(progress.processed, 12);
-        assert_eq!(progress.total, 15);
+    fn completion_does_not_require_matching_or_present_plan_counts() {
+        let mut completed = job(true, 0, None);
+        assert!(terminal_result("job-4", &completed).unwrap());
+        completed.files_to_embed = None;
+        completed.files_to_delete = None;
+        completed.files_deleted = None;
+        assert!(terminal_result("job-4", &completed).unwrap());
+        completed.completed_at = None;
+        assert!(!terminal_result("job-4", &completed).unwrap());
     }
 }

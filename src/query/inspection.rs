@@ -3,8 +3,8 @@
 use std::fmt::Write;
 
 use super::render::{
-    local_path, render_files, render_hits, render_job, render_projects, render_tree,
-    truncation_note,
+    local_path, markdown_cell, markdown_code, render_fenced, render_files, render_projects,
+    render_tree, truncation_note,
 };
 use super::{Client, ToolError, api, bound_codebase, urlencode};
 use crate::engine::CoordinatorStatus;
@@ -46,7 +46,7 @@ pub(super) async fn fetch_files_page(
 /// but the endpoints now page, so fetch `pageSize`-row windows until the total
 /// is covered (or `cap` rows, a safety bound on pathological codebases). Returns
 /// the rows plus the reported `total` so the caller can note truncation.
-async fn fetch_all_pages<T: serde::de::DeserializeOwned>(
+pub(super) async fn fetch_all_pages<T: serde::de::DeserializeOwned>(
     client: &Client,
     base_path: &str,
     cap: usize,
@@ -112,13 +112,19 @@ pub async fn list_files(
         }
         if matches.is_empty() {
             return Ok(format!(
-                "(no indexed files match `{raw}` — searched all {total} catalogued files)"
+                "(no indexed files match {} — searched all {total} catalogued files)",
+                markdown_code(raw)
             ));
         }
         matches.sort_by(|a, b| a.path.cmp(&b.path));
         let mut out = render_files(&matches, root);
-        writeln!(out, "({} of {total} files match `{raw}`)", matches.len())
-            .expect("writing to a String cannot fail");
+        writeln!(
+            out,
+            "\n({} of {total} files match {})",
+            matches.len(),
+            markdown_code(raw)
+        )
+        .expect("writing to a String cannot fail");
         return Ok(out);
     }
 
@@ -146,7 +152,7 @@ pub async fn list_files(
     let start = pg as usize * page_size as usize; // 0-based index of the first row
     let end = start + files.len(); // exclusive
     let mut out = render_files(&files, root);
-    write!(out, "(rows {}–{end} of {total}", start + 1).expect("writing to a String cannot fail");
+    write!(out, "\n(rows {}–{end} of {total}", start + 1).expect("writing to a String cannot fail");
     if end < total {
         write!(out, "; pass page={} for the next {page_size}", pg + 1)
             .expect("writing to a String cannot fail");
@@ -165,7 +171,8 @@ pub async fn list_files(
 pub async fn sync_status(
     client: &Client,
     checkout: Option<&CoordinatorStatus>,
-) -> Result<String, ToolError> {
+    presentation: super::QueryPresentation,
+) -> Result<super::QueryOutput, ToolError> {
     let codebase_id = bound_codebase(client, "sync_status")?;
     let totals = catalog_totals(client, codebase_id).await;
     let job_id = checkout.and_then(|status| status.last_job_id.as_deref());
@@ -179,93 +186,438 @@ pub async fn sync_status(
         None => None,
     };
 
-    let watch = match checkout.map(|status| &status.watcher) {
-        Some(crate::engine::coordinator::WatcherState::Active) => "active".to_string(),
-        Some(crate::engine::coordinator::WatcherState::Unavailable(reason)) => {
-            format!("not active ({reason})")
-        }
-        None => "not active (no local checkout selected)".to_string(),
-    };
-    let mut out = format!("codebase {codebase_id}");
-    if let Some(phase) = checkout.and_then(|status| status.first_index.as_ref()) {
-        write!(out, "\n{}", first_index_line(phase)).expect("writing to a String cannot fail");
-    }
+    let first_index = checkout.and_then(|status| status.first_index.as_ref());
+    let local_error = checkout.and_then(|status| status.last_error.as_deref());
+    let job_status = job.as_ref().and_then(|(_, result)| result.as_ref().ok());
+    let status_error = job
+        .as_ref()
+        .and_then(|(_, result)| result.as_ref().err())
+        .or(totals.as_ref().err());
+    let root = checkout
+        .map(|status| status.root.as_path())
+        .or(client.local_root());
+    // A basename is only a display label for this already-bound checkout, never
+    // an identity lookup. The full root and immutable id remain below.
+    let label = root
+        .and_then(|path| path.file_name())
+        .map(|name| name.to_string_lossy());
+    let mut out = format!(
+        "{} · {}",
+        markdown_code(label.as_deref().unwrap_or(codebase_id)),
+        sync_summary(checkout, job_status, status_error.is_some()),
+    );
+    let local_attempt = checkout.is_some_and(|status| {
+        status.running
+            || status.sync_progress.is_some()
+            || matches!(
+                status.first_index,
+                Some(FirstIndexPhase::Registering | FirstIndexPhase::Syncing)
+            )
+    });
     if let Some(progress) = checkout.and_then(|status| status.sync_progress.as_ref()) {
-        write!(out, "\n{}", current_sync_line(progress)).expect("writing to a String cannot fail");
+        write!(out, " · {}", markdown_code(&progress.to_string()))
+            .expect("writing to a String cannot fail");
+    } else if !local_attempt && let Some(status) = job_status {
+        out.push_str(" · last server job: ");
+        render_job_counts(&mut out, status);
     }
-    if let Some(error) = checkout.and_then(|status| status.last_error.as_deref()) {
-        write!(
+    let diagnostic = match first_index {
+        Some(FirstIndexPhase::Failed { reason }) => Some(reason.as_str()),
+        _ => local_error,
+    }
+    .or_else(|| {
+        if local_attempt {
+            None
+        } else {
+            job_status.and_then(|status| status.error.as_deref())
+        }
+    });
+    if let Some(reason) = diagnostic {
+        write!(out, " · {}", diagnostic_preview(reason)).expect("writing to a String cannot fail");
+    }
+    out.push_str("  \n");
+    render_sync_recovery(&mut out, checkout, job_status, local_attempt, status_error);
+    out.push_str("\n### Status evidence\n\n");
+    writeln!(out, "Codebase: {}  ", markdown_code(codebase_id))
+        .expect("writing to a String cannot fail");
+    if let Some(root) = root {
+        writeln!(
             out,
-            "\nlast local sync failed: {error}\nindexed results may be stale"
+            "Local root: {}  ",
+            markdown_code(&root.display().to_string())
         )
         .expect("writing to a String cannot fail");
     }
-    if let Some(seconds) = checkout.and_then(|status| status.retry_after_secs) {
-        write!(out, "\nnext local sync attempt in {seconds} s")
+    if let Some(phase) = first_index {
+        writeln!(out, "{}  ", first_index_line(phase)).expect("writing to a String cannot fail");
+    }
+    if let Some(progress) = checkout.and_then(|status| status.sync_progress.as_ref()) {
+        writeln!(out, "{}  ", markdown_code(&current_sync_line(progress)))
             .expect("writing to a String cannot fail");
     }
-    write!(out, "\nlocal checkout watch: {watch}\ntotal indexed state:")
+    render_sync_state(&mut out, checkout, &totals, job_status);
+    render_local_sync_failures(&mut out, checkout);
+    render_sync_job(
+        &mut out,
+        checkout,
+        job.as_ref().map(|(id, result)| (*id, result)),
+    );
+    let display = if presentation == super::QueryPresentation::Inspector {
+        super::display::status(
+            client,
+            checkout,
+            &totals,
+            job.as_ref().map(|(id, result)| (*id, result)),
+        )
+    } else {
+        None
+    };
+    Ok(super::QueryOutput::new(out, display))
+}
+
+/// Keep corrective actions beside the compact failure preview, not repeated
+/// throughout the expanded evidence.
+fn render_sync_recovery(
+    out: &mut String,
+    checkout: Option<&CoordinatorStatus>,
+    job_status: Option<&api::JobStatus>,
+    local_attempt: bool,
+    status_error: Option<&anyhow::Error>,
+) {
+    let first_failed = checkout
+        .is_some_and(|status| matches!(status.first_index, Some(FirstIndexPhase::Failed { .. })));
+    let local_failed = checkout.is_some_and(|status| status.last_error.is_some());
+    if first_failed {
+        out.push_str("Correct the reported failure, then call `index_codebase` for this codebase to retry the failed first index.  \n");
+    } else if local_failed {
+        if let Some(seconds) = checkout.and_then(|status| status.retry_after_secs) {
+            writeln!(
+                out,
+                "Correct the local failure; next local sync attempt in {seconds} s.  "
+            )
+            .expect("writing to a String cannot fail");
+        } else {
+            out.push_str("Correct the local failure; no retry delay reported.  \n");
+        }
+    }
+    if let Some(status) = job_status.filter(|status| job_phase(status) == JobPhase::Failed) {
+        out.push_str("Last server job failed");
+        if (local_attempt || local_failed || first_failed)
+            && let Some(reason) = &status.error
+        {
+            write!(out, ": {}", diagnostic_preview(reason))
+                .expect("writing to a String cannot fail");
+        }
+        if status.files_failed > 0 {
+            write!(out, ": {} failed files", status.files_failed)
+                .expect("writing to a String cannot fail");
+        }
+        out.push_str("; correct the server failure before retrying.  \n");
+    }
+    if let Some(error) = status_error {
+        writeln!(
+            out,
+            "Status unavailable: {}; resolve access/connectivity and call `sync_status` again.  ",
+            diagnostic_preview(&error.to_string()),
+        )
         .expect("writing to a String cannot fail");
+    }
+}
+
+/// Keep the native collapsed preview short; the fenced diagnostic below is raw.
+fn diagnostic_preview(reason: &str) -> String {
+    let line = reason
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("(empty diagnostic)");
+    let mut preview: String = line.chars().take(160).collect();
+    if line.chars().nth(160).is_some() {
+        preview.push('…');
+    }
+    markdown_code(&preview)
+}
+
+/// Catalog totals are persisted evidence, not a current sync's work counters.
+fn render_sync_state(
+    out: &mut String,
+    checkout: Option<&CoordinatorStatus>,
+    totals: &anyhow::Result<(u32, i64)>,
+    job: Option<&api::JobStatus>,
+) {
     match totals {
         Ok((files, bytes)) => {
-            write!(
+            writeln!(
                 out,
-                "\n  files: {files}\n  source bytes: {} ({bytes} bytes)",
-                human_bytes(bytes)
+                "Persisted catalog: {files} files; {} ({bytes} bytes).  ",
+                human_bytes(*bytes)
             )
             .expect("writing to a String cannot fail");
         }
-        Err(e) => write!(out, "\n  catalog totals unavailable: {e}")
-            .expect("writing to a String cannot fail"),
+        Err(_) => out.push_str("Persisted catalog totals: unknown (request failed).  \n"),
     }
-    if let Some((_, Ok(status))) = &job
-        && let Some(chunks) = status.chunk_count
-    {
-        write!(out, "\n  chunks: {chunks} (post-sync total)")
+    if let Some(chunks) = job.and_then(|status| status.chunk_count) {
+        writeln!(out, "Chunks reported by last server job: {chunks}.  ")
             .expect("writing to a String cannot fail");
     }
+    let watch = match checkout.map(|status| &status.watcher) {
+        Some(crate::engine::coordinator::WatcherState::Active) => "active".to_string(),
+        Some(crate::engine::coordinator::WatcherState::Unavailable(reason)) => {
+            format!("not active ({reason}); periodic reconciliation may still run")
+        }
+        None => "not active (no local checkout selected)".to_string(),
+    };
+    writeln!(out, "Local checkout watch: {}  ", markdown_code(&watch))
+        .expect("writing to a String cannot fail");
+    if let Some(status) = checkout {
+        writeln!(
+            out,
+            "Local reconcile: {}; pending triggers: {}{}; leases: {}.  ",
+            if status.running || status.sync_progress.is_some() {
+                "running"
+            } else {
+                "idle"
+            },
+            status.pending_triggers,
+            if status.trigger_overflow {
+                " (overflowed; changes coalesced)"
+            } else {
+                ""
+            },
+            status.leases,
+        )
+        .expect("writing to a String cannot fail");
+        if let Some(seconds) = status.retry_after_secs {
+            writeln!(
+                out,
+                "Retry schedule: next local sync attempt in {seconds} s.  "
+            )
+            .expect("writing to a String cannot fail");
+        }
+        if let Some(outcome) = &status.last_outcome {
+            out.push_str("\nLast local outcome:\n\n");
+            render_fenced(out, outcome, None);
+        }
+        if let crate::engine::coordinator::WatcherState::Unavailable(reason) = &status.watcher {
+            out.push_str("\nWatcher diagnostic:\n\n");
+            render_fenced(out, reason, None);
+        }
+    }
+    if let Err(error) = totals {
+        out.push_str("\n### Catalog totals unavailable\n\n");
+        render_fenced(out, &error.to_string(), None);
+        out.push_str("\nResolve the reported access/connectivity error, then call `sync_status` again; unknown totals are not zero.\n");
+    }
+}
 
+/// Keep complete local diagnostics and the first-index retry gate together,
+/// independent of any server job left over from an earlier reconcile.
+fn render_local_sync_failures(out: &mut String, checkout: Option<&CoordinatorStatus>) {
+    let Some(status) = checkout else { return };
+    let first_failed = matches!(status.first_index, Some(FirstIndexPhase::Failed { .. }));
+    if let Some(error) = &status.last_error
+        && !matches!(&status.first_index, Some(FirstIndexPhase::Failed { reason }) if reason == error)
+    {
+        out.push_str("\n### Local scan/upload failure\n\n");
+        render_fenced(out, error, None);
+        out.push_str(
+            "\nCorrect the reported local access, authentication, or server connectivity failure. ",
+        );
+        if !first_failed {
+            if status.retry_after_secs.is_some() {
+                out.push_str("Retained work retries on the reported schedule.\n");
+            } else {
+                out.push_str(
+                    "No retry delay was reported; inspect a later `sync_status` snapshot.\n",
+                );
+            }
+        }
+    }
+    if let Some(FirstIndexPhase::Failed { reason }) = &status.first_index {
+        out.push_str("\n### First-index failure\n\n");
+        render_fenced(out, reason, None);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobPhase {
+    Pending,
+    Running,
+    Done,
+    Failed,
+}
+
+/// Timestamps and failure evidence take precedence over the wire status enum.
+fn job_phase(job: &api::JobStatus) -> JobPhase {
+    if job.error.is_some() || job.files_failed > 0 {
+        JobPhase::Failed
+    } else if job.completed_at.is_some() {
+        JobPhase::Done
+    } else if job.started_at.is_some() {
+        JobPhase::Running
+    } else {
+        JobPhase::Pending
+    }
+}
+
+fn render_job(job_id: &str, j: &api::JobStatus) -> String {
+    let phase = job_phase(j);
+    let label = match phase {
+        JobPhase::Failed => "**Failed**",
+        JobPhase::Done => "**Done**",
+        JobPhase::Running => "**Running**",
+        JobPhase::Pending => "**Pending**",
+    };
+    let mut out = format!("{label} · Server job {} · ", markdown_code(job_id));
+    render_job_counts(&mut out, j);
+    out.push_str("  \n");
+    if let Some(started) = &j.started_at {
+        writeln!(out, "Started: {}  ", markdown_code(started))
+            .expect("writing to a String cannot fail");
+    }
+    if let Some(completed) = &j.completed_at {
+        writeln!(out, "Completed: {}  ", markdown_code(completed))
+            .expect("writing to a String cannot fail");
+    }
+    if let Some(error) = &j.error {
+        out.push_str("\nServer diagnostic:\n\n");
+        render_fenced(&mut out, error, None);
+    }
+    if phase == JobPhase::Done && j.files_to_embed == Some(0) && j.files_to_delete == Some(0) {
+        out.push_str(
+            "\nThis job reported no planned work; this does not establish checkout freshness.\n",
+        );
+    }
+    out
+}
+
+/// Named wire counters are evidence, not a derived completion ratio.
+fn render_job_counts(out: &mut String, job: &api::JobStatus) {
+    for (index, (label, count)) in [
+        ("embedded", Some(job.files_embedded)),
+        ("deleted", job.files_deleted),
+        ("failed", Some(job.files_failed)),
+        ("planned embed", job.files_to_embed),
+        ("planned delete", job.files_to_delete),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if index > 0 {
+            out.push_str("; ");
+        }
+        write!(out, "{label} ").expect("writing to a String cannot fail");
+        match count {
+            Some(value) => write!(out, "{value}").expect("writing to a String cannot fail"),
+            None => out.push_str("unknown"),
+        }
+    }
+}
+
+/// A recorded server job may predate the current local attempt. Preserve its
+/// units, outcome and diagnostic without treating it as that attempt's result.
+fn render_sync_job(
+    out: &mut String,
+    checkout: Option<&CoordinatorStatus>,
+    job: Option<(&str, &anyhow::Result<api::JobStatus>)>,
+) {
     match job {
         Some((id, Ok(status))) => {
-            out.push_str("\n\n");
-            out.push_str(&render_job(id, &status));
+            out.push_str("\n### Last recorded server job\n\n");
+            if checkout.is_some_and(|local| {
+                local.running || local.sync_progress.is_some() || local.last_error.is_some()
+                    || matches!(local.first_index, Some(FirstIndexPhase::Registering | FirstIndexPhase::Syncing))
+            }) {
+                out.push_str("This job may precede the current local attempt.\n\n");
+            }
+            out.push_str(&render_job(id, status));
         }
-        Some((id, Err(e))) => {
-            write!(out, "\n\nlast sync run {id}: status could not be read: {e}")
-                .expect("writing to a String cannot fail");
+        Some((id, Err(error))) => {
+            writeln!(
+                out,
+                "\n### Server job status unknown\n\nLast sync run {}: status could not be read.\n",
+                markdown_code(id)
+            )
+            .expect("writing to a String cannot fail");
+            render_fenced(out, &error.to_string(), None);
+            out.push_str("\nResolve the reported access/connectivity error, then call `sync_status` again; the job outcome remains unknown.\n");
         }
         None if checkout.is_some_and(|status| status.last_error.is_some()) => out.push_str(
-            "\n\nlast sync run: no server job queued; the local sync failed before it recorded \
-             a job. The totals above are the persisted server state.",
+            "\nNo server job queued; the local sync failed before it recorded a job.\n",
         ),
         None if checkout.is_some() => out.push_str(
-            "\n\nlast sync run: no server job queued yet; the local checkout may still \
-             be scanning/preparing its initial sync. The totals above are the persisted server \
-             state.",
+            "\nNo server job queued yet; local scanning/preparation or retained work may still be pending.\n",
         ),
         None => out.push_str(
-            "\n\nlast sync run: none queued by this MCP session; the totals above are the \
-             persisted server state.",
+            "\nNo server job queued by this MCP session; local progress and checkout freshness are unknown.\n",
         ),
     }
-    Ok(out)
 }
 
-/// The `first index:` line of `sync_status`. A failed first index also names
-/// the call that retries it.
+/// Local failures and active work take precedence over a previously recorded
+/// server job. Neither an HTTP success nor catalog totals prove indexing passed.
+fn sync_summary(
+    checkout: Option<&CoordinatorStatus>,
+    job: Option<&api::JobStatus>,
+    unavailable: bool,
+) -> &'static str {
+    let first = checkout.and_then(|status| status.first_index.as_ref());
+    if matches!(first, Some(FirstIndexPhase::Failed { .. })) {
+        return "**First index failed — retrieval not ready**";
+    }
+    if checkout.is_some_and(|status| status.last_error.is_some()) {
+        return "**Local sync failed — indexed results may be stale**";
+    }
+    if checkout.is_some_and(|status| status.running || status.sync_progress.is_some()) {
+        return "**Local sync running — indexing not yet complete**";
+    }
+    match first {
+        Some(FirstIndexPhase::Registering) => {
+            return "**First index registering — retrieval not ready**";
+        }
+        Some(FirstIndexPhase::Syncing) => {
+            return "**First index syncing — waiting for local work; retrieval not ready**";
+        }
+        _ => {}
+    }
+    let phase = job.map(job_phase);
+    if phase == Some(JobPhase::Failed) {
+        return "**Server indexing failed — indexed results may be stale**";
+    }
+    if matches!(first, Some(FirstIndexPhase::Embedding { .. })) {
+        return "**First index embedding — retrieval not ready**";
+    }
+    if unavailable {
+        return "**Status incomplete — server state unknown**";
+    }
+    if matches!(phase, Some(JobPhase::Pending | JobPhase::Running)) {
+        return if phase == Some(JobPhase::Running) {
+            "**Server indexing running — not yet complete**"
+        } else {
+            "**Server indexing queued — not yet complete**"
+        };
+    }
+    if checkout.is_some_and(|status| status.pending_triggers > 0 || status.trigger_overflow) {
+        return "**Local sync pending — indexed results may be stale**";
+    }
+    if matches!(first, Some(FirstIndexPhase::Ready)) {
+        return "**Ready** · Retrieval available; checkout freshness not established";
+    }
+    if phase == Some(JobPhase::Done) {
+        return "**Last server job done** · Checkout freshness not established";
+    }
+    "**Indexing state unknown — no completion reported**"
+}
+
 fn first_index_line(phase: &FirstIndexPhase) -> String {
     match phase {
-        FirstIndexPhase::Failed { .. } => {
-            format!("first index: {phase}; call index_codebase to retry")
-        }
-        _ => format!("first index: {phase}"),
+        FirstIndexPhase::Failed { .. } => "First index: failed".into(),
+        _ => format!("First index: {}", markdown_code(&phase.to_string())),
     }
 }
 
-/// The `current sync:` line of `sync_status`. The milestone text is the one
-/// `semctl index` shows, so both commands use the same words.
+/// Reuse the engine's milestones and authoritative upload-batch counters.
 fn current_sync_line(progress: &SyncProgress) -> String {
-    format!("current sync: {progress}")
+    format!("Current sync: {progress}")
 }
 
 async fn catalog_totals(client: &Client, codebase_id: &str) -> anyhow::Result<(u32, i64)> {
@@ -309,80 +661,137 @@ pub(super) fn human_bytes(bytes: i64) -> String {
 }
 
 /// The detected project graph for the codebase.
-pub async fn list_projects(client: &Client) -> Result<String, ToolError> {
+pub async fn list_projects(
+    client: &Client,
+    presentation: super::QueryPresentation,
+) -> Result<super::QueryOutput, ToolError> {
     let cb = bound_codebase(client, "list_projects")?;
     match client
         .get::<api::ProjectGraph>(&format!("/v1/codebases/{cb}/projects"))
         .await
     {
-        Ok(graph) => Ok(render_projects(&graph)),
+        Ok(graph) => Ok(super::graph_output(
+            client,
+            render_projects(&graph),
+            super::display::GraphInput::Projects(&graph),
+            presentation,
+        )),
         Err(e) => Err(ToolError::from_client("list_projects", &e)),
     }
 }
 
 /// File→file import edges across the codebase.
-pub async fn imports(client: &Client) -> Result<String, ToolError> {
+pub async fn imports(
+    client: &Client,
+    presentation: super::QueryPresentation,
+) -> Result<super::QueryOutput, ToolError> {
     let cb = bound_codebase(client, "imports")?;
     let path = format!("/v1/codebases/{cb}/graph/imports");
     let (edges, total) = fetch_all_pages::<api::ImportEdge>(client, &path, GRAPH_LIST_CAP)
         .await
         .map_err(|e| ToolError::from_client("imports", &e))?;
     if edges.is_empty() {
-        return Ok("(no import edges)".into());
+        return Ok(super::graph_output(
+            client,
+            "(no import edges)".into(),
+            super::display::GraphInput::Imports {
+                edges: &edges,
+                total,
+            },
+            presentation,
+        ));
     }
     let root = client.local_root();
-    let mut out = String::new();
+    let mut out = String::from("| From | To | Import |\n| --- | --- | --- |\n");
     for e in &edges {
         writeln!(
             out,
-            "{}  ->  {}  ({})",
-            local_path(root, &e.from),
-            local_path(root, &e.to),
-            e.import_path
+            "| {} | {} | {} |",
+            markdown_cell(&local_path(root, &e.from)),
+            markdown_cell(&local_path(root, &e.to)),
+            markdown_cell(&e.import_path)
         )
         .expect("writing to a String cannot fail");
     }
     truncation_note(&mut out, edges.len(), total);
-    Ok(out)
+    Ok(super::graph_output(
+        client,
+        out,
+        super::display::GraphInput::Imports {
+            edges: &edges,
+            total,
+        },
+        presentation,
+    ))
 }
 
 /// Reference→definition symbol bindings across the codebase.
-pub async fn symbol_edges(client: &Client) -> Result<String, ToolError> {
+pub async fn symbol_edges(
+    client: &Client,
+    presentation: super::QueryPresentation,
+) -> Result<super::QueryOutput, ToolError> {
     let cb = bound_codebase(client, "symbol_edges")?;
     let path = format!("/v1/codebases/{cb}/graph/symbol-edges");
     let (edges, total) = fetch_all_pages::<api::SymbolEdge>(client, &path, GRAPH_LIST_CAP)
         .await
         .map_err(|e| ToolError::from_client("symbol_edges", &e))?;
     if edges.is_empty() {
-        return Ok("(no symbol bindings)".into());
+        return Ok(super::graph_output(
+            client,
+            "(no symbol bindings)".into(),
+            super::display::GraphInput::SymbolEdges {
+                edges: &edges,
+                total,
+            },
+            presentation,
+        ));
     }
     let root = client.local_root();
-    let mut out = String::new();
+    let mut out = String::from("| From | Name | To | Moniker |\n| --- | --- | --- | --- |\n");
     for e in &edges {
         writeln!(
             out,
-            "{} `{}`  ->  {}  ({})",
-            local_path(root, &e.from_file),
-            e.name,
-            local_path(root, &e.to_file),
-            e.moniker
+            "| {} | {} | {} | {} |",
+            markdown_cell(&local_path(root, &e.from_file)),
+            markdown_cell(&e.name),
+            markdown_cell(&local_path(root, &e.to_file)),
+            markdown_cell(&e.moniker)
         )
         .expect("writing to a String cannot fail");
     }
     truncation_note(&mut out, edges.len(), total);
-    Ok(out)
+    Ok(super::graph_output(
+        client,
+        out,
+        super::display::GraphInput::SymbolEdges {
+            edges: &edges,
+            total,
+        },
+        presentation,
+    ))
 }
 
 /// Cross-codebase links — this codebase's imports resolved into other
 /// codebases the caller can see.
-pub async fn external_links(client: &Client) -> Result<String, ToolError> {
+pub async fn external_links(
+    client: &Client,
+    presentation: super::QueryPresentation,
+) -> Result<super::QueryOutput, ToolError> {
     let cb = bound_codebase(client, "external_links")?;
     let path = format!("/v1/codebases/{cb}/graph/external-links");
     let (links, total) = fetch_all_pages::<api::ExternalLink>(client, &path, GRAPH_LIST_CAP)
         .await
         .map_err(|e| ToolError::from_client("external_links", &e))?;
     if links.is_empty() {
-        return Ok("(no cross-codebase links)".into());
+        return Ok(super::graph_output(
+            client,
+            "(no cross-codebase links)".into(),
+            super::display::GraphInput::ExternalLinks {
+                links: &links,
+                total,
+            },
+            presentation,
+        ));
     }
     // Only `from_file` is local — `target_file` lives in the linked codebase,
     // so it stays relative (we have no root for it here).
@@ -405,7 +814,17 @@ pub async fn external_links(client: &Client) -> Result<String, ToolError> {
         .expect("writing to a String cannot fail");
     }
     truncation_note(&mut out, links.len(), total);
-    Ok(out)
+    let mut rendered = String::new();
+    render_fenced(&mut rendered, &out, None);
+    Ok(super::graph_output(
+        client,
+        rendered,
+        super::display::GraphInput::ExternalLinks {
+            links: &links,
+            total,
+        },
+        presentation,
+    ))
 }
 
 /// The symbol at `path:line[:column]` (1-based). With a column, the identifier
@@ -415,7 +834,8 @@ pub async fn symbol_at_position(
     path: &str,
     line: u32,
     column: Option<u32>,
-) -> Result<String, ToolError> {
+    presentation: super::QueryPresentation,
+) -> Result<super::QueryOutput, ToolError> {
     let cb = bound_codebase(client, "symbol_at_position")?;
     let mut url = format!(
         "/v1/codebases/{cb}/graph/symbol-at-position?path={}&line={line}",
@@ -429,8 +849,17 @@ pub async fn symbol_at_position(
         None => format!("{path}:{line}"),
     };
     match client.get_maybe::<api::SearchHit>(&url).await {
-        Ok(Some(hit)) => Ok(render_hits(&[hit], "", client.local_root(), false)),
-        Ok(None) => Ok(format!("(no symbol at {at})")),
+        Ok(Some(hit)) => Ok(super::lookup_output(
+            client,
+            &at,
+            std::slice::from_ref(&hit),
+            "",
+            presentation,
+        )),
+        Ok(None) => Ok(super::QueryOutput::new(
+            format!("(no symbol at {at})"),
+            None,
+        )),
         Err(e) => Err(ToolError::from_client("symbol_at_position", &e)),
     }
 }
@@ -440,10 +869,18 @@ pub async fn batch_lookup(
     client: &Client,
     symbols: &[String],
     references: bool,
-) -> Result<String, ToolError> {
+    presentation: super::QueryPresentation,
+) -> Result<super::QueryOutput, ToolError> {
     let cb = bound_codebase(client, "batch_lookup")?;
     if symbols.is_empty() {
-        return Ok("(no symbols requested)".into());
+        return Ok(super::QueryOutput::new(
+            "(no symbols requested)".into(),
+            if presentation == super::QueryPresentation::Inspector {
+                super::display::batch(client, &[])
+            } else {
+                None
+            },
+        ));
     }
     let url = format!("/v1/codebases/{cb}/graph/batch");
     let body = serde_json::json!({ "symbols": symbols, "references": references });
@@ -451,33 +888,50 @@ pub async fn batch_lookup(
         .post_read::<_, Vec<api::SymbolHits>>(&url, &body)
         .await
         .map_err(|e| ToolError::from_client("batch_lookup", &e))?;
-    let kind = if references {
-        "references"
+    let (kind, column) = if references {
+        ("references", "Reference location")
     } else {
-        "definitions"
+        ("definitions", "Definition location")
     };
+    let (matches, unmatched) = results.iter().fold((0, 0), |(matches, unmatched), result| {
+        (
+            matches + result.hits.len(),
+            unmatched + usize::from(result.hits.is_empty()),
+        )
+    });
     let root = client.local_root();
-    let mut out = String::new();
+    let mut out = format!(
+        "**{} symbols · {matches} {kind} · {unmatched} unmatched**\n\n\
+         | Symbol | {column} |\n| --- | --- |\n",
+        results.len(),
+    );
     for r in &results {
+        let symbol = markdown_cell(&r.symbol);
         if r.hits.is_empty() {
-            writeln!(out, "{} — no {kind}", r.symbol).expect("writing to a String cannot fail");
+            writeln!(out, "| {symbol} | No {kind} |").expect("writing to a String cannot fail");
             continue;
         }
-        writeln!(out, "{} ({} {kind}):", r.symbol, r.hits.len())
-            .expect("writing to a String cannot fail");
         for h in &r.hits {
             let loc = h.path.as_deref().unwrap_or("?");
             writeln!(
                 out,
-                "  {}:{}-{}",
-                local_path(root, loc),
-                h.line_start.unwrap_or(0),
-                h.line_end.unwrap_or(0)
+                "| {symbol} | {} |",
+                markdown_cell(&format!(
+                    "{}:{}-{}",
+                    local_path(root, loc),
+                    h.line_start.unwrap_or(0),
+                    h.line_end.unwrap_or(0)
+                ))
             )
             .expect("writing to a String cannot fail");
         }
     }
-    Ok(out)
+    let display = if presentation == super::QueryPresentation::Inspector {
+        super::display::batch(client, &results)
+    } else {
+        None
+    };
+    Ok(super::QueryOutput::new(out, display))
 }
 
 /// The codebase's files as an indented directory tree.
@@ -489,7 +943,9 @@ pub async fn file_tree(client: &Client) -> Result<String, ToolError> {
         Ok(nodes) => {
             let mut out = String::new();
             render_tree(&nodes, 0, &mut out);
-            Ok(out)
+            let mut rendered = String::new();
+            render_fenced(&mut rendered, &out, None);
+            Ok(rendered)
         }
         Err(e) => Err(ToolError::from_client("file_tree", &e)),
     }
@@ -512,7 +968,9 @@ pub async fn list_domains(client: &Client) -> Result<String, ToolError> {
                         .expect("writing to a String cannot fail");
                 }
             }
-            Ok(out)
+            let mut rendered = String::new();
+            render_fenced(&mut rendered, &out, None);
+            Ok(rendered)
         }
         Err(e) => Err(ToolError::from_client("list_domains", &e)),
     }

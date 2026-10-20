@@ -3,7 +3,7 @@
 `semctl` is the command-line client for the **semctx** code-intelligence server —
 semantic + exact code search and a precise symbol/call/value-flow graph over your
 repositories, exposed both as a CLI and as an [MCP](https://modelcontextprotocol.io)
-stdio server for AI coding tools (Claude Code, Codex).
+stdio server for AI coding tools (Claude Code, Codex, Oh My Pi).
 
 It's a thin HTTP+JSON client: all indexing and retrieval happen server-side, so
 `semctl` links no engine code and has an entirely public dependency graph.
@@ -118,6 +118,184 @@ reversed with the hash-guarded `undo_edit` action. Read-only additions include
 reference/search/outline tools expose the richer occurrence, scope, and nesting
 options instead of gaining aliases.
 
+`current_context` reports the selected checkout's opaque source identity and
+lists the server's indexed copies with their exact identities, canonical flag,
+revision and file count. A copy matches only when its source identity equals
+the checkout's. Historical copies remain intact. The codebase's reported graph
+state does not establish per-copy freshness.
+
+MCP results use ranked snippets, attributed batch tables, language-tagged source,
+and phase-first sync snapshots. Source bytes, provenance, and full diagnostics
+remain in the original result. Hybrid scores are query-relative, not confidence.
+Search source binding requires a local byte snapshot to match the ready
+content-plane full-file hash, plus exact snippet bytes and supplied byte/line
+coordinates in that snapshot. It does not verify semantic symbol/focus identity
+or guarantee that the file stays unchanged. Changed bytes, mismatched ranges,
+and unavailable verification stay distinct. Use local Read/Grep for current
+locations when binding is not established. Verification does not start a reindex.
+
+The semctl OMP adapter presents search, reference, source, and graph results in
+native tool cards. Compact results show the first six matches.
+The native tool header opens the complete result.
+A muted badge in the native tool header shows the codebase identity.
+The badge text is the display name. Canonical copies add `· canonical`.
+The badge tooltip shows the codebase ID, checkout path, and copy.
+A search with an index freshness warning adds an `index warning` badge to the
+header. The badge tooltip keeps the original diagnostic.
+Result bodies start with the match chips. The result-graph toggle trails the
+chips on their last row. Match chips
+use Read-style icons, path links, spacing, and independent previews. Scored
+matches use small native relevance bars; unscored matches reserve no bar space.
+Relevance rails sit 6 pixels from the location text.
+They use a rounded track and an accent fill that eases when values change.
+Native rails and MCP text bars use the same query-relative scale, not confidence.
+A result set with only nonnegative scores uses the ratio to its highest score.
+A result set with any negative score uses the range from its lowest to highest
+score, with a 10% floor for the lowest score.
+Range-bar tooltips describe position between the lowest and highest result
+scores, not confidence.
+When a result set has equal signed scores, a missing score, a non-finite score,
+or no usable ratio, its scored matches keep a neutral native rail and `—` in the
+MCP text table.
+Match chips fade and rise in with a short stagger on first appearance.
+Reduced-motion mode disables this result-card effect.
+Hover shows rank, score, or the verification diagnostic. A fixed-size composer
+indicator sits above the native composer controls. It shows one native progress
+circle for producer-backed sync and embedding counts. Unknown active work uses
+subtle motion that respects reduced-motion mode. Select the indicator for status,
+or use `/semctl` and `/semctl details`.
+`/semctl graph` opens a native OMP/Tern popup card. The default overview
+includes indexed files, directories, projects, imports, and resolved symbol
+bindings. Native dots support individual hover and selection. Group and node
+controls expose supplied relationships and metadata without a model turn.
+The overview title has the checkout name below it. `Partial graph` and
+`Relationship layers loading` are native badges. The line under the map shows
+group and route counts. A right-aligned hint tells you to select a dot.
+Graph drawings sit in a soft canvas well and are centered in it.
+Uncolored dots use a soft neutral tone. Every dot has a thin ring in the canvas
+color that separates it from links. A hovered dot grows slightly.
+Links are thin, low-contrast lines.
+Containment and project-association routes stay faint until selected or hovered.
+In the compact popup, arrowheads appear only on links of the selected or
+hovered node.
+The compact toolbar uses native icons. Grouped analysis tabs and diagnostics
+share a stable viewing area. Switching views preserves the selected node.
+Shared graph colors identify the same source consistently across graph views.
+Validated concepts also color match chips. Source-directory colors fill gaps
+without claiming semantic similarity.
+Concept groups use Markdown documentation from the local checkout.
+Document titles name the groups. Explicit file paths and distinctive identifiers
+connect documentation to catalog files. Reference and folder evidence can extend
+an assignment. Broad index documents and ambiguous mentions do not seed concepts.
+The map keeps source-directory groups where the evidence is insufficient.
+Group details name the source document. Group labels distinguish projects with
+the same directory names.
+This step reads local files. It makes no embedding requests or model calls.
+The client cannot retrieve the server's stored embedding vectors.
+
+Concept map is the default layout for new profiles.
+It combines documentation concepts, lexical term vectors, and recorded links.
+Related concept families form soft islands when the drawing has enough space.
+Force also uses shared terms and family cohesion.
+Term frequency and inverse document frequency weight paths, labels, and resolved
+symbol names. Classical multidimensional scaling supplies stable coordinates.
+The vectors are not the server's semantic embeddings.
+Position does not prove a relationship or indicate confidence.
+Input order does not change geometry.
+Activity, selection, indexing state, scores, and theme do not move nodes.
+Concept map and Force can draw soft tinted territories.
+Document folders name concept families. Without these families, shared terms
+can name lexical families. A territory is omitted if it would cover an unrelated
+node or most of the canvas. Compact popups hide territory labels.
+Radial, Layers, and Components draw no territories.
+Overview group dots scale with member count.
+Aggregated group routes use four weight tiers.
+Each higher tier makes a route thicker and more opaque.
+In Radial, isolated nodes sit on one outer ring around the largest map when that
+map has at least three nodes and every other component is smaller.
+That ring does not show a distance. An isolated node has no recorded relation.
+Ungrouped result graphs keep their previous dot sizes.
+Nodes keep their identity across layout changes and refreshes.
+They glide to new positions when geometry changes.
+Routes and territories fade in after nodes settle.
+Dots arrive with a short staggered scale-in.
+Labels fade in after their dot.
+Reduced-motion mode and Motion Off disable these graph effects.
+Tern owns transitions. The graph does not use SVG images or a web viewer.
+`/semctl graph live` toggles a native live overview popup. The popup shows a
+compact project map, observed request counts, and producer-backed progress.
+The popup title is `Project map`. A subline shows `N files · M groups`.
+A warning icon after the subline marks a partial map.
+A slim stacked indexing bar shows `N% ready`.
+This value is the ready share of the files that report a catalog state.
+The bar tooltip shows the exact counts.
+The map sits in the canvas well.
+With no selection, a one-line legend explains dot size (files) and line weight
+(links). It identifies concept families or shared terms only when territories
+are drawn. The `Busiest` chips select individual groups with many cross-group
+links. The folded remainder does not compete with individual groups.
+Small, medium, and large popups show up to three, four, and five chips.
+Select the grip at the upper left to enlarge the popup.
+Shift+click makes it smaller. Both controls wrap through the three sizes.
+Double-click the title to switch between small and large.
+Tern does not expose continuous drag-resize events.
+The popup size is saved per OMP profile.
+Group rows use small stacked indexing bars.
+The popup footer uses one row for a fixed progress ring, a percentage, a separate
+warning badge, and request counters.
+The counters show `↑` for sent requests and `↓` for returned requests.
+Percentage digits animate when motion is allowed.
+Phase changes stay in tooltips.
+The warning badge appears only for a current problem.
+It sits beside the ring in its own space.
+The live popup and graph page show a native spinner and a shimmer label while
+the first map loads. Refresh buttons show a native spinner during a refresh.
+The graph page footer uses a native spinner while loading or working.
+Reduced-motion mode and Motion Off use static icons, labels, and percentage digits.
+Available structure stays visible while embeddings or relationship layers are
+incomplete. A small status pip at the lower right of a dot shows the catalog
+embedding state. A failed pip uses the error color. A processing pip uses the
+accent color. A pending pip is hollow. Status pips use catalog evidence;
+aggregate progress does not invent per-file activity.
+On an overview group dot, the failed pip gets stronger as the failed share of
+members grows: below 25%, from 25% to 60%, and above 60%.
+The group dot tooltip states the failed share.
+A failed refresh retains the last available map.
+The popup's `Diagnostics` disclosure retains the full request error.
+Compact hover text does not replace the diagnostic.
+Overview group rows show a compact native stacked meter for catalog indexing
+states: ready, processing, pending, failed, and unknown.
+Exact counts stay in the tooltip.
+Hosts without meters retain the text summary.
+Typing, refreshing, and closing preserve the composer draft and focus.
+The popup uses the extension APIs in stock OMP. No OMP patch is required.
+The appearance icon opens compact native controls for layout, colors, detail,
+labels, link contrast, motion, and popup size.
+Concept map, Force, Radial, Layers, and Components provide different views.
+Changes update the live popup and project page immediately.
+Color choices apply to all graph views.
+Preferences are saved per OMP profile. Existing layout choices remain unchanged.
+System reduced motion always takes priority.
+Graph-based feed results expose compact diagrams inside the native disclosure.
+Match lists offer a graph icon that groups supplied matches by file and codebase.
+Result chips wrap into compact rows and retain file directories.
+Linked filenames open the checkout file. Tooltips use compact identity, score,
+and state summaries; existing details retain the complete evidence.
+Expanded snippets highlight reported match locations without asserting that
+the current checkout matches the indexed source.
+The adapter reads bounded, typed `_meta.semctlDisplay`
+metadata. It does not parse transcript Markdown or change model-facing content.
+The original MCP transcript, errors, approvals, and cancellation remain intact.
+The extension adapts the native presentation hooks on OMP's existing MCP tools.
+Tern supplies native elements and surface-scoped styles. Plain terminals retain
+the stock MCP output and compact text status.
+A cached overview supplies shared concept colors.
+Result-card presentation makes no extra source fetches.
+Overview concept discovery reads bounded Markdown files from the local checkout.
+It makes no extra network searches or embedding calls.
+The adapter does not automatically combine calls or establish token savings.
+See the [plugin documentation](plugins/semctx/README.md) for limits.
+
 Every read-only MCP tool call ends within one deadline. The default is 25
 seconds, below the 30 seconds after which Oh My Pi ends an MCP request. Set
 `SEMCTX_TOOL_DEADLINE_SECS` to change it. A value from 5 to 600 applies as
@@ -132,11 +310,16 @@ changed would report a failed edit that was applied.
 
 The `index_codebase` tool does not wait for the first index. It registers the
 codebase, starts the scan and upload in the background, and returns at once with
-the codebase id and the path. The `sync_status` tool then reports the first-index
-phase: registering, syncing, embedding, ready, or failed. While a sync runs, it
-also reports a `current sync:` line with the latest step, such as the number of
-uploaded files. `semctl daemon status` reports the same phase and step for each
-checkout.
+the codebase id and the path. The `sync_status` tool reports the first-index
+phase: registering, syncing, embedding, ready, or failed. It reports the latest
+local scan/upload step when available. `semctl daemon status` exposes the same
+local phase and step for each checkout. Do not depend on a fixed line layout.
+Status separates current local work, persisted catalog totals, and the last
+recorded server job. Missing server counters are unknown; named reported counts
+are not a processed/total completion ratio. A completed or zero-file job does not
+establish checkout freshness. Inspect and correct a first-index failure before
+calling `index_codebase` for the same path to retry. Active local checkouts use
+their watcher and periodic reconciliation.
 
 ### Coming from the old `semctx` CLI
 
@@ -347,7 +530,9 @@ configured semctx server. When trusted Claude/Codex hooks or the native Oh My Pi
 extension are enabled, retrieval-shaped user prompts are also sent to `semctl
 hook` for a bounded, best-effort candidate search. The OMP extension runs
 in-process but delegates retrieval, authentication, and nudge state to the
-`semctl` subprocess; it does not make network requests itself. Set
+`semctl` subprocess. Graph views are native OMP/Tern components, with no graph
+HTTP listener, browser launcher, or viewer asset route. The subprocess owns
+requests to the configured server. Set
 `SEMCTX_HOOK_DISABLE=1` to disable all hook behavior or
 `SEMCTX_NUDGE_DISABLE=1` to disable only shell-search reminders.
 
@@ -385,11 +570,13 @@ is installed. It skips a missing shell and reports the skip. CI runs `sh` on
 Linux and `pwsh` on Windows. Use `--shell all` to require both shells.
 
 `plugins/semctx/` is the shared plugin root for every supported coding agent.
-Its `skills/codebase-retrieval/` has one physical source. Claude/Codex consume
-the shared hook manifest; OMP loads `adapters/omp/index.ts`, which maps native
+Its `.mcp.json` declares the MCP server once: Claude/Codex reference it, and OMP
+discovers it in linked and npm-installed packages. Its
+`skills/codebase-retrieval/` has one physical source. Claude/Codex consume the
+shared hook manifest; OMP loads `adapters/omp/index.ts`, which maps native
 lifecycle events onto the same `semctl hook` wire contract. See
-[`plugins/semctx/README.md`](plugins/semctx/README.md) before adding another
-agent integration. Do not copy or symlink shared skills.
+[`plugins/semctx/README.md`](plugins/semctx/README.md) for native MCP presentation
+and host ownership. Do not copy or symlink shared skills.
 
 The deterministic hook and OMP-extension cases run under the normal Rust and Bun
 test commands.

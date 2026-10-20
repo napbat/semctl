@@ -61,7 +61,12 @@ impl Reconciler for ScriptedReconciler {
         })
     }
 
-    fn await_job(&self, _client: Client, _job_id: String) -> JobAwaited {
+    fn await_job(
+        &self,
+        _client: Client,
+        _job_id: String,
+        _observer: super::super::JobObserver,
+    ) -> JobAwaited {
         Box::pin(async { Ok(()) })
     }
 }

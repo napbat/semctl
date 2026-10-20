@@ -23,6 +23,8 @@ export interface HostSession {
 	exitCode: number;
 	/** Host stdout and stderr, for failure messages. */
 	output: string;
+	/** The host's JSON event stream, without stderr diagnostics. */
+	stdout: string;
 	trace: TraceRecord[];
 	/** Raw agent-loop model requests, in order. */
 	requests: string[];
@@ -87,12 +89,12 @@ export class HostSuite {
 		private readonly context: HostContext,
 	) {}
 
-	/** Prepare a workspace, the scripted model, and the host configuration. */
-	static start(adapter: HostAdapter): HostSuite {
+	/** Prepare the suite. A supplied binary directory reuses an existing build. */
+	static start(adapter: HostAdapter, semctlBinDir?: string): HostSuite {
 		const command = hostCommand(adapter);
 		if (Bun.which(command[0]) === null) throw new Error(`${adapter.id}: \`${command[0]}\` is not on PATH`);
 
-		const bin = buildSemctl();
+		const bin = semctlBinDir ?? buildSemctl();
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), `semctx-${adapter.id}-`));
 		const home = path.join(root, "host-home");
 		fs.mkdirSync(home);
@@ -104,6 +106,9 @@ export class HostSuite {
 			XDG_CONFIG_HOME: path.join(root, "semctl-config"),
 			SEMCTX_SERVER: "http://127.0.0.1:9",
 			SEMCTX_TOKEN: undefined,
+			SEMCTX_TENANT: undefined,
+			SEMCTX_CODEBASE: undefined,
+			SEMCTX_TOOL_DEADLINE_SECS: undefined,
 			SEMCTX_HOOK_DISABLE: undefined,
 			SEMCTX_NUDGE_DISABLE: undefined,
 			SEMCTX_HOOK_UPDATE_CHECK: "0",
@@ -158,6 +163,7 @@ export class HostSuite {
 			return {
 				exitCode,
 				output: `${stdout}\n${stderr}`,
+				stdout,
 				trace: readTrace(tracePath),
 				requests: [...this.context.model.requests],
 			};

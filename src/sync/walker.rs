@@ -22,7 +22,7 @@ use ignore::overrides::OverrideBuilder;
 use super::blocking::Cancellation;
 use super::policy::SourcePolicy;
 
-pub(super) const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Both names remain supported at the indexing boundary.
 pub(crate) const IGNORE_FILES: &[&str] = &[".semctxignore", ".semctlignore"];

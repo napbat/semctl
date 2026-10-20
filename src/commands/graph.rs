@@ -4,17 +4,30 @@
 //! references) against a live server, mirroring the MCP tools.
 
 use anyhow::Result;
-use clap::Subcommand;
+use clap::{Args, Subcommand};
 
 use crate::cli::Cli;
 use crate::client;
 use crate::query;
 
+#[derive(Debug, Args)]
+pub struct GraphArgs {
+    /// Emit the original text and bounded native presentation as JSON.
+    #[arg(long)]
+    json: bool,
+    #[command(subcommand)]
+    command: GraphCommand,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum GraphCommand {
+    /// Complete indexed file/directory overview with detected projects and resolved imports.
+    Overview,
     /// File→file import edges (the resolution layer). Rust resolves these; C#
     /// has no file-level imports; C++ include edges are not resolved yet.
     Imports,
+    /// Detected projects, groups, and their dependency links.
+    Projects,
     /// Reference→definition symbol bindings via the project-qualified moniker
     /// index (the resolution layer). Any resolving language pack; C++ needs
     /// build context.
@@ -154,34 +167,75 @@ pub enum GraphCommand {
         #[arg(long)]
         include_body: bool,
     },
+    /// Indexed chunks overlapping an inclusive line range.
+    Expand {
+        path: String,
+        line_start: u32,
+        line_end: u32,
+    },
 }
 
-pub async fn run(command: GraphCommand, cli: &Cli) -> Result<()> {
+pub async fn run(args: GraphArgs, cli: &Cli) -> Result<()> {
     let client = client::for_cwd(cli).await?;
-    let out = match command {
-        GraphCommand::Imports => query::imports(&client).await,
-        GraphCommand::SymbolEdges => query::symbol_edges(&client).await,
-        GraphCommand::ExternalLinks => query::external_links(&client).await,
-        GraphCommand::Definitions { symbol } => query::find_definition(&client, &symbol).await,
+    let presentation = if args.json {
+        query::QueryPresentation::Inspector
+    } else {
+        query::QueryPresentation::Plain
+    };
+    let output = dispatch(args.command, &client, presentation)
+        .await
+        .map_err(query::ToolError::into_cli_error)?;
+    if args.json {
+        serde_json::to_writer(std::io::stdout().lock(), &output)?;
+        println!();
+    } else {
+        print!("{}", output.text);
+        if !output.text.ends_with('\n') {
+            println!();
+        }
+    }
+    Ok(())
+}
+
+async fn dispatch(
+    command: GraphCommand,
+    client: &client::Client,
+    presentation: query::QueryPresentation,
+) -> Result<query::QueryOutput, query::ToolError> {
+    match command {
+        GraphCommand::Overview => query::overview(client, presentation).await,
+        GraphCommand::Projects => query::list_projects(client, presentation).await,
+        GraphCommand::Imports => query::imports(client, presentation).await,
+        GraphCommand::SymbolEdges => query::symbol_edges(client, presentation).await,
+        GraphCommand::ExternalLinks => query::external_links(client, presentation).await,
+        GraphCommand::Definitions { symbol } => {
+            query::find_definition(client, &symbol, presentation).await
+        }
         GraphCommand::References { symbol, namespace } => {
-            query::find_references(&client, &symbol, namespace.as_deref()).await
+            query::find_references(client, &symbol, namespace.as_deref(), presentation).await
         }
-        GraphCommand::WhoCalls { symbol } => query::who_calls(&client, &symbol).await,
+        GraphCommand::WhoCalls { symbol } => query::who_calls(client, &symbol, presentation).await,
         GraphCommand::Implementations { symbol } => {
-            query::implementations_of(&client, &symbol).await
+            query::implementations_of(client, &symbol, presentation).await
         }
-        GraphCommand::CallPath { from, to } => query::call_path(&client, &from, &to).await,
-        GraphCommand::Reaches { from } => query::reaches(&client, &from).await,
-        GraphCommand::FlowsInto { to } => query::flows_into(&client, &to).await,
-        GraphCommand::FlowsBetween { from, to } => query::flows_between(&client, &from, &to).await,
-        GraphCommand::Trace { symbol, depth } => query::trace(&client, &symbol, depth).await,
+        GraphCommand::CallPath { from, to } => {
+            query::call_path(client, &from, &to, presentation).await
+        }
+        GraphCommand::Reaches { from } => query::reaches(client, &from, presentation).await,
+        GraphCommand::FlowsInto { to } => query::flows_into(client, &to, presentation).await,
+        GraphCommand::FlowsBetween { from, to } => {
+            query::flows_between(client, &from, &to, presentation).await
+        }
+        GraphCommand::Trace { symbol, depth } => {
+            query::trace(client, &symbol, depth, presentation).await
+        }
         GraphCommand::SymbolAtPosition { path, line, column } => {
-            query::symbol_at_position(&client, &path, line, column).await
+            query::symbol_at_position(client, &path, line, column, presentation).await
         }
         GraphCommand::Batch {
             symbols,
             references,
-        } => query::batch_lookup(&client, &symbols, references).await,
+        } => query::batch_lookup(client, &symbols, references, presentation).await,
         GraphCommand::SearchSymbols {
             query: symbol_query,
             mode,
@@ -192,7 +246,7 @@ pub async fn run(command: GraphCommand, cli: &Cli) -> Result<()> {
             limit,
         } => {
             query::search_symbols(
-                &client,
+                client,
                 &query::SymbolSearchOptions {
                     query: &symbol_query,
                     mode: &mode,
@@ -202,6 +256,7 @@ pub async fn run(command: GraphCommand, cli: &Cli) -> Result<()> {
                     language: language.as_deref(),
                     limit,
                 },
+                presentation,
             )
             .await
         }
@@ -209,26 +264,29 @@ pub async fn run(command: GraphCommand, cli: &Cli) -> Result<()> {
             symbol,
             direction,
             depth,
-        } => query::type_hierarchy(&client, &symbol, &direction, depth).await,
+        } => query::type_hierarchy(client, &symbol, &direction, depth, presentation).await,
         GraphCommand::CallGraph {
             symbol,
             depth,
             direction,
-        } => query::call_graph(&client, &symbol, depth, &direction).await,
-        GraphCommand::Cycles => query::cycles(&client).await,
-        GraphCommand::Unused { page, page_size } => query::unused(&client, page, page_size).await,
-        GraphCommand::Duplicates => query::duplicates(&client).await,
+        } => query::call_graph(client, &symbol, depth, &direction, presentation).await,
+        GraphCommand::Cycles => query::cycles(client, presentation).await,
+        GraphCommand::Unused { page, page_size } => {
+            query::unused(client, page, page_size, presentation).await
+        }
+        GraphCommand::Duplicates => query::duplicates(client, presentation).await,
         GraphCommand::Outline {
             path,
             max_depth,
             kinds,
             include_body,
-        } => query::file_outline(&client, &path, max_depth, &kinds, include_body).await,
-    };
-    let out = out.map_err(query::ToolError::into_cli_error)?;
-    print!("{out}");
-    if !out.ends_with('\n') {
-        println!();
+        } => {
+            query::file_outline(client, &path, max_depth, &kinds, include_body, presentation).await
+        }
+        GraphCommand::Expand {
+            path,
+            line_start,
+            line_end,
+        } => query::expand_chunk(client, &path, line_start, line_end, presentation).await,
     }
-    Ok(())
 }

@@ -23,10 +23,20 @@ Hybrid (dense + lexical) retrieval over the indexed codebase. Returns ranked hit
 
 ## Result freshness
 
-When the codebase has a local checkout, a hit whose file has been edited since it
-was indexed is flagged `⚠ stale (edited since indexed)` — read those files
-directly rather than trusting the snippet. A footer flags when a background sync
-is still running or failed (check `sync_status`).
+For a selected local checkout, source binding compares a bounded local byte
+snapshot with the ready content-plane source's full-file BLAKE3 hash. A bound hit
+also requires exact snippet bytes and agreement with the supplied byte/line
+coordinates in that same snapshot. This verifies bytes and coordinates, not
+semantic symbol identity, graph generation, or the meaning of an indexed focus.
+It does not guarantee that the file remains unchanged after the snapshot.
+
+Changed local bytes, mismatched indexed ranges, and unavailable verification are
+reported separately. Missing checkout identity, missing coordinates, probe limits,
+or a content-plane failure leave a hit unverified, not verified by default.
+Content-plane diagnostics remain visible. Use host Read/Grep for current bytes
+and locations when binding is not established. Check `sync_status` for background
+work or failures. Verification does not start a reindex; active local checkouts
+use their existing watcher and periodic reconciliation.
 
 ## Good queries
 

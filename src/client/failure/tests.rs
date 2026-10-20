@@ -115,6 +115,56 @@ async fn a_paged_failure_is_typed_like_an_enveloped_failure() {
 }
 
 #[tokio::test]
+async fn paged_loading_failures_do_not_require_success_page_fields() {
+    let body = r#"{"success":false,"errors":[{"code":"GraphLoading","message":"This code graph is still loading from storage. Retry shortly.","details":"The replica is restoring this codebase's graph projection from storage."}],"httpStatusCode":409}"#;
+    let (response, url) = answered("409 Conflict", &[("Retry-After", "2")], body).await;
+    let error = unwrap_page::<String>(response, "GET", &url)
+        .await
+        .unwrap_err();
+    let failure = typed(&error);
+    assert_eq!(failure.status(), StatusCode::CONFLICT);
+    assert_eq!(failure.code.as_deref(), Some("GraphLoading"));
+    assert_eq!(failure.retry_after(), Some(Duration::from_secs(2)));
+    assert!(failure.is_api_response());
+    assert!(failure.is_loading());
+    assert!(
+        error
+            .to_string()
+            .contains("restoring this codebase's graph projection")
+    );
+}
+
+#[tokio::test]
+async fn failure_flags_on_http_success_keep_typed_errors_without_page_metadata() {
+    let body = r#"{"success":false,"errors":[{"code":"Forbidden","message":"denied"}]}"#;
+    let (response, url) = answered("200 OK", &[("Retry-After", "3")], body).await;
+    let error = unwrap_page::<String>(response, "GET", &url)
+        .await
+        .unwrap_err();
+    let failure = typed(&error);
+    assert_eq!(failure.status(), StatusCode::OK);
+    assert_eq!(failure.code.as_deref(), Some("Forbidden"));
+    assert_eq!(failure.retry_after(), Some(Duration::from_secs(3)));
+    assert!(failure.is_api_response());
+    assert!(!failure.is_loading());
+}
+
+#[tokio::test]
+async fn failed_envelopes_preserve_codes_even_when_data_has_the_wrong_success_type() {
+    for status in ["403 Forbidden", "200 OK"] {
+        let body = r#"{"success":false,"errors":[{"code":"TenantBindingDenied"}],"data":{"not":"a string"}}"#;
+        let (response, url) = answered(status, &[("Retry-After", "4")], body).await;
+        let error = unwrap_envelope::<String>(response, "GET", &url)
+            .await
+            .unwrap_err();
+        let failure = typed(&error);
+        assert_eq!(failure.code.as_deref(), Some("TenantBindingDenied"));
+        assert_eq!(failure.retry_after(), Some(Duration::from_secs(4)));
+        assert!(failure.is_api_response());
+    }
+}
+
+#[tokio::test]
 async fn a_failure_of_any_status_keeps_its_retry_after_delay() {
     let body = r#"{"success":false,"errors":[{"message":"busy"}]}"#;
     let (response, url) = answered("503 Service Unavailable", &[("Retry-After", "30")], body).await;

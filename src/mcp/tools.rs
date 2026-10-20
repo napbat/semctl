@@ -7,10 +7,10 @@ use rmcp::{
         common::Extension, router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters,
     },
     model::{
-        CallToolRequestParams, CallToolResult, ListToolsResult, ServerCapabilities, ServerInfo,
-        Tool,
+        CallToolRequestParams, CallToolResult, Implementation, IntoContents, ListToolsResult, Meta,
+        ServerCapabilities, ServerInfo, Tool,
     },
-    service::RequestContext,
+    service::{NotificationContext, RequestContext},
     tool, tool_handler, tool_router,
 };
 use tokio::time::Instant;
@@ -26,6 +26,19 @@ use super::tool_types::{
 };
 use super::{CallBudget, FailureKind, McpServer, ToolError, client, query, ready_for_codebases};
 
+/// Add inspector metadata without changing the original model-facing content.
+fn query_result(output: query::QueryOutput) -> CallToolResult {
+    let result = CallToolResult::success(output.text.into_contents());
+    match output.display {
+        Some(display) => {
+            let mut meta = Meta::new();
+            meta.insert("semctlDisplay".to_string(), display);
+            result.with_meta(Some(meta))
+        }
+        None => result,
+    }
+}
+
 // Tool descriptions come entirely from `docs/tools/<name>.md`: the `#[tool]`
 // macro's `description` is a string literal (darling FromMeta) that can't take
 // `include_str!`, so the macro leaves it empty and `tool_doc` injects the
@@ -37,7 +50,7 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<SearchArgs>,
         Extension(budget): Extension<CallBudget>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<CallToolResult, ToolError> {
         let opts = query::SearchOpts {
             prefer: args.prefer,
             kinds: args.kinds.unwrap_or_default(),
@@ -90,25 +103,29 @@ impl McpServer {
             args.top_k.unwrap_or(8),
             &args.domains.unwrap_or_default(),
             &opts,
+            query::QueryPresentation::Inspector,
         )
         .await?;
         drop(indexes);
         // The launch checkout's watcher does not describe a broader search.
-        if opts.scope.is_none()
-            && opts.codebase_ids.is_empty()
-            && let Some(footer) = self.index_freshness(&client, &budget).await
-        {
-            out.push_str("\n\n");
-            out.push_str(&footer);
+        let warning = if opts.scope.is_none() && opts.codebase_ids.is_empty() {
+            self.index_freshness(&client, &budget).await
+        } else {
+            None
+        };
+        if let Some(footer) = &warning {
+            out.text.push_str("\n\n");
+            out.text.push_str(footer);
         }
+        out.set_index_warning(warning);
         // One-shot ride-along fallback when a newer CLI is published. The
         // SessionStart hook is the primary user-facing notice; consuming this
         // note prevents repeated search results from spending tokens on it.
         if let Some(note) = self.update_note().await {
-            out.push_str("\n\n");
-            out.push_str(&note);
+            out.text.push_str("\n\n");
+            out.text.push_str(&note);
         }
-        Ok(out)
+        Ok(query_result(out))
     }
 
     #[tool]
@@ -116,7 +133,7 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<SymbolArgs>,
         Extension(budget): Extension<CallBudget>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<CallToolResult, ToolError> {
         let client = self
             .client_for_copy(
                 "find_definition",
@@ -125,7 +142,9 @@ impl McpServer {
                 &budget,
             )
             .await?;
-        query::find_definition(&client, &args.symbol).await
+        query::find_definition(&client, &args.symbol, query::QueryPresentation::Inspector)
+            .await
+            .map(query_result)
     }
 
     #[tool]
@@ -133,11 +152,18 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<ReferenceArgs>,
         Extension(budget): Extension<CallBudget>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<CallToolResult, ToolError> {
         let client = self
             .client_for("find_references", args.codebase.as_deref(), &budget)
             .await?;
-        query::find_references(&client, &args.symbol, args.namespace.as_deref()).await
+        query::find_references(
+            &client,
+            &args.symbol,
+            args.namespace.as_deref(),
+            query::QueryPresentation::Inspector,
+        )
+        .await
+        .map(query_result)
     }
 
     #[tool]
@@ -145,7 +171,7 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<SymbolArgs>,
         Extension(budget): Extension<CallBudget>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<CallToolResult, ToolError> {
         let client = self
             .client_for_copy(
                 "who_calls",
@@ -154,7 +180,9 @@ impl McpServer {
                 &budget,
             )
             .await?;
-        query::who_calls(&client, &args.symbol).await
+        query::who_calls(&client, &args.symbol, query::QueryPresentation::Inspector)
+            .await
+            .map(query_result)
     }
 
     #[tool]
@@ -162,7 +190,7 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<SymbolArgs>,
         Extension(budget): Extension<CallBudget>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<CallToolResult, ToolError> {
         let client = self
             .client_for_copy(
                 "implementations_of",
@@ -171,7 +199,9 @@ impl McpServer {
                 &budget,
             )
             .await?;
-        query::implementations_of(&client, &args.symbol).await
+        query::implementations_of(&client, &args.symbol, query::QueryPresentation::Inspector)
+            .await
+            .map(query_result)
     }
 
     #[tool]
@@ -179,11 +209,18 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<CallPathArgs>,
         Extension(budget): Extension<CallBudget>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<CallToolResult, ToolError> {
         let client = self
             .client_for("call_path", args.codebase.as_deref(), &budget)
             .await?;
-        query::call_path(&client, &args.from, &args.to).await
+        query::call_path(
+            &client,
+            &args.from,
+            &args.to,
+            query::QueryPresentation::Inspector,
+        )
+        .await
+        .map(query_result)
     }
 
     #[tool]
@@ -191,11 +228,13 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<FlowFromArgs>,
         Extension(budget): Extension<CallBudget>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<CallToolResult, ToolError> {
         let client = self
             .client_for("reaches", args.codebase.as_deref(), &budget)
             .await?;
-        query::reaches(&client, &args.from).await
+        query::reaches(&client, &args.from, query::QueryPresentation::Inspector)
+            .await
+            .map(query_result)
     }
 
     #[tool]
@@ -203,11 +242,13 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<FlowToArgs>,
         Extension(budget): Extension<CallBudget>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<CallToolResult, ToolError> {
         let client = self
             .client_for("flows_into", args.codebase.as_deref(), &budget)
             .await?;
-        query::flows_into(&client, &args.to).await
+        query::flows_into(&client, &args.to, query::QueryPresentation::Inspector)
+            .await
+            .map(query_result)
     }
 
     #[tool]
@@ -215,11 +256,18 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<FlowBetweenArgs>,
         Extension(budget): Extension<CallBudget>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<CallToolResult, ToolError> {
         let client = self
             .client_for("flows_between", args.codebase.as_deref(), &budget)
             .await?;
-        query::flows_between(&client, &args.from, &args.to).await
+        query::flows_between(
+            &client,
+            &args.from,
+            &args.to,
+            query::QueryPresentation::Inspector,
+        )
+        .await
+        .map(query_result)
     }
 
     #[tool]
@@ -227,7 +275,7 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<TraceArgs>,
         Extension(budget): Extension<CallBudget>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<CallToolResult, ToolError> {
         let client = self
             .client_for_copy(
                 "trace",
@@ -236,7 +284,14 @@ impl McpServer {
                 &budget,
             )
             .await?;
-        query::trace(&client, &args.symbol, args.depth.unwrap_or(1)).await
+        query::trace(
+            &client,
+            &args.symbol,
+            args.depth.unwrap_or(1),
+            query::QueryPresentation::Inspector,
+        )
+        .await
+        .map(query_result)
     }
 
     #[tool]
@@ -269,7 +324,7 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<OutlineArgs>,
         Extension(budget): Extension<CallBudget>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<CallToolResult, ToolError> {
         let client = self
             .client_for_copy(
                 "file_outline",
@@ -284,8 +339,10 @@ impl McpServer {
             args.max_depth,
             &args.kinds.unwrap_or_default(),
             args.include_body.unwrap_or(false),
+            query::QueryPresentation::Inspector,
         )
         .await
+        .map(query_result)
     }
 
     #[tool]
@@ -293,11 +350,19 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<ExpandArgs>,
         Extension(budget): Extension<CallBudget>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<CallToolResult, ToolError> {
         let client = self
             .client_for("expand_chunk", args.codebase.as_deref(), &budget)
             .await?;
-        query::expand_chunk(&client, &args.path, args.line_start, args.line_end).await
+        query::expand_chunk(
+            &client,
+            &args.path,
+            args.line_start,
+            args.line_end,
+            query::QueryPresentation::Inspector,
+        )
+        .await
+        .map(query_result)
     }
 
     #[tool]
@@ -305,11 +370,19 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<SymbolAtPositionArgs>,
         Extension(budget): Extension<CallBudget>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<CallToolResult, ToolError> {
         let client = self
             .client_for("symbol_at_position", args.codebase.as_deref(), &budget)
             .await?;
-        query::symbol_at_position(&client, &args.path, args.line, args.column).await
+        query::symbol_at_position(
+            &client,
+            &args.path,
+            args.line,
+            args.column,
+            query::QueryPresentation::Inspector,
+        )
+        .await
+        .map(query_result)
     }
 
     #[tool]
@@ -317,11 +390,18 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<BatchArgs>,
         Extension(budget): Extension<CallBudget>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<CallToolResult, ToolError> {
         let client = self
             .client_for("batch_lookup", args.codebase.as_deref(), &budget)
             .await?;
-        query::batch_lookup(&client, &args.symbols, args.references.unwrap_or(false)).await
+        query::batch_lookup(
+            &client,
+            &args.symbols,
+            args.references.unwrap_or(false),
+            query::QueryPresentation::Inspector,
+        )
+        .await
+        .map(query_result)
     }
 
     #[tool]
@@ -358,11 +438,13 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<NoArgs>,
         Extension(budget): Extension<CallBudget>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<CallToolResult, ToolError> {
         let client = self
             .client_for("list_projects", args.codebase.as_deref(), &budget)
             .await?;
-        query::list_projects(&client).await
+        query::list_projects(&client, query::QueryPresentation::Inspector)
+            .await
+            .map(query_result)
     }
 
     #[tool]
@@ -370,11 +452,13 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<NoArgs>,
         Extension(budget): Extension<CallBudget>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<CallToolResult, ToolError> {
         let client = self
             .client_for("imports", args.codebase.as_deref(), &budget)
             .await?;
-        query::imports(&client).await
+        query::imports(&client, query::QueryPresentation::Inspector)
+            .await
+            .map(query_result)
     }
 
     #[tool]
@@ -382,11 +466,13 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<NoArgs>,
         Extension(budget): Extension<CallBudget>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<CallToolResult, ToolError> {
         let client = self
             .client_for("symbol_edges", args.codebase.as_deref(), &budget)
             .await?;
-        query::symbol_edges(&client).await
+        query::symbol_edges(&client, query::QueryPresentation::Inspector)
+            .await
+            .map(query_result)
     }
 
     #[tool]
@@ -394,11 +480,13 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<NoArgs>,
         Extension(budget): Extension<CallBudget>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<CallToolResult, ToolError> {
         let client = self
             .client_for("external_links", args.codebase.as_deref(), &budget)
             .await?;
-        query::external_links(&client).await
+        query::external_links(&client, query::QueryPresentation::Inspector)
+            .await
+            .map(query_result)
     }
 
     #[tool]
@@ -448,7 +536,7 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<ReadSourceArgs>,
         Extension(budget): Extension<CallBudget>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<CallToolResult, ToolError> {
         let client = self
             .client_for_copy(
                 "read_source",
@@ -492,8 +580,10 @@ impl McpServer {
             args.revision.as_deref(),
             byte_range,
             line_range,
+            query::QueryPresentation::Inspector,
         )
         .await
+        .map(query_result)
     }
 
     #[tool]
@@ -501,7 +591,7 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<SymbolSearchArgs>,
         Extension(budget): Extension<CallBudget>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<CallToolResult, ToolError> {
         let client = self
             .client_for_copy(
                 "search_symbols",
@@ -521,8 +611,10 @@ impl McpServer {
                 language: args.language.as_deref(),
                 limit: args.limit.unwrap_or(50),
             },
+            query::QueryPresentation::Inspector,
         )
         .await
+        .map(query_result)
     }
 
     #[tool]
@@ -530,7 +622,7 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<TypeHierarchyArgs>,
         Extension(budget): Extension<CallBudget>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<CallToolResult, ToolError> {
         let client = self
             .client_for("type_hierarchy", args.codebase.as_deref(), &budget)
             .await?;
@@ -539,8 +631,10 @@ impl McpServer {
             &args.symbol,
             args.direction.as_deref().unwrap_or("Both"),
             args.depth.unwrap_or(4),
+            query::QueryPresentation::Inspector,
         )
         .await
+        .map(query_result)
     }
 
     #[tool]
@@ -548,7 +642,7 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<CallGraphArgs>,
         Extension(budget): Extension<CallBudget>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<CallToolResult, ToolError> {
         let client = self
             .client_for("call_graph", args.codebase.as_deref(), &budget)
             .await?;
@@ -557,8 +651,10 @@ impl McpServer {
             &args.symbol,
             args.depth.unwrap_or(2),
             args.direction.as_deref().unwrap_or("Both"),
+            query::QueryPresentation::Inspector,
         )
         .await
+        .map(query_result)
     }
 
     #[tool]
@@ -566,11 +662,13 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<NoArgs>,
         Extension(budget): Extension<CallBudget>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<CallToolResult, ToolError> {
         let client = self
             .client_for("cycles", args.codebase.as_deref(), &budget)
             .await?;
-        query::cycles(&client).await
+        query::cycles(&client, query::QueryPresentation::Inspector)
+            .await
+            .map(query_result)
     }
 
     #[tool]
@@ -578,7 +676,7 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<AnalysisPageArgs>,
         Extension(budget): Extension<CallBudget>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<CallToolResult, ToolError> {
         let client = self
             .client_for("unused", args.codebase.as_deref(), &budget)
             .await?;
@@ -586,8 +684,10 @@ impl McpServer {
             &client,
             args.page.unwrap_or(0),
             args.page_size.unwrap_or(100),
+            query::QueryPresentation::Inspector,
         )
         .await
+        .map(query_result)
     }
 
     #[tool]
@@ -595,11 +695,13 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<NoArgs>,
         Extension(budget): Extension<CallBudget>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<CallToolResult, ToolError> {
         let client = self
             .client_for("duplicates", args.codebase.as_deref(), &budget)
             .await?;
-        query::duplicates(&client).await
+        query::duplicates(&client, query::QueryPresentation::Inspector)
+            .await
+            .map(query_result)
     }
 
     #[tool]
@@ -745,7 +847,7 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<NoArgs>,
         Extension(budget): Extension<CallBudget>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<CallToolResult, ToolError> {
         let client = self
             .client_for_unchecked("sync_status", args.codebase.as_deref(), &budget)
             .await?;
@@ -755,12 +857,22 @@ impl McpServer {
         // Reported from the coordinator that owns this checkout, not from
         // per-session bookkeeping: any session's sync is this index's sync.
         let status = self.checkout_status(&client).await;
-        query::sync_status(&client, status.as_ref()).await
+        query::sync_status(
+            &client,
+            status.as_ref(),
+            query::QueryPresentation::Inspector,
+        )
+        .await
+        .map(query_result)
     }
 }
 
 #[tool_handler]
 impl ServerHandler for McpServer {
+    async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
+        self.shared.sync_notifications.start(context.peer).await;
+    }
+
     // Defining `list_tools` and `get_tool` here makes `#[tool_handler]` skip its
     // generated versions (it checks `has_method`), so the Markdown descriptions
     // reach the host. `call_tool` is defined here for the same reason: it gives
@@ -820,6 +932,10 @@ impl ServerHandler for McpServer {
         // the fields we care about.
         let mut info = ServerInfo::default();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        info.server_info = Implementation::new("semctx", env!("CARGO_PKG_VERSION"))
+            .with_title("semctx code intelligence")
+            .with_description("Search, navigate, and edit indexed code with semctl.")
+            .with_website_url(env!("CARGO_PKG_REPOSITORY"));
         // Hosts can prepend server instructions to every tool description.
         // The session hook delivers server.md once per context segment instead.
         info
@@ -828,4 +944,35 @@ impl ServerHandler for McpServer {
 
 pub(super) fn router() -> ToolRouter<McpServer> {
     McpServer::tool_router()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inspector_metadata_never_replaces_or_duplicates_plain_content() {
+        let text = "original result\n```rs\nfn exact() {}\n```\n";
+        let display = serde_json::json!({
+            "version": 1, "kind": "source", "text": "inspector-only source"
+        });
+        let result = query_result(query::QueryOutput {
+            text: text.to_string(),
+            display: Some(display.clone()),
+        });
+        let wire = serde_json::to_value(result).unwrap();
+        let plain = serde_json::to_value(CallToolResult::success(text.to_string().into_contents()))
+            .unwrap();
+        assert_eq!(wire["content"], plain["content"]);
+        assert_eq!(wire["isError"], plain["isError"]);
+        assert_eq!(wire["_meta"]["semctlDisplay"], display);
+        assert!(wire.get("structuredContent").is_none());
+
+        let omitted = serde_json::to_value(query_result(query::QueryOutput {
+            text: text.to_string(),
+            display: None,
+        }))
+        .unwrap();
+        assert_eq!(omitted, plain);
+    }
 }

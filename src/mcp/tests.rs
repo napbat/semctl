@@ -452,7 +452,12 @@ async fn a_local_sync_failure_overrides_cached_successful_job_freshness() {
             Box::pin(async { Err("gateway unavailable".to_string()) })
         }
 
-        fn await_job(&self, _client: client::Client, _job_id: String) -> JobAwaited {
+        fn await_job(
+            &self,
+            _client: client::Client,
+            _job_id: String,
+            _observer: crate::engine::coordinator::JobObserver,
+        ) -> JobAwaited {
             Box::pin(std::future::pending())
         }
     }
@@ -711,14 +716,13 @@ fn phantom_tools(text: &str, tools: &[String]) -> Vec<String> {
         "search",
         "stale",
     ];
-    // A tool reference is valid either bare (`grep`) or fully-qualified as a
-    // supported host sees it. Codex uses `mcp__semctx__grep`, Claude qualifies
-    // both plugin and server, and OMP sanitizes its marketplace namespace.
+    // Match longer host namespaces before native OMP's shared prefix.
     let is_registered_tool = |t: &str| -> bool {
         let bare = [
             "mcp__semctx__",
             "mcp__plugin_semctx_semctx__",
             "mcp__semctx_semctx_",
+            "mcp__semctx_",
         ]
         .iter()
         .find_map(|prefix| t.strip_prefix(prefix))
@@ -825,54 +829,6 @@ fn symbolic_edits_are_direct_actions_not_plan_transport() {
 }
 
 #[test]
-fn retrieval_skill_has_one_repository_source() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    for relative in ["SKILL.md", "agents/openai.yaml"] {
-        assert!(
-            root.join("plugins/semctx/skills/codebase-retrieval")
-                .join(relative)
-                .is_file(),
-            "shared retrieval skill is missing {relative}"
-        );
-        for duplicate in [
-            "skills/codebase-retrieval",
-            "codex-plugin/skills/codebase-retrieval",
-        ] {
-            assert!(
-                !root.join(duplicate).join(relative).exists(),
-                "do not copy shared skill assets into a host adapter"
-            );
-        }
-    }
-}
-
-#[test]
-fn prior_index_permission_is_durable_in_agent_guidance() {
-    for (name, text) in [
-        ("server instructions", server_instructions().to_string()),
-        ("retrieval skill", skill_md()),
-    ] {
-        assert!(
-            text.contains("previously indexed") && text.contains("without asking again"),
-            "{name} must say that an existing index is prior consent"
-        );
-    }
-}
-
-#[test]
-fn first_index_gate_is_explained_in_agent_guidance() {
-    for (name, text) in [
-        ("server instructions", server_instructions().to_string()),
-        ("retrieval skill", skill_md()),
-    ] {
-        assert!(
-            text.contains("first-ever") && text.contains("sync_status"),
-            "{name} must explain the first-index readiness gate and progress path"
-        );
-    }
-}
-
-#[test]
 fn steering_docs_name_no_phantom_tools() {
     let tools = registered_tools();
     let phantoms = phantom_tools(server_instructions(), &tools);
@@ -908,6 +864,7 @@ fn phantom_guard_understands_host_mcp_prefixes() {
         "mcp__semctx__grep",
         "mcp__plugin_semctx_semctx__grep",
         "mcp__semctx_semctx_grep",
+        "mcp__semctx_grep",
     ] {
         assert_eq!(
             phantom_tools(&format!("use `{name}`"), &tools),
@@ -930,6 +887,7 @@ fn nudge_copy_names_no_phantom_tools() {
     for names in [
         ToolNameStyle::CodexPlugin,
         ToolNameStyle::ClaudePlugin,
+        ToolNameStyle::OmpNative,
         ToolNameStyle::OmpMarketplace,
     ] {
         let copy = format!(

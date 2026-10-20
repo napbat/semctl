@@ -22,6 +22,7 @@ mod upload;
 pub(crate) mod walker;
 
 pub(crate) use cache::SyncCache;
+pub(crate) use walker::MAX_FILE_BYTES;
 
 use std::fmt;
 use std::path::{Path, PathBuf};

@@ -3,13 +3,14 @@
 //! model. No `Client`, no `async`, no network — just formatting, so this
 //! layer is cheap to unit-test in isolation.
 
-use std::collections::HashSet;
+use std::borrow::Cow;
 use std::fmt::Write;
 use std::path::Path;
 
 use crate::client::api;
 
 use super::inspection::GRAPH_LIST_CAP;
+use super::source::HitSource;
 
 /// Local paths are valid only for hits from the selected checkout.
 #[derive(Clone, Copy)]
@@ -86,14 +87,19 @@ pub(super) fn render_compact(
     if hits.is_empty() {
         return format!("{empty_msg}\n");
     }
-    let mut out = String::new();
+    let mut out = String::from("| Location | Symbol | Access |\n| --- | --- | --- |\n");
     for h in hits {
+        let marker = write_marker(h);
         writeln!(
             out,
-            "  {} {}{}",
-            hit_location(h, root),
-            hit_symbol(h),
-            write_marker(h)
+            "| {} | {} | {} |",
+            markdown_cell(&hit_location(h, root)),
+            markdown_cell(&hit_symbol(h)),
+            markdown_cell(if marker.is_empty() {
+                "-"
+            } else {
+                marker.trim()
+            })
         )
         .expect("writing to a String cannot fail");
     }
@@ -108,13 +114,11 @@ pub(super) fn render_boundaries(boundaries: &[String], empty_msg: &str) -> Strin
     }
     let mut out = String::new();
     for b in boundaries {
-        out.push_str("  ");
-        out.push_str(b);
-        out.push('\n');
+        writeln!(out, "- {}", markdown_code(b)).expect("writing to a String cannot fail");
     }
     writeln!(
         out,
-        "({} boundar{})",
+        "\n({} boundar{})",
         boundaries.len(),
         if boundaries.len() == 1 { "y" } else { "ies" }
     )
@@ -125,69 +129,100 @@ pub(super) fn render_boundaries(boundaries: &[String], empty_msg: &str) -> Strin
 /// Render a file list (sorted by path), absolutizing each against the local
 /// checkout when known.
 pub(super) fn render_files(files: &[api::CodebaseFile], root: Option<&Path>) -> String {
-    let mut out = String::new();
+    let mut out = String::from("| Path | Bytes |\n| --- | ---: |\n");
     for f in files {
-        writeln!(out, "{}  ({} bytes)", local_path(root, &f.path), f.size)
-            .expect("writing to a String cannot fail");
+        writeln!(
+            out,
+            "| {} | {} |",
+            markdown_cell(&local_path(root, &f.path)),
+            f.size
+        )
+        .expect("writing to a String cannot fail");
     }
     out
 }
 
-/// Render a job's progress. The phase is derived from timestamps/error rather
-/// than the server's status enum, so it's robust to the enum's wire encoding.
-pub(super) fn render_job(job_id: &str, j: &api::JobStatus) -> String {
-    let phase = if j.error.is_some() {
-        "failed"
-    } else if j.completed_at.is_some() {
-        "done"
-    } else if j.started_at.is_some() {
-        "running"
-    } else {
-        "queued"
-    };
-    let done = j.files_embedded + j.files_deleted + j.files_failed;
-    let total = j.files_to_embed + j.files_to_delete;
+/// Keep outline depth explicit and declaration bodies separate from metadata.
+pub(super) fn render_outline(outline: &api::FileOutline, root: Option<&Path>) -> String {
+    let location = local_path(root, &outline.path);
     let mut out = format!(
-        "last sync run {job_id}: {phase}\n  \
-             files: {done}/{total} processed (embedded {}, deleted {}, failed {})",
-        j.files_embedded, j.files_deleted, j.files_failed,
+        "{} · {} outline entries\n\n| Depth | Lines | Kind | Symbol |\n| ---: | --- | --- | --- |\n",
+        markdown_code(&location),
+        outline.entries.len(),
     );
-    if let Some(e) = &j.error {
-        write!(out, "\n  error: {e}").expect("writing to a String cannot fail");
+    for entry in &outline.entries {
+        let symbol = entry
+            .qualified_symbol
+            .as_deref()
+            .or(entry.symbol.as_deref())
+            .unwrap_or("-");
+        writeln!(
+            out,
+            "| {} | {}-{} | {} | {} |",
+            entry.depth,
+            entry.line_start,
+            entry.line_end,
+            markdown_cell(entry.symbol_kind.as_deref().unwrap_or(&entry.kind)),
+            markdown_cell(symbol)
+        )
+        .expect("writing to a String cannot fail");
     }
-    if phase == "done" && total == 0 {
-        out.push_str("\n  (up to date — nothing to sync)");
+    out.push('\n');
+    for entry in &outline.entries {
+        if let Some(body) = &entry.body {
+            writeln!(
+                out,
+                "### {}\n",
+                markdown_code(&format!(
+                    "{location}:{}-{}",
+                    entry.line_start, entry.line_end
+                ))
+            )
+            .expect("writing to a String cannot fail");
+            render_fenced(&mut out, body, source_language_hint(&outline.path));
+            out.push('\n');
+        }
     }
     out
 }
 
-/// Render a project graph as readable text — groups (workspaces/solutions),
-/// then leaf projects with their file counts.
+/// Render project fields as Markdown tables. Tables also remain readable in
+/// ordinary terminal output.
 pub fn render_projects(graph: &api::ProjectGraph) -> String {
     if graph.projects.is_empty() && graph.groups.is_empty() {
         return "(no projects detected — synced files may not include manifests)".into();
     }
     let mut out = String::new();
-    for g in &graph.groups {
-        writeln!(
-            out,
-            "[group] {}  ({}, {})  {} member(s)",
-            g.name,
-            g.kind,
-            g.root,
-            g.children.len()
-        )
-        .expect("writing to a String cannot fail");
+    if !graph.groups.is_empty() {
+        out.push_str("| Group | Kind | Root | Members |\n| --- | --- | --- | ---: |\n");
+        for g in &graph.groups {
+            writeln!(
+                out,
+                "| {} | {} | {} | {} |",
+                markdown_cell(&g.name),
+                markdown_cell(&g.kind),
+                markdown_cell(&g.root),
+                g.children.len()
+            )
+            .expect("writing to a String cannot fail");
+        }
+        out.push('\n');
     }
-    for p in &graph.projects {
-        writeln!(
-            out,
-            "{}  ({}, {})  {} file(s)",
-            p.name, p.kind, p.root, p.file_count
-        )
-        .expect("writing to a String cannot fail");
-        if let Some(cfg) = &p.config_file {
-            writeln!(out, "    {cfg}").expect("writing to a String cannot fail");
+    if !graph.projects.is_empty() {
+        out.push_str(
+            "| Project | Kind | Root | Files | Config |\n| --- | --- | --- | ---: | --- |\n",
+        );
+        for p in &graph.projects {
+            writeln!(
+                out,
+                "| {} | {} | {} | {} | {} |",
+                markdown_cell(&p.name),
+                markdown_cell(&p.kind),
+                markdown_cell(&p.root),
+                p.file_count,
+                markdown_cell(p.config_file.as_deref().unwrap_or("-"))
+            )
+            .expect("writing to a String cannot fail");
         }
     }
     out
@@ -220,9 +255,8 @@ pub(super) fn render_tree(nodes: &[api::FileTreeNode], depth: usize, out: &mut S
     }
 }
 
-/// Render a hit list as readable text. Each hit is a location line plus
-/// a few lines of snippet — enough for the model to decide whether to
-/// expand, without flooding the context.
+/// Render a hit list as Markdown. The count and first location lead the output.
+/// Each hit has a heading, a fenced snippet, and source metadata.
 ///
 /// `show_score` gates the relevance score: it's meaningful for `search`
 /// (ranked by hybrid similarity) but a constant 0.000 for the symbol-graph
@@ -239,114 +273,93 @@ pub(super) fn render_hits(
         empty_msg,
         HitContext::local(root),
         show_score,
-        &HashSet::new(),
+        &[],
         false,
     )
 }
 
-/// As [`render_hits`], but annotates any hit whose codebase-relative path is in
-/// `stale` (its local file no longer matches the index), and — when `full_body`
-/// — prints the whole snippet instead of the first four lines (for `--expand`,
-/// where the server already returned the full enclosing-symbol body). The public
-/// [`render_hits`] passes an empty set and `false`; only `search` varies them.
+/// As [`render_hits`], but includes the per-hit source-binding outcome before
+/// indexed evidence. `full_body` prints the full returned snippet; source
+/// validation never replaces or relocates that evidence.
 pub(super) fn render_hits_inner(
     hits: &[api::SearchHit],
     empty_msg: &str,
     context: HitContext<'_>,
     show_score: bool,
-    stale: &HashSet<String>,
+    sources: &[HitSource],
     full_body: bool,
 ) -> String {
     if hits.is_empty() {
         return empty_msg.to_string();
     }
-    // Grouping (search only): hits arrive ranked, with a long low-relevance tail.
-    // Split the tail off under a separator so strong matches aren't visually equal
-    // to the noise — without DROPPING any hit (a relevance floor could silently cut
-    // recall). "Weak" is relative to the top hit, adapting to each query's scale.
-    let weak_below = show_score
-        .then(|| hits.iter().map(|h| h.score).fold(f64::MIN, f64::max) * WEAK_HIT_FRACTION);
-
-    let mut out = String::new();
-    let mut separated = false;
+    let mut out = format!(
+        "**{} {}**",
+        hits.len(),
+        if hits.len() == 1 { "match" } else { "matches" }
+    );
+    out.push('\n');
+    if show_score {
+        render_search_table(&mut out, hits, context, sources);
+    }
     let mut expanded_chars = 0_usize;
-    let mut snipped = 0_usize;
-    for h in hits {
+    let mut shortened_hits = 0_usize;
+    for (index, h) in hits.iter().enumerate() {
         let root = context.root_for(h);
-        if let Some(floor) = weak_below
-            && !separated
-            && h.score < floor
-        {
-            out.push_str("--- weaker matches (below ");
-            write!(
-                out,
-                "{:.0}% of top score) ---\n\n",
-                WEAK_HIT_FRACTION * 100.0
-            )
-            .expect("writing to a String cannot fail");
-            separated = true;
+        if show_score {
+            writeln!(out, "\n**{}**", index + 1).expect("writing to a String cannot fail");
+        } else {
+            render_hit_heading(&mut out, h, root);
         }
-        let lang = h
-            .language
-            .as_deref()
-            .map(|l| format!(" {l}"))
-            .unwrap_or_default();
-        let score = if show_score {
-            format!("  (score {:.3})", h.score)
-        } else {
-            String::new()
-        };
-        let sym = hit_symbol(h);
-        // Kind (container/function/block) lets the reader tell a type/def chunk
-        // from a free block at a glance. Omitted when the server didn't send one.
-        let kind = if h.kind.is_empty() {
-            String::new()
-        } else {
-            format!(" ({})", h.kind)
-        };
-        let stale_mark = if root.is_some() && h.path.as_deref().is_some_and(|p| stale.contains(p)) {
-            "  ⚠ stale (edited since indexed)"
-        } else {
-            ""
-        };
-        let codebase = if show_score {
-            h.codebase_id
-                .as_deref()
-                .map(|id| format!(" [codebase {id}]"))
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
-        writeln!(
-            out,
-            "[{}{lang}]{codebase} {}  {sym}{kind}{}{score}{stale_mark}",
-            h.domain_id,
-            hit_location(h, root),
-            write_marker(h)
-        )
-        .expect("writing to a String cannot fail");
-        // Skip leading blank lines so the declaration/signature leads the snippet
-        // rather than whitespace. `--expand` shows the whole body; otherwise the
-        // first few lines, enough to judge relevance without flooding context.
-        let lines = h.snippet.lines().skip_while(|l| l.trim().is_empty());
         let expand = full_body
             && (expanded_chars == 0 || expanded_chars + h.snippet.len() <= EXPANDED_BODY_CHARS);
         if expand {
             expanded_chars += h.snippet.len();
         } else if full_body {
-            snipped += 1;
+            shortened_hits += 1;
         }
-        for line in lines.take(if expand { usize::MAX } else { 4 }) {
-            out.push_str("    ");
-            out.push_str(line);
-            out.push('\n');
+        // The preview starts at the first nonblank line. Expanded bodies retain
+        // all source bytes, including leading blank lines and indentation.
+        let snippet = if expand {
+            Cow::Borrowed(h.snippet.as_str())
+        } else {
+            Cow::Owned(
+                h.snippet
+                    .lines()
+                    .skip_while(|line| line.trim().is_empty())
+                    .take(4)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+        };
+        if !snippet.is_empty() {
+            render_fenced(&mut out, &snippet, h.language.as_deref());
+        }
+        render_hit_metadata(&mut out, h);
+        if show_score {
+            writeln!(out, "Score: {:.3}", h.score).expect("writing to a String cannot fail");
+        }
+        if let Some(source) = sources.get(index) {
+            if matches!(
+                source,
+                HitSource::ChangedLocal | HitSource::IndexedRangeMismatch
+            ) && let Some(reason) = source.warning()
+            {
+                writeln!(out, "Source detail: {reason}").expect("writing to a String cannot fail");
+            }
+            render_source_diagnostic(&mut out, h.path.as_deref().unwrap_or("(no path)"), source);
         }
         out.push('\n');
     }
-    if snipped > 0 {
+    if sources
+        .iter()
+        .any(|source| matches!(source, HitSource::Bound))
+    {
+        out.push_str("Verified source means matching ready-source bytes and reported coordinates, not semantic symbol/focus identity.\n");
+    }
+    if shortened_hits > 0 {
         writeln!(
             out,
-            "{snipped} hit(s) shown as snippets: expanded bodies stop at \
+            "{shortened_hits} hit(s) shown as snippets: expanded bodies stop at \
              {EXPANDED_BODY_CHARS} characters. Use expand_chunk for one of them."
         )
         .expect("writing to a String cannot fail");
@@ -354,16 +367,216 @@ pub(super) fn render_hits_inner(
     out
 }
 
+/// Rank rows summarize the same evidence retained in the source previews below.
+fn render_search_table(
+    out: &mut String,
+    hits: &[api::SearchHit],
+    context: HitContext<'_>,
+    sources: &[HitSource],
+) {
+    // Both scales match the native inspector and are query-relative, not confidence.
+    // Nonnegative scores use ratios; signed scores use the result set's range.
+    let scale = score_scale(hits);
+    out.push_str("\n| | Match | Source |\n| --- | --- | --- |\n");
+    for (index, hit) in hits.iter().enumerate() {
+        let binding = match sources.get(index) {
+            Some(HitSource::Bound) => "bound",
+            Some(HitSource::ChangedLocal) => "changed",
+            Some(HitSource::IndexedRangeMismatch) => "range mismatch",
+            Some(HitSource::Unverified(_)) => "unverified",
+            None => "not probed",
+        };
+        writeln!(
+            out,
+            "| {}\u{a0}{} | {} — {} | {} |",
+            index + 1,
+            score_bar(hit.score, scale),
+            markdown_code(&hit_location(hit, context.root_for(hit))).replace('|', "\\|"),
+            markdown_code(&format!("{}{}", hit_symbol(hit), write_marker(hit))).replace('|', "\\|"),
+            binding,
+        )
+        .expect("writing to a String cannot fail");
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ScoreScale {
+    Ratio(f64),
+    Range { min: f64, max: f64 },
+}
+
+fn score_scale(hits: &[api::SearchHit]) -> Option<ScoreScale> {
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    for hit in hits {
+        if !hit.score.is_finite() {
+            return None;
+        }
+        min = min.min(hit.score);
+        max = max.max(hit.score);
+    }
+    if min >= 0.0 {
+        (max > 0.0).then_some(ScoreScale::Ratio(max))
+    } else {
+        (max - min > 1e-12).then_some(ScoreScale::Range { min, max })
+    }
+}
+
+fn score_bar(score: f64, scale: Option<ScoreScale>) -> &'static str {
+    const BARS: [&str; 6] = ["▱▱▱▱▱", "▰▱▱▱▱", "▰▰▱▱▱", "▰▰▰▱▱", "▰▰▰▰▱", "▰▰▰▰▰"];
+    scale.map_or("—", |scale| {
+        let strength = match scale {
+            ScoreScale::Ratio(max) => score / max,
+            ScoreScale::Range { min, max } => 0.1 + 0.9 * (score - min) / (max - min),
+        };
+        BARS[[0.0, 0.2, 0.4, 0.6, 0.8].partition_point(|threshold| strength > *threshold)]
+    })
+}
+
+fn render_hit_heading(out: &mut String, hit: &api::SearchHit, root: Option<&Path>) {
+    out.push_str("### ");
+    write!(
+        out,
+        "{} — {}",
+        markdown_code(&hit_location(hit, root)),
+        markdown_code(&hit_symbol(hit))
+    )
+    .expect("writing to a String cannot fail");
+    let marker = write_marker(hit);
+    if !marker.is_empty() {
+        write!(out, " {}", markdown_code(marker.trim())).expect("writing to a String cannot fail");
+    }
+    out.push('\n');
+}
+
+/// Raw failures follow the preview and remain fenced, including hostile Markdown.
+pub(crate) fn render_source_diagnostic(out: &mut String, path: &str, source: &HitSource) {
+    if let HitSource::Unverified(reason) = source {
+        writeln!(
+            out,
+            "\nSource verification diagnostic for {}:",
+            markdown_code(path)
+        )
+        .expect("writing to a String cannot fail");
+        render_fenced(out, reason, Some("text"));
+    }
+}
+
+fn render_hit_metadata(out: &mut String, hit: &api::SearchHit) {
+    write!(out, "Domain: {}", markdown_code(&hit.domain_id))
+        .expect("writing to a String cannot fail");
+    if !hit.kind.is_empty() {
+        write!(out, " · Kind: {}", markdown_code(&hit.kind))
+            .expect("writing to a String cannot fail");
+    }
+    if let Some(codebase) = &hit.codebase_id {
+        write!(out, " · Codebase: {}", markdown_code(codebase))
+            .expect("writing to a String cannot fail");
+    }
+    out.push('\n');
+}
+
+/// Keep untrusted values on one line and outside Markdown syntax.
+pub(super) fn markdown_code(value: &str) -> String {
+    if value.is_empty() {
+        return "(empty)".into();
+    }
+    let mut text = String::new();
+    for character in value.chars() {
+        if character.is_control() {
+            text.extend(character.escape_default());
+        } else {
+            text.push(character);
+        }
+    }
+    let fence = "`".repeat(longest_backtick_run(&text).saturating_add(1));
+    // Padding separates delimiter backticks and preserves surrounding spaces.
+    // CommonMark removes one padding space at each end of a code span.
+    let needs_padding = text.starts_with('`')
+        || text.ends_with('`')
+        || (text.starts_with(' ') && text.ends_with(' ') && !text.trim().is_empty());
+    let padding = if needs_padding { " " } else { "" };
+    format!("{fence}{padding}{text}{padding}{fence}")
+}
+
+/// Keep pipe escapes outside code spans, including values ending in backslashes.
+pub(super) fn markdown_cell(value: &str) -> String {
+    if !value.contains('|') {
+        return markdown_code(value);
+    }
+    let mut out = String::new();
+    for (index, part) in value.split('|').enumerate() {
+        if index > 0 {
+            out.push_str("\\|");
+        }
+        if !part.is_empty() {
+            out.push_str(&markdown_code(part));
+        }
+    }
+    out
+}
+
+/// Pass suffixes as display-only hints to the host's grammar-alias resolver.
+/// This does not identify a parser language; absent or unsafe hints render text.
+pub(super) fn source_language_hint(path: &str) -> Option<&str> {
+    let path = Path::new(path);
+    match path.file_name()?.to_str()? {
+        "CMakeLists.txt" => return Some("cmake"),
+        "Makefile" | "makefile" => return Some("makefile"),
+        "Dockerfile" => return Some("dockerfile"),
+        _ => {}
+    }
+    let suffix = path.extension()?.to_str()?;
+    // Fence normalization lowercases hints. Preserve the C++ meaning of `.C`.
+    Some(if suffix == "C" { "cpp" } else { suffix })
+}
+
+/// Protect whitespace and source delimiters without changing the body bytes.
+pub(super) fn render_fenced(out: &mut String, body: &str, language: Option<&str>) {
+    let fence = "`".repeat(longest_backtick_run(body).saturating_add(1).max(3));
+    let language = fence_language(language);
+    write!(out, "{fence}{language}\n{body}").expect("writing to a String cannot fail");
+    if !body.ends_with('\n') {
+        out.push('\n');
+    }
+    writeln!(out, "{fence}").expect("writing to a String cannot fail");
+}
+
+fn longest_backtick_run(value: &str) -> usize {
+    value
+        .split(|character| character != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Keep source literal even when the host reserves a fence for rich rendering.
+fn fence_language(language: Option<&str>) -> Cow<'_, str> {
+    let language = language
+        .filter(|value| {
+            !value.is_empty()
+                && value.chars().all(|character| {
+                    character.is_ascii_alphanumeric()
+                        || matches!(character, '_' | '-' | '+' | '#' | '.')
+                })
+        })
+        .unwrap_or("text");
+    if language.eq_ignore_ascii_case("mermaid") {
+        Cow::Borrowed("text")
+    } else if language.eq_ignore_ascii_case("svg") {
+        Cow::Borrowed("xml")
+    } else if language.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Cow::Owned(language.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(language)
+    }
+}
+
 /// The total length of expanded bodies in one search answer. The first hit is
 /// always expanded; a later hit that does not fit is shown as a snippet. The
 /// server has no size limit of its own, and one expanded search with a broad
 /// `top_k` can otherwise return tens of thousands of characters.
 const EXPANDED_BODY_CHARS: usize = 30_000;
-
-/// A hit scoring below this fraction of the top hit's score is sorted under the
-/// "weaker matches" separator. Relative (not absolute) because raw hybrid
-/// scores aren't calibrated across queries.
-const WEAK_HIT_FRACTION: f64 = 0.5;
 
 /// The symbol column: the MATCHED symbol, qualified by the declaration that
 /// contains it when the server reports one (`dispatch in run_until`). Without
@@ -419,11 +632,9 @@ pub(super) fn hit_location(h: &api::SearchHit, root: Option<&Path>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
 
-    use super::{
-        EXPANDED_BODY_CHARS, HitContext, api, render_hits_inner, render_job, strip_verbatim_prefix,
-    };
+    use super::{EXPANDED_BODY_CHARS, HitContext, api, render_hits_inner, strip_verbatim_prefix};
+    use crate::query::HitSource;
 
     /// A `SearchHit` with a chosen chunk id + path — for the render test that
     /// keys on those.
@@ -457,26 +668,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn render_marks_only_stale_paths() {
-        let hits = [node("a", "dirty.rs"), node("b", "clean.rs")];
-        let stale: HashSet<String> = ["dirty.rs".to_string()].into_iter().collect();
-
-        let out = render_hits_inner(
-            &hits,
-            "none",
-            HitContext::local(Some(std::path::Path::new("/repo"))),
-            true,
-            &stale,
-            false,
-        );
-        let dirty = out.lines().find(|l| l.contains("dirty.rs")).unwrap();
-        let clean = out.lines().find(|l| l.contains("clean.rs")).unwrap();
-
-        assert!(dirty.contains("⚠ stale"), "edited file flagged");
-        assert!(!clean.contains("⚠ stale"), "untouched file not flagged");
-    }
-
     /// A hit whose expanded body has `lines` lines of 10 characters each.
     fn body(id: &str, lines: usize) -> api::SearchHit {
         let mut hit = node(id, &format!("{id}.rs"));
@@ -485,14 +676,62 @@ mod tests {
     }
 
     fn expanded(hits: &[api::SearchHit]) -> String {
-        render_hits_inner(
-            hits,
-            "none",
-            HitContext::local(None),
-            true,
-            &HashSet::new(),
-            true,
-        )
+        render_hits_inner(hits, "none", HitContext::local(None), true, &[], true)
+    }
+
+    fn assert_score_bars(scores: &[f64], bars: &[&str]) {
+        assert_eq!(scores.len(), bars.len());
+        let hits: Vec<_> = scores
+            .iter()
+            .map(|&score| {
+                let mut hit = node("result", "source.rs");
+                hit.score = score;
+                hit
+            })
+            .collect();
+        let mut output = String::new();
+        super::render_search_table(&mut output, &hits, HitContext::local(None), &[]);
+        for (index, bar) in bars.iter().enumerate() {
+            assert!(
+                output.contains(&format!("| {}\u{a0}{bar} |", index + 1)),
+                "{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_bars_keep_nonnegative_ratio_thresholds() {
+        assert_score_bars(
+            &[1.0, 0.8, 0.6, 0.4, 0.2, 0.0],
+            &["▰▰▰▰▰", "▰▰▰▰▱", "▰▰▰▱▱", "▰▰▱▱▱", "▰▱▱▱▱", "▱▱▱▱▱"],
+        );
+        assert_score_bars(&[2.0, 1.0], &["▰▰▰▰▰", "▰▰▰▱▱"]);
+    }
+
+    #[test]
+    fn search_bars_scale_all_negative_scores_across_the_result_range() {
+        assert_score_bars(&[-1.59, -3.865, -6.14], &["▰▰▰▰▰", "▰▰▰▱▱", "▰▱▱▱▱"]);
+    }
+
+    #[test]
+    fn search_bars_scale_mixed_scores_across_the_result_range() {
+        assert_score_bars(&[2.0, 0.0, -2.0], &["▰▰▰▰▰", "▰▰▰▱▱", "▰▱▱▱▱"]);
+    }
+
+    #[test]
+    fn search_bars_are_unavailable_for_every_hit_when_any_score_is_nonfinite() {
+        for score in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_score_bars(&[1.0, score, -2.0], &["—", "—", "—"]);
+        }
+    }
+
+    #[test]
+    fn search_bars_are_unavailable_without_a_nonzero_scale() {
+        assert_score_bars(&[0.0, 0.0], &["—", "—"]);
+        assert_score_bars(&[-2.0, -2.0], &["—", "—"]);
+        assert_score_bars(&[-2.0], &["—"]);
+        assert_score_bars(&[-2.0, -2.0 + 5e-13], &["—", "—"]);
+        assert_score_bars(&[-2.0, -2.0 + 2e-12], &["▰▱▱▱▱", "▰▰▰▰▰"]);
     }
 
     #[test]
@@ -532,27 +771,31 @@ mod tests {
         remote.codebase_id = Some("b".into());
         let unidentified = node("unidentified", "src/lib.rs");
         let context = HitContext::search(Some(root), Some("a"), false);
-        let stale = HashSet::from(["src/lib.rs".to_string()]);
+        let sources = [HitSource::ChangedLocal];
         let output = render_hits_inner(
             &[local, remote, unidentified],
             "none",
             context,
             true,
-            &stale,
+            &sources,
             false,
         );
-        let lines: Vec<_> = output
+        let local_row = output
             .lines()
-            .filter(|line| line.starts_with('['))
-            .collect();
-        assert!(lines[0].contains("[codebase a]"));
-        assert!(lines[0].contains(&root.join("src/lib.rs").display().to_string()));
-        assert!(lines[0].contains("stale"));
-        assert!(lines[1].contains("[codebase b] src/lib.rs"));
-        assert!(!lines[1].contains("checkout-a"));
-        assert!(!lines[1].contains("stale"));
-        assert!(!lines[2].contains("checkout-a"));
-        assert!(!lines[2].contains("stale"));
+            .find(|line| line.contains("`local`"))
+            .unwrap();
+        let remote_row = output
+            .lines()
+            .find(|line| line.contains("`remote`"))
+            .unwrap();
+        let unknown_row = output
+            .lines()
+            .find(|line| line.contains("`unidentified`"))
+            .unwrap();
+        assert!(local_row.contains(&root.join("src/lib.rs").display().to_string()));
+        assert!(remote_row.contains("`src/lib.rs:1-2`") && !remote_row.contains("checkout-a"));
+        assert!(unknown_row.contains("`src/lib.rs:1-2`") && !unknown_row.contains("checkout-a"));
+        assert!(output.contains("Codebase: `a`") && output.contains("Codebase: `b`"));
     }
 
     #[test]
@@ -573,21 +816,117 @@ mod tests {
         let mut write = node("dispatch", "run.rs");
         write.enclosing_symbol = Some("reset".into());
         write.is_write = Some(true);
+        write.reference_namespace = Some("Value".into());
+        write.reference_kind = Some("assignment".into());
+        write.qualified_symbol = Some("crate::dispatch".into());
 
         let out = render_hits_inner(
             &[read, write],
             "none",
             HitContext::local(None),
             false,
-            &HashSet::new(),
+            &[],
             false,
         );
         let lines: Vec<&str> = out.lines().filter(|l| l.contains("run.rs")).collect();
 
         assert!(lines[0].contains("dispatch in run_until"), "{out}");
-        assert!(!lines[0].contains("(write)"), "a read isn't marked: {out}");
+        assert!(lines[0].contains("(read)"), "{out}");
         assert!(lines[1].contains("dispatch in reset"), "{out}");
-        assert!(lines[1].contains("(write)"), "{out}");
+        assert!(
+            lines[1].contains("(write; value; assignment; -> crate::dispatch)"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("hybrid score"),
+            "graph hits have no relevance score: {out}"
+        );
+    }
+
+    #[test]
+    fn source_diagnostics_preserve_raw_failure_after_source_without_markdown_injection() {
+        let mut hit = node("original", "source.rs");
+        hit.snippet = "fn original() {}".into();
+        let diagnostic = "FileNotIndexed Pending\n```\n# injected heading\n````\n";
+        let output = render_hits_inner(
+            &[hit],
+            "none",
+            HitContext::local(None),
+            false,
+            &[HitSource::Unverified(diagnostic.into())],
+            true,
+        );
+        assert!(output.contains("source.rs:1-2") && output.contains("fn original() {}"));
+        assert!(output.find("fn original() {}").unwrap() < output.find("FileNotIndexed").unwrap());
+        assert!(output.contains(&format!("`````text\n{diagnostic}`````\n")));
+    }
+
+    #[test]
+    fn render_fences_preserve_snippet_markdown_and_preview_line_selection() {
+        let mut hit = node("snippet", "source.rs");
+        hit.snippet =
+            "\n  \nfn example() {\n    ```rust\n    ~~~\n    **text** <tag>  \n    omitted\n}"
+                .into();
+        let output = render_hits_inner(&[hit], "none", HitContext::local(None), false, &[], false);
+        assert!(
+            output.contains(
+                "\n````rust\nfn example() {\n    ```rust\n    ~~~\n    **text** <tag>  \n````\n"
+            ),
+            "{output}"
+        );
+        assert!(!output.contains("omitted"), "{output}");
+    }
+
+    #[test]
+    fn render_expanded_body_preserves_all_source_bytes() {
+        let mut hit = node("expanded", "source.rs");
+        let source = "\r\n  fn example() {\r\n    one\r\n    two\r\n    three\r\n    four\r\n    `````\r\n  }\r\n";
+        hit.snippet = source.into();
+        let output = render_hits_inner(&[hit], "none", HitContext::local(None), false, &[], true);
+        assert!(
+            output.contains(&format!("\n``````rust\n{source}``````\n")),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn render_untrusted_values_cannot_open_markdown_blocks() {
+        let mut hit = node("`symbol`|\n<!--", "`source`|\n```\n.rs");
+        hit.language = Some("rust\n```".into());
+        hit.domain_id = "<details>\n```".into();
+        hit.codebase_id = Some("a`\r\n# hidden".into());
+        hit.snippet = "let value = 1;".into();
+        let output = render_hits_inner(&[hit], "none", HitContext::local(None), true, &[], false);
+        let row = output
+            .lines()
+            .find(|line| line.contains("`symbol`"))
+            .unwrap();
+        assert!(row.contains("```` `source`\\|\\n```\\n.rs:1-2 ````"));
+        assert!(row.contains("`` `symbol`\\|\\n<!-- ``"));
+        assert!(output.contains("Codebase: ``a`\\r\\n# hidden``"));
+        assert!(output.contains("\n```text\nlet value = 1;\n```\n"));
+    }
+
+    #[test]
+    fn render_empty_results_preserves_the_exact_message() {
+        for message in ["no results", "nothing calls `run`", ""] {
+            assert_eq!(
+                render_hits_inner(&[], message, HitContext::local(None), true, &[], false,),
+                message
+            );
+        }
+    }
+
+    #[test]
+    fn render_missing_and_empty_values_remain_visible() {
+        let mut hit = node("", "source.rs");
+        hit.path = None;
+        hit.domain_id.clear();
+        hit.language = None;
+        hit.kind.clear();
+        let output = render_hits_inner(&[hit], "none", HitContext::local(None), false, &[], false);
+        assert!(output.contains("`(no location)` — (empty)"));
+        assert!(output.contains("Domain: (empty)"));
     }
 
     #[test]
@@ -617,23 +956,5 @@ mod tests {
             strip_verbatim_prefix("/home/dev/repo/src/lib.rs".into()),
             "/home/dev/repo/src/lib.rs"
         );
-    }
-
-    #[test]
-    fn job_progress_counts_failed_files_as_processed() {
-        let job = api::JobStatus {
-            files_to_embed: 10,
-            files_to_delete: 2,
-            files_embedded: 4,
-            files_deleted: 2,
-            files_failed: 3,
-            chunk_count: None,
-            error: None,
-            started_at: Some("2026-07-14T00:00:00Z".into()),
-            completed_at: None,
-        };
-
-        let out = render_job("job-1", &job);
-        assert!(out.contains("files: 9/12 processed"), "{out}");
     }
 }
