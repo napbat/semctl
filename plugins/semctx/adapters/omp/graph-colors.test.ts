@@ -1,9 +1,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { conceptRevision, lookupConcept, resetConcepts, setConceptSnapshot, subscribeConcepts } from "./concept-colors";
+import type { DescribeContext } from "@oh-my-pi/pi-tui";
+import { conceptRevision, groupConcept, lookupConcept, resetConcepts, setConceptSnapshot, subscribeConcepts } from "./concept-colors";
 import { bindGraphGroupColors, getGraphColorMode, graphColorRevision, graphGroupColor, lookupGraphColor, setGraphColorMode } from "./graph-colors";
 import type { GraphData } from "./graph";
 import { readDisplay, type Display, type Hit } from "./inspector";
+import type { DocSource } from "./graph-data/doc-concepts.js";
 import { conceptPalette } from "./graph-data/palette.js";
+import { nativeGraphColorCue } from "./native-concepts";
 
 type GraphNode = GraphData["nodes"][number];
 function file(path: string, extra: Partial<GraphNode> = {}): GraphNode {
@@ -21,10 +24,10 @@ function overview(codebaseId: string): Extract<Display, { kind: "graph" }> {
 		nodes: [file("src/a.ts", { id: "a" }), file("src/b.ts", { id: "b" }), file("src/unsupported.ts", { id: "unsupported" })],
 		edges: [{ from: "a", to: "b", kind: "reference", label: "references", symbol: "ResolveSymbol", moniker: "actual::ResolveSymbol" }] };
 }
-function snapshot(value: Extract<Display, { kind: "graph" }>): void {
+function snapshot(value: Extract<Display, { kind: "graph" }>, docs: readonly DocSource[] = []): void {
 	const display = readDisplay(value, "overview", true);
 	if (!display) throw new Error("Invalid graph color fixture");
-	setConceptSnapshot(display);
+	setConceptSnapshot(display, docs);
 }
 
 describe("shared codebase graph colors", () => {
@@ -58,7 +61,8 @@ describe("shared codebase graph colors", () => {
 		expect(fallback).toEqual(lookupGraphColor(null, foreign, "concepts"));
 		expect(fallback?.key).not.toBe(lookupGraphColor("local-envelope", local, "structure")?.key);
 		snapshot(overview("foreign-hit"));
-		expect(lookupGraphColor("local-envelope", foreign, "concepts")).toMatchObject({ ...lookupConcept("foreign-hit", "src/a.ts"), source: "concept" });
+		const foreignConcept = lookupConcept("foreign-hit", "src/a.ts");
+		expect(lookupGraphColor("local-envelope", foreign, "concepts")).toMatchObject({ key: foreignConcept?.key, light: foreignConcept?.light, source: "concept", concept: foreignConcept });
 		expect(graphGroupColor("local-envelope", [local, foreign], "concepts")).toBeUndefined();
 		expect(graphGroupColor("local-envelope", [local, foreign], "structure")).toBeUndefined();
 	});
@@ -86,7 +90,7 @@ describe("shared codebase graph colors", () => {
 		snapshot(raw);
 		const concept = lookupConcept("validated-colors", "src/a.ts")!;
 		expect(concept).toBeDefined();
-		expect(lookupGraphColor("validated-colors", raw.nodes[0], "concepts")).toMatchObject({ ...concept, source: "concept" });
+		expect(lookupGraphColor("validated-colors", raw.nodes[0], "concepts")).toMatchObject({ key: concept.key, label: concept.label, ...conceptPalette(concept.key), source: "concept", concept });
 		expect(lookupGraphColor("validated-colors", { id: "different-result", label: "Resolve", detail: null, hit: hit("src/a.ts") }, "concepts")).toEqual(
 			lookupGraphColor("validated-colors", raw.nodes[0], "concepts"));
 		expect(lookupGraphColor("validated-colors", raw.nodes[0], "structure")?.source).toBe("structure");
@@ -120,6 +124,36 @@ describe("shared codebase graph colors", () => {
 		expect(graphGroupColor("aggregate-colors", [a, b], "concepts")?.source).toBe("concept");
 		expect(graphGroupColor("aggregate-colors", [a, file("src/unsupported.ts")], "concepts")).toBeUndefined();
 		expect(graphGroupColor("aggregate-colors", [a, file("src", { category: "directory" })], "concepts")).toBeUndefined();
+	});
+
+	test("doc concepts color files, directories and project roots alike; groups show the concept without one member's route", () => {
+		const paths = ["docs/dispatch.md", "src/dispatch/queue.ts", "src/dispatch/worker.ts", "src/dispatch/pool.ts", "lib/other.ts"];
+		snapshot({ ...overview("doc-colors"), truncated: true, edges: [],
+			nodes: [...paths.map((path, index) => file(path, { id: String(index) })), file("src/dispatch", { id: "directory", category: "directory" })] },
+		[{ path: "docs/dispatch.md", text: "# Dispatch\n\nQueue in `src/dispatch/queue.ts`; workers live in `src/dispatch/`.\n" }]);
+		const doc = file("docs/dispatch.md"), queue = file("src/dispatch/queue.ts"), directory = file("src/dispatch", { category: "directory" });
+		const color = lookupGraphColor("doc-colors", queue, "concepts"), folder = lookupGraphColor("doc-colors", directory, "concepts");
+		expect(color).toMatchObject({ source: "concept", key: "doc:docs/dispatch.md", concept: lookupConcept("doc-colors", "src/dispatch/queue.ts") });
+		expect(color?.concept?.via).toBe("mention");
+		expect(folder).toMatchObject({ source: "concept", key: color?.key });
+		expect(folder?.concept?.via).toBe("folder");
+		expect(lookupGraphColor("doc-colors", file("src/dispatch", { category: "project" }), "concepts")).toBe(folder!);
+		expect(lookupGraphColor("doc-colors", directory, "structure")?.source).toBe("structure");
+		const group = graphGroupColor("doc-colors", [doc, directory, queue], "concepts");
+		expect(group).toMatchObject({ source: "concept", key: color?.key });
+		expect(group?.concept).toBe(groupConcept(color!.concept!));
+		expect(group?.concept && "via" in group.concept).toBe(false);
+		const projected = file("ignored/path.ts", { category: "group" });
+		bindGraphGroupColors(projected, "doc-colors", [doc, directory, queue]);
+		expect(lookupGraphColor("doc-colors", projected, "concepts")).toBe(group!);
+		expect(graphGroupColor("doc-colors", [queue, file("lib/other.ts")], "concepts")).toBeUndefined();
+		const cx: DescribeContext = { cols: 80, dark: true, reduceMotion: false, supports: () => true, feature: name => name === "styles" };
+		const title = (value: typeof color) => value && nativeGraphColorCue(value, cx)?.p.title;
+		expect(title(color)).toBe("Concept: Dispatch\nFrom docs/dispatch.md · mentioned in the doc");
+		expect(title(folder)).toBe("Concept: Dispatch\nFrom docs/dispatch.md · same folder");
+		expect(title(lookupGraphColor("doc-colors", doc, "concepts"))).toBe("Concept: Dispatch\nFrom docs/dispatch.md · the doc itself");
+		expect(title(group)).toBe("Concept: Dispatch\nFrom docs/dispatch.md");
+		expect(title(lookupGraphColor("doc-colors", file("lib/other.ts"), "concepts"))).toBe("Code structure: lib\nSource-directory color");
 	});
 
 	test("projection bindings preserve both palettes, neutral mixed aggregates and codebase scope without parsing projected metadata", () => {

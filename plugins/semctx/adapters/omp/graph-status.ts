@@ -4,6 +4,7 @@ import type { GraphAppearance } from "./graph-appearance";
 import type { GraphRequestState } from "./overview";
 import { nativeElement, supportsElements } from "./native-elements";
 import { progressTooltip } from "./status-tooltip";
+import { boundedTooltip, compactTooltip } from "./tooltip-text";
 
 interface GraphStatusInput {
 	request: GraphRequestState;
@@ -50,60 +51,64 @@ export function graphStatus(cx: DescribeContext, input: GraphStatusInput): Nativ
 	const detail = progressTooltip(model.label, progress, input.request.error ?? producer?.diagnostic ?? (warning ? producer?.details : loadingNotes),
 		"Overview → Diagnostics for the full error");
 	const traffic = requests ? `${requests.sent} sent · ${requests.received} returned · ${requests.failed} failed` : "";
-	const activityTitle = [traffic, operations.length ? `Active: ${[...new Set(operations)].join(", ")}` : undefined].filter(Boolean).join("\n");
+	const activityTitle = compactTooltip(traffic, operations.length ? `Active: ${[...new Set(operations)].join(", ")}` : undefined);
 	const styled = supportsElements(cx) && cx.feature("styles");
-	const motion = !compact && input.motion !== "off" && !cx.reduceMotion;
+	const motion = input.motion !== "off" && !cx.reduceMotion;
 	const mark: NativeNode = (compact || progress !== undefined) && cx.supports("meter")
 		? { k: "meter", key: "progress", p: { value: progress ?? null, style: "ring", size: "sm",
 			tone: compact ? progress === undefined ? "muted" : progress === 1 ? "success" : "accent" : tone,
 			title: detail, aria: "Producer-reported embedding and sync progress" } }
 		: !compact && cx.supports("icon") && (mode === "failed" || mode === "warning")
 			? { k: "icon", key: "warning", p: { name: "warn", tone, title: detail, aria: detail } }
-			: styled ? nativeElement({ k: "el", key: "state", p: { tag: "span", class: "semctl-state-ring", attrs: { "aria-hidden": true } } })
-				: text(!compact && mode === "failed" ? "!" : "○", { tone: compact ? "muted" : tone, title: detail });
-	const warningMark: NativeNode = cx.supports("icon")
-		? { k: "icon", p: { name: "warn", tone: "warning", title: detail, aria: detail } }
-		: text("!", { tone: "warning", title: detail });
-	const slot: NativeNode = compact && styled ? nativeElement({ k: "el", key: "status-slot", p: {
-		tag: "div", class: "semctl-live-progress", title: detail,
-	}, c: [mark, nativeElement({ k: "el", key: "warning", p: { tag: "span", class: "semctl-live-warning",
-		title: detail, attrs: { "data-alert": warning, "aria-hidden": !warning },
-	}, c: [warningMark] })] }) : { k: "row", key: "status-slot", p: {
-		role: "semctl.graph.status-slot", min: { w: compact ? "4ch" : "2.5ch" }, max: { w: compact ? "4ch" : "2.5ch" }, grow: 0, shrink: 0, align: "center",
-	}, c: [mark, ...(compact && warning ? [warningMark] : [])] };
+			: !compact && motion && (mode === "loading" || mode === "working") && cx.supports("spinner")
+				? { k: "spinner", key: "spinner", p: { style: "orbit", tone: "accent", title: detail, aria: detail } }
+				: styled ? nativeElement({ k: "el", key: "state", p: { tag: "span", class: "semctl-state-ring", attrs: { "aria-hidden": true } } })
+					: text(!compact && mode === "failed" ? "!" : "○", { tone: compact ? "muted" : tone, title: detail });
+	// The warning has its own slot after the spacer, so it never covers the ring.
+	const alert: NativeNode[] = compact && warning ? [cx.supports("icon")
+		? { k: "icon", key: "warning", p: { name: "warn", role: "semctl.live.warning", tone: "warning", shrink: 0, title: detail, aria: detail } }
+		: { ...text("!", { role: "semctl.live.warning", tone: "warning", shrink: 0, title: detail, aria: detail }), key: "warning" }] : [];
+	const slot: NativeNode = compact && styled
+		? nativeElement({ k: "el", key: "status-slot", p: { tag: "div", class: "semctl-live-progress", title: detail }, c: [mark] })
+		: { k: "row", key: "status-slot", p: {
+			role: "semctl.graph.status-slot", min: { w: "2.5ch" }, max: { w: "2.5ch" }, grow: 0, shrink: 0, align: "center",
+		}, c: [mark] };
 	const children: NativeNode[] = [slot,
 		text(compact ? progress === undefined ? "—" : `${Math.floor(progress * 100)}%` : model.label, {
 			role: compact ? "semctl.live.progress-value" : "semctl.graph.status-label",
-			grow: 1, basis: 0, min: { w: compact ? "4ch" : 0 }, tone: compact ? "muted" : tone,
-			wrap: "none", truncate: "end", title: `${progress === undefined ? "Progress unknown" : "Producer-reported progress"}\n${detail}`,
+			...compact ? { shrink: 0, min: { w: "4ch" } } : { grow: 1, basis: 0, min: { w: 0 } }, tone: compact ? "muted" : tone,
+			wrap: "none", truncate: "end", title: boundedTooltip([detail, progress === undefined ? "Progress unknown" : undefined], 4),
 		}),
-		...(requests && requests.sent > 0 ? [text(`${requests.sent} out · ${requests.received} in`, {
-			role: "semctl.live.traffic", tone: "muted", shrink: 0, wrap: "none", title: activityTitle,
+		...(compact ? [{ k: "row" as const, key: "spacer", p: { grow: 1, basis: 0, min: { w: 0 } } }, ...alert] : []),
+		...(requests && requests.sent > 0 ? [{ k: "row" as const, p: {
+			role: "semctl.live.traffic", gap: "sm" as const, shrink: 0, align: "center" as const, title: activityTitle,
 			aria: `${requests.sent} observed requests sent, ${requests.received} returned${requests.failed ? `, ${requests.failed} failed` : ""}`,
-		})] : []),
+		}, c: [text(`↑ ${requests.sent}`, { tone: "muted", wrap: "none" }), text(`↓ ${requests.received}`, { tone: "muted", wrap: "none" })] }] : []),
 		...(!compact && requests?.failed ? [cx.supports("icon") ? { k: "icon" as const, key: "traffic-failed", p: { name: "warn", tone: "error" as const,
 			title: activityTitle, aria: `${requests.failed} observed requests failed in this session`, shrink: 0 } }
 			: text(`${requests.failed} failed`, { tone: "error", title: activityTitle, shrink: 0 })] : []),
 	];
 	return styled ? nativeElement({ k: "el", key: "activity", p: { tag: "div", class: `semctl-graph-status is-${mode}`,
-		attrs: { "data-motion": motion ? "full" : "reduced", "data-status": mode }, aria: detail,
+		attrs: { "data-motion": motion ? "full" : "reduced", "data-presentation": compact ? "icon" : "label", "data-status": mode }, aria: detail,
 	}, c: children }) : { k: "row", key: "activity", p: { gap: "sm", align: "center", min: { h: "1.5lines" } }, c: children };
 }
 
 export const GRAPH_STATUS_STYLES = { name: "semctl-graph-status", css: `
 .semctl-graph-status{display:flex;align-items:center;gap:6px;min-width:0;min-height:26px;color:var(--sf-muted);border-top:1px solid var(--l2);padding-top:6px}
-.semctl-live-progress{position:relative;display:flex;align-items:center;width:20px;height:20px;flex:0 0 20px}
-.semctl-live-warning{position:absolute;right:-1px;bottom:0;display:flex;align-items:center;justify-content:center;width:10px;height:10px;border-radius:50%;background:var(--panel);opacity:0;pointer-events:none}
-.semctl-live-warning[data-alert=true]{opacity:1;pointer-events:auto}
-.semctl-live-warning .sf-icon{width:10px;height:10px;font-size:10px}
+.semctl-graph-status[data-presentation=icon]{box-sizing:content-box;height:22px;min-height:22px;padding-top:4px}
+.semctl-live-progress{display:flex;align-items:center;justify-content:center;width:20px;height:20px;flex:0 0 20px}
 [data-role="semctl.live.progress-value"]{font-size:11px;font-variant-numeric:tabular-nums}
+.semctl-graph-status[data-motion=full] [data-role="semctl.live.progress-value"]{-stencil-text-effect:numeric;-stencil-text-duration:320ms}
+[data-role="semctl.live.warning"]{display:flex;align-items:center;justify-content:center;flex:none;width:12px;height:12px}
+[data-role="semctl.live.warning"] .ico{width:12px;height:12px}
+[data-role="semctl.live.traffic"],[data-role="semctl.live.traffic"] .sf-text{font-size:11px;font-variant-numeric:tabular-nums}
 .semctl-graph-status .semctl-state-ring{display:block;width:12px;height:12px;border:1.5px solid currentColor;border-radius:50%;opacity:.6;box-sizing:border-box}
 .semctl-graph-status.is-working .semctl-state-ring{color:var(--sf-accent,var(--accent));border-right-color:transparent}
 .semctl-graph-status.is-loading .semctl-state-ring{border-right-color:transparent}
 .semctl-graph-status.is-pending .semctl-state-ring{opacity:.45}
 .semctl-graph-status.is-ready .semctl-state-ring,.semctl-graph-status.is-returned .semctl-state-ring{color:var(--sf-p-success,var(--ok));opacity:.9}
 .semctl-graph-status[data-motion=full] .semctl-state-ring{transition:color 160ms ease-out,opacity 160ms ease-out}
-.semctl-graph-status[data-motion=full].is-working .semctl-state-ring,.semctl-graph-status[data-motion=full].is-loading .semctl-state-ring{animation:semctl-state-breathe 2200ms ease-in-out 240ms infinite}
+.semctl-graph-status[data-motion=full][data-presentation=label].is-working .semctl-state-ring,.semctl-graph-status[data-motion=full][data-presentation=label].is-loading .semctl-state-ring{animation:semctl-state-breathe 2200ms ease-in-out 240ms infinite}
 @keyframes semctl-state-breathe{0%,100%{opacity:.45}50%{opacity:.85}}
-@media(prefers-reduced-motion:reduce){.semctl-graph-status .semctl-state-ring{transition:none;animation:none}}
+@media(prefers-reduced-motion:reduce){.semctl-graph-status .semctl-state-ring{transition:none;animation:none}.semctl-graph-status[data-motion] [data-role="semctl.live.progress-value"]{-stencil-text-effect:none}}
 ` };

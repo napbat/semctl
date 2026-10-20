@@ -3,6 +3,7 @@ import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { Component, DescribeContext, NativeNode, NativeScroll, NativeUiEvent } from "@oh-my-pi/pi-tui";
 import { NativeSurface } from "./native-surface";
 import { progressTooltip } from "./status-tooltip";
+import { compactTooltip } from "./tooltip-text";
 import { nativeElement, supportsElements } from "./native-elements";
 
 const STATUS_KEY = "semctl.sync";
@@ -349,12 +350,12 @@ export function installSyncStatus(pi: ExtensionAPI, openGraph?: (ctx: ExtensionC
 								{ k: "spacer", p: { grow: 1 } },
 								...(openGraph ? [
 									{ k: "text" as const, key: "graph", p: { spans: [{ t: "Project graph", s: "accent" }],
-										actions: { click: "graph" }, title: "Open project overview", aria: "Open semctl project and relationship overview" } },
+										actions: { click: "graph" }, title: compactTooltip("Open project overview"), aria: "Open semctl project and relationship overview" } },
 									{ k: "text" as const, key: "live", p: { spans: [{ t: "Live popup", s: "accent" }],
-										actions: { click: "live" }, title: "Toggle live overview", aria: "Toggle the native live graph popup" } },
+										actions: { click: "live" }, title: compactTooltip("Toggle live overview"), aria: "Toggle the native live graph popup" } },
 								] : []),
 								{ k: "text", key: "close", p: { spans: [{ t: "Close", s: "accent" }],
-									actions: { click: "close" }, title: "Close status", aria: "Close semctl status" } },
+									actions: { click: "close" }, title: compactTooltip("Close status"), aria: "Close semctl status" } },
 							] },
 							{ k: "col", key: "snapshot", p: { role: "semctl.status.snapshot", max: { h: "18lines" } }, scroll, c: [
 								{ k: "text", key: "snapshot-text", p: { text: details, wrap: "word" } },

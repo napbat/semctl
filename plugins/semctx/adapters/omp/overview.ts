@@ -5,7 +5,9 @@ import type { StatusUpdate } from "./status";
 import type { Display } from "./inspector";
 import { GraphActivityTracker, type GraphActivity } from "./graph-activity";
 import { resetConcepts, setConceptSnapshot } from "./concept-colors";
-import { LiveGraphPopup, type LiveGraphState } from "./live-graph";
+import { readDocSources } from "./doc-sources";
+import type { DocSource } from "./graph-data/doc-concepts.js";
+import { LiveGraphPopup, livePopupOverlay, type LiveGraphState } from "./live-graph";
 import { NativeSurface } from "./native-surface";
 import { GraphAppearanceStore } from "./graph-appearance";
 import { GraphAppearancePanel, type GraphAppearanceKeyMatcher } from "./graph-appearance-panel";
@@ -74,6 +76,8 @@ export interface GraphOverviewDependencies {
 	scheduleRefresh?(callback: () => void, delay: number): () => void;
 	appearance?: GraphAppearanceStore;
 	appearanceKey?: GraphAppearanceKeyMatcher;
+	/** Reads the checkout docs of a validated overview. The default reads the local files. */
+	readDocSources?(display: Display, signal: AbortSignal): Promise<readonly DocSource[]>;
 }
 export interface GraphRequestState { loading: boolean; text: string; error?: string; display?: Display }
 
@@ -105,6 +109,7 @@ export class GraphRequest {
 		let retained: GraphRequestState | undefined;
 		this.state = { loading: true, text: "" };
 		const current = () => !controller.signal.aborted && this.generation === generation && graphRoot(currentCwd()) === root;
+		let concepts: Display | undefined;
 		try {
 			if (!root) throw new Error("Current checkout is not an absolute local path.");
 			({ operation, args } = graphArguments(operation.id, args));
@@ -127,15 +132,26 @@ export class GraphRequest {
 				if (display?.identity.localRoot && (!displayRoot || !within(displayRoot, root))) throw new Error("CLI display belongs to a different checkout; result was not opened.");
 				this.state = { loading: false, text: value.text, display,
 					error: [value.display && !display ? "Structured preview unavailable or invalid; showing original result." : "", result.stderr.trim()].filter(Boolean).join("\n") || undefined };
-				if (operation.id === "overview" && display) setConceptSnapshot(display);
+				if (operation.id === "overview" && display?.kind === "graph" && !display.loading) concepts = display;
 			}
 		} catch (error) {
 			if (!current()) return;
 			this.state = { loading: false, text: retained?.text ?? "", ...(retained?.display ? { display: retained.display } : {}),
 				error: [error instanceof Error ? error.message : String(error), ...(retained ? ["Showing the last available graph for this request."] : [])].join("\n") };
 		} finally {
-			if (current()) { this.controller = undefined; this.changed(); }
+			// A pending doc read keeps the controller, so `cancel` also stops the read.
+			if (current()) { if (!concepts) this.controller = undefined; this.changed(); }
 		}
+		// The graph is visible before the docs are read. Doc concepts repaint it through the concept subscription.
+		if (concepts && current()) void this.readConcepts(concepts, controller, current);
+	}
+	private async readConcepts(display: Display, controller: AbortController, current: () => boolean): Promise<void> {
+		let docs: readonly DocSource[] = [];
+		try { docs = await (this.dependencies.readDocSources?.(display, controller.signal) ?? readDocSources(display, controller.signal)); }
+		catch { /* Docs are optional evidence. Without them, the overview keeps its reference communities. */ }
+		if (!current()) return;
+		this.controller = undefined;
+		setConceptSnapshot(display, docs);
 	}
 }
 
@@ -351,6 +367,7 @@ export function createGraphOverview(pi: ExtensionAPI, dependencies: GraphOvervie
 						refresh: () => { if (current()) void warm(ctx, true); },
 						expand: () => { if (current()) void this.open(ctx); },
 						appearance: () => { if (current()) void showAppearance(ctx); },
+						resize: size => { if (current()) void appearance.update({ popup: size }); },
 					});
 					void warm(ctx);
 					if (!current()) dispose();
@@ -358,10 +375,7 @@ export function createGraphOverview(pi: ExtensionAPI, dependencies: GraphOvervie
 						render: width => closed ? [] : view!.render(width),
 						describe(cx) {
 							surface?.prepare(cx);
-							return { k: "overlay", key: "semctl-live", p: {
-								role: "omp.overlay.semctl-live", modal: false, size: "sm", anchor: "top", hidden: closed,
-								min: { w: 0 }, max: { w: "40ch" },
-							}, c: view ? [view] : [] };
+							return { k: "overlay", key: "semctl-live", p: livePopupOverlay(appearance.state.value.popup, closed), c: view ? [view] : [] };
 						},
 						dispose,
 					};

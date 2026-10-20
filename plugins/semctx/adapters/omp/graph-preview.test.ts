@@ -6,11 +6,13 @@ import { conceptRevision, lookupConcept, resetConcepts, setConceptSnapshot } fro
 import { conceptClass } from "./native-concepts";
 import { nativeGraphLayout } from "./graph-native-layout";
 import { readDisplay, type Hit } from "./inspector";
-import { quantizedSegment, routeStrokeClasses } from "./graph-native-styles";
+import { GRAPH_STYLES, positionClasses, quantizedSegment, routeStrokeClasses } from "./graph-native-styles";
 import { asNativeElement, type NativeElement } from "./native-elements";
 import { DEFAULT_GRAPH_APPEARANCE, type GraphAppearance } from "./graph-appearance";
 import { projectSummary } from "./graph-projection";
 import { graphColorRevision, lookupGraphColor, setGraphColorMode } from "./graph-colors";
+import { bindDrawingWeight } from "./graph-data/layout.js";
+import { bindIndexingCounts, boundIndexingCounts, indexingCounts } from "./graph-indexing";
 
 afterEach(() => { resetConcepts(); setGraphColorMode("concepts"); });
 const cx: DescribeContext = { cols: 80, dark: true, reduceMotion: false, supports: kind => String(kind) === "el", feature: name => name === "styles" };
@@ -31,6 +33,14 @@ function targets(root: NativeNode | undefined): NativeElement[] {
 }
 function links(root: NativeNode | undefined): NativeElement[] {
 	return nodes(root).map(asNativeElement).filter((node): node is NativeElement => node?.p.attrs?.["data-count"] !== undefined);
+}
+function elements(root: NativeNode | undefined, className: string): NativeElement[] {
+	return nodes(root).map(asNativeElement).filter((node): node is NativeElement => node?.p.class?.split(" ").includes(className) ?? false);
+}
+function expectCompact(title: string | undefined, lines = 3): void {
+	if (title === undefined) throw new Error("Missing tooltip");
+	expect(title.split("\n").length).toBeLessThanOrEqual(lines);
+	for (const line of title.split("\n")) expect(line.length).toBeLessThanOrEqual(88);
 }
 
 test("native capabilities are required independently, without image fallback", () => {
@@ -83,7 +93,7 @@ test("hover evidence preserves real direction, type, multiplicity, references an
 	expect(routes.find(node => node.p?.attrs?.["data-kind"] === "association")?.p?.attrs).toMatchObject({ "data-from": "a", "data-to": "a", "data-count": 1 });
 });
 
-test("dot hovers retain unique source identity and full errors without details or incident evidence dumps", () => {
+test("dot hovers lead with unique identity and one status line without details or incident evidence dumps", () => {
 	const data = graph(), diagnostic = `Provider unavailable\n${"Exact backend diagnostic. ".repeat(80)}`;
 	data.nodes[0] = { ...data.nodes[0], label: "app.render", detail: "Full detail stays in selection",
 		hit: { qualifiedName: "app.render", symbol: "render", path: "src/views/render.ts" } as Hit,
@@ -91,16 +101,19 @@ test("dot hovers retain unique source identity and full errors without details o
 	data.edges = Array.from({ length: 8 }, (_, index) => ({ from: "a", to: "b", label: `actual relation ${index}` }));
 	const preview = graphPreview(data, cx, { codebaseId: "hover", activeIds: new Set(["a"]), nodeAction: () => "inspect" });
 	const title = targets(preview)[0].p.title!;
-	expect(title.split("\n").filter(line => line === "app.render")).toHaveLength(1);
-	expect(title).toContain("src/views/render.ts");
-	expect(title).toContain(diagnostic);
+	expectCompact(title);
+	expect(title.split("\n")[0]).toBe("app.render");
+	expect(title.split("\n")[1]).toBe("src/views/render.ts");
+	expect(title).toContain("Provider unavailable");
+	expect(title).toContain("Active request target");
+	expect(title).not.toContain("Exact backend diagnostic");
 	expect(title).not.toContain(data.nodes[0].detail!);
 	for (const edge of data.edges) expect(title).not.toContain(edge.label);
 	expect(title).not.toContain("→");
-	expect(preview?.p.title?.split("\n").length).toBeLessThanOrEqual(5);
+	expectCompact(preview?.p.title, 2);
 });
 
-test("route hovers cap distinct evidence without changing direction, multiplicity or source bindings", () => {
+test("route hovers fold extra evidence into the last line without changing direction, multiplicity or source bindings", () => {
 	const data = graph();
 	data.edges = Array.from({ length: 8 }, (_, index) => ({ from: "b", to: "a", label: "references", kind: "reference" as const,
 		symbol: `render${index}`, moniker: `local::render${index}` }));
@@ -109,15 +122,22 @@ test("route hovers cap distinct evidence without changing direction, multiplicit
 	expect(routes).toHaveLength(1);
 	expect(routes[0].p.attrs).toMatchObject({ "data-from": "b", "data-to": "a", "data-kind": "reference", "data-count": 10 });
 	const title = routes[0].p.title!;
-	expect(title.split("\n")[0]).toBe("B → A");
-	for (const edge of data.edges.slice(0, 3)) {
+	expectCompact(title);
+	expect(title.split("\n")[0]).toStartWith("B → A");
+	expect(title.split("\n")[0]).toContain("10");
+	for (const edge of data.edges.slice(0, 2)) {
 		expect(title).toContain(edge.symbol!);
 		expect(title).toContain(edge.moniker!);
 	}
-	expect(title).not.toContain(data.edges[3].moniker!);
-	expect(title).toContain("+5");
-	expect(title.split("\n").length).toBeLessThanOrEqual(6);
+	expect(title).not.toContain(data.edges[2].moniker!);
+	expect(title.split("\n").at(-1)).toEndWith("+6 more");
 	expect(data.edges).toHaveLength(10);
+	const long = graph();
+	long.edges = Array.from({ length: 3 }, (_, index) => ({ from: "b", to: "a", label: "references", kind: "reference" as const,
+		symbol: `${"symbol".repeat(20)}${index}`, moniker: `local::${"moniker".repeat(20)}${index}` }));
+	const folded = links(graphPreview(long, cx))[0].p.title!;
+	expectCompact(folded);
+	expect(folded.split("\n").at(-1)).toEndWith("+1 more");
 });
 
 test("grouped route hovers preserve source relationship counts rather than counting summary edges", () => {
@@ -162,6 +182,319 @@ test("activity and focus preserve keyed dots and settled geometry, including mot
 	expect(targets(graphPreview(data, cx))[0].p?.aria).not.toContain("active");
 });
 
+test("layout changes retain the plane and node keys while remounting routes and territories at current positions", () => {
+	const data = graph();
+	data.nodes.push({ id: "c", label: "C", detail: null, hit: null, category: "file", path: "src/c.ts" });
+	data.edges.push({ from: "a", to: "c", label: "imports" });
+	const force = graphPreview(data, cx, { appearance: DEFAULT_GRAPH_APPEARANCE });
+	const radial = graphPreview(data, cx, { appearance: { ...DEFAULT_GRAPH_APPEARANCE, layout: "radial" } });
+	const rerender = graphPreview(data, { ...cx, dark: false }, { selected: "b", activeIds: new Set(["a"]),
+		appearance: { ...DEFAULT_GRAPH_APPEARANCE, layout: "radial", color: "neutral", labels: "more", motion: "off" } });
+	const nodeKeys = (preview: NativeNode | undefined) => nodes(preview).map(node => node.key).filter(key => key?.startsWith("node:"));
+	expect(nodeKeys(force)).toEqual(["node:a", "node:b", "node:c"]);
+	expect(nodeKeys(radial)).toEqual(nodeKeys(force));
+	expect(nodeKeys(rerender)).toEqual(nodeKeys(force));
+	for (const [preview, layoutChoice] of [[force, "force"], [radial, "radial"], [rerender, "radial"]] as const) {
+		const plane = elements(preview, "sg-plane")[0], children = plane.c?.map(child => asNativeElement(child as NativeNode));
+		expect(plane.key).toBe("plane");
+		expect(children?.map(child => child?.p.class)).toEqual(["sg-territories", "sg-routes", "sg-node", "sg-node", "sg-node"]);
+		const layout = nativeGraphLayout(data, "inline", layoutChoice);
+		for (const target of targets(preview)) {
+			const dot = layout.dots.find(candidate => candidate.node.id === target.p.attrs?.["data-node"])!;
+			expect(target.key).toBe("target");
+			expect(target.p.class).toContain(positionClasses(dot.x, dot.y, layout.width, layout.height));
+		}
+	}
+	for (const className of ["sg-routes", "sg-territories"]) {
+		expect(elements(force, className)[0].key).not.toBe(elements(radial, className)[0].key);
+		expect(elements(rerender, className)[0].key).toBe(elements(radial, className)[0].key);
+	}
+	expect(targets(rerender).map(target => target.p.class?.match(/sg-x\d+ sg-y\d+ sg-fx\d+ sg-fy\d+/)?.[0]))
+		.toEqual(targets(radial).map(target => target.p.class?.match(/sg-x\d+ sg-y\d+ sg-fx\d+ sg-fy\d+/)?.[0]));
+	const resized = graphPreview(data, cx, { size: "compact", appearance: DEFAULT_GRAPH_APPEARANCE });
+	const refreshed = graphPreview({ ...data, nodes: [...data.nodes], edges: [...data.edges] }, cx, { appearance: DEFAULT_GRAPH_APPEARANCE });
+	for (const changed of [resized, refreshed]) {
+		expect(elements(changed, "sg-routes")[0].key).not.toBe(elements(force, "sg-routes")[0].key);
+		expect(nodeKeys(changed)).toEqual(nodeKeys(force));
+	}
+});
+
+test("node morph transitions include explicit durations and dense map styles keep lighter low-tier links and compact fills", () => {
+	const css = GRAPH_STYLES.map(sheet => sheet.css).join("\n");
+	const target = css.match(/\.semctl-graph\[data-motion=full\] \.sg-target\{([^}]+)\}/)?.[1];
+	expect(target).toContain("transition:left 560ms spring(560ms,.08),top 560ms spring(560ms,.08)");
+	for (const [index, opacity] of [.55, .85, 1.1, 1.4].entries()) expect(css).toContain(`.sg-route.sg-w${index + 1}{--sg-weight-opacity:${opacity}}`);
+	for (const [index, scale] of [1, 1.35, 1.8, 2.4].entries()) expect(css).toContain(`.sg-w${index + 1} .sg-stroke{transform:scaleY(${scale})}`);
+	expect(css).toContain(".semctl-graph.sg-compact .sg-territory{background:radial-gradient(closest-side,rgb(from var(--sg-tint) r g b / 9%),rgb(from var(--sg-tint) r g b / 4%) 72%,transparent)}");
+});
+
+test("shared graph wells set the opaque canvas and dot separation background from theme colors", () => {
+	const css = GRAPH_STYLES.map(sheet => sheet.css).join("\n");
+	const well = css.match(/\.semctl-graph-well\{([^}]+)\}/)?.[1];
+	expect(well).toContain("--sg-well:color-mix(in oklab, var(--panel) 95%, var(--t1))");
+	expect(well).toContain("--sg-bg:var(--sg-well)");
+	expect(well).toContain("border-radius:8px");
+	expect(well).toContain("background:var(--sg-well)");
+	expect(well).toContain("padding:6px");
+	expect(well).toContain("border:0");
+	expect(well).toContain("display:flex");
+	expect(well).toContain("justify-content:center");
+	expect(css).toContain(".semctl-graph-well .semctl-graph{flex:1 1 auto;width:100%}");
+	expect(css.match(/\.semctl-graph\{([^}]+)\}/)?.[1]).toContain("--sg-bg:var(--sg-well,var(--panel))");
+});
+
+test("neutral dots have canvas separation and centered hover scales while labels use secondary theme text", () => {
+	const css = GRAPH_STYLES.map(sheet => sheet.css).join("\n");
+	const dot = css.match(/\.semctl-graph \.sg-dot\{([^}]+)\}/)?.[1];
+	expect(css).toContain("color:var(--sg-node);--sg-fg:");
+	expect(css).toContain("--sg-node:color-mix(in oklab, var(--sg-fg) 45%, var(--sg-bg))");
+	expect(css).toContain(".semctl-graph.sg-neutral .sg-target{color:var(--sg-node)}");
+	expect(dot).toContain("box-shadow:0 0 0 1.5px var(--sg-bg)");
+	expect(dot).toContain("transform:translate(-50%,-50%) scale(var(--sg-dot-scale,1))");
+	expect(css).toContain(".sg-target:hover .sg-dot,.semctl-graph .sg-target:focus-visible .sg-dot{--sg-dot-scale:1.18}");
+	expect(css).toContain("transition:transform 120ms ease-out,");
+	expect(css).toContain("to{opacity:var(--sg-dot-opacity,1);transform:translate(-50%,-50%) scale(var(--sg-dot-scale,1))}");
+	expect(css).toContain(".sg-selected .sg-dot{outline:2px solid var(--sg-accent);outline-offset:2px}");
+	expect(css).toContain(".sg-muted .sg-dot{--sg-dot-opacity:.28;opacity:.28}");
+	const label = css.match(/\.semctl-graph \.sg-label\{([^}]+)\}/)?.[1];
+	expect(label).toContain("font:500 11px/14px");
+	expect(label).toContain("color:var(--t2)");
+	expect(label).toContain("drop-shadow(1px 0 1px var(--sg-bg))");
+	expect(css).toContain(".semctl-graph.sg-compact .sg-label{font-size:10.5px}");
+	expect(css).toContain(".sg-target:focus-visible .sg-label{color:var(--t1);font-weight:600}");
+});
+
+
+test("indexing status pips use small separated dots and the node tooltip names their state", () => {
+	const css = GRAPH_STYLES.map(sheet => sheet.css).join("\n");
+	const pip = css.match(/\.semctl-graph \.sg-indexing-state\{([^}]+)\}/)?.[1];
+	expect(pip).toContain("width:5px;height:5px");
+	expect(pip).toContain("left:calc(50% + (var(--sg-d) / 2 + 2px) * .62)");
+	expect(pip).toContain("top:calc(50% + (var(--sg-d) / 2 + 2px) * .62)");
+	expect(pip).toContain("background:transparent");
+	expect(pip).toContain("box-shadow:0 0 0 1.5px var(--sg-bg)");
+	expect(css).toContain(".sg-indexing-pending .sg-indexing-state{border:1px solid var(--sg-edge)}");
+	expect(css).toContain(".sg-indexing-processing .sg-indexing-state{background:var(--sg-accent)}");
+	expect(css).toContain(".sg-indexing-failed .sg-indexing-state{background:var(--sg-negative)}");
+	const data = graph(); data.nodes[0].indexing = "failed";
+	const preview = graphPreview(data, cx);
+	expectCompact(preview?.p.title, 2);
+	expect(targets(preview)[0].p.title).toContain("Embedding failed");
+	expect(elements(targets(preview)[0], "sg-indexing-state")[0].key).toBe("indexing:failed");
+	expect(targets(preview)[0].p.aria).toContain("Embedding failed");
+});
+
+test("indexing count bindings use node identity without changing protocol fields", () => {
+	const node = graph().nodes[0], copy = { ...node }, before = JSON.stringify(node);
+	const counts = { ...indexingCounts([]), failed: 1, ready: 3 };
+	expect(boundIndexingCounts(node)).toBeUndefined();
+	bindIndexingCounts(node, counts);
+	expect(boundIndexingCounts(node)).toBe(counts);
+	expect(boundIndexingCounts(copy)).toBeUndefined();
+	expect(JSON.stringify(node)).toBe(before);
+	const updated = { ...counts, ready: 4 };
+	bindIndexingCounts(node, updated);
+	expect(boundIndexingCounts(node)).toBe(updated);
+});
+
+test("bound failed-member shares grade group pips at the quarter and sixty-percent boundaries", () => {
+	for (const [failed, members, bucket] of [[12, 61, "faint"], [24, 100, "faint"], [25, 100, "mid"],
+		[60, 100, "mid"], [61, 100, "strong"]] as const) {
+		const data = graph(), node = data.nodes[0];
+		node.category = "group"; node.indexing = "failed";
+		const before = targets(graphPreview(data, cx)).find(target => target.p.attrs?.["data-node"] === node.id)!;
+		expect(before.p.class).not.toContain("sg-pip-");
+		bindIndexingCounts(node, { ...indexingCounts([]), failed, ready: members - failed - 1, unreported: 1 });
+		const target = targets(graphPreview(data, cx)).find(target => target.p.attrs?.["data-node"] === node.id)!;
+		expect(target.p.class?.match(/\bsg-pip-\w+\b/)?.[0]).toBe(`sg-pip-${bucket}`);
+		expect(target.p.class).toContain("sg-indexing-failed");
+		expect(target.p.title).toContain(`Failed · ${failed} of ${members} members`);
+		expectCompact(target.p.title);
+		expect(elements(target, "sg-indexing-state")[0].key).toBe("indexing:failed");
+		expect(target.p.class?.match(/sg-x\d+ sg-y\d+ sg-fx\d+ sg-fy\d+/)?.[0])
+			.toBe(before.p.class?.match(/sg-x\d+ sg-y\d+ sg-fx\d+ sg-fy\d+/)?.[0]);
+	}
+	const data = graph(); data.nodes[0].indexing = "processing";
+	bindIndexingCounts(data.nodes[0], { ...indexingCounts([]), processing: 3 });
+	expect(targets(graphPreview(data, cx)).find(target => target.p.attrs?.["data-node"] === data.nodes[0].id)?.p.class).not.toContain("sg-pip-");
+	const css = GRAPH_STYLES.map(sheet => sheet.css).join("\n");
+	expect(css).toContain(".sg-pip-faint .sg-indexing-state{--sg-pip-opacity:.4;opacity:.4;width:4px;height:4px}");
+	expect(css).toContain(".sg-pip-mid .sg-indexing-state{--sg-pip-opacity:.75;opacity:.75}");
+	expect(css).toContain(".sg-pip-strong .sg-indexing-state{--sg-pip-opacity:1;opacity:1;width:6px;height:6px}");
+	expect(css).toContain("@keyframes semctl-graph-failure{from{opacity:.2}to{opacity:var(--sg-pip-opacity,1)}}");
+});
+
+test("focus mutes every unrelated dot while keeping request and indexing cues", () => {
+	const data = graph();
+	data.nodes.push(...["c", "d", "e"].map((id, index) => ({ id, label: id, detail: null, hit: null,
+		indexing: (["failed", "processing", "pending"] as const)[index] })));
+	const preview = graphPreview(data, cx, { selected: "a", activeIds: new Set(["c"]),
+		feedback: new Map([["d", { id: 1, outcome: "returned" }]]) });
+	const rendered = targets(preview);
+	for (const target of rendered.slice(0, 2)) expect(target.p.class).not.toContain("sg-muted");
+	for (const target of rendered.slice(2)) {
+		expect(target.p.class).toContain("sg-muted");
+		expect(elements(target, "sg-indexing-state")).toHaveLength(1);
+	}
+	expect(rendered[2].p.class).toContain("sg-active");
+	expect(elements(rendered[3], "sg-feedback")).toHaveLength(1);
+});
+
+test("weighted dots use bounded diameter classes and deterministic root-first arrival buckets", () => {
+	const data = graph();
+	data.nodes.push(...["d", "c"].map(id => ({ id, label: id, detail: null, hit: null, category: "group" as const })));
+	data.roots = ["d"];
+	data.edges = [{ from: "b", to: "a", label: "calls" }, { from: "b", to: "c", label: "calls" }, { from: "b", to: "d", label: "calls" }];
+	data.nodes.forEach((node, index) => bindDrawingWeight(node, index + 1));
+	const layout = nativeGraphLayout(data, "inline"), preview = graphPreview(data, cx);
+	for (const target of targets(preview)) {
+		const dot = layout.dots.find(candidate => candidate.node.id === target.p.attrs?.["data-node"])!;
+		const diameter = Math.round(dot.radius * 2);
+		expect(diameter).toBeGreaterThanOrEqual(7); expect(diameter).toBeLessThanOrEqual(19);
+		expect(target.p.class?.split(" ")).toContain(`sg-s${diameter}`);
+		expect(elements(target, "sg-dot")).toHaveLength(1);
+		expect(elements(target, "sg-dot")[0].key).toBe("dot");
+		expect(target.p.class).not.toContain("sg-large");
+	}
+	const delays = Object.fromEntries(targets(preview).map(target => [target.p.attrs?.["data-node"], target.p.class?.match(/\bsg-d[0-7]\b/)?.[0]]));
+	expect(delays).toEqual({ d: "sg-d0", b: "sg-d1", a: "sg-d2", c: "sg-d3" });
+	const reordered = graphPreview({ ...data, nodes: [...data.nodes].reverse(), edges: [...data.edges].reverse() }, cx);
+	expect(Object.fromEntries(targets(reordered).map(target => [target.p.attrs?.["data-node"], target.p.class?.match(/\bsg-d[0-7]\b/)?.[0]]))).toEqual(delays);
+});
+
+test("route weight classes appear only for routes with bound drawing tiers and retain every hover copy", () => {
+	const ordinary = graph();
+	for (const route of elements(graphPreview(ordinary, cx), "sg-route")) expect(route.p.class).not.toMatch(/\bsg-w[1-4]\b/);
+	const weighted = graph();
+	weighted.nodes.push({ id: "c", label: "C", detail: null, hit: null });
+	weighted.edges.push({ from: "b", to: "c", label: "imports" });
+	bindDrawingWeight(weighted.edges[0], 12);
+	const layout = nativeGraphLayout(weighted, "inline"), preview = graphPreview(weighted, cx);
+	expect(layout.routes.some(route => route.tier !== undefined)).toBe(true);
+	for (const route of layout.routes) {
+		const key = `route:${JSON.stringify([route.link.from, route.link.to, route.link.kind])}`;
+		const copies = elements(preview, "sg-route").filter(element => element.key === key);
+		expect(copies.length).toBeGreaterThanOrEqual(2);
+		for (const copy of copies) {
+			if (route.tier !== undefined) expect(copy.p.class?.split(" ")).toContain(`sg-w${route.tier}`);
+			else expect(copy.p.class).not.toMatch(/\bsg-w[1-4]\b/);
+		}
+	}
+});
+
+test("lexical territories render layout bounds, theme tints and honest tooltips without chips in compact previews", () => {
+	const data = graph();
+	data.nodes = ["CacheEntryStore", "CacheEntryRead", "CacheEntryEvict", "CacheEntryWrite",
+		"QueryExecutionPlan", "QueryExecutionRun", "QueryExecutionParse", "QueryExecutionExplain"].map(label => ({
+		id: label, label, detail: null, hit: null, category: "file" as const,
+		path: `${label.startsWith("Cache") ? "cache/entry" : "query/execution"}/${label}.ts`,
+	}));
+	data.roots = [data.nodes[0].id, data.nodes[4].id];
+	data.edges = data.nodes.flatMap((node, index) => index % 4 ? [{ from: data.nodes[index - index % 4].id, to: node.id, label: "calls" }] : []);
+	const layout = nativeGraphLayout(data, "inline");
+	expect(layout.territories.length).toBeGreaterThan(0);
+	for (const dark of [false, true]) {
+		const preview = graphPreview(data, { ...cx, dark }), territories = elements(preview, "sg-territory");
+		expect(territories).toHaveLength(layout.territories.length);
+		expectCompact(preview?.p.title, 2);
+		expect(preview?.p.title).not.toContain("embedding");
+		for (const [index, territory] of layout.territories.entries()) {
+			const element = territories[index], chip = elements(element, "sg-territory-label")[0];
+			expect(element.key).toBe(`territory:${territory.key}`);
+			expect(element.p.class?.split(" ")).toContain(`sg-territory-${territory.kind}`);
+			expect(element.p.class).toContain(positionClasses(territory.x, territory.y, layout.width, layout.height));
+			expect(element.p.class?.split(" ")).toContain(`sg-tint-${territory.color[dark ? "dark" : "light"].slice(1)}`);
+			expect(element.p.class?.split(" ")).toContain(`sg-tw${Math.max(0, Math.min(200, Math.round(territory.rx * 400 / layout.width)))}`);
+			expect(element.p.class?.split(" ")).toContain(`sg-th${Math.max(0, Math.min(200, Math.round(territory.ry * 400 / layout.height)))}`);
+			if (chip) {
+				expect(chip.p.text).toBe(territory.label);
+				expect(chip.p.title).toBe(territory.title ?? `${territory.label}\nShared identifier terms`);
+				expectCompact(chip.p.title);
+			} else {
+				expect(element.p.attrs?.["aria-hidden"]).toBe(true);
+				expect(element.p.title).toBeUndefined();
+			}
+		}
+	}
+	const compact = graphPreview(data, cx, { size: "compact" });
+	expect(elements(compact, "sg-territory").length).toBeGreaterThan(0);
+	expect(elements(compact, "sg-territory-label")).toHaveLength(0);
+	const neutral = graphPreview(data, cx, { appearance: { ...DEFAULT_GRAPH_APPEARANCE, color: "neutral" } });
+	expect(neutral?.p.class).toContain("sg-neutral");
+	expect(elements(neutral, "sg-territory")).toHaveLength(layout.territories.length);
+	for (const layoutChoice of ["radial", "layers", "components"] as const) {
+		const preview = graphPreview(data, cx, { appearance: { ...DEFAULT_GRAPH_APPEARANCE, layout: layoutChoice } });
+		expect(nativeGraphLayout(data, "inline", layoutChoice).territories).toHaveLength(0);
+		expect(elements(preview, "sg-territory")).toHaveLength(0);
+		expectCompact(preview?.p.title, 2);
+	}
+});
+
+test("territory chips choose clear edges or stay absent and node labels avoid every placed chip", () => {
+	const data = graph();
+	data.nodes = ["a", "b", "c", "d"].map(id => ({ id, label: `Node${id.toUpperCase()}`, detail: null, hit: null, category: "group" as const }));
+	data.edges = [];
+	const layout = nativeGraphLayout(data, "inline");
+	const coordinates: Record<string, readonly [number, number]> = { a: [160, 45], b: [380, 45], c: [380, 95], d: [260, 90] };
+	layout.dots = data.nodes.map(node => ({ node, x: coordinates[node.id][0], y: coordinates[node.id][1], radius: 3.5, degree: 0, root: node.id === "a" }));
+	const territory = { kind: "lexical" as const, terms: [], members: [], cohesion: 1, rx: 40, ry: 25, color: { light: "#526fbd", dark: "#8ca8ef" } };
+	layout.territories = [
+		{ ...territory, key: "a-free", label: "free", x: 80, y: 60, rx: 35, ry: 20 },
+		{ ...territory, key: "b-bottom", label: "bottom", x: 160, y: 70 },
+		{ ...territory, key: "c-conflict", label: "second", x: 80, y: 65 },
+		{ ...territory, key: "d-hidden", label: "hidden", x: 380, y: 70 },
+		{ ...territory, key: "e-label", label: "label", x: 301, y: 101, ry: 20 },
+	];
+	const preview = graphPreview(data, cx), rendered = elements(preview, "sg-territory");
+	const chipBoxes = layout.territories.flatMap(territory => {
+		const element = rendered.find(element => element.key === `territory:${territory.key}`)!;
+		const chip = elements(element, "sg-territory-label")[0];
+		if (!chip) {
+			expect(territory.key).toBe("d-hidden");
+			expect(element.p.attrs?.["aria-hidden"]).toBe(true);
+			expect(element.p.title).toBeUndefined();
+			return [];
+		}
+		const below = chip.p.class?.includes("sg-territory-label-bottom") ?? false;
+		expect(below).toBe(territory.key === "b-bottom" || territory.key === "c-conflict");
+		const width = Array.from(territory.label).length * 6 + 12, y = territory.y + (below ? territory.ry : -territory.ry);
+		return [{ left: territory.x - width / 2, right: territory.x + width / 2, top: y - 7, bottom: y + 7 }];
+	});
+	expect(chipBoxes).toHaveLength(4);
+	for (const [index, box] of chipBoxes.entries()) {
+		for (const dot of layout.dots) expect(dot.x + dot.radius > box.left && dot.x - dot.radius < box.right && dot.y + dot.radius > box.top && dot.y - dot.radius < box.bottom).toBe(false);
+		for (const other of chipBoxes.slice(index + 1)) expect(box.left < other.right && box.right > other.left && box.top < other.bottom && box.bottom > other.top).toBe(false);
+	}
+	for (const appearance of [undefined, { ...DEFAULT_GRAPH_APPEARANCE, labels: "hover" as const }]) {
+		for (const target of targets(graphPreview(data, cx, { appearance }))) {
+			const dot = layout.dots.find(dot => dot.node.id === target.p.attrs?.["data-node"])!, label = elements(target, "sg-label")[0];
+			const width = Array.from(label.p.text ?? "").length * 6.8 + 4, gap = 9 + (dot.radius - 3.5);
+			const left = dot.x + (label.p.class?.includes("sg-label-left") ? -gap - width : gap);
+			const top = dot.y + (label.p.class?.includes("sg-label-below") ? gap - 2 : -gap - 7);
+			for (const chip of chipBoxes) expect(left < chip.right && left + width > chip.left && top < chip.bottom && top + 14 > chip.top).toBe(false);
+		}
+	}
+	expect(elements(targets(preview).find(target => target.p.attrs?.["data-node"] === "d"), "sg-label")[0].p.class).toContain("sg-label-below");
+	const before = Object.fromEntries(rendered.map(element => [element.key, elements(element, "sg-territory-label").map(chip => chip.p.class)]));
+	layout.territories.reverse(); layout.dots.reverse();
+	const reordered = graphPreview(data, cx, { selected: "a", activeIds: new Set(["b"]) });
+	expect(Object.fromEntries(elements(reordered, "sg-territory").map(element => [element.key, elements(element, "sg-territory-label").map(chip => chip.p.class)]))).toEqual(before);
+});
+
+test("compact labels near the right canvas edge flip left with room for the text halo", () => {
+	const data = graph();
+	data.nodes = [{ ...data.nodes[0], category: "group", label: "src/daemon" }];
+	data.edges = [];
+	const layout = nativeGraphLayout(data, "compact");
+	layout.dots = [{ ...layout.dots[0], x: 202, y: 80, radius: 3.5 }];
+	layout.territories = [];
+	const target = targets(graphPreview(data, cx, { size: "compact" })).find(target => target.p.attrs?.["data-node"] === "a");
+	const label = elements(target, "sg-label")[0];
+	expect(label.p.text).toBe("src/daemon");
+	expect(label.p.class).toContain("sg-label-left");
+	expect(label.p.class).not.toContain("sg-label-transient");
+});
+
 test("current targets suppress older receipts while completed targets retain keyed feedback until expiry", () => {
 	const data = graph(), activeIds = new Set(["a"]);
 	for (const outcome of ["returned", "failed"] as const) {
@@ -197,7 +530,7 @@ test("current targets suppress older receipts while completed targets retain key
 		expect(settled[1].p.attrs?.["aria-pressed"]).toBe(true);
 	}
 });
-test("catalog indexing rings persist independently of request receipts and keep geometry and concept colors", () => {
+test("catalog indexing status pips persist independently of request receipts and keep geometry and concept colors", () => {
 	const baseline = graph();
 	baseline.nodes.push(...["c", "d", "e", "f"].map(id => ({ id, label: id, detail: null, hit: null, category: "file" as const, path: `src/${id}.ts` })));
 	baseline.edges = [
@@ -425,6 +758,9 @@ test("detail budgets retain every source node and account truthfully for every f
 		expect(summary.allGroups.flatMap(group => group.members.map(node => node.id)).sort()).toEqual(data.nodes.map(node => node.id).sort());
 		expect(summary.groups.reduce((sum, group) => sum + group.internal, 0) + summary.drawnLinks + summary.omitted).toBe(data.edges.length);
 		expect(summary.groups.reduce((sum, group) => sum + group.indexing.failed, 0)).toBe(10);
+		for (const node of summary.graph.nodes) {
+			expect(boundIndexingCounts(node)).toBe(summary.groups.find(group => group.id === node.id)?.indexing);
+		}
 		const expectedRoots = data.roots.map(id => {
 			const group = summary.groupOf.get(id);
 			if (group === undefined) throw new Error(`Root ${id} has no projected group`);

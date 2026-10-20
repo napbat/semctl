@@ -11,6 +11,7 @@ import { resultGraph } from "./result-graph";
 import { acceptConceptOverview, conceptRevision, lookupConcept, subscribeConcepts } from "./concept-colors";
 import { nativeElement, supportsElements } from "./native-elements";
 import type { GraphAppearance } from "./graph-appearance";
+import { boundedTooltip, compactTooltip } from "./tooltip-text";
 
 const MAX_BYTES = 32 * 1024;
 const MAX_HITS = 32;
@@ -300,7 +301,8 @@ export class SemctlInspector implements Component {
 			const rank = this.comparisonHits ? compared.indexOf(h) : i;
 			const strength = scales[rank];
 			const indicator = matchScoreIndicator(h, rank, strength ?? null, cx, `hit:${i}`);
-			const tip = `${h.qualifiedName ?? h.symbol ?? h.kind ?? "Symbol unavailable"}${h.enclosingSymbol ? `\nIn ${h.enclosingSymbol}` : ""}\n${expanded ? "Collapse" : "Expand"} source`;
+			const tip = compactTooltip(h.qualifiedName ?? h.symbol ?? h.kind ?? "Symbol unavailable", h.enclosingSymbol && `In ${h.enclosingSymbol}`,
+				`${expanded ? "Collapse" : "Expand"} source`);
 			const file = label(h.path ?? "Path unavailable");
 			const symbol = h.symbol ?? h.qualifiedName ?? h.kind ?? "—";
 			const concept = lookupConcept(h.codebaseId ?? d.identity.codebaseId, h.path);
@@ -312,7 +314,7 @@ export class SemctlInspector implements Component {
 				{ t: file.slice(cut), s: "strong", ...(href ? { href } : {}) },
 				{ t: label(location(h).slice((h.path ?? "Path unavailable").length)), s: "muted" },
 			], shrink: 1, min: { w: 0 }, wrap: "none", truncate: "middle",
-				title: `${location(h)}${href ? `\n${h.binding.state === "bound" ? "Open checkout file" : UNVERIFIED_FILE_LINK}` : ""}` } };
+				title: compactTooltip(location(h), href && (h.binding.state === "bound" ? "Open checkout file" : UNVERIFIED_FILE_LINK)) } };
 			const chip: NativeNode = { k: "row", key: `hit-${i}`, p: { role: "omp.tool.chip", gap: "xs", align: "center", wrap: false, mark: expanded ? "pick" : undefined, max: { w: 1 }, actions: { click: `hit:${i}` }, title: tip, aria: `${expanded ? "Collapse" : "Expand"} match ${i + 1}: ${location(h)}. ${label(context)}` }, c: [
 				cue ? nativeElement({ ...cue, k: "el", p: { ...cue.p, actions: { click: `hit:${i}` } } }) : text(expanded ? "▾" : "▸", { tone: "muted", wrap: "none", shrink: 0 }),
 				...(cx.supports("icon") ? [{ k: "icon" as const, key: "file-icon", p: { name: "file", shrink: 0, aria: file } }] : []),
@@ -325,9 +327,8 @@ export class SemctlInspector implements Component {
 				hidden: !this.expandedResult() && i >= COMPACT_MATCHES }, c: [
 				chip,
 				...(expanded ? [{ k: "col" as const, key: "preview", p: { role: "semctl.match.preview", gap: "xs" as const }, c: [
-					text(context, { tone: "muted", wrap: "none", truncate: "end", title: [
-						h.qualifiedName ?? h.symbol, h.enclosingSymbol ? `In ${h.enclosingSymbol}` : null, h.project ? `Project: ${h.project}` : null,
-					].filter(Boolean).join("\n") }),
+					text(context, { tone: "muted", wrap: "none", truncate: "end", title: compactTooltip(
+						h.qualifiedName ?? h.symbol, h.enclosingSymbol && `In ${h.enclosingSymbol}`, h.project && `Project: ${h.project}`) }),
 					...this.preview(h, cx), ...this.matchDetails(d, h, i, cx),
 				] }] : []),
 			] };
@@ -339,35 +340,10 @@ export class SemctlInspector implements Component {
 		if (!(["col", "row", "text"] as const).every(k => cx.supports(k))) {
 			return { k: "col", c: [...this.fallbackBody()] };
 		}
-		const children: NativeNode[] = [];
 		const d = this.display;
-		const id = d.identity;
-		const displayName = id.name ?? (id.localRoot !== null && path.isAbsolute(id.localRoot) ? path.basename(id.localRoot) || "checkout" : "Codebase");
-		const identity = text(`${id.copy} · ${displayName}`, { tone: "muted", title: `Codebase: ${id.codebaseId ?? "unbound"}${id.localRoot ? `\nCheckout: ${id.localRoot}` : ""}` });
-		const freshness = d.kind === "search" && d.indexWarning ? {
-			role: "semctl.index-warning", tone: "warning" as const, shrink: 0, title: d.indexWarning, aria: `Index warning: ${d.indexWarning}`,
-		} : undefined;
-		const warning: NativeNode | undefined = freshness ? cx.supports("icon")
-			? { k: "icon", key: "index-warning", p: { name: "warn", ...freshness } }
-			: { ...text("!", freshness), key: "index-warning" } : undefined;
-		const graphOpen = this.expandedSections.has("graph");
-		const graphAction = { actions: { click: "graph" }, title: `${graphOpen ? "Hide" : "Show"} result graph\nFile membership, not calls or dependencies.`,
-			aria: graphOpen ? "Hide result graph" : "Show result graph", shrink: 0 };
-		const graphControl: NativeNode = supportsElements(cx) && cx.feature("styles")
-			? nativeElement({ k: "el", key: "graph-control", p: { tag: "button", class: "semctl-icon-action", ...graphAction,
-				attrs: { "aria-pressed": graphOpen, "aria-expanded": graphOpen } }, c: [cx.supports("icon") ? { k: "icon", p: { name: "diagram" } } : text("Graph")] })
-			: cx.supports("icon") ? { k: "icon", key: "graph-control", p: { name: "diagram", ...graphAction } }
-				: { ...text("Graph", { ...graphAction, tone: "accent" }), key: "graph-control" };
-		children.push(this.supplementaryGraph || warning ? {
-			k: "row", p: { gap: "sm", align: "center" }, c: [
-				{ ...identity, p: { ...identity.p, grow: 1, min: { w: 0 }, truncate: "end", wrap: "none" } },
-				...(warning ? [warning] : []), ...(this.supplementaryGraph ? [graphControl] : []),
-			],
-		} : identity);
-		if (d.kind === "graph") return { k: "col", p: { gap: "sm" }, c: [identity, this.graph!] };
-		if (this.supplementaryGraph && this.expandedSections.has("graph")) children.push({
-			k: "col", key: "result-graph", p: { gap: "xs" }, c: [text("Matches by file", { tone: "muted" }), this.graph!],
-		});
+		if (d.kind === "graph") return { k: "col", p: { gap: "sm" }, c: [this.graph!] };
+		const children: NativeNode[] = [];
+		const styled = supportsElements(cx) && cx.feature("styles");
 		if (d.kind === "search" || d.kind === "batch") {
 			const rows = this.hits;
 			const rendered = this.hitRows(d, rows, cx);
@@ -388,18 +364,36 @@ export class SemctlInspector implements Component {
 					entries.push(...rendered.slice(offset, offset + s.hits.length)); offset += s.hits.length;
 				}
 			} else entries.push(...rendered);
+			if (this.supplementaryGraph) entries.push(this.graphControl(cx, styled));
 			// Keep stable match nodes and selection while the native tool header
 			// switches between the compact preview and the complete result.
-			children.push({ k: "row", key: "matches", p: { role: "semctl.matches", gap: "xs", wrap: true, align: "start" }, c: entries });
+			// Styled hosts gate chip arrival and score easing on data-motion, which only an element carries.
+			children.push(styled ? nativeElement({ k: "el", key: "matches", p: { tag: "div", role: "semctl.matches",
+				attrs: { "data-motion": cx.reduceMotion ? "reduced" : "full" } }, c: entries })
+				: { k: "row", key: "matches", p: { role: "semctl.matches", gap: "xs", wrap: true, align: "start" }, c: entries });
+			if (this.supplementaryGraph && this.expandedSections.has("graph")) children.push({
+				k: "col", key: "result-graph", p: { gap: "xs" }, c: [text("Matches by file", { tone: "muted" }), this.graph!],
+			});
 		} else if (d.kind === "source") {
-			const header = text(`${d.path} · ${d.sourceOrigin} · bytes ${d.byteStart}–${d.byteEnd}/${d.fileSize}${d.truncated ? " · truncated" : ""}${d.binary ? " · binary" : ""}`, { title: `Hash: ${d.contentHash}\nEncoding: ${d.encoding}` });
-			const concept = lookupConcept(id.codebaseId, d.path), cue = concept && nativeConceptCue(concept, cx);
+			const header = text(`${d.path} · ${d.sourceOrigin} · bytes ${d.byteStart}–${d.byteEnd}/${d.fileSize}${d.truncated ? " · truncated" : ""}${d.binary ? " · binary" : ""}`, { title: compactTooltip(`Hash: ${d.contentHash}`, `Encoding: ${d.encoding}`) });
+			const concept = lookupConcept(d.identity.codebaseId, d.path), cue = concept && nativeConceptCue(concept, cx);
 			children.push(cue ? { k: "row", p: { gap: "sm", align: "center" }, c: [cue, header] } : header);
 			const numbered = d.lineStart !== null && d.lineStart > 0 && d.lineEnd !== null && lineCount(d.text) === d.lineEnd - d.lineStart + 1;
 			children.push(...this.sourceNodes(d.text, { path: d.path, language: d.language ?? undefined, start: numbered ? d.lineStart! : undefined,
 				limit: this.expandedResult() ? Math.max(16, lineCount(d.text)) : 16 }, cx));
 		} else children.push(...this.status(d, cx));
 		return { k: "col", p: { gap: "sm" }, c: children };
+	}
+	/** The result graph toggle trails the match chips on their last line. */
+	private graphControl(cx: DescribeContext, styled: boolean): NativeNode {
+		const open = this.expandedSections.has("graph");
+		const action = { role: "semctl.match.graph", actions: { click: "graph" }, title: compactTooltip(`${open ? "Hide" : "Show"} result graph`, "File membership, not calls or dependencies"),
+			aria: open ? "Hide result graph" : "Show result graph", shrink: 0 };
+		return styled
+			? nativeElement({ k: "el", key: "graph-control", p: { tag: "button", class: "semctl-icon-action", ...action,
+				attrs: { "aria-pressed": open, "aria-expanded": open } }, c: [cx.supports("icon") ? { k: "icon", p: { name: "diagram" } } : text("Graph")] })
+			: cx.supports("icon") ? { k: "icon", key: "graph-control", p: { name: "diagram", ...action } }
+				: { ...text("Graph", { ...action, tone: "accent" }), key: "graph-control" };
 	}
 	private status(d: Status, cx: DescribeContext): NativeNode[] {
 		const out: NativeNode[] = [text("Index snapshot · not live progress", { tone: "muted" })];
@@ -419,6 +413,19 @@ export class SemctlInspector implements Component {
 	render(width: number): readonly string[] {
 		return clean(this.fallbackText).split(/\r?\n/).map(line => line.slice(0, Math.max(0, Math.floor(width))));
 	}
+}
+
+interface HeadBadge { text: string; tone: "muted" | "warning"; title: string }
+/** The tool header carries the codebase identity, so a result body starts with its content. */
+export function identityBadge(id: Display["identity"]): HeadBadge {
+	const name = id.name ?? (id.localRoot !== null && path.isAbsolute(id.localRoot) ? path.basename(id.localRoot) || "checkout" : "Codebase");
+	return { text: `${label(name)}${id.copy === "canonical" ? " · canonical" : ""}`, tone: "muted",
+		title: compactTooltip(`Codebase: ${id.codebaseId ?? "unbound"}`, id.localRoot && `Checkout: ${id.localRoot}`, `Copy: ${id.copy}`) };
+}
+function headBadges(display: Display): HeadBadge[] {
+	const badges = [identityBadge(display.identity)];
+	if (display.kind === "search" && display.indexWarning) badges.push({ text: "index warning", tone: "warning", title: boundedTooltip([display.indexWarning], 4) });
+	return badges;
 }
 
 /** One tool can render many retained cards. MCP details own each response's local UI state. */
@@ -469,7 +476,7 @@ export function createInspectorRenderer(server: string, operation: string) {
 						meta: display.kind === "graph" ? [`${display.nodes.length} nodes`, `${display.edges.length} links`,
 							...(display.truncated ? ["partial"] : [])] : count === undefined ? undefined : [
 								`${!options.expanded && count > COMPACT_MATCHES ? `${COMPACT_MATCHES} of ` : ""}${count} ${count === 1 ? "match" : "matches"}`,
-							] },
+							], badges: headBadges(display) },
 					body: [current.view],
 					inline: true,
 					preview: "children",

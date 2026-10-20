@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import type { Component, DescribeContext, NativeNode } from "@oh-my-pi/pi-tui";
 import { readDisplay, SemctlInspector, type Hit } from "./inspector";
 import { GraphInspector, graphRelations, readGraph, type GraphData } from "./graph";
@@ -7,7 +7,9 @@ import { conceptRevision, resetConcepts } from "./concept-colors";
 import { lookupGraphColor, setGraphColorMode } from "./graph-colors";
 import { nativeGraphLayout } from "./graph-native-layout";
 import { conceptClass } from "./native-concepts";
-import { DEFAULT_GRAPH_APPEARANCE, type GraphAppearance } from "./graph-appearance";
+import { DEFAULT_GRAPH_APPEARANCE, GraphAppearanceStore, type GraphAppearance } from "./graph-appearance";
+import { indexingParts, type GraphIndexingCounts } from "./graph-indexing";
+import { GraphPage } from "./graph-page";
 
 afterEach(() => { resetConcepts(); setGraphColorMode("concepts"); });
 
@@ -32,10 +34,15 @@ function nodes(root: NativeNode): NativeNode[] {
 	return result;
 }
 function content(root: NativeNode): string {
-	return nodes(root).map(n => n.k === "text" ? n.p?.text ?? n.p?.spans?.map(s => s.t).join("") ?? "" : "").join("\n");
+	return nodes(root).map(n => n.k === "text" ? n.p?.text ?? n.p?.spans?.map(s => s.t).join("") ?? "" : n.k === "badge" ? n.p?.text ?? "" : "").join("\n");
 }
 function action(view: GraphInspector, act: string): void {
 	view.handleNativeEvent({ type: "action", key: "", act, mods: [] });
+}
+function expectCompact(title: string | undefined): void {
+	if (title === undefined) throw new Error("Missing tooltip");
+	expect(title.split("\n").length).toBeLessThanOrEqual(3);
+	for (const line of title.split("\n")) expect(line.length).toBeLessThanOrEqual(88);
 }
 
 describe("bounded graph carrier", () => {
@@ -101,6 +108,71 @@ describe("bounded graph carrier", () => {
 });
 
 describe("native graph navigation", () => {
+	test("wraps inline and overview diagrams in the shared well only on styled hosts", () => {
+		const styled: DescribeContext = { ...native, feature: name => name === "styles" };
+		for (const presentation of ["inline", "overview"] as const) {
+			const view = new GraphInspector(graph(), () => {}, () => ({} as Component), null, undefined, "body", presentation);
+			const root = view.describe(styled), well = root.c?.find(child => "k" in child && child.key === "graph-well");
+			if (!well || !("k" in well)) throw new Error("Missing graph well");
+			expect(asNativeElement(well)?.p.class).toBe("semctl-graph-well");
+			expect(well.c).toHaveLength(1);
+			expect(well.c?.[0] && "k" in well.c[0] ? asNativeElement(well.c[0])?.key : undefined).toBe("graph-preview");
+			expect(root.c?.some(child => "k" in child && child.key === "graph-preview")).toBe(false);
+			for (const cx of [native, { ...styled, supports: (kind: string) => kind !== "el" } as DescribeContext]) {
+				const fallback = view.describe(cx);
+				expect(nodes(fallback).some(node => node.key === "graph-well" || node.key === "graph-preview")).toBe(false);
+				expect(content(fallback)).toContain("Native graph drawing unavailable · use node navigation below.");
+			}
+		}
+	});
+	test("keeps a supplied diagram directly in the column when the host has no styles", () => {
+		const view = new GraphInspector(graph(), () => {}, () => ({} as Component));
+		const diagram: NativeNode = { k: "text", key: "graph-preview", p: { text: "Diagram" } };
+		const preview = spyOn(view as unknown as { diagram(cx: DescribeContext): NativeNode | undefined }, "diagram").mockReturnValue(diagram);
+		try {
+			const root = view.describe(native);
+			expect(root.c).toContain(diagram);
+			expect(nodes(root).some(node => node.key === "graph-well")).toBe(false);
+		} finally { preview.mockRestore(); }
+	});
+	test("uses native state badges with the original titles and retains plain text fallbacks", () => {
+		const view = new GraphInspector({ ...graph(), loading: true }, () => {}, () => ({} as Component));
+		const root = view.describe(native), badges = nodes(root).filter(node => node.k === "badge");
+		expect(badges.map(node => node.p)).toEqual([
+			{ text: "Partial graph", tone: "warning", title: "The graph is truncated. The original result retains all returned data." },
+			{ text: "Relationship layers loading", tone: "muted", title: "Available nodes remain usable." },
+		]);
+		const counts = nodes(root).find(node => node.k === "text" && node.p?.text === "5 nodes · 7 relationships");
+		expect(counts?.p?.tone).toBe("muted");
+		expect(counts?.p?.role).toBe("semctl.graph.hint");
+		const fallback = view.describe({ ...native, supports: kind => kind !== "badge" });
+		expect(nodes(fallback).some(node => node.k === "badge")).toBe(false);
+		for (const badge of badges) {
+			const label = nodes(fallback).find(node => node.k === "text" && node.p?.text === badge.p?.text);
+			expect(label?.p?.tone).toBe(badge.p?.tone);
+			expect(label?.p?.title).toBe(badge.p?.title);
+		}
+	});
+	test("keeps drawing counts and the node selection hint in one quiet row", () => {
+		const data = graph();
+		data.nodes = Array.from({ length: 96 }, (_, index) => ({ id: String(index), label: `File ${index}`, category: "file",
+			path: `module-${index % 4}/${index}.ts`, detail: null, hit: null }));
+		data.roots = ["0"]; data.edges = [];
+		const view = new GraphInspector(data, () => {}, () => ({} as Component), null, undefined, "body", "overview");
+		const row = nodes(view.describe({ ...native, feature: name => name === "styles" })).find(node => node.key === "graph-drawing-summary");
+		if (!row) throw new Error("Missing drawing summary");
+		expect(row.k).toBe("row");
+		expect(content(row)).toContain("group summaries · 0 routes drawn");
+		expect(content(row)).toContain("Select a dot for details");
+		const labels = nodes(row).filter(node => node.k === "text");
+		expect(labels.map(node => [node.p?.role, node.p?.tone])).toEqual([
+			["semctl.graph.hint", "muted"], ["semctl.graph.hint", "muted"],
+		]);
+		expect(labels[0].p?.grow).toBe(1);
+		expect(labels[0].p?.title).toBeTruthy();
+		expect(labels[1].p?.shrink).toBe(0);
+		expect(content(view.describe(native))).not.toContain("Select a dot for details");
+	});
 	test("hosts without native graph elements retain names, hover details and relationship selection", () => {
 		const view = new GraphInspector(graph(), () => {}, () => ({} as Component));
 		const fallback: DescribeContext = { ...native, supports: kind => String(kind) !== "el" && kind !== "tree" && kind !== "section" };
@@ -214,7 +286,7 @@ describe("native graph navigation", () => {
 		action(view, "node:4");
 		expect(content(view.describe(native))).not.toContain("Embedding failed.");
 	});
-	test("node and group hover errors remain complete and selected details keep full descriptions", () => {
+	test("node hovers stay compact with the first error line while selected details keep full descriptions", () => {
 		const diagnostic = `Provider unavailable\n${"Exact failure reason. ".repeat(100)}`;
 		for (const category of ["file", "group"] as const) {
 			const data = graph();
@@ -222,8 +294,10 @@ describe("native graph navigation", () => {
 				detail: "Full selected description", indexing: "failed", indexingError: diagnostic };
 			const view = new GraphInspector(data, () => {}, () => ({} as Component));
 			const title = nodes(view.describe(native)).find(node => node.key === "quick-0")?.p?.title!;
+			expectCompact(title);
 			expect(title.split("\n").filter(line => line === "src/main.ts")).toHaveLength(1);
-			expect(title).toContain(diagnostic);
+			expect(title).toContain("Provider unavailable");
+			expect(title).not.toContain("Exact failure reason");
 			expect(title).not.toContain(data.nodes[0].detail!);
 			action(view, "node:0");
 			const selected = content(view.describe(native));
@@ -231,16 +305,86 @@ describe("native graph navigation", () => {
 			expect(selected).toContain(data.nodes[0].detail!);
 		}
 	});
-	test("group hover previews account for omitted members and exploration retains every source", () => {
+	test("indexing meter parts omit zero and unreported states and have no empty total", () => {
+		const counts: GraphIndexingCounts = { ready: 0, processing: 0, pending: 0, failed: 0, unknown: 0, unreported: 3 };
+		expect(indexingParts({ ...counts, unreported: 0 })).toBeUndefined();
+		expect(indexingParts(counts)).toBeUndefined();
+		expect(indexingParts({ ...counts, ready: 3, failed: 1 })).toEqual([
+			{ value: 0.75, token: "success", label: "3 ready" }, { value: 0.25, token: "error", label: "1 failed" },
+		]);
+	});
+	test("overview and scoped groups use ordered indexing meter parts with a text fallback", () => {
+		const data = graph(), states = [["ready", 2], ["processing", 4], ["pending", 6], ["failed", 8], ["unknown", 10]] as const;
+		data.nodes = states.flatMap(([indexing, count]) => Array.from({ length: count }, (_, index) => ({
+			id: `${indexing}-${index}`, label: `${indexing}-${index}`, category: "file" as const,
+			path: `src/${indexing}-${index}.ts`, indexing, detail: null, hit: null,
+		})));
+		data.edges = []; data.roots = [data.nodes[0].id];
+		const expected = [
+			{ value: 2 / 30, token: "success", label: "2 ready" }, { value: 4 / 30, token: "accent", label: "4 processing" },
+			{ value: 6 / 30, token: "muted", label: "6 pending" }, { value: 8 / 30, token: "error", label: "8 failed" },
+			{ value: 10 / 30, token: "dim", label: "10 unknown" },
+		];
+		const view = new GraphInspector(data, () => {}, () => ({} as Component), null, undefined, "body", "overview");
+		const withoutMeter: DescribeContext = { ...native, supports: kind => kind !== "meter" };
+		for (const scoped of [false, true]) {
+			if (scoped) action(view, "group:0");
+			const key = scoped ? "graph-scope" : "group-0", row = nodes(view.describe(native)).find(node => node.key === key)!;
+			const meter = nodes(row).find(node => node.k === "meter");
+			if (!meter || meter.k !== "meter") throw new Error("Missing group indexing meter");
+			expect(meter.p?.parts).toEqual(expected);
+			expect(meter.p?.value).toBe(2 / 30);
+			expect(meter.p?.style).toBe("bar");
+			expect(meter.p?.size).toBe("sm");
+			expect(meter.p?.min).toEqual({ w: "10ch" });
+			expect(meter.p?.max).toEqual({ w: "10ch" });
+			expect(meter.p?.shrink).toBe(0);
+			expect(meter.p?.title).toContain("Indexing:");
+			for (const part of expected) expect(meter.p?.title).toContain(part.label);
+			expect(meter.p?.aria).toBe(meter.p?.title);
+			expect(content(row)).not.toContain("Indexing:");
+			if (!scoped) {
+				expect(row.p?.role).toBe("semctl.graph.group");
+				expect(row.c?.find(node => "k" in node && node.k === "text" && node.p?.spans)?.p?.grow).toBe(1);
+				expect(row.p?.title).toContain(meter.p?.title!);
+				expect(row.p?.aria).toContain(meter.p?.title!);
+				const count = row.c?.find(node => "k" in node && node.k === "row" && node.p?.min?.w === "4ch");
+				expect(count && "k" in count ? count.p?.justify : undefined).toBe("end");
+				expect(count && "k" in count ? nodes(count).find(node => node.k === "text")?.p?.text : undefined).toBe("30");
+			}
+			const fallback = nodes(view.describe(withoutMeter)).find(node => node.key === key)!;
+			expect(nodes(fallback).some(node => node.k === "meter")).toBe(false);
+			expect(content(fallback)).toContain(meter.p?.title!);
+			expect(fallback.p?.title).toBe(row.p?.title);
+			expect(fallback.p?.aria).toBe(row.p?.aria);
+		}
+	});
+	test("every graph view hover stays within three short lines, even with long names and many caveats", () => {
+		const data = graph(), long = "very-long-segment/".repeat(12);
+		data.caveats = Array.from({ length: 7 }, (_, index) => `Caveat ${index}: ${"bounded detail ".repeat(10)}`);
+		data.nodes = data.nodes.map(node => ({ ...node, label: `${long}${node.label}`, path: `${long}${node.id}.ts`, category: "file" as const,
+			indexing: "failed" as const, indexingError: `${"Provider failure ".repeat(12)}\nsecond line` }));
+		for (const presentation of ["inline", "overview"] as const) {
+			const view = new GraphInspector(data, () => {}, () => ({} as Component), null, undefined, "body", presentation);
+			view.handleNativeEvent({ type: "toggle", key: "graph-nodes", collapsed: false });
+			const titles = nodes(view.describe(native)).map(node => node.p?.title).filter((title): title is string => typeof title === "string");
+			expect(titles.length).toBeGreaterThan(0);
+			for (const title of titles) expectCompact(title);
+			const notes = nodes(view.describe(native)).find(node => node.key === "graph-notes");
+			expect(notes?.p?.title).toContain("+5 more notes");
+			expect(notes?.p?.aria).toContain("Caveat 6");
+		}
+	});
+	test("group hovers stay compact and exploration retains every source", () => {
 		const data = graph();
 		data.nodes = Array.from({ length: 96 }, (_, index) => ({ id: String(index), label: `File ${index}`,
 			category: "file", path: `src/file-${index}.ts`, detail: `Selected file ${index}`, hit: null }));
 		data.roots = ["0"]; data.edges = [];
 		const view = new GraphInspector(data, () => {}, () => ({} as Component), null, undefined, "body", "overview");
 		const group = nodes(view.describe(native)).find(node => node.key === "group-0")!;
-		expect(group.p?.title?.match(/src\/file-\d+\.ts/g)).toHaveLength(3);
-		expect(group.p?.title).toContain("+93");
-		expect(group.p?.title).not.toContain("src/file-95.ts");
+		expectCompact(group.p?.title);
+		expect(group.p?.title).toContain("96 nodes");
+		expect(group.p?.title).not.toContain("src/file-");
 		action(view, "group:0");
 		view.handleNativeEvent({ type: "toggle", key: "graph-nodes", collapsed: false });
 		action(view, "more-nodes"); action(view, "more-nodes");
@@ -406,6 +550,34 @@ describe("native graph navigation", () => {
 		}
 		expect(content(view.describe(native))).toContain("A → B · relation 24");
 	});
+});
+
+test("graph toolbar gives the overview a checkout subline without changing other operation headings or actions", () => {
+	for (const id of ["overview", "trace"]) {
+		const operation = { id, label: id === "overview" ? "Indexed overview" : "Symbol neighbourhood", operation: id, fields: [] };
+		const view = new GraphPage({
+			operation, operations: [operation], cwd: "/workspace/checkout-name",
+			state: () => ({ loading: false, text: "Result" }), activity: () => ({ operations: [], targets: [], producer: null }),
+			appearance: new GraphAppearanceStore(), createInspector: () => ({} as Component),
+			requestRender() {}, height: () => 24, matches: () => false, close() {}, refresh() {}, showAppearance() {},
+		});
+		const root = view.describe(native), heading = nodes(root).find(node => node.key === "heading");
+		if (!heading) throw new Error("Missing graph heading");
+		const title = nodes(heading).find(node => node.p?.role === "semctl.graph.title");
+		expect(title?.p?.text).toBe(operation.label);
+		expect(title?.p?.title).toContain("configured semctl CLI · /workspace/checkout-name");
+		const subline = nodes(heading).find(node => node.p?.role === "semctl.graph.hint");
+		if (id === "overview") {
+			expect(subline?.p?.text).toBe("checkout-name");
+			expect(subline?.p?.tone).toBe("muted");
+			expect(subline?.p?.title).toBe("/workspace/checkout-name");
+		} else expect(subline).toBeUndefined();
+		for (const action of ["analyses", "appearance", "refresh", "info", "close"]) {
+			expect(nodes(root).some(node => node.p?.actions?.click === action)).toBe(true);
+		}
+		expect(content(root)).toContain("A analyses · S appearance · I details · R refresh · Esc close");
+		view.dispose();
+	}
 });
 
 test("existing graph results repaint shared structural cues on profile changes without moving geometry or creating previews", () => {

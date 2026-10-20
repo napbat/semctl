@@ -5,7 +5,11 @@ import { join } from "node:path";
 import { DEFAULT_GRAPH_APPEARANCE, GraphAppearanceStore, type GraphAppearance, type GraphAppearancePersistence } from "./graph-appearance";
 
 function document(patch: Partial<GraphAppearance> = {}): string {
-	return JSON.stringify({ version: 1, appearance: { ...DEFAULT_GRAPH_APPEARANCE, ...patch } });
+	return JSON.stringify({ version: 2, appearance: { ...DEFAULT_GRAPH_APPEARANCE, ...patch } });
+}
+/** A version 1 appearance object: the six keys that predate the popup size. */
+function versionOne(patch: Partial<GraphAppearance> = {}): Record<string, unknown> {
+	return Object.fromEntries(Object.entries({ ...DEFAULT_GRAPH_APPEARANCE, ...patch }).filter(([key]) => key !== "popup"));
 }
 class MemoryPreferences implements GraphAppearancePersistence {
 	readonly writes: { file: string; contents: string }[] = [];
@@ -37,7 +41,7 @@ describe("graph appearance preferences", () => {
 			expect(await readdir(directory)).toEqual([]);
 			await store.update({ layout: "layers", color: "structure", labels: "hover", motion: "off" });
 			expect(store.saved).toBe(true);
-			expect(JSON.parse(await readFile(file, "utf8"))).toEqual({ version: 1, appearance: store.state.value });
+			expect(JSON.parse(await readFile(file, "utf8"))).toEqual({ version: 2, appearance: store.state.value });
 			expect(await readdir(join(directory, "preferences"))).toEqual(["graph-appearance.json"]);
 			const reopened = new GraphAppearanceStore(file);
 			await reopened.load();
@@ -50,32 +54,53 @@ describe("graph appearance preferences", () => {
 		} finally { await rm(directory, { recursive: true, force: true }); }
 	});
 
-	test("loads every original version1 layout unchanged and round-trips Components in the same schema", async () => {
-		for (const layout of ["force", "radial", "layers"] as const) {
-			const appearance = { layout, color: "structure", detail: "calm", labels: "hover", links: "clear", motion: "off" } as const;
+	test("loads a user's version 1 file unchanged with a small popup and writes version 2 only on edit", async () => {
+		const contents = `${JSON.stringify({ version: 1, appearance: { layout: "radial", color: "concepts", detail: "detailed", labels: "more", links: "soft", motion: "system" } }, null, 2)}\n`;
+		const io = new MemoryPreferences(contents), store = new GraphAppearanceStore("graph-appearance.json", io);
+		await store.load();
+		expect(store.state.value).toEqual({ layout: "radial", color: "concepts", detail: "detailed", labels: "more", links: "soft", motion: "system", popup: "small" });
+		expect(Object.keys(store.state.value)).toEqual(Object.keys(DEFAULT_GRAPH_APPEARANCE));
+		expect(store.state.error).toBeUndefined();
+		expect(store.saved).toBe(true);
+		await store.flush();
+		expect(io.writes).toHaveLength(0);
+		expect(io.contents).toBe(contents);
+		await store.update({ popup: "medium" });
+		expect(JSON.parse(io.contents)).toEqual({ version: 2, appearance: { layout: "radial", color: "concepts", detail: "detailed", labels: "more", links: "soft", motion: "system", popup: "medium" } });
+	});
+
+	test("loads every version 1 layout unchanged and round-trips version 2 with all seven keys", async () => {
+		for (const layout of ["force", "radial", "layers", "components"] as const) {
+			const appearance = versionOne({ layout, color: "structure", detail: "calm", labels: "hover", links: "clear", motion: "off" });
 			const io = new MemoryPreferences(JSON.stringify({ version: 1, appearance }));
 			const store = new GraphAppearanceStore("preferences.json", io);
 			await store.load();
-			expect(store.state.value).toEqual(appearance);
+			expect(store.state.value).toEqual({ ...appearance, popup: "small" } as GraphAppearance);
 			expect(store.state.error).toBeUndefined();
 			expect(io.writes).toHaveLength(0);
-			await store.update({ layout: "components" });
-			expect(JSON.parse(io.contents)).toEqual({ version: 1, appearance: { ...appearance, layout: "components" } });
+			await store.update({ layout: "map", popup: "large" });
+			const saved = { ...appearance, layout: "map", popup: "large" };
+			expect(JSON.parse(io.contents)).toEqual({ version: 2, appearance: saved });
 			const reopened = new GraphAppearanceStore("preferences.json", io);
 			await reopened.load();
-			expect(reopened.state.value).toEqual({ ...appearance, layout: "components" });
+			expect(reopened.state.value).toEqual(saved as GraphAppearance);
 			expect(reopened.state.error).toBeUndefined();
+			expect(reopened.saved).toBe(true);
 		}
 	});
 
-	test("rejects malformed, incomplete, oversized and future schemas without auto-overwriting", async () => {
+	test("rejects malformed, incomplete, mixed-version, oversized and future schemas without auto-overwriting", async () => {
 		const malformed = [
-			"{", "null", "[]", " ".repeat(8193), JSON.stringify({ version: 2, appearance: DEFAULT_GRAPH_APPEARANCE }),
+			"{", "null", "[]", " ".repeat(8193), JSON.stringify({ version: 3, appearance: DEFAULT_GRAPH_APPEARANCE }),
+			JSON.stringify({ version: "2", appearance: DEFAULT_GRAPH_APPEARANCE }),
 			JSON.stringify({ version: 1, appearance: { layout: "force" } }),
-			JSON.stringify({ version: 1, appearance: { ...DEFAULT_GRAPH_APPEARANCE, layout: "random" } }),
-			JSON.stringify({ version: 1, appearance: { ...DEFAULT_GRAPH_APPEARANCE, motion: false } }),
-			JSON.stringify({ version: 1, appearance: { ...DEFAULT_GRAPH_APPEARANCE, foreign: "leave alone" } }),
-			JSON.stringify({ version: 1, appearance: DEFAULT_GRAPH_APPEARANCE, unrelated: {} }),
+			JSON.stringify({ version: 1, appearance: DEFAULT_GRAPH_APPEARANCE }),
+			JSON.stringify({ version: 2, appearance: versionOne() }),
+			JSON.stringify({ version: 2, appearance: { ...DEFAULT_GRAPH_APPEARANCE, popup: "huge" } }),
+			JSON.stringify({ version: 1, appearance: versionOne({ layout: "random" as GraphAppearance["layout"] }) }),
+			JSON.stringify({ version: 1, appearance: { ...versionOne(), motion: false } }),
+			JSON.stringify({ version: 2, appearance: { ...DEFAULT_GRAPH_APPEARANCE, foreign: "leave alone" } }),
+			JSON.stringify({ version: 2, appearance: DEFAULT_GRAPH_APPEARANCE, unrelated: {} }),
 		];
 		for (const contents of malformed) {
 			const io = new MemoryPreferences(contents), store = new GraphAppearanceStore("only-own-preferences.json", io);
@@ -98,7 +123,7 @@ describe("graph appearance preferences", () => {
 	test("validates runtime updates without accepting unknown keys, getters or unsupported values", async () => {
 		const io = new MemoryPreferences(), store = new GraphAppearanceStore("preferences.json", io);
 		await store.load();
-		const inputs: unknown[] = [null, [], { color: "red" }, { links: 1 }, { motion: undefined }, { layout: "radial", other: true },
+		const inputs: unknown[] = [null, [], { color: "red" }, { links: 1 }, { motion: undefined }, { layout: "radial", other: true }, { popup: "huge" }, { popup: "sm" },
 			Object.defineProperty({}, "layout", { enumerable: true, get() { throw new Error("must not execute getter"); } })];
 		for (const input of inputs) {
 			await store.update(input as Partial<GraphAppearance>);
@@ -106,9 +131,10 @@ describe("graph appearance preferences", () => {
 			expect(store.state.value).toEqual(DEFAULT_GRAPH_APPEARANCE);
 		}
 		expect(io.writes).toHaveLength(0);
-		await store.update({ color: "neutral" });
+		await store.update({ color: "neutral", popup: "large" });
 		expect(store.state.error).toBeUndefined();
 		expect(store.state.value.color).toBe("neutral");
+		expect(store.state.value.popup).toBe("large");
 	});
 
 	test("late loading merges untouched disk preferences with the latest edits and coalesces writes", async () => {

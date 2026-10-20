@@ -1,11 +1,12 @@
-import { conceptRevision, lookupConcept, notifyColorObservers, type ConceptColor } from "./concept-colors";
+import { conceptRevision, groupConcept, lookupConcept, notifyColorObservers, type ConceptColor } from "./concept-colors";
 import type { GraphData } from "./graph";
 import type { GraphAppearance } from "./graph-appearance";
 import { conceptPalette, normalizeConceptPath } from "./graph-data/palette.js";
 
 type GraphNode = GraphData["nodes"][number];
 type ColorMode = GraphAppearance["color"];
-export interface GraphColor extends ConceptColor { source: "concept" | "structure" }
+/** `concept` carries the concept evidence; structure colors have none. */
+export interface GraphColor extends Pick<ConceptColor, "key" | "label" | "light" | "dark" | "reason"> { source: "concept" | "structure"; concept?: ConceptColor }
 interface GroupColor { color: GraphColor; identity: string }
 interface GroupBinding {
 	scope: string | null;
@@ -22,6 +23,14 @@ let revision = 0;
 
 export function getGraphColorMode(): ColorMode { return currentMode; }
 export function graphColorRevision(): number { return revision; }
+function conceptColor(concept: ConceptColor): GraphColor {
+	let color = conceptColors.get(concept);
+	if (!color) {
+		color = Object.freeze({ key: concept.key, label: concept.label, light: concept.light, dark: concept.dark, reason: concept.reason, source: "concept", concept });
+		conceptColors.set(concept, color);
+	}
+	return color;
+}
 
 /** Category colors are profile-wide; changing them repaints without changing graph evidence or grouping. */
 export function setGraphColorMode(mode: ColorMode): void {
@@ -53,16 +62,10 @@ export function lookupGraphColor(codebaseId: string | null | undefined, node: Gr
 	const source = node.hit?.path ?? node.path;
 	const path = directoryNode && source === "" ? "" : normalizeConceptPath(source);
 	if (path === undefined) return undefined;
-	if (mode === "concepts" && !directoryNode) {
+	// Doc concepts also name directories and project roots by path.
+	if (mode === "concepts") {
 		const concept = lookupConcept(codebase, path);
-		if (concept) {
-			let color = conceptColors.get(concept);
-			if (!color) {
-				color = Object.freeze({ ...concept, source: "concept" });
-				conceptColors.set(concept, color);
-			}
-			return color;
-		}
+		if (concept) return conceptColor(concept);
 	}
 	const directory = directoryNode ? path : path.slice(0, Math.max(0, path.lastIndexOf("/")));
 	const key = `structure:${JSON.stringify([codebase, directory])}`;
@@ -90,7 +93,9 @@ function resolveGroup(codebaseId: string | null | undefined, members: readonly G
 		if (result && result.identity !== identity) return undefined;
 		result ??= { color, identity };
 	}
-	return result;
+	// A group shows the concept itself, never the assignment route of one member.
+	const concept = result?.color.concept && groupConcept(result.color.concept);
+	return result && concept && concept !== result.color.concept ? { color: conceptColor(concept), identity: result.identity } : result;
 }
 
 /** A mixed or unresolved source aggregate stays neutral, including across codebase boundaries. */

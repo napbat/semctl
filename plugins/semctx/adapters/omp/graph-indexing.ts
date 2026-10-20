@@ -3,6 +3,15 @@ import type { GraphData } from "./graph";
 export type GraphIndexing = "pending" | "processing" | "ready" | "failed" | "unknown";
 export type GraphIndexingCounts = Record<GraphIndexing | "unreported", number>;
 const states: readonly GraphIndexing[] = ["failed", "processing", "pending", "ready", "unknown"];
+const countsByNode = new WeakMap<object, Readonly<GraphIndexingCounts>>();
+
+/** Aggregate counts stay outside the source protocol node. */
+export function bindIndexingCounts(node: object, counts: Readonly<GraphIndexingCounts>): void {
+	countsByNode.set(node, counts);
+}
+export function boundIndexingCounts(node: object): Readonly<GraphIndexingCounts> | undefined {
+	return countsByNode.get(node);
+}
 
 /** Explicit metadata is evidence; legacy source nodes stay unreported, synthetic hierarchy does not. */
 export function indexingCounts(nodes: readonly GraphData["nodes"][number][]): GraphIndexingCounts {
@@ -17,6 +26,13 @@ export function indexingCounts(nodes: readonly GraphData["nodes"][number][]): Gr
 export function indexingSummary(counts: GraphIndexingCounts): string | undefined {
 	if (!states.some(state => counts[state] > 0)) return undefined;
 	return `Indexing: ${[...states, "unreported" as const].filter(state => counts[state] > 0).map(state => `${counts[state]} ${state}`).join(" · ")}`;
+}
+/** Meter shares use reported states only; absent metadata is not an unknown state. */
+export function indexingParts(counts: GraphIndexingCounts): { value: number; token: string; label: string }[] | undefined {
+	const total = states.reduce((sum, state) => sum + counts[state], 0);
+	if (!total) return undefined;
+	return ([["ready", "success"], ["processing", "accent"], ["pending", "muted"], ["failed", "error"], ["unknown", "dim"]] as const)
+		.filter(([state]) => counts[state] > 0).map(([state, token]) => ({ value: counts[state] / total, token, label: `${counts[state]} ${state}` }));
 }
 export function groupIndexing(counts: GraphIndexingCounts): GraphIndexing | undefined {
 	for (const state of ["failed", "processing", "pending"] as const) if (counts[state]) return state;

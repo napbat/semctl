@@ -1,3 +1,4 @@
+import * as path from "node:path";
 import type { Component, DescribeContext, NativeNode, NativeScroll, NativeUiEvent } from "@oh-my-pi/pi-tui";
 import type { Display } from "./inspector";
 import type { GraphActivity } from "./graph-activity";
@@ -6,6 +7,7 @@ import type { GraphAppearanceKeyMatcher } from "./graph-appearance-panel";
 import type { GRAPH_OPERATIONS, GraphOverviewDependencies, GraphRequestState } from "./overview";
 import { nativeElement, supportsElements } from "./native-elements";
 import { graphStatus } from "./graph-status";
+import { compactTooltip } from "./tooltip-text";
 
 type Operation = (typeof GRAPH_OPERATIONS)[number];
 type Key = "cancel" | "confirm" | "up" | "down" | "pageUp" | "pageDown";
@@ -36,14 +38,17 @@ const groups = [
 const clean = (value: string) => value.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "");
 const text = (value: string, p: Record<string, unknown> = {}): NativeNode => ({ k: "text", p: { text: clean(value), wrap: "word", ...p } });
 
-function button(cx: DescribeContext, id: string, icon: "diagram" | "repeat" | "settings" | "info" | "x", label: string, title: string, selected = false, disabled = false): NativeNode {
-	const actions = disabled ? undefined : { click: id };
+/** A busy button stays disabled and shows a native spinner. Callers set busy only when motion is allowed. */
+function button(cx: DescribeContext, id: string, icon: "diagram" | "repeat" | "settings" | "info" | "x", label: string, hint: string, selected = false, disabled = false, busy = false): NativeNode {
+	const actions = disabled ? undefined : { click: id }, title = compactTooltip(hint);
+	const spinning = busy && cx.supports("spinner");
 	if (supportsElements(cx) && cx.feature("styles")) return nativeElement({ k: "el", key: id, p: {
 		tag: "button", class: "semctl-icon-action", actions, title, aria: title,
-		attrs: { "aria-pressed": selected, "aria-disabled": disabled },
-	}, c: [cx.supports("icon") ? { k: "icon", p: { name: icon } } : text(label)] });
+		attrs: { "aria-pressed": selected, "aria-disabled": disabled, "aria-busy": spinning },
+	}, c: [spinning ? { k: "spinner", p: { style: "orbit", aria: "Refreshing" } } : cx.supports("icon") ? { k: "icon", p: { name: icon } } : text(label)] });
 	const p = { actions, title, aria: title, tone: selected ? "accent" as const : "muted" as const, shrink: 0 };
-	return cx.supports("icon") ? { k: "icon", key: id, p: { ...p, name: icon } } : { ...text(label, p), key: id };
+	return spinning ? { k: "spinner", key: id, p: { ...p, style: "orbit" } }
+		: cx.supports("icon") ? { k: "icon", key: id, p: { ...p, name: icon } } : { ...text(label, p), key: id };
 }
 
 /** Full project page state belongs to this view, not to preference or activity updates. */
@@ -101,7 +106,7 @@ export class GraphPage implements Component {
 					mark: this.group === index ? "pick" : undefined, aria: `${group.label} analyses${this.group === index ? ", selected" : ""}` }), key: group.id })) },
 			cx.supports("list") ? { k: "list", key: "analyses", p: { selected: this.selectedMenu }, c: operations.map(operation => ({
 				k: "item", key: operation.id, reveal: operation.id === this.selectedMenu ? { at: "nearest", n: this.menuRevision } : undefined,
-				p: { label: operation.label, title: operation.fields.length ? `Arguments: ${operation.fields.join(", ")}` : "No arguments" },
+				p: { label: operation.label, title: compactTooltip(operation.fields.length ? `Arguments: ${operation.fields.join(", ")}` : "No arguments") },
 			})) } : { k: "col", c: operations.map(operation => ({ ...text(operation.label, {
 				tone: this.selectedMenu === operation.id ? "accent" : "muted", actions: { click: `choose:${operation.id}` }, aria: `Run ${operation.label}`,
 			}), key: operation.id })) },
@@ -125,18 +130,29 @@ export class GraphPage implements Component {
 	describe(cx: DescribeContext): NativeNode {
 		this.syncInspector();
 		const { operation, cwd, appearance } = this.options, request = this.options.state(), activity = this.options.activity();
+		const motion = appearance.state.value.motion !== "off" && !cx.reduceMotion;
 		const out: NativeNode[] = [{ k: "row", key: "toolbar", p: { role: "semctl.graph.toolbar", gap: "sm", align: "center" }, c: [
-			text(operation.label, { grow: 1, min: { w: 0 }, truncate: "end", wrap: "none", title: `Read-only · configured semctl CLI · ${cwd}` }),
+			{ k: "col", key: "heading", p: { grow: 1, min: { w: 0 } }, c: [
+				text(operation.label, { role: "semctl.graph.title", truncate: "end", wrap: "none", title: compactTooltip(`Read-only · configured semctl CLI · ${cwd}`) }),
+				...(operation.id === "overview" ? [text(path.basename(cwd), {
+					role: "semctl.graph.hint", tone: "muted", truncate: "end", wrap: "none", title: compactTooltip(cwd),
+				})] : []),
+			] },
 			{ k: "row", p: { gap: "xs", shrink: 0, align: "center" }, c: [
 				button(cx, "analyses", "diagram", "Analyses", "Choose graph analysis (A)", this.menu),
 				button(cx, "appearance", "settings", "Appearance", appearance.state.error ? "Graph appearance (S)\nLocal preferences need attention · open for details" : "Graph appearance (S)"),
-				button(cx, "refresh", "repeat", "Refresh", request.loading ? "Refreshing graph" : "Refresh graph (R)", false, request.loading),
+				button(cx, "refresh", "repeat", "Refresh", request.loading ? "Refreshing graph" : "Refresh graph (R)", false, request.loading, request.loading && motion),
 				button(cx, "info", "info", "Details", "Graph details (I)\nProvenance and diagnostics", this.diagnostics),
 				button(cx, "close", "x", "Close", "Close graph (Esc)"),
 			] },
 		] }];
+		const reading = request.loading && !request.text && motion && cx.supports("spinner") && cx.supports("shimmer");
 		const body: (NativeNode | Component)[] = this.menu ? [this.chooser(cx)] : this.diagnostics ? [] : this.inspector ? [this.inspector] :
-			[text(request.text || (request.loading ? "Reading indexed project map…" : "No result text returned."), { tone: request.loading ? "muted" : undefined })];
+			reading ? [{ k: "row", key: "reading", p: { role: "semctl.graph.loading", gap: "sm", align: "center" }, c: [
+				{ k: "spinner", p: { style: "dots", tone: "muted", aria: "Reading indexed project map" } },
+				{ k: "shimmer", p: { text: "Reading indexed project map", tone: "muted" } },
+			] }]
+			: [text(request.text || (request.loading ? "Reading indexed project map…" : "No result text returned."), { tone: request.loading ? "muted" : undefined })];
 		if (this.diagnostics) {
 			body.push(text(`Read-only · configured semctl CLI · ${cwd}`, { tone: "muted" }));
 			if (activity.operations.length) body.push(text(`Observed semctx requests: ${activity.operations.join(", ")}`, { tone: "muted" }));

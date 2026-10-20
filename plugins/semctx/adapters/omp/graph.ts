@@ -7,9 +7,10 @@ import { graphColorRevision, graphGroupColor, lookupGraphColor } from "./graph-c
 import { strengths } from "./graph-data/matches.js";
 import { matchScoreIndicator, matchVerificationIcon } from "./match-indicators";
 import { graphWindow, projectSummary, type GraphGroup, type ProjectSummary } from "./graph-projection";
-import { supportsElements } from "./native-elements";
-import { indexingSummary, indexingText, type GraphIndexing } from "./graph-indexing";
+import { nativeElement, supportsElements } from "./native-elements";
+import { indexingParts, indexingSummary, indexingText, type GraphIndexing, type GraphIndexingCounts } from "./graph-indexing";
 import type { GraphAppearance } from "./graph-appearance";
+import { compactTooltip } from "./tooltip-text";
 
 export interface GraphData {
 	kind: "graph";
@@ -25,6 +26,12 @@ export interface GraphData {
 const object = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
 const clean = (s: string) => s.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
 const text = (s: string, p: Record<string, unknown> = {}): NativeNode => ({ k: "text", p: { text: clean(s), wrap: "word", ...p } });
+/** At most three caveat lines; the last kept line counts the rest. */
+function caveatTitle(caveats: readonly string[]): string | undefined {
+	const lines = caveats.flatMap(caveat => caveat.split(/\r?\n/)).map(line => line.trim()).filter(Boolean);
+	if (!lines.length) return undefined;
+	return lines.length <= 3 ? compactTooltip(...lines) : compactTooltip(lines[0], lines[1], `+${lines.length - 2} more notes`);
+}
 
 /** Validate topology, never repair endpoints or guess missing roots/relations. Envelope owns the byte bound. */
 export function readGraph(value: Record<string, unknown>, validateHit: (v: unknown) => boolean, localOverview = false): value is Record<string, unknown> & GraphData {
@@ -190,29 +197,46 @@ export class GraphInspector implements Component {
 	}
 	private groupControls(cx: DescribeContext): NativeNode[] {
 		if (!this.projection) return [];
-		if (this.scope) return [{ k: "row", key: "graph-scope", p: { gap: "sm", align: "center" }, c: [
-			text("Overview", { tone: "accent", actions: { click: "overview" }, aria: "Return to project overview" }),
-			text("›", { tone: "muted" }), text(this.scope.label, { grow: 1, truncate: "end", wrap: "none", title: this.scope.label }),
-			text(`${this.scope.members.length} nodes`, { tone: "muted" }),
-			...(indexingSummary(this.scope.indexing) ? [text(indexingSummary(this.scope.indexing)!, { tone: "muted" })] : []),
-		] }];
+		const meter = (counts: GraphIndexingCounts): NativeNode | undefined => {
+			const parts = cx.supports("meter") ? indexingParts(counts) : undefined;
+			if (!parts) return undefined;
+			const summary = indexingSummary(counts);
+			return { k: "meter", p: { value: parts.find(part => part.token === "success")?.value ?? 0, style: "bar", size: "sm",
+				parts, title: summary && compactTooltip(summary), aria: summary, min: { w: "10ch" }, max: { w: "10ch" }, shrink: 0 } };
+		};
+		if (this.scope) {
+			const status = meter(this.scope.indexing);
+			return [{ k: "row", key: "graph-scope", p: { gap: "sm", align: "center" }, c: [
+				text("Overview", { tone: "accent", actions: { click: "overview" }, aria: "Return to project overview" }),
+				text("›", { tone: "muted" }), text(this.scope.label, { grow: 1, truncate: "end", wrap: "none",
+					title: compactTooltip(this.scope.label, this.scope.source && `From ${this.scope.source}`) }),
+				...(this.scope.source ? [text(this.scope.source, { role: "semctl.graph.group-source", tone: "muted", wrap: "none", truncate: "start",
+					shrink: 1, min: { w: 0 }, max: { w: "32ch" } })] : []),
+				text(`${this.scope.members.length} nodes`, { tone: "muted" }),
+				...(status ? [status] : indexingSummary(this.scope.indexing) ? [text(indexingSummary(this.scope.indexing)!, { tone: "muted" })] : []),
+			] }];
+		}
 		const rows: NativeNode[] = this.projection.allGroups.slice(0, this.shownGroups).map((group, index) => {
 			const active = this.activeIds.size > 0 && group.members.some(node => this.activeIds.has(node.id));
 			const action = `group:${index}`;
-			const preview = group.members.slice(0, 3).map(node => node.hit?.path ?? node.path ?? node.label), more = group.members.length - preview.length;
+			const status = meter(group.indexing);
 			let cue = this.groupCues.get(group.id);
 			if (!cue && supportsElements(cx) && cx.feature("styles")) {
 				const color = graphGroupColor(this.codebaseId, group.members, this.appearance?.color);
 				if (color) cue = nativeGraphColorCue(color, cx, undefined, `group-cue-${index}`);
 				if (cue) this.groupCues.set(group.id, cue);
 			}
-			return { k: "row", key: `group-${index}`, p: { gap: "sm", align: "center", actions: { click: action },
-				title: clean([group.label, `${group.members.length} indexed nodes · ${group.internal} internal links`, indexingSummary(group.indexing),
-					...preview, ...(more ? [`+${more} more nodes`] : []), ...(active ? ["Active request target in group"] : []), "Select to explore group"].filter(Boolean).join("\n")),
+			return { k: "row", key: `group-${index}`, p: { role: "semctl.graph.group", gap: "sm", align: "center", actions: { click: action },
+				title: compactTooltip(group.label, group.source && `From ${group.source}`,
+					`${group.members.length} nodes · ${group.internal} internal links${active ? " · active request target" : ""}`, indexingSummary(group.indexing)),
 				aria: `Explore ${clean(group.label)}${active ? ", active request target" : ""}${indexingSummary(group.indexing) ? `, ${indexingSummary(group.indexing)}` : ""}` }, c: [...(cue ? [cue] : []),
 				{ k: "text", p: { grow: 1, wrap: "none", truncate: "end", spans: [{ t: clean(group.label), s: active ? "success" : "",
-					fx: active && !cx.reduceMotion ? "pulse" : undefined }] } }, text(`${group.members.length}`, { tone: "muted" }),
-				...(indexingSummary(group.indexing) ? [text(indexingSummary(group.indexing)!, { tone: group.indexing.failed ? "error" : "muted", wrap: "none", truncate: "end" })] : []),
+					fx: active && !cx.reduceMotion ? "pulse" : undefined }] } },
+				...(group.source ? [text(group.source, { role: "semctl.graph.group-source", tone: "muted", wrap: "none", truncate: "start",
+					shrink: 1, min: { w: 0 }, max: { w: "32ch" } })] : []),
+				status ? { k: "row", p: { justify: "end", min: { w: "4ch" }, shrink: 0 }, c: [text(`${group.members.length}`, { tone: "muted" })] }
+					: text(`${group.members.length}`, { tone: "muted" }),
+				...(status ? [status] : indexingSummary(group.indexing) ? [text(indexingSummary(group.indexing)!, { tone: group.indexing.failed ? "error" : "muted", wrap: "none", truncate: "end" })] : []),
 			] };
 		});
 		if (this.shownGroups < this.projection.allGroups.length) rows.push(text(`${this.projection.allGroups.length - this.shownGroups} more groups`, {
@@ -234,12 +258,13 @@ export class GraphInspector implements Component {
 	}
 	private nodeTitle(node: GraphData["nodes"][number]): string {
 		const color = lookupGraphColor(this.codebaseId, node, this.appearance?.color);
-		return `${graphNodeTitle(node, color, this.active(node))}\n${this.relations.get(node.id)!.length} incident relationships · select for details`;
+		const count = this.relations.get(node.id)!.length;
+		return graphNodeTitle(node, color, { active: this.active(node), hint: `${count} relationship${count === 1 ? "" : "s"} · select for details` });
 	}
 	private nodeIndicators(node: GraphData["nodes"][number], index: number, cx: DescribeContext): NativeNode[] {
 		const cue = this.conceptCue(node, cx), result = cue ? [cue] : [];
 		if (node.indexing !== undefined) result.push(text(node.indexing, { tone: node.indexing === "failed" ? "error" : node.indexing === "processing" ? "accent" : "muted",
-			title: indexingText(node), aria: indexingText(node), shrink: 0 }));
+			title: compactTooltip(indexingText(node)), aria: indexingText(node), shrink: 0 }));
 		if (node.hit) {
 			const rank = this.ranks.get(node.hit)!;
 			const score = matchScoreIndicator(node.hit, rank.index, rank.strength, cx, `node:${index}`);
@@ -378,27 +403,40 @@ export class GraphInspector implements Component {
 		});
 		const out: NativeNode[] = [], summary: NativeNode[] = [];
 		if (this.summary === "body") summary.push(text(`${d.nodes.length} nodes · ${d.edges.length} relationships`, {
-			tone: "muted", title: "Arrows show edge direction. Shared nodes and cycles remain links.",
+			role: "semctl.graph.hint", tone: "muted", title: compactTooltip("Arrows show edge direction. Shared nodes and cycles remain links."),
 		}));
-		if (d.truncated) summary.push(text("Partial graph", { tone: "warning", title: "The graph is truncated. The original result retains all returned data." }));
-		if (d.loading) summary.push(text("Relationship layers loading", { tone: "muted", title: "Available nodes remain usable." }));
+		if (d.truncated) {
+			const title = compactTooltip("The graph is truncated. The original result retains all returned data.");
+			summary.push(cx.supports("badge") ? { k: "badge", p: { text: "Partial graph", tone: "warning", title } } : text("Partial graph", { tone: "warning", title }));
+		}
+		if (d.loading) {
+			const title = compactTooltip("Available nodes remain usable.");
+			summary.push(cx.supports("badge") ? { k: "badge", p: { text: "Relationship layers loading", tone: "muted", title } } : text("Relationship layers loading", { tone: "muted", title }));
+		}
 		if (d.caveats.length) {
-			const title = clean(d.caveats.join("\n")), tone = d.truncated ? "warning" as const : "muted" as const;
-			summary.push(cx.supports("icon") ? { k: "icon", key: "graph-notes", p: { name: "info", tone, title, aria: title } }
-				: text("Graph notes", { tone, title, aria: title }));
+			const title = caveatTitle(d.caveats), aria = clean(d.caveats.join("\n")), tone = d.truncated ? "warning" as const : "muted" as const;
+			summary.push(cx.supports("icon") ? { k: "icon", key: "graph-notes", p: { name: "info", tone, title, aria } }
+				: text("Graph notes", { tone, title, aria }));
 		}
 		if (summary.length) out.push({ k: "row", p: { gap: "sm", align: "center" }, c: summary });
 		if (!rows.length) out.push(text("No graph nodes in this result.", { tone: "muted" }));
 		if (this.scope) out.push(...this.groupControls(cx));
 		const diagram = this.diagram(cx);
-		if (diagram) out.push(diagram);
+		if (diagram) out.push(drawingSupported ? nativeElement({ k: "el", key: "graph-well", p: {
+			tag: "div", class: "semctl-graph-well",
+		}, c: [diagram] }) : diagram);
 		else if (d.nodes.length) out.push(text("Native graph drawing unavailable · use node navigation below.", {
-			tone: "muted", title: "Graph drawing requires Tern native elements and surface styles.",
+			tone: "muted", title: compactTooltip("Graph drawing requires Tern native elements and surface styles."),
 		}));
 		const drawing = this.focusDrawing ?? this.scopeDrawing ?? this.projection?.graph;
-		if (diagram && drawing) out.push(text(`${drawing.nodes.length} ${drawing === this.projection?.graph ? "group summaries" : "nodes"} · ${drawing.edges.length} routes drawn`, {
-			tone: "muted", title: drawing.caveats.join("\n") || "Exact relationships remain in native node details.",
-		}));
+		if (diagram && drawing) out.push({ k: "row", key: "graph-drawing-summary", p: { gap: "sm", align: "center" }, c: [
+			text(`${drawing.nodes.length} ${drawing === this.projection?.graph ? "group summaries" : "nodes"} · ${drawing.edges.length} routes drawn`, {
+				role: "semctl.graph.hint", tone: "muted", grow: 1, title: caveatTitle(drawing.caveats) ?? compactTooltip("Exact relationships remain in native node details."),
+			}),
+			...(drawing.nodes.some(node => this.diagramAction(node.id) !== undefined) ? [text("Select a dot for details", {
+				role: "semctl.graph.hint", tone: "muted", shrink: 0, wrap: "none",
+			})] : []),
+		] });
 		if (this.projection && !this.scope && !this.selected) out.push(...this.groupControls(cx));
 		const quick = this.quickCache ??= members.slice(0, 3).map((node): NativeNode => {
 			const index = this.nodeOrder.get(node.id)!;
@@ -422,7 +460,7 @@ export class GraphInspector implements Component {
 				{ ...text("Close preview", { tone: "muted", actions: { click: "clear" }, aria: "Close selected node preview" }), key: "clear" }] });
 			if (this.relation) {
 				const e = d.edges[this.relation.index];
-				out.push(text(`${this.nodeById.get(e.from)!.label} → ${this.nodeById.get(e.to)!.label} · ${this.relation.label}`, { tone: "accent", title: e.moniker }));
+				out.push(text(`${this.nodeById.get(e.from)!.label} → ${this.nodeById.get(e.to)!.label} · ${this.relation.label}`, { tone: "accent", title: e.moniker && compactTooltip(e.moniker) }));
 			}
 			if (selected.detail) out.push(text(selected.detail, { tone: "muted" }));
 			if (selected.indexing !== undefined) out.push(text(indexingText(selected)!, { tone: selected.indexing === "failed" ? "error" : "muted" }));

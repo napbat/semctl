@@ -3,16 +3,17 @@ import { mkdir, open, rename, unlink } from "node:fs/promises";
 import { dirname } from "node:path";
 
 export interface GraphAppearance {
-	layout: "force" | "radial" | "layers" | "components";
+	layout: "map" | "force" | "radial" | "layers" | "components";
 	color: "concepts" | "structure" | "neutral";
 	detail: "calm" | "balanced" | "detailed";
 	labels: "key" | "more" | "hover";
 	links: "soft" | "clear";
 	motion: "system" | "off";
+	popup: "small" | "medium" | "large";
 }
 
 export const DEFAULT_GRAPH_APPEARANCE: Readonly<GraphAppearance> = Object.freeze({
-	layout: "force", color: "concepts", detail: "balanced", labels: "key", links: "soft", motion: "system",
+	layout: "map", color: "concepts", detail: "balanced", labels: "key", links: "soft", motion: "system", popup: "small",
 });
 
 export interface GraphAppearanceState {
@@ -29,19 +30,23 @@ export interface GraphAppearancePersistence {
 }
 
 const MAX_BYTES = 8192;
+const VERSION = 2;
 const choices: { readonly [K in keyof GraphAppearance]: readonly GraphAppearance[K][] } = {
-	layout: ["force", "radial", "layers", "components"], color: ["concepts", "structure", "neutral"],
+	layout: ["map", "force", "radial", "layers", "components"], color: ["concepts", "structure", "neutral"],
 	detail: ["calm", "balanced", "detailed"], labels: ["key", "more", "hover"],
-	links: ["soft", "clear"], motion: ["system", "off"],
+	links: ["soft", "clear"], motion: ["system", "off"], popup: ["small", "medium", "large"],
 };
 const keys = Object.keys(choices) as (keyof GraphAppearance)[];
+/** Version 1 files predate the popup size; they hold the other six keys. */
+const VERSION_1_KEYS = keys.filter(key => key !== "popup");
 const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
 
-function validPatch(value: unknown, complete = false): value is Partial<GraphAppearance> {
+/** Without `required`, any subset of supported keys is valid. With it, the value holds exactly those keys. */
+function validPatch(value: unknown, required?: readonly (keyof GraphAppearance)[]): value is Partial<GraphAppearance> {
 	if (!record(value)) return false;
-	const fields = Reflect.ownKeys(value);
-	return (!complete || fields.length === keys.length) && fields.every(key => typeof key === "string" &&
-		Object.hasOwn(choices, key) && Object.hasOwn(Object.getOwnPropertyDescriptor(value, key)!, "value") &&
+	const fields = Reflect.ownKeys(value), allowed: readonly string[] = required ?? keys;
+	return (!required || fields.length === required.length) && fields.every(key => typeof key === "string" &&
+		allowed.includes(key) && Object.hasOwn(Object.getOwnPropertyDescriptor(value, key)!, "value") &&
 		(choices[key as keyof GraphAppearance] as readonly unknown[]).includes(value[key]));
 }
 
@@ -49,10 +54,14 @@ function decode(contents: string): Readonly<GraphAppearance> {
 	if (Buffer.byteLength(contents, "utf8") > MAX_BYTES) throw new Error("Appearance file exceeds the 8 KiB preference limit.");
 	let value: unknown;
 	try { value = JSON.parse(contents); } catch { throw new Error("Appearance file is not valid JSON."); }
-	if (!record(value) || value.version !== 1 || Object.keys(value).length !== 2 || !Object.hasOwn(value, "appearance") || !validPatch(value.appearance, true)) {
+	const version = record(value) ? value.version : undefined;
+	const required = version === 1 ? VERSION_1_KEYS : version === VERSION ? keys : undefined;
+	if (!record(value) || !required || Object.keys(value).length !== 2 || !Object.hasOwn(value, "appearance") || !validPatch(value.appearance, required)) {
 		throw new Error("Appearance file has an unsupported version or invalid preferences.");
 	}
-	return Object.freeze({ ...value.appearance } as GraphAppearance);
+	const saved = value.appearance as Partial<GraphAppearance>;
+	// A key that the file version does not store keeps its default.
+	return Object.freeze(Object.fromEntries(keys.map(key => [key, saved[key] ?? DEFAULT_GRAPH_APPEARANCE[key]])) as unknown as GraphAppearance);
 }
 
 const filesystem: GraphAppearancePersistence = {
@@ -181,7 +190,7 @@ export class GraphAppearanceStore {
 				await this.load();
 				while (this.savedRevision < this.revision) {
 					const revision = this.revision;
-					const contents = `${JSON.stringify({ version: 1, appearance: this.state.value }, null, 2)}\n`;
+					const contents = `${JSON.stringify({ version: VERSION, appearance: this.state.value }, null, 2)}\n`;
 					try {
 						await this.persistence.writeAtomic(this.file!, contents);
 						this.savedRevision = revision;

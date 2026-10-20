@@ -1,6 +1,7 @@
 import type { Component, DescribeContext, NativeNode, NativeUiEvent } from "@oh-my-pi/pi-tui";
 import { GraphAppearanceStore, type GraphAppearance } from "./graph-appearance";
 import { nativeElement, supportsElements } from "./native-elements";
+import { compactTooltip } from "./tooltip-text";
 
 /** Public matchesKey KeyIds, not KeybindingsManager action names. Inject OMP's parser for Kitty/remapped input. */
 export type GraphAppearanceKeyMatcher = (data: string, key: "up" | "down" | "left" | "right" | "enter" | "escape") => boolean;
@@ -18,6 +19,7 @@ type AppearanceRow = { [K in keyof GraphAppearance]: {
 } }[keyof GraphAppearance];
 const rows: readonly AppearanceRow[] = [
 	{ key: "layout", label: "Layout", hint: "Choose a stable arrangement; activity and color do not move nodes.", options: [
+		{ value: "map", label: "Concept map", hint: "Groups placed by shared doc concepts and terms; position is not a score." },
 		{ value: "force", label: "Force", hint: "Balance recorded links. Nearby nodes do not imply extra relationships." },
 		{ value: "radial", label: "Radial", hint: "Rings show undirected hops from roots, or a high-degree node. Disconnected sets stay separate." },
 		{ value: "layers", label: "Layers", hint: "Recorded direction runs left to right. Cycles share a column. Ordering reduces link crossings." },
@@ -45,6 +47,11 @@ const rows: readonly AppearanceRow[] = [
 	{ key: "motion", label: "Motion", hint: "System respects Reduce Motion; Off disables graph animation.", options: [
 		{ value: "system", label: "System", hint: "Follow the terminal's reduced-motion preference." },
 		{ value: "off", label: "Off", hint: "Disable graph animation regardless of the system preference." },
+	] },
+	{ key: "popup", label: "Popup size", hint: "Live popup only. The grip in the popup header steps through the same sizes.", options: [
+		{ value: "small", label: "Small", hint: "Compact map beside the editor." },
+		{ value: "medium", label: "Medium", hint: "Wider map and more busiest groups." },
+		{ value: "large", label: "Large", hint: "Overview-size map with the most labels." },
 	] },
 ];
 
@@ -142,7 +149,7 @@ export class GraphAppearancePanel implements Component {
 			p: { role: "semctl.appearance.row", gap: "xs", aria: row.label }, c: [
 				{ k: "text", p: { role: "semctl.appearance.label", text: row.label, tone: this.selectedRow === index ? "accent" : "muted" } },
 				{ k: "row", p: { role: row.key === "layout" ? "semctl.appearance.layouts" : "semctl.appearance.options", gap: "xs", wrap: true, aria: row.label }, c: row.options.map(option => this.button(cx,
-					`appearance:${row.key}:${option.value}`, option.label, `${row.label} · ${option.label}\n${option.hint}`,
+					`appearance:${row.key}:${option.value}`, option.label, compactTooltip(`${row.label} · ${option.label}`, option.hint),
 					value[row.key] === option.value, this.selectedRow === index && value[row.key] === option.value)) },
 			],
 		}));

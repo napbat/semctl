@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import * as path from "node:path";
 import type { ExecOptions, ExecResult, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { Component, DescribeContext, NativeNode, NativeUiEvent, TUI } from "@oh-my-pi/pi-tui";
@@ -6,6 +6,9 @@ import { readDisplay, SemctlInspector, type Display } from "./inspector";
 import { readStatusUpdate } from "./status";
 import { GRAPH_OPERATIONS, GraphRequest, createGraphOverview, graphArguments, type GraphOverviewDependencies } from "./overview";
 import { GraphAppearanceStore } from "./graph-appearance";
+import { conceptRevision, lookupConcept, resetConcepts } from "./concept-colors";
+import { inferConcepts } from "./graph-data/concepts.js";
+import type { DocSource } from "./graph-data/doc-concepts.js";
 
 const cwd = path.resolve("graph-overview-checkout");
 const native: DescribeContext = { cols: 88, dark: true, reduceMotion: false, supports: () => true, feature: () => false };
@@ -165,6 +168,124 @@ describe("read-only graph requests", () => {
 	});
 });
 
+const DOCS: readonly DocSource[] = [{ path: "docs/dispatch.md", text: "# Dispatch\n\nQueue in `src/dispatch/queue.ts`; workers live in `src/dispatch/`.\n" }];
+function docOverview(codebaseId: string, extra: { truncated?: boolean; loading?: boolean } = {}) {
+	const entries = [["docs/dispatch.md", "file"], ["src/dispatch", "directory"], ["src/dispatch/queue.ts", "file"],
+		["src/dispatch/worker.ts", "file"], ["src/dispatch/pool.ts", "file"], ["lib/other.ts", "file"]] as const;
+	return { version: 1, kind: "graph", identity: { codebaseId, name: null, localRoot: cwd, copy: "checkout" }, title: "Project overview", query: null,
+		nodes: entries.map(([file, category], index) => ({ id: String(index), label: file.slice(file.lastIndexOf("/") + 1), detail: null, hit: null, category, path: file })),
+		edges: [{ from: "2", to: "3", kind: "reference", label: "references", symbol: "Job", moniker: "dispatch::Job" }],
+		roots: ["0"], caveats: [], truncated: true, ...extra };
+}
+describe("overview doc concepts", () => {
+	afterEach(resetConcepts);
+	test("reads checkout docs only after the overview is visible, then applies doc concepts", async () => {
+		const host = pendingExecutor(), reads: { display: Display; signal: AbortSignal; visible?: Display; changes: number; docs: Deferred<readonly DocSource[]> }[] = [];
+		let changes = 0;
+		const request: GraphRequest = new GraphRequest(host.exec, { ...deps, readDisplay, readDocSources(display, signal) {
+			const docs = deferred<readonly DocSource[]>();
+			reads.push({ display, signal, visible: request.state.display, changes, docs });
+			return docs.promise;
+		} }, () => changes++);
+		const work = request.run(GRAPH_OPERATIONS[0], [], cwd, () => cwd);
+		host.pending[0].response.resolve(result(JSON.stringify({ text: "Docs overview", display: docOverview("docs-request") })));
+		await work;
+		const display = request.state.display;
+		expect(display?.kind).toBe("graph");
+		expect(reads).toHaveLength(1);
+		expect(reads[0].display).toBe(display!);
+		expect(reads[0].visible).toBe(display!);
+		expect(reads[0].changes).toBe(2);
+		expect(reads[0].signal.aborted).toBe(false);
+		expect(lookupConcept("docs-request", "src/dispatch/queue.ts")).toBeUndefined();
+		reads[0].docs.resolve(DOCS);
+		await reads[0].docs.promise;
+		expect(lookupConcept("docs-request", "src/dispatch/queue.ts")).toMatchObject({ kind: "doc", key: "doc:docs/dispatch.md", source: "docs/dispatch.md", via: "mention" });
+		expect(lookupConcept("docs-request", "src/dispatch")).toMatchObject({ kind: "doc", via: "folder" });
+		expect(lookupConcept("docs-request", "lib/other.ts")).toBeUndefined();
+		expect(changes).toBe(2);
+		// Loading overviews and other analyses never read docs.
+		for (const [operation, value] of [[GRAPH_OPERATIONS[0], docOverview("docs-request", { loading: true })], [projects, docOverview("docs-request")]] as const) {
+			const next = request.run(operation, [], cwd, () => cwd);
+			host.pending.at(-1)!.response.resolve(result(JSON.stringify({ text: "No docs", display: value })));
+			await next;
+			expect(request.state.display?.kind).toBe("graph");
+		}
+		expect(reads).toHaveLength(1);
+	});
+	test("cancelled, replaced and moved requests drop their doc reads", async () => {
+		const host = pendingExecutor(), reads: { signal: AbortSignal; docs: Deferred<readonly DocSource[]> }[] = [];
+		let current = cwd;
+		const request = new GraphRequest(host.exec, { ...deps, readDisplay, readDocSources(_display, signal) {
+			const docs = deferred<readonly DocSource[]>();
+			reads.push({ signal, docs });
+			return docs.promise;
+		} }, () => {});
+		const open = async () => {
+			const work = request.run(GRAPH_OPERATIONS[0], [], cwd, () => current);
+			host.pending.at(-1)!.response.resolve(result(JSON.stringify({ text: "Docs overview", display: docOverview("docs-stale") })));
+			await work;
+			return reads.at(-1)!;
+		};
+		const revision = conceptRevision();
+		const cancelled = await open();
+		request.cancel();
+		expect(cancelled.signal.aborted).toBe(true);
+		cancelled.docs.resolve(DOCS); await cancelled.docs.promise;
+		const replaced = await open();
+		const replacement = request.run(projects, [], cwd, () => current);
+		expect(replaced.signal.aborted).toBe(true);
+		replaced.docs.resolve(DOCS); await replaced.docs.promise;
+		host.pending.at(-1)!.response.resolve(result(JSON.stringify({ text: "Projects", display: null })));
+		await replacement;
+		const moved = await open();
+		current = path.resolve("another-docs-checkout");
+		moved.docs.resolve(DOCS); await moved.docs.promise;
+		expect(reads).toHaveLength(3);
+		expect(lookupConcept("docs-stale", "src/dispatch/queue.ts")).toBeUndefined();
+		expect(conceptRevision()).toBe(revision);
+	});
+	test("newer accepted overviews win when different request instances finish their doc reads out of order", async () => {
+		const host = pendingExecutor(), reads: { signal: AbortSignal; docs: Deferred<readonly DocSource[]> }[] = [];
+		const dependencies: GraphOverviewDependencies = { ...deps, readDisplay, readDocSources(_display, signal) {
+			const docs = deferred<readonly DocSource[]>();
+			reads.push({ signal, docs });
+			return docs.promise;
+		} };
+		const popup = new GraphRequest(host.exec, dependencies, () => {});
+		const page = new GraphRequest(host.exec, dependencies, () => {});
+		const old = popup.run(GRAPH_OPERATIONS[0], [], cwd, () => cwd);
+		host.pending[0].response.resolve(result(JSON.stringify({ text: "Old overview", display: docOverview("docs-shared-order") })));
+		await old;
+		const newer = page.run(GRAPH_OPERATIONS[0], [], cwd, () => cwd);
+		host.pending[1].response.resolve(result(JSON.stringify({ text: "New overview", display: docOverview("docs-shared-order") })));
+		await newer;
+		expect(reads).toHaveLength(2);
+		expect(reads[0].signal.aborted).toBe(false);
+		reads[1].docs.resolve([{ ...DOCS[0], text: DOCS[0].text.replace("# Dispatch", "# Updated dispatch") }]);
+		await reads[1].docs.promise;
+		const color = lookupConcept("docs-shared-order", "src/dispatch/queue.ts"), revision = conceptRevision();
+		expect(color).toMatchObject({ kind: "doc", title: "Updated dispatch" });
+		reads[0].docs.resolve(DOCS);
+		await reads[0].docs.promise;
+		expect(lookupConcept("docs-shared-order", "src/dispatch/queue.ts")).toBe(color!);
+		expect(conceptRevision()).toBe(revision);
+	});
+	test("a failing doc reader keeps the graph and its reference communities", async () => {
+		for (const failure of [async () => { throw new Error("docs unreadable"); }, () => { throw new Error("reader crashed"); }]) {
+			resetConcepts();
+			const value = docOverview("docs-failure", { truncated: false });
+			const request = new GraphRequest(async () => result(JSON.stringify({ text: "Complete overview", display: value })), { ...deps, readDisplay, readDocSources: failure }, () => {});
+			await request.run(GRAPH_OPERATIONS[0], [], cwd, () => cwd);
+			await settle();
+			const display = request.state.display, inferred = display?.kind === "graph" ? inferConcepts(display).assignments.get("2") : undefined;
+			expect(request.state.error).toBeUndefined();
+			expect(inferred).toBeDefined();
+			expect(lookupConcept("docs-failure", "src/dispatch/queue.ts")).toMatchObject({ kind: "reference", key: inferred!.key });
+		}
+	});
+});
+
 type View = Omit<Component, "describe" | "handleInput" | "handleNativeEvent"> & { describe(cx: DescribeContext): NativeNode; handleInput(data: string): void; handleNativeEvent(event: NativeUiEvent): void };
 function harness(extra: Partial<GraphOverviewDependencies> = {}) {
 	const host = pendingExecutor();
@@ -203,8 +324,10 @@ describe("native overview popup", () => {
 		expect(toolbar && nodes(toolbar).some(node => node.p?.title?.includes(`configured semctl CLI · ${cwd}`))).toBe(true);
 		expect(content(body)).not.toContain(cwd);
 		expect(nodes(body).find(node => node.key === "activity")).toBeDefined();
-		expect(nodes(body).some(node => node.k === "spinner")).toBe(false);
-		expect(nodes(h.views[0].describe({ ...native, reduceMotion: true })).find(node => node.key === "activity")).toBeDefined();
+		expect(nodes(body).some(node => node.k === "spinner")).toBe(true);
+		const still = h.views[0].describe({ ...native, reduceMotion: true });
+		expect(nodes(still).find(node => node.key === "activity")).toBeDefined();
+		expect(nodes(still).some(node => node.k === "spinner")).toBe(false);
 		h.views[0].handleInput("tui.select.cancel");
 		await open;
 		expect(h.pending[0].options?.signal?.aborted).toBe(true);
@@ -329,12 +452,14 @@ describe("native overview popup", () => {
 		expect(nodes(h.views[0].describe(native)).some(node => node.p?.title?.includes("call_graph"))).toBe(true);
 		h.overview.observe({ type: "tool_result", toolCallId: "call" }, h.ctx);
 		expect(nodes(h.views[0].describe(native)).some(node => node.p?.title?.includes("call_graph"))).toBe(false);
+		expect(nodes(h.views[0].describe(native)).some(n => n.k === "spinner")).toBe(false);
 		h.overview.observe({ server: "semctx", method: "notifications/semctl/sync_status", params: { root: path.resolve("unrelated"), text: "private other checkout" } }, h.ctx);
 		expect(content(h.views[0].describe(native))).not.toContain("private other checkout");
 		h.overview.observe({ server: "semctx", method: "notifications/semctl/sync_status", params: { root: cwd, text: "7 files embedded, job running" } }, h.ctx);
 		expect(content(h.views[0].describe(native))).toContain("7 files embedded, job running");
 		expect(content(h.views[0].describe(native))).not.toContain("Last producer observation:");
-		expect(nodes(h.views[0].describe(native)).some(n => n.k === "spinner")).toBe(false);
+		expect(nodes(h.views[0].describe(native)).some(n => n.k === "spinner")).toBe(true);
+		expect(nodes(h.views[0].describe({ ...native, reduceMotion: true })).some(n => n.k === "spinner")).toBe(false);
 		expect(h.pending).toHaveLength(1);
 		h.overview.reset(); await open;
 	});
@@ -438,17 +563,17 @@ describe("native live graph popup", () => {
 		await h.overview.togglePopup(h.ctx);
 		h.pending[0].response.resolve(result(JSON.stringify({ text: "map", display }))); await settle();
 		h.views[0].handleNativeEvent({ type: "toggle", key: "groups", collapsed: false });
-		const exposesSource = (root: NativeNode) => nodes(root).some(node => typeof node.p?.title === "string" && node.p.title.includes("src/a.ts"));
-		expect(exposesSource(h.views[0].describe(native))).toBe(true);
+		const showsMap = (root: NativeNode) => content(root).includes("1 file");
+		expect(showsMap(h.views[0].describe(native))).toBe(true);
 		action(h.views[0], "refresh");
 		action(h.views[0], "refresh");
-		expect(exposesSource(h.views[0].describe(native))).toBe(true);
+		expect(showsMap(h.views[0].describe(native))).toBe(true);
 		expect(h.pending).toHaveLength(2);
 		h.pending[1].response.resolve(result("", { code: 1, stderr: "offline" })); await settle();
 		expect(h.pending).toHaveLength(3);
 		h.pending[2].response.resolve(result("", { code: 1, stderr: "still offline" })); await settle();
 		const failed = h.views[0].describe(native);
-		expect(exposesSource(failed)).toBe(true);
+		expect(showsMap(failed)).toBe(true);
 		expect(nodes(failed).some(node => typeof node.p?.title === "string" && node.p.title.includes("still offline"))).toBe(true);
 		action(h.views[0], "refresh");
 		h.ctx.cwd = path.resolve("another-popup-checkout");
@@ -456,7 +581,7 @@ describe("native live graph popup", () => {
 		expect(h.pending[3].options?.signal?.aborted).toBe(true);
 		h.pending[3].response.resolve(result(JSON.stringify({ text: "stale", display }))); await settle();
 		await h.overview.togglePopup(h.ctx);
-		expect(exposesSource(h.views[1].describe(native))).toBe(false);
+		expect(showsMap(h.views[1].describe(native))).toBe(false);
 		h.overview.reset();
 	});
 	test("reuses the cached map after toggling without rerunning the graph CLI", async () => {
@@ -624,7 +749,7 @@ describe("native observation engine", () => {
 		const settings = h.views[1];
 		settings.handleInput("right");
 		await appearance.flush();
-		expect(appearance.state.value.layout).toBe("radial");
+		expect(appearance.state.value.layout).toBe("force");
 		expect(h.pending).toHaveLength(1);
 		expect(nodes(live.describe(native)).some(node => node.p?.actions?.click === "clear-group")).toBe(true);
 		settings.handleInput("tui.select.cancel");

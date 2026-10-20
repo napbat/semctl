@@ -1,12 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import type { DescribeContext, NativeNode } from "@oh-my-pi/pi-tui";
-import { LiveGraphPopup, type LiveGraphState } from "./live-graph";
+import { LiveGraphPopup, livePopupOverlay, type LiveGraphState } from "./live-graph";
 import type { GraphActivity } from "./graph-activity";
 import type { Display } from "./inspector";
 import { graphWindow, projectSummary } from "./graph-projection";
 import { asNativeElement, type NativeElement } from "./native-elements";
-import { groupIndexing, indexingCounts, indexingSummary } from "./graph-indexing";
-import { DEFAULT_GRAPH_APPEARANCE } from "./graph-appearance";
+import { groupIndexing, indexingCounts, indexingParts, indexingSummary } from "./graph-indexing";
+import { DEFAULT_GRAPH_APPEARANCE, type GraphAppearance } from "./graph-appearance";
+import { nativeGraphLayout } from "./graph-native-layout";
 
 type Overview = Extract<Display, { kind: "graph" }>;
 function overview(paths: string[]): Overview {
@@ -161,7 +162,15 @@ function popupState(display: Overview, activity: Partial<GraphActivity> = {}): L
 	return { request: { loading: false, text: "", display }, activity: { operations: [], targets: [], producer: null, ...activity } };
 }
 function popup(state: LiveGraphState) {
-	return new LiveGraphPopup(state, () => {}, { close() {}, refresh() {}, expand() {}, appearance() {} });
+	return new LiveGraphPopup(state, () => {}, { close() {}, refresh() {}, expand() {}, appearance() {}, resize() {} });
+}
+/** Every hover line stays short: at most 3 lines of at most 88 characters. */
+function expectCompactTitles(root: NativeNode): void {
+	for (const node of tree(root)) {
+		const lines = node.p?.title?.split("\n") ?? [];
+		expect(lines.length).toBeLessThanOrEqual(3);
+		for (const line of lines) expect(line.length).toBeLessThanOrEqual(88);
+	}
 }
 function action(view: LiveGraphPopup, act: string): void {
 	view.handleNativeEvent({ type: "action", key: "", act, mods: [] });
@@ -195,7 +204,7 @@ describe("live group inspection", () => {
 		];
 		const summary = projectSummary(data, data.identity.codebaseId), api = summary.groupOf.get("0")!, db = summary.groupOf.get("2")!;
 		let opened = 0;
-		const view = new LiveGraphPopup(popupState(data), () => {}, { close() {}, refresh() {}, expand() { opened++; }, appearance() {} });
+		const view = new LiveGraphPopup(popupState(data), () => {}, { close() {}, refresh() {}, expand() { opened++; }, appearance() {}, resize() {} });
 		try {
 			const initial = view.describe(native), hint = content(inspection(initial));
 			action(view, dots(initial).find(node => node.p.attrs?.["data-node"] === api)!.p.actions!.click!);
@@ -227,6 +236,85 @@ describe("live group inspection", () => {
 			expectLinks(view.describe(native), 1, 3, 2);
 			expect(opened).toBe(0);
 		} finally { view.dispose(); }
+	});
+	test("fills the empty inspector with a short glyph legend that names a tint only when the drawing has tinted areas", () => {
+		const names = ["cache-entry-store", "cache-entry-read", "cache-entry-evict", "cache-entry-write",
+			"query-execution-plan", "query-execution-run", "query-execution-parse", "query-execution-explain"];
+		const data = overview(names.flatMap(name => [`src/${name}/index.ts`, `src/${name}/${name}.ts`])), view = popup(popupState(data));
+		const pair = overview(["src/api/a.ts", "src/db/c.ts"]), quiet = popup(popupState(pair));
+		const summary = projectSummary(data, data.identity.codebaseId), id = summary.groupOf.get("0")!;
+		const legendOf = (root: NativeNode) => tree(inspection(root)).filter(node => node.p?.role === "semctl.live.legend");
+		try {
+			expect(DEFAULT_GRAPH_APPEARANCE.layout).toBe("map");
+			expect(nativeGraphLayout(summary.graph, "compact", "map").territories.map(territory => territory.kind)).toContain("lexical");
+			const initial = view.describe(native), legend = legendOf(initial);
+			expect(legend).toHaveLength(1);
+			expect((legend[0].c ?? []).map(child => "k" in child ? [child.key, asNativeElement(child)?.p.title] : [])).toEqual([
+				["size", "Dot size = member nodes, mostly files"], ["weight", "Line weight = links between groups"], ["tint", "Tint = shared identifier terms"]]);
+			const parts = tree(legend[0]).map(asNativeElement).filter((node): node is NativeElement => !!node);
+			const glyphs = parts.filter(node => /^semctl-legend-(size|weight|tint)$/.test(node.p.class ?? ""));
+			expect(glyphs.map(node => [node.p.class, node.p.attrs?.["aria-hidden"]])).toEqual([["semctl-legend-size", true], ["semctl-legend-weight", true], ["semctl-legend-tint", true]]);
+			expect(parts.flatMap(node => node.p.text ?? [])).toEqual(["files", "links", "shared terms"]);
+			expect(legend[0].p?.title?.split("\n")).toEqual(["Dot size = member nodes · line weight = links between groups", "Tint = shared identifier terms"]);
+			expect(legend[0].p?.title).not.toMatch(/embedding/i);
+			expect(content(inspection(initial))).toContain("Select a group to inspect links");
+			// A host without styles draws no map, so its plain legend names no tint.
+			const plain = legendOf(view.describe({ ...native, feature: () => false }));
+			expect(plain.map(node => [node.k, node.p?.text, node.p?.tone])).toEqual([["text", "Dot size = files · line weight = links", "muted"]]);
+			expect(plain[0].p?.title?.split("\n")).toHaveLength(1);
+			view.update({ ...popupState(data), appearance: { ...DEFAULT_GRAPH_APPEARANCE, layout: "force" } });
+			expect(tree(legendOf(view.describe(native))[0]).flatMap(node => asNativeElement(node)?.p.text ?? [])).toEqual(["files", "links", "shared terms"]);
+			view.update({ ...popupState(data), appearance: { ...DEFAULT_GRAPH_APPEARANCE, layout: "radial" } });
+			const radial = legendOf(view.describe(native))[0];
+			expect(tree(radial).flatMap(node => asNativeElement(node)?.p.text ?? [])).toEqual(["files", "links"]);
+			expect(radial.p?.title).not.toContain("Tint");
+			expect(tree(legendOf(quiet.describe(native))[0]).flatMap(node => asNativeElement(node)?.p.text ?? [])).toEqual(["files", "links"]);
+			view.update(popupState(data));
+			action(view, dots(view.describe(native)).find(node => node.p.attrs?.["data-node"] === id)!.p.actions!.click!);
+			const selected = view.describe(native);
+			expect(tree(inspection(selected)).some(node => node.p?.role === "semctl.live.legend")).toBe(false);
+			expect(tree(inspection(selected)).some(node => node.p?.role === "semctl.live.links")).toBe(true);
+		} finally { view.dispose(); quiet.dispose(); }
+	});
+	test("fills the idle third inspector row with the busiest groups as short selectable chips", () => {
+		const data = overview(["src/api/a.ts", "src/db/b.ts", "src/cache/c.ts", "src/web/d.ts", "src/cli/e.ts"]);
+		data.edges = [["0", "1"], ["0", "2"], ["0", "3"], ["1", "2"], ["3", "4"], ["4", "4"]].map(([from, to]) => ({ from, to, label: "imports" }));
+		const groupOf = projectSummary(data, data.identity.codebaseId).groupOf;
+		const names = new Map([[groupOf.get("0")!, "api"], [groupOf.get("1")!, "db"], [groupOf.get("2")!, "cache"], [groupOf.get("3")!, "web"]]);
+		// api has 3 cross-group links; db, cache and web tie at 2 and order by id; cli has 1.
+		const expected = [groupOf.get("0")!, ...[groupOf.get("1")!, groupOf.get("2")!, groupOf.get("3")!].sort()].slice(0, 3);
+		const view = popup(popupState(data)), quiet = popup(popupState(overview(["src/api/a.ts", "src/db/b.ts"])));
+		try {
+			const row = inspection(view.describe(native)).c?.[2] as NativeNode;
+			expect(row.key).toBe("neighbors");
+			expect(row.c?.[0]).toMatchObject({ k: "text", key: "busiest-label", p: { text: "Busiest:", tone: "muted" } });
+			const chips = tree(row).filter(node => node.p?.role === "semctl.live.busiest");
+			expect(chips.map(node => [node.key, asNativeElement(node)?.p.class])).toEqual(expected.map(id => [`busiest-${id}`, "semctl-live-neighbor"]));
+			expect(chips.map(chip => tree(chip).filter(node => node.k === "text").map(node => node.p?.text))).toEqual(expected.map(id => [names.get(id)]));
+			expect(chips.every(node => node.p?.grow === 1 && node.p?.basis === 0)).toBe(true);
+			expect(chips[0].p?.title).toContain("src/api");
+			expect(chips[0].p?.title).toContain("3 cross-group links · 0 incoming · 3 outgoing");
+			expect(chips[0].p?.aria).toContain("3 cross-group links · 0 incoming links · 3 outgoing links");
+			action(view, chips[1].p!.actions!.click!);
+			const selected = view.describe(native);
+			expect(selectedGroup(selected)).toBe(expected[1]);
+			expect(tree(inspection(selected)).some(node => node.p?.role === "semctl.live.busiest")).toBe(false);
+			const api = neighbors(selected).find(node => node.p?.actions?.click === chips[0].p?.actions?.click)!;
+			expect(tree(api).filter(node => node.k === "text").map(node => node.p?.text)).toEqual(["src/api", "1"]);
+			action(view, "clear-group");
+			const fallback = tree(inspection(view.describe({ ...native, feature: () => false }))).filter(node => node.p?.role === "semctl.live.busiest");
+			expect(fallback.map(node => [node.k, node.key])).toEqual(expected.map(id => ["row", `busiest-${id}`]));
+			expect(content(inspection(quiet.describe(native)).c?.[2] as NativeNode)).toContain("No cross-group links in this map");
+			// Wider popups show more busiest chips; the ranking stays the same.
+			const ranked = [groupOf.get("0")!, ...[groupOf.get("1")!, groupOf.get("2")!, groupOf.get("3")!].sort(), groupOf.get("4")!];
+			const busiestAt = (size: GraphAppearance["popup"]) => {
+				view.update({ ...popupState(data), appearance: { ...DEFAULT_GRAPH_APPEARANCE, popup: size } });
+				return tree(inspection(view.describe(native))).filter(node => node.p?.role === "semctl.live.busiest").map(node => node.key);
+			};
+			expect(busiestAt("medium")).toEqual(ranked.slice(0, 4).map(id => `busiest-${id}`));
+			expect(busiestAt("large")).toEqual(ranked.map(id => `busiest-${id}`));
+			expect(busiestAt("small")).toEqual(ranked.slice(0, 3).map(id => `busiest-${id}`));
+		} finally { view.dispose(); quiet.dispose(); }
 	});
 	test("inspects omitted source routes while bounding and deterministically ordering neighboring controls", () => {
 		const data = overview(Array.from({ length: 12 }, (_, index) => `module-${index}/a.ts`));
@@ -267,6 +355,9 @@ describe("live group inspection", () => {
 		const view = popup(popupState(data));
 		try {
 			const initial = view.describe(native);
+			const busiest = tree(initial).filter(node => node.p?.role === "semctl.live.busiest");
+			expect(busiest.map(node => node.key)).not.toContain(`busiest-${folded.id}`);
+			expect(busiest.map(node => node.key)).toContain(`busiest-${first.id}`);
 			action(view, dots(initial).find(node => node.p.attrs?.["data-node"] === folded.id)!.p.actions!.click!);
 			const selected = view.describe(native);
 			expectLinks(selected, 2, 2, 2);
@@ -316,7 +407,9 @@ describe("live group inspection", () => {
 				expect(evidence).toContain(data.caveats[0]);
 				expect(content(inspector)).not.toMatch(/isolated|no links|no relationships/i);
 				expect(neighbors(selected)).toHaveLength(0);
-				for (const node of tree(inspector)) if (node.p?.title) expect(node.p.title.length).toBeLessThanOrEqual(720);
+				expectCompactTitles(inspector);
+				expectCompactTitles(tree(selected).find(node => node.p?.role === "semctl.live.header")!);
+				expect(tree(selected).find(node => node.key === "partial")?.p?.title).toBe(loading ? undefined : "Partial indexed map\nImport layer is incomplete");
 			} finally { view.dispose(); }
 		}
 	});
@@ -393,7 +486,9 @@ describe("compact live popup observations", () => {
 			expect(dots(initial).filter(node => node.p.class?.includes("sg-indexing-"))).toHaveLength(1);
 			action(view, failed.p.actions!.click!);
 			const chosen = view.describe(native);
-			expect(content(chosen)).toContain("1 failed · 1 pending");
+			expect(tree(chosen).find(node => node.p?.role === "semctl.live.indexing")).toMatchObject({ k: "meter", p: { value: 0 } });
+			expect(tree(chosen).find(node => node.p?.role === "semctl.live.indexing-label")?.p?.text).toBe("0% ready");
+			expect(tree(chosen).find(node => node.p?.role === "semctl.live.indexing")?.p?.title).toContain("1 failed · 1 pending · 22 unreported");
 			expect(tree(chosen).filter(node => node.k === "text" && node.p?.title?.includes("1 failed · 1 pending")).length).toBeGreaterThan(0);
 			view.update({ ...popupState(display), request: { loading: true, text: "", display, error: "Temporary map refresh failure" } });
 			const retained = dots(view.describe({ ...native, reduceMotion: true })).find(node => node.p.attrs?.["data-node"] === "other-groups")!;
@@ -401,8 +496,17 @@ describe("compact live popup observations", () => {
 			expect(retained.p.aria).not.toContain("recently");
 			expect(retained.p.attrs?.["aria-pressed"]).toBe(true);
 			view.handleNativeEvent({ type: "toggle", key: "groups", collapsed: false });
-			const list = tree(view.describe(native)).find(node => node.p?.role === "semctl.live.group" && node.p?.actions?.click === failed.p.actions?.click);
-			expect(list?.p?.title).toContain("1 failed · 1 pending");
+			const row = (cx: DescribeContext) => tree(view.describe(cx)).find(node => node.p?.role === "semctl.live.group" && node.p?.actions?.click === failed.p.actions?.click)!;
+			expect(row(native).p?.title).toContain("1 failed · 1 pending");
+			const meter = tree(row(native)).find(node => node.p?.role === "semctl.live.group.indexing");
+			expect(meter).toMatchObject({ k: "meter", p: { style: "bar", size: "sm", min: { w: "6ch" }, max: { w: "6ch" },
+				parts: [{ value: 0.5, token: "muted", label: "1 pending" }, { value: 0.5, token: "error", label: "1 failed" }] } });
+			expect(meter?.p?.title).toContain("Indexing: 1 failed · 1 pending");
+			expect(meter?.p).not.toHaveProperty("label");
+			expect(tree(row(native)).some(node => node.p?.role === "semctl.live.indexing-label")).toBe(false);
+			expect(tree(row(native)).some(node => node.p?.role === "semctl.live.group.status")).toBe(false);
+			const badge = tree(row({ ...native, supports: kind => String(kind) === "el" || kind === "section" })).find(node => node.p?.role === "semctl.live.group.status");
+			expect(asNativeElement(badge!)?.p).toMatchObject({ text: "1 failed", class: "semctl-live-badge-error" });
 			view.update(popupState(data));
 			expect(dots(view.describe(native)).some(node => node.p.class?.includes("sg-indexing-"))).toBe(false);
 		} finally { view.dispose(); }
@@ -416,9 +520,55 @@ describe("compact live popup observations", () => {
 			const rendered = view.describe(native);
 			expect(dots(rendered)).toHaveLength(3);
 			expect(dots(rendered).some(node => node.p.class?.includes("sg-indexing-") || node.p.class?.includes("sg-active"))).toBe(false);
-			expect(content(rendered)).toContain("1 ready · 1 unknown · 1 unreported");
-			expect(tree(rendered).find(node => node.k === "meter")?.p?.value).toBe(0);
+			const indexing = tree(rendered).find(node => node.p?.role === "semctl.live.indexing");
+			expect(indexing).toMatchObject({ k: "meter", p: { value: 0.5 } });
+			expect(tree(rendered).find(node => node.p?.role === "semctl.live.indexing-label")?.p?.text).toBe("50% ready");
+			expect(indexing?.p?.title).toContain("1 ready · 1 unknown · 1 unreported");
+			expect(tree(rendered).find(node => node.key === "progress")?.p?.value).toBe(0);
 		} finally { view.dispose(); }
+	});
+	test("reads as a titled card with a subline, a ready-share meter and a cached graph well", () => {
+		const data: Overview = { ...overview(["src/api/a.ts", "src/api/b.ts", "src/db/c.ts", "src/cache/d.ts"]), truncated: true, caveats: ["upstream edge limit"] };
+		data.nodes[0].indexing = "ready"; data.nodes[1].indexing = "ready"; data.nodes[2].indexing = "failed";
+		const live: DescribeContext = { ...native, supports: kind => ["el", "section", "meter", "icon"].includes(String(kind)) };
+		const view = popup(popupState(data)), single = popup(popupState(overview(["src/a.ts"])));
+		try {
+			const card = view.describe(live), header = tree(card).find(node => node.p?.role === "semctl.live.header")!;
+			expect(tree(header).find(node => node.p?.role === "semctl.live.title")?.p?.text).toBe("Project map");
+			const subline = tree(header).find(node => node.p?.role === "semctl.live.subline");
+			expect(subline?.p?.text).toBe("4 files · 3 groups");
+			expect(subline?.p?.title).toContain("4 indexed nodes · 3 groups");
+			expect(tree(header).find(node => node.key === "partial")).toMatchObject({ k: "icon", p: { name: "warn", role: "semctl.live.partial", tone: "warning" } });
+			expect(tree(header).find(node => node.key === "partial")?.p?.title).toContain("upstream edge limit");
+			expect(tree(single.describe(live)).find(node => node.p?.role === "semctl.live.subline")?.p?.text).toBe("1 file · 1 group");
+			// Toolbar: resize grip at the moving top-left corner, the title, then the action buttons.
+			const toolbar = tree(header).find(node => node.key === "toolbar")!;
+			const [grip, title, buttons] = (toolbar.c ?? []) as NativeNode[];
+			expect(asNativeElement(grip)?.p).toMatchObject({ tag: "button", class: "semctl-icon-action", role: "semctl.live.resize", actions: { click: "resize" },
+				title: "Popup size: Small\nClick to enlarge · Shift+click for large" });
+			expect(grip.c?.[0]).toMatchObject({ k: "icon", p: { name: "grip" } });
+			expect(title).toMatchObject({ k: "text", p: { role: "semctl.live.title", text: "Project map", actions: { dblclick: "resize:toggle" } } });
+			expect((buttons.c ?? []).map(child => "k" in child ? child.key : undefined)).toEqual(["expand", "appearance", "refresh", "close"]);
+			expectCompactTitles(header);
+			const row = tree(card).find(node => node.p?.role === "semctl.live.indexing-row");
+			expect(row).toMatchObject({ k: "row", key: "indexing-row", p: { gap: "sm", align: "center" } });
+			const [meter, share] = (row?.c ?? []) as NativeNode[];
+			expect(meter).toMatchObject({ k: "meter", key: "indexing", p: { role: "semctl.live.indexing", style: "bar", size: "sm", grow: 1, min: { w: 0 } } });
+			expect(meter.p).not.toHaveProperty("label");
+			expect(meter.p?.parts).toEqual(indexingParts(indexingCounts(data.nodes)));
+			expect(meter.p?.title).toContain("Indexing: 1 failed · 2 ready · 1 unreported");
+			expect(share).toMatchObject({ k: "text", p: { text: "66% ready", role: "semctl.live.indexing-label", tone: "muted", shrink: 0, title: meter.p?.title } });
+			expect(row?.c).toHaveLength(2);
+			const well = tree(card).find(node => asNativeElement(node)?.p.class === "semctl-graph-well");
+			expect(well?.key).toBe("graph-well");
+			expect(well?.c?.map(child => "k" in child ? child.key : undefined)).toEqual(["graph-preview"]);
+			expect(tree(view.describe(live)).find(node => node.key === "graph-well")).toBe(well);
+			const plain = view.describe({ ...native, supports: kind => kind === "section", feature: () => false });
+			expect(tree(plain).find(node => node.p?.role === "semctl.live.indexing")).toMatchObject({ k: "text", p: { text: "1 failed · 2 ready · 1 unreported" } });
+			expect(tree(plain).some(node => node.key === "graph-well" || node.k === "meter" || node.p?.role === "semctl.live.indexing-row")).toBe(false);
+			expect(tree(plain).find(node => node.key === "partial")).toMatchObject({ k: "text", p: { text: "Partial map", tone: "warning" } });
+			expect(tree(plain).find(node => node.p?.role === "semctl.live.subline")?.p?.text).toBe("4 files · 3 groups");
+		} finally { view.dispose(); single.dispose(); }
 	});
 	test("renders available graph and group actions while typed relationship layers load", () => {
 		const data: Overview = { ...overview(["src/api/a.ts", "src/db/b.ts"]), loading: true, truncated: true, caveats: ["Import layer is loading"] };
@@ -493,7 +643,8 @@ describe("compact live popup observations", () => {
 			const selected = view.describe(fallback);
 			const clear = tree(selected).find(node => node.p?.actions?.click === "clear-group");
 			expect(clear).toBeDefined();
-			expect(tree(selected).some(node => node.p?.title?.includes("src/api/a.ts"))).toBe(true);
+			const label = projectSummary(data, data.identity.codebaseId).groups[0].label;
+			expect(tree(selected).some(node => node.p?.title?.startsWith(`${label} · 1 file`))).toBe(true);
 			action(view, clear!.p!.actions!.click!);
 			expect(tree(view.describe(fallback)).some(node => node.p?.actions?.click === "clear-group")).toBe(false);
 		} finally { view.dispose(); }
@@ -513,10 +664,40 @@ describe("compact live popup observations", () => {
 			view.update({ ...popupState(data, { requests: { sent: 2, received: 1, failed: 1 } }),
 				request: { loading: false, text: "", display: data, error: "Private backend diagnostic: connection refused" } });
 			const failed = view.describe(native);
-			expect(tree(failed).map(asNativeElement).some(node => node?.p.attrs?.["data-alert"] === true)).toBe(true);
+			const warning = tree(failed).find(node => node.p?.role === "semctl.live.warning");
+			expect(warning?.p?.text).toBe("!");
+			expect(tree(tree(failed).find(node => node.key === "status-slot")!).some(node => node === warning)).toBe(false);
 			expect(content(failed)).not.toContain("Private backend diagnostic");
 			expect(tree(failed).some(node => node.k === "text" && node.p?.title?.includes("Private backend diagnostic"))).toBe(true);
 			expect(tree(failed).find(node => node.k === "meter")?.p?.value).toBeNull();
+		} finally { view.dispose(); }
+	});
+	test("loading states use native spinner and shimmer when supported and keep static fallbacks", () => {
+		const loading: LiveGraphState = { request: { loading: true, text: "" }, activity: { operations: [], targets: [], producer: null } };
+		const live: DescribeContext = { ...native, supports: kind => ["el", "section", "meter", "icon", "spinner", "shimmer"].includes(String(kind)) };
+		const empty = (root: NativeNode) => tree(root).find(node => node.key === "empty")!;
+		const view = popup(loading);
+		try {
+			const animated = view.describe(live);
+			expect(tree(empty(animated)).find(node => node.k === "spinner")?.p).toMatchObject({ style: "dots" });
+			expect(tree(empty(animated)).find(node => node.k === "shimmer")?.p).toMatchObject({ text: "Reading the indexed map" });
+			expect(tree(animated).find(node => node.p?.role === "semctl.live.title")?.p?.text).toBe("Project map");
+			expect(tree(animated).some(node => node.p?.role === "semctl.live.subline")).toBe(false);
+			const refresh = asNativeElement(tree(animated).find(node => node.key === "refresh")!)!;
+			expect(refresh.p.actions).toBeUndefined();
+			expect(refresh.p.attrs?.["aria-disabled"]).toBe(true);
+			expect(refresh.c?.[0]).toMatchObject({ k: "spinner", p: { style: "orbit", aria: "Refreshing" } });
+			for (const still of [view.describe({ ...live, reduceMotion: true }), view.describe(native)]) {
+				expect(tree(still).some(node => node.k === "spinner" || node.k === "shimmer")).toBe(false);
+				expect(content(empty(still))).toContain("Reading the indexed map");
+			}
+			view.update({ ...loading, appearance: { ...DEFAULT_GRAPH_APPEARANCE, motion: "off" } });
+			expect(tree(view.describe(live)).some(node => node.k === "spinner" || node.k === "shimmer")).toBe(false);
+			view.update({ ...loading, request: { loading: false, text: "", error: "offline" } });
+			const failed = view.describe(live);
+			expect(tree(failed).some(node => node.k === "spinner" || node.k === "shimmer")).toBe(false);
+			expect(content(empty(failed))).toContain("The indexed map is unavailable");
+			expect(tree(tree(failed).find(node => node.key === "refresh")!).find(node => node.k === "icon")?.p?.name).toBe("repeat");
 		} finally { view.dispose(); }
 	});
 	test("appearance changes preserve visible selection and clear a group folded by a lower detail level", () => {
@@ -540,4 +721,81 @@ describe("compact live popup observations", () => {
 			expect(dots(view.describe(native)).some(node => node.p.attrs?.["aria-pressed"] === true)).toBe(true);
 		} finally { view.dispose(); }
 	});
+});
+
+describe("resizable live popup", () => {
+	test("the header grip steps sizes with wrap, Shift+click steps back and a title double-click toggles small and large", () => {
+		const data = overview(["src/api/a.ts", "src/db/b.ts"]), requested: GraphAppearance["popup"][] = [];
+		let state: LiveGraphState = popupState(data);
+		const view: LiveGraphPopup = new LiveGraphPopup(state, () => {}, { close() {}, refresh() {}, expand() {}, appearance() {}, resize(size) {
+			// The host persists the size through the appearance store and passes the new value back.
+			requested.push(size);
+			state = { ...state, appearance: { ...DEFAULT_GRAPH_APPEARANCE, popup: size } };
+			view.update(state);
+		} });
+		const click = (act: string, mods: string[] = []) => view.handleNativeEvent({ type: "action", key: "", act, mods });
+		const grip = () => asNativeElement(tree(view.describe(native)).find(node => node.key === "resize")!)!;
+		try {
+			expect(grip().p.title).toBe("Popup size: Small\nClick to enlarge · Shift+click for large");
+			click("resize"); click("resize");
+			expect(grip().p.title).toBe("Popup size: Large\nClick for small · Shift+click to shrink");
+			click("resize");
+			click("resize", ["shift"]); click("resize", ["shift"]);
+			expect(grip().p.title).toBe("Popup size: Medium\nClick to enlarge · Shift+click to shrink");
+			click("resize", ["shift"]); click("resize", ["shift", "ctrl"]);
+			click("resize:toggle"); click("resize:toggle");
+			expect(requested).toEqual(["medium", "large", "small", "large", "medium", "small", "large", "small", "large"]);
+			expectCompactTitles(tree(view.describe(native)).find(node => node.p?.role === "semctl.live.header")!);
+		} finally { view.dispose(); }
+	});
+	test("each size maps to a Tern overlay size and a preview size without moving dots within a preview size", () => {
+		expect((["small", "medium", "large"] as const).map(size => livePopupOverlay(size, false).size)).toEqual(["sm", "md", "lg"]);
+		expect(livePopupOverlay("medium", true)).toEqual({ role: "omp.overlay.semctl-live", modal: false, size: "md", anchor: "top", hidden: true, min: { w: 0 } });
+		const data = overview(["src/api/a.ts", "src/api/b.ts", "src/db/c.ts", "src/cache/d.ts", "src/web/e.ts"]);
+		data.edges = [{ from: "0", to: "2", label: "imports" }, { from: "2", to: "3", label: "imports" }, { from: "3", to: "4", label: "imports" }];
+		const view = popup(popupState(data));
+		const drawing = (size: GraphAppearance["popup"]) => {
+			view.update({ ...popupState(data), appearance: { ...DEFAULT_GRAPH_APPEARANCE, popup: size } });
+			const root = view.describe(native), preview = asNativeElement(tree(root).find(node => node.key === "graph-preview")!)!;
+			return { preview: preview.p.class?.match(/\bsg-(compact|inline|overview)\b/)?.[1],
+				positions: dots(root).map(dot => [dot.p.attrs?.["data-node"], dot.p.class?.match(/sg-x\d+ sg-y\d+ sg-fx\d+ sg-fy\d+/)?.[0]]) };
+		};
+		try {
+			const small = drawing("small");
+			expect(small.preview).toBe("compact");
+			expect(drawing("medium").preview).toBe("inline");
+			expect(drawing("large").preview).toBe("overview");
+			expect(drawing("small")).toEqual(small);
+		} finally { view.dispose(); }
+	});
+	test("group hovers name the group, its file count and catalog state in at most three short lines", () => {
+		const data = overview(["src/api/a.ts", "src/api/b.ts", `src/${"deep-".repeat(30)}/c.ts`]);
+		data.nodes[0].indexing = "failed";
+		const view = popup(popupState(data));
+		try {
+			view.handleNativeEvent({ type: "toggle", key: "groups", collapsed: false });
+			const rows = tree(view.describe(native)).filter(node => node.p?.role === "semctl.live.group");
+			const api = projectSummary(data, data.identity.codebaseId).groups.find(group => group.members.some(node => node.id === "0"))!;
+			expect(rows.find(node => node.p?.title?.startsWith(api.label))?.p?.title?.split("\n")).toEqual([`${api.label} · 2 files`, indexingSummary(api.indexing)]);
+			expect(rows).toHaveLength(2);
+			for (const row of rows) expectCompactTitles(row);
+		} finally { view.dispose(); }
+	});
+});
+
+test("compact failure hovers keep the full diagnostic reachable with and without a retained map", () => {
+	const error = `Overview failed: ${"request context ".repeat(12)}\nServer details\nRetry details\nActionable cause on line four`;
+	for (const display of [undefined, overview(["src/api/a.ts"])]) {
+		const view = popup({ request: { loading: false, text: "", error, display }, activity: { operations: [], targets: [], producer: null } });
+		try {
+			const closed = view.describe(native);
+			expect(tree(closed).some(node => node.p?.role === "semctl.live.diagnostic-text")).toBe(false);
+			const section = tree(closed).find(node => node.p?.role === "semctl.live.diagnostics");
+			if (!section?.key) throw new Error("Missing diagnostic disclosure");
+			view.handleNativeEvent({ type: "toggle", key: section.key, collapsed: false });
+			expect(tree(view.describe(native)).find(node => node.p?.role === "semctl.live.diagnostic-text")?.p?.text).toBe(error);
+			const fallback = view.describe({ ...native, supports: kind => kind !== "section" && native.supports(kind) });
+			expect(content(fallback)).toContain("Actionable cause on line four");
+		} finally { view.dispose(); }
+	}
 });

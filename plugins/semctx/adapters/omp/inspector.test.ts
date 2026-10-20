@@ -3,11 +3,12 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { DescribeContext, NativeNode } from "@oh-my-pi/pi-tui";
 import type { ToolRenderer, ToolRenderResult } from "@oh-my-pi/pi-tui/tools";
-import { SemctlInspector, createInspectorRenderer, readDisplay, snippetWindow, type Display, type Hit } from "./inspector";
+import { SemctlInspector, createInspectorRenderer, identityBadge, readDisplay, snippetWindow, type Display, type Hit } from "./inspector";
 import { strengths } from "./graph-data/matches.js";
 import { GraphInspector } from "./graph";
 import { resultGraph } from "./result-graph";
 import { matchScoreIndicator } from "./match-indicators";
+import { asNativeElement } from "./native-elements";
 
 function match(overrides: Partial<Hit> = {}): Hit {
 	return { path: "src/main.ts", symbol: "main", qualifiedName: "app.main", language: "typescript", kind: "function", score: 2,
@@ -93,12 +94,15 @@ describe("bounded semctl display carrier", () => {
 		expect(snippetWindow(match({ focusLine: 999 }))?.focus).toBeUndefined();
 		expect(snippetWindow(match({ focusByte: 999 }))?.focus).toBeUndefined();
 	});
-	test("normalizes only nonnegative query-relative scales, preserving ties and raw scores", () => {
+	test("normalizes nonnegative sets by ratio and signed sets by range, preserving ties and raw scores", () => {
 		const values = (scores: (number | null)[]) => strengths(scores.map(score => match({ score })));
 		expect(values([4, 2, 0])).toEqual([1, 0.5, 0]);
 		expect(values([2, 2])).toEqual([1, 1]);
 		expect(values([0, 0])).toEqual([null, null]);
-		for (const invalid of [[4, -1], [-2, -1], [4, null], [4, Number.POSITIVE_INFINITY]]) expect(values(invalid)).toEqual([null, null]);
+		expect(values([4, -1])).toEqual([1, 0.1]);
+		expect(values([-2, -1])).toEqual([0.1, 1]);
+		expect(values([-1, -1])).toEqual([null, null]);
+		for (const invalid of [[4, null], [-4, null], [4, Number.POSITIVE_INFINITY], [-4, Number.NEGATIVE_INFINITY]]) expect(values(invalid)).toEqual([null, null]);
 	});
 	test("retains batch misses and applies the total-hit bound across symbols", () => {
 		const payload: Display = { version: 1, kind: "batch", identity: search().identity,
@@ -205,6 +209,30 @@ describe("per-card native renderer", () => {
 			}
 		}
 	});
+	test("signed score sets render filled rank-ordered rails with range tooltips in native and text rows", () => {
+		const rows = [match({ score: -1.59 }), match({ score: -6.14 }), match({ score: -3.865 })];
+		for (const supportsMeter of [true, false]) {
+			const cx = { ...native, supports: (kind: string) => kind !== "meter" || supportsMeter };
+			const view = new SemctlInspector(search(rows), () => {});
+			const indicators = nodes(view.describe(cx)).filter(node => node.key?.startsWith("hit-"))
+				.map(card => nodes(card).find(node => node.key === "relevance")!);
+			if (supportsMeter) {
+				expect(indicators.slice(0, 2).map(node => node.p?.value)).toEqual([1, 0.1]);
+				expect(indicators[2].p?.value).toBeCloseTo(0.55, 12);
+				for (const node of indicators) expect(node.p?.tone).toBe("accent");
+			} else expect(indicators.map(node => node.p?.text)).toEqual(["▰▰▰▰▰▰", "▰▱▱▱▱▱", "▰▰▰▱▱▱"]);
+			indicators.forEach((node, index) => {
+				expect(node.p?.title).toContain(`Score ${rows[index].score}`);
+				expect(node.p?.title).toContain("Bar: position between lowest and highest result scores");
+				expect(node.p?.title).toContain("not confidence");
+			});
+		}
+		const ratio = [match({ score: 4 }), match({ score: 1 })];
+		const titles = nodes(new SemctlInspector(search(ratio), () => {}).describe(native))
+			.filter(node => node.key === "relevance").map(node => node.p?.title);
+		expect(titles).toHaveLength(2);
+		for (const title of titles) expect(title).toContain("Bar: relative to highest result score");
+	});
 	test("unscored matches allocate no score child in native or text-only rows, while zero keeps its indicator", () => {
 		for (const supportsMeter of [true, false]) {
 			const cx = { ...native, supports: (kind: string) => kind !== "meter" || supportsMeter };
@@ -235,21 +263,76 @@ describe("per-card native renderer", () => {
 			expect(described.filter(node => node.key !== "verification").every(node => !node.p?.title?.includes(reason))).toBe(true);
 		}
 	});
-	test("compact freshness diagnostics remain hoverable and accessible without repeating warning prose", () => {
+	test("freshness warnings move to a header badge without repeating warning prose in the body", () => {
 		const warning = "The latest indexing job failed; results may be stale.";
-		const value = result({ ...search(), indexWarning: warning });
-		const view = component(renderer(), value);
+		const value = result({ ...search(), indexWarning: warning }), r = renderer();
+		const view = component(r, value);
+		expect(r.describeResult!(value, compact)?.tool?.badges).toEqual([identityBadge(search().identity), { text: "index warning", tone: "warning", title: warning }]);
+		expect(renderer().describeResult!(result(), compact)?.tool?.badges).toEqual([identityBadge(search().identity)]);
 		for (const cx of [native, { ...native, supports: (kind: string) => kind !== "icon" }]) {
 			const described = nodes(view.describe(cx));
-			const diagnostic = described.find(node => node.key === "index-warning");
-			expect(diagnostic?.p).toMatchObject({ title: warning, tone: "warning" });
-			expect(diagnostic?.p?.aria).toContain(warning);
+			expect(described.some(node => node.key === "index-warning" || node.p?.role === "semctl.index-warning")).toBe(false);
 			expect(described.map(textContent).join("\n")).not.toContain(warning);
 		}
 		for (const indexWarning of [undefined, 42, {}]) {
 			const unknown = result(search(), { mcpMeta: { semctlDisplay: { ...search(), indexWarning } } });
 			expect(renderer().describeResult!(unknown, compact)).toBe(nativeFallback);
 		}
+	});
+	test("the tool header carries codebase identity and bodies start with their content", () => {
+		const styled: DescribeContext = { ...native, feature: name => name === "styles" };
+		const r = renderer(), value = result(search([match(), match({ path: "other.ts" })]));
+		expect(r.describeResult!(value, compact)?.tool?.badges).toEqual([
+			{ text: "repo", tone: "muted", title: `Codebase: cb\nCheckout: ${resolve("/repo")}\nCopy: checkout` },
+		]);
+		expect(identityBadge({ codebaseId: null, name: "semctl", localRoot: null, copy: "canonical" }))
+			.toEqual({ text: "semctl · canonical", tone: "muted", title: "Codebase: unbound\nCopy: canonical" });
+		expect(identityBadge({ codebaseId: "cb", name: null, localRoot: null, copy: "canonical" }).text).toBe("Codebase · canonical");
+		const source: Display = { version: 1, kind: "source", identity: search().identity, path: "src/main.ts", text: "one",
+			language: "typescript", sourceOrigin: "content-plane", contentHash: "hash", encoding: "utf-8", binary: false, truncated: false,
+			byteStart: 0, byteEnd: 3, fileSize: 3, lineStart: 1, lineEnd: 1 };
+		const view = component(r, value);
+		for (const cx of [native, styled]) {
+			const root = view.describe(cx), first = root?.c?.[0];
+			expect(nodes(root).some(node => node.p?.role === "semctl.identity")).toBe(false);
+			expect(first && "k" in first ? first.p?.role : undefined).toBe("semctl.matches");
+			const sourceRoot = new SemctlInspector(source, () => {}).describe(cx), sourceFirst = sourceRoot?.c?.[0];
+			expect(nodes(sourceRoot).some(node => node.p?.role === "semctl.identity")).toBe(false);
+			expect(sourceFirst && "k" in sourceFirst ? textContent(sourceFirst) : undefined).toStartWith("src/main.ts");
+		}
+	});
+	test("header badges and match hovers stay within short tooltip bounds", () => {
+		const longRoot = resolve(`/${"checkout-segment/".repeat(8)}repo`);
+		const badge = identityBadge({ codebaseId: "cb".repeat(60), name: null, localRoot: longRoot, copy: "checkout" });
+		expect(badge.title.split("\n")).toHaveLength(3);
+		for (const line of badge.title.split("\n")) expect(line.length).toBeLessThanOrEqual(88);
+		const warning = Array.from({ length: 6 }, (_, index) => `Warning line ${index}: ${"stale ".repeat(30)}`).join("\n");
+		const warned = renderer().describeResult!(result({ ...search(), indexWarning: warning }), compact)?.tool?.badges?.[1];
+		expect(warned?.title?.split("\n").length).toBe(4);
+		for (const line of warned?.title?.split("\n") ?? []) expect(line.length).toBeLessThanOrEqual(88);
+		const long = "segment::".repeat(20);
+		const view = new SemctlInspector(search([match({ qualifiedName: long, enclosingSymbol: long, binding: { state: "changed-local", reason: "reason ".repeat(40) } })]), () => {});
+		for (const node of nodes(view.describe(native))) if (node.p?.title) {
+			expect(node.p.title.split("\n").length).toBeLessThanOrEqual(3);
+			for (const line of node.p.title.split("\n")) expect(line.length).toBeLessThanOrEqual(88);
+		}
+	});
+	test("the result graph toggle is the last item of the matches flow and opens the graph below it", () => {
+		const styled: DescribeContext = { ...native, feature: name => name === "styles" };
+		const view = new SemctlInspector(search([match(), match({ path: "other.ts" })]), () => {});
+		const control = (cx: DescribeContext) => {
+			const last = nodes(view.describe(cx)).find(node => node.p?.role === "semctl.matches")?.c?.at(-1);
+			return last && "k" in last ? last : undefined;
+		};
+		for (const cx of [native, styled, { ...native, supports: (kind: string) => kind !== "icon" }]) {
+			expect(control(cx)?.key).toBe("graph-control");
+			expect(control(cx)?.p).toMatchObject({ role: "semctl.match.graph", actions: { click: "graph" }, aria: "Show result graph" });
+		}
+		expect(asNativeElement(control(styled)!)?.p.attrs).toMatchObject({ "aria-pressed": false, "aria-expanded": false });
+		activate(view, "graph-control");
+		expect(asNativeElement(control(styled)!)?.p.attrs).toMatchObject({ "aria-pressed": true, "aria-expanded": true });
+		expect(view.describe(styled)?.c?.map(child => "k" in child ? child.key : undefined)).toEqual(["matches", "result-graph"]);
+		expect(new SemctlInspector(search(), () => {}).describe(native)?.c?.some(child => "k" in child && nodes(child).some(node => node.key === "graph-control"))).toBe(false);
 	});
 	test("concurrent cards retain independent query and open matches across repaint and full-result expansion", () => {
 		const older = renderer(), newer = older;
@@ -391,6 +474,18 @@ describe("per-card native renderer", () => {
 		expect(described.some(node => node.key === "hit-0")).toBe(true);
 		expect(described.some(node => node.k === "meter")).toBe(true);
 		expect(described.some(node => textContent(node) === "complete native output")).toBe(false);
+	});
+	test("styled matches expose data-motion from reduced motion and keep match keys across expansion", () => {
+		const styled: DescribeContext = { ...native, feature: name => name === "styles" };
+		const view = new SemctlInspector(search([match(), match({ path: "other.ts" })]), () => {});
+		const container = (cx: DescribeContext) => nodes(view.describe(cx)).find(node => node.p?.role === "semctl.matches");
+		const before = container(styled)?.c?.map(child => "k" in child ? child.key : undefined);
+		expect(asNativeElement(container(styled)!)?.p.attrs?.["data-motion"]).toBe("full");
+		expect(asNativeElement(container({ ...styled, reduceMotion: true })!)?.p.attrs?.["data-motion"]).toBe("reduced");
+		expect(container(native)?.k).toBe("row");
+		view.handleNativeEvent({ type: "action", key: "hit-0", act: "hit:0", mods: [] });
+		expect(container(styled)?.c?.map(child => "k" in child ? child.key : undefined)).toEqual(before);
+		expect(nodes(view.describe(styled)).some(node => node.p?.role === "semctl.identity")).toBe(false);
 	});
 });
 

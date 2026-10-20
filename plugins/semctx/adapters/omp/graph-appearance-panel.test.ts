@@ -36,11 +36,13 @@ describe("native graph appearance panel", () => {
 		action(h.panel, "appearance:labels:hover");
 		action(h.panel, "appearance:links:clear");
 		action(h.panel, "appearance:motion:off");
-		expect(h.store.state.value).toEqual({ layout: "radial", color: "neutral", detail: "detailed", labels: "hover", links: "clear", motion: "off" });
-		for (const key of ["layout:radial", "color:neutral", "detail:detailed", "labels:hover", "links:clear", "motion:off"]) {
+		action(h.panel, "appearance:popup:large");
+		expect(h.store.state.value).toEqual({ layout: "radial", color: "neutral", detail: "detailed", labels: "hover", links: "clear", motion: "off", popup: "large" });
+		for (const key of ["layout:radial", "color:neutral", "detail:detailed", "labels:hover", "links:clear", "motion:off", "popup:large"]) {
 			expect(asNativeElement(control(h.panel, `appearance:${key}`))?.p.attrs?.["aria-pressed"]).toBe(true);
 		}
 		expect(asNativeElement(control(h.panel, "appearance:motion:system"))?.p.attrs?.["aria-pressed"]).toBe(false);
+		expect(asNativeElement(control(h.panel, "appearance:popup:small"))?.p.attrs?.["aria-pressed"]).toBe(false);
 		expect(h.renders).toBeGreaterThan(0);
 		action(h.panel, "appearance:layout:unknown");
 		action(h.panel, "appearance:unknown:off");
@@ -56,19 +58,26 @@ describe("native graph appearance panel", () => {
 		h.panel.handleInput("left");
 		expect(h.store.state.value.layout).toBe("components");
 		h.panel.handleInput("right");
-		expect(h.store.state.value.layout).toBe("force");
+		expect(h.store.state.value.layout).toBe("map");
 		h.panel.handleInput("enter");
-		expect(h.store.state.value.layout).toBe("radial");
+		expect(h.store.state.value.layout).toBe("force");
 		h.panel.handleInput("down");
 		h.panel.handleInput("right");
 		expect(h.store.state.value.color).toBe("structure");
 		for (let i = 0; i < 4; i++) h.panel.handleInput("down");
 		h.panel.handleInput("enter");
 		expect(h.store.state.value.motion).toBe("off");
+		h.panel.handleInput("down"); // Popup size.
+		h.panel.handleInput("right");
+		expect(h.store.state.value.popup).toBe("medium");
+		h.panel.handleInput("left");
+		h.panel.handleInput("left");
+		expect(h.store.state.value.popup).toBe("large");
 		h.panel.handleInput("down"); // Reset defaults.
 		h.panel.handleInput("enter");
 		expect(h.store.state.value).toEqual(DEFAULT_GRAPH_APPEARANCE);
-		for (let i = 0; i < 7; i++) h.panel.handleInput("down");
+		// Reset returns to the first row; Close follows the seven rows and Reset defaults.
+		for (let i = 0; i < 8; i++) h.panel.handleInput("down");
 		h.panel.handleInput("enter");
 		expect(h.closes).toBe(1);
 		h.panel.handleInput("escape");
@@ -76,14 +85,18 @@ describe("native graph appearance panel", () => {
 		h.panel.dispose();
 	});
 
-	test("all four layouts expose their meaning without hover and remain reachable by pointer and keyboard", () => {
+	test("all five layouts expose their meaning without hover and remain reachable by pointer and keyboard", () => {
 		const h = harness();
 		const help = () => {
 			const node = nodes(h.panel.describe(native)).find(node => node.key === "help");
 			return node?.k === "text" ? node.p : undefined;
 		};
 		const layouts = nodes(h.panel.describe(native)).find(node => node.p?.role === "semctl.appearance.layouts");
-		expect(layouts?.c).toHaveLength(4);
+		expect(layouts?.c?.map(child => "k" in child ? child.key : undefined)).toEqual(
+			["map", "force", "radial", "layers", "components"].map(layout => `appearance:layout:${layout}`));
+		expect(asNativeElement(control(h.panel, "appearance:layout:map"))?.p.text).toBe("Concept map");
+		expect(help()?.text).toContain("Groups placed by shared doc concepts and terms; position is not a score.");
+		h.panel.handleInput("right");
 		expect(help()?.text).toContain("Nearby nodes do not imply extra relationships");
 		h.panel.handleInput("right");
 		expect(help()?.text).toContain("undirected hops");
@@ -94,7 +107,7 @@ describe("native graph appearance panel", () => {
 		expect(help()?.text).toContain("Rows within a block do not imply direction");
 		expect(asNativeElement(control(h.panel, "appearance:layout:components"))?.p.attrs?.["aria-pressed"]).toBe(true);
 		h.panel.handleInput("right");
-		expect(h.store.state.value.layout).toBe("force");
+		expect(h.store.state.value.layout).toBe("map");
 		action(h.panel, "appearance:layout:components");
 		expect(h.store.state.value.layout).toBe("components");
 		expect(help()?.aria).toBe(help()?.text);
@@ -107,7 +120,7 @@ describe("native graph appearance panel", () => {
 		h.panel.dispose();
 	});
 
-	test("only unselected option controls own hover help while selected facts stay visible", () => {
+	test("only unselected option controls own short hover help while selected facts stay visible", () => {
 		const h = harness();
 		for (const supportsElements of [true, false]) {
 			const cx: DescribeContext = { ...native, supports: kind => supportsElements || String(kind) !== "el" };
@@ -115,9 +128,14 @@ describe("native graph appearance panel", () => {
 			for (const node of all.filter(node => node.p?.role === "semctl.appearance.row" || node.p?.role === "semctl.appearance.label")) {
 				expect(node.p?.title).toBeUndefined();
 			}
-			expect(control(h.panel, "appearance:layout:force", cx).p?.title).toBeUndefined();
-			expect(control(h.panel, "appearance:layout:radial", cx).p?.title?.split("\n")).toHaveLength(2);
-			expect(control(h.panel, "appearance:layout:force", cx).p?.aria).toBeTruthy();
+			for (const node of all) {
+				const lines = node.p?.title?.split("\n") ?? [];
+				expect(lines.length).toBeLessThanOrEqual(3);
+				for (const line of lines) expect(line.length).toBeLessThanOrEqual(88);
+			}
+			expect(control(h.panel, "appearance:layout:map", cx).p?.title).toBeUndefined();
+			expect(control(h.panel, "appearance:layout:radial", cx).p?.title?.split("\n")).toEqual(["Layout · Radial", expect.stringContaining("undirected hops")]);
+			expect(control(h.panel, "appearance:layout:map", cx).p?.aria).toBeTruthy();
 		}
 		action(h.panel, "appearance:color:neutral");
 		const help = nodes(h.panel.describe(native)).find(node => node.key === "help");
@@ -131,13 +149,34 @@ describe("native graph appearance panel", () => {
 		let closes = 0;
 		const panel = new GraphAppearancePanel(store, () => {}, () => closes++);
 		panel.handleInput("\x1b[C");
-		expect(store.state.value.layout).toBe("radial");
+		expect(store.state.value.layout).toBe("force");
 		panel.handleInput("\x1b[B");
 		panel.handleInput("\r");
 		expect(store.state.value.color).toBe("structure");
 		panel.handleInput("\x1b");
 		expect(closes).toBe(1);
 		panel.dispose();
+	});
+
+	test("the Popup size row offers Small, Medium and Large and saves the choice like other preferences", async () => {
+		const writes: string[] = [];
+		const store = new GraphAppearanceStore("preferences.json", {
+			async read() { return JSON.stringify({ version: 2, appearance: DEFAULT_GRAPH_APPEARANCE }); },
+			async writeAtomic(_file, contents) { writes.push(contents); },
+		});
+		const h = harness(store);
+		await store.load();
+		const row = nodes(h.panel.describe(native)).filter(node => node.p?.role === "semctl.appearance.row").at(-1);
+		expect(row?.p?.aria).toBe("Popup size");
+		const options = row ? nodes(row).map(asNativeElement).filter(node => node?.p.tag === "button") : [];
+		expect(options.map(node => [node?.key, node?.p.text, node?.p.attrs?.["aria-pressed"]])).toEqual([
+			["appearance:popup:small", "Small", true], ["appearance:popup:medium", "Medium", false], ["appearance:popup:large", "Large", false]]);
+		action(h.panel, "appearance:popup:medium");
+		await store.flush();
+		expect(store.state.value.popup).toBe("medium");
+		expect(JSON.parse(writes.at(-1)!)).toEqual({ version: 2, appearance: { ...DEFAULT_GRAPH_APPEARANCE, popup: "medium" } });
+		expect(h.panel.render(80)).toContain("> Popup size: Medium");
+		h.panel.dispose();
 	});
 
 	test("motion selection stays explicit across system reduced-motion changes and narrow descriptions", () => {
@@ -156,7 +195,7 @@ describe("native graph appearance panel", () => {
 
 	test("save errors remain visible and retry saves the selected in-memory value", async () => {
 		const writeStarted = Promise.withResolvers<void>(), writeGate = Promise.withResolvers<void>();
-		let contents = JSON.stringify({ version: 1, appearance: DEFAULT_GRAPH_APPEARANCE }), calls = 0;
+		let contents = JSON.stringify({ version: 2, appearance: DEFAULT_GRAPH_APPEARANCE }), calls = 0;
 		const store = new GraphAppearanceStore("preferences.json", {
 			async read() { return contents; },
 			async writeAtomic(_file, next) {
@@ -204,7 +243,7 @@ describe("native graph appearance panel", () => {
 		await store.flush();
 		expect(writes).toBe(0);
 		expect(contents).toBe("not JSON");
-		for (let i = 0; i < 6; i++) h.panel.handleInput("down");
+		for (let i = 0; i < 7; i++) h.panel.handleInput("down");
 		h.panel.handleInput("enter"); // Keyboard retry, not an appearance edit.
 		await store.flush();
 		expect(writes).toBe(0);

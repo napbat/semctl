@@ -91,8 +91,12 @@ This integration does not require an OMP source patch or a custom executable.
 Plain-text search results put the exact query above a compact ranked table,
 without per-match Markdown headings or a separate weak-match section. Source
 previews, raw scores, copy/domain identity, and verification diagnostics remain
-below the table. Text score bars use the same nonnegative, query-relative scale
-as the native renderer; an unavailable scale stays unknown.
+below the table. Text score bars use the same query-relative scale as native
+relevance rails. A result set with only nonnegative scores uses the ratio to its
+highest score. A result set with any negative score uses the range from its
+lowest to highest score, with a 10% floor for the lowest score.
+Equal scores in a signed result set, missing scores, and non-finite scores keep
+an unknown scale. The MCP text table shows `—` when the scale is unavailable.
 
 Replacing the MCP executable does not reload an already-running OMP extension.
 Use `/restart` in an idle session to load the updated adapter. Session-history
@@ -105,8 +109,9 @@ Markdown or model-facing `structuredContent`. Each payload is limited to 32 KiB.
 Match lists allow at most 32 total hits per call. Overflow omits their payload
 rather than silently showing a partial result. Graph previews have separate,
 explicit limits described below. Search metadata includes the nullable
-`indexWarning`; a small warning icon keeps the original freshness diagnostic in
-its tooltip and accessible label. A missing or malformed warning field falls back
+`indexWarning`. A warning badge with the text `index warning` in the native tool
+header shows it. The badge tooltip keeps the original freshness diagnostic.
+A missing or malformed warning field falls back
 to the complete native result, so older producer metadata cannot hide a warning.
 Missing/invalid metadata, wrong origins, errors, partial results, and
 cancellation also retain native rendering.
@@ -120,6 +125,10 @@ the full location. Filenames use native link styling when a safe checkout link i
 Hover and expanded previews retain the symbol and
 reference context. An open preview occupies its own row.
 The native tool-header disclosure opens the entire result.
+A muted badge in the native tool header shows the codebase identity.
+The badge text is the display name. Canonical copies add `· canonical`.
+The badge tooltip shows the codebase ID, checkout path, and copy.
+The result body starts with the match chips.
 No second result-list disclosure appears between chips.
 Hosts without the required native primitives use the original result body.
 ANSI and noninteractive output retain the original renderer.
@@ -128,16 +137,29 @@ All match chips start folded. Select a chip to open or close its source preview
 in place. Multiple chips can stay open for comparison. Each open chip has a
 `Details` disclosure for its full location, qualified symbol, reference
 context, and codebase identity.
+Match chips fade and rise in with a short stagger on first appearance.
+Reduced-motion mode disables this arrival effect.
 
 Every scored match has a small relevance bar. The adapter uses native meters.
 Text bars appear only when meters are unavailable.
 Match chips, graph controls, and selected sources use the same
-40 by 4 pixel rail. Hover the bar to see rank and score. Expanded results do not repeat
-scores. A bar shows strength relative to the highest score in its original
-result set, not confidence. Scores that do not support that ratio keep a solid
-neutral rail, not a dotted or animated progress indicator. The tooltip retains
-the raw score and explains the missing scale. Matches without scores have no
-bar or reserved score space.
+40 by 4 pixel rail. Relevance rails sit 6 pixels from the location text.
+They use a rounded track and an accent fill.
+The fill eases when its value changes.
+Reduced-motion mode disables this transition.
+Hover the bar to see rank and score. Expanded results do not repeat
+scores. A result set with only nonnegative scores uses the ratio to its highest
+score. A result set with any negative score, such as reranker logits, uses each
+score's position between the lowest and highest result scores.
+The lowest score receives a 10% floor.
+Neither scale indicates confidence.
+Range-bar tooltips say
+“Bar: position between lowest and highest result scores · not confidence”.
+When a result set has equal signed scores, a missing score, or a non-finite
+score, its scored matches keep a solid neutral rail, not a dotted or animated
+progress indicator. An unavailable ratio also keeps a neutral rail.
+Matches without scores have no bar or reserved score space.
+The tooltip retains the raw score when available and explains a missing scale.
 
 Verification icons distinguish bound, changed-local, range-mismatch, and
 unverified/not-probed states. Hover and accessible labels explain the state and
@@ -164,8 +186,8 @@ exist. Full tool-header expansion shows the complete returned source for
 `read_source` and opened match chips. Compact results show the first six
 matches. The native tool header reveals every returned match. Folding restores
 the compact preview. Reopening restores each chip's source selection.
-Presentation makes no additional source requests, automatically combined calls,
-or token-saving claim.
+Result-card presentation makes no additional source requests.
+It does not combine calls automatically or claim token savings.
 
 Nested Eval calls currently retain OMP's native trace presentation, not these
 custom result cards. Eval stores summaries rather than canonical child result
@@ -191,15 +213,74 @@ hover tooltip and selection target. Select a group to inspect its members.
 Select a node to focus its neighbors and supplied source preview. Crossing a
 link updates the group context. All groups and nodes remain reachable when
 the overview combines smaller groups. Relationship details retain cycles,
-shared targets, parallel links, and self-links. Position is not an embedding
-distance or similarity score.
+shared targets, parallel links, and self-links.
 
-Concept colors are inferred from resolved symbol bindings, with imports as
-weaker support. Frequently shared identifiers receive less weight. These are
-evidence-backed communities, not a semantic guarantee. Unsupported paths remain
-neutral. Tern owns brief arrival and hover transitions. Observed activity fades
-in and out without moving the graph. Idle graphs have no animation loop.
-Reduced-motion mode disables these effects without hiding observations.
+The overview title has the checkout name below it. `Partial graph` and
+`Relationship layers loading` are native badges. Their tooltips explain the
+limit. The line under the map shows the group and route counts. A right-aligned
+hint tells you to select a dot for details.
+
+Concept map is the default layout for profiles without a saved choice.
+It combines documentation concepts, shared terms, and recorded links.
+Concept families use folders of source documents, such as `Architecture`.
+The layout separates families when space permits.
+Force also uses lexical similarity and family cohesion.
+Terms come from paths, labels, resolved symbol names, and concept headings.
+Term frequency and inverse document frequency weight the terms.
+Classical multidimensional scaling supplies stable coordinates.
+These vectors are not the server's semantic embeddings.
+The client has no endpoint for retrieving stored embedding vectors.
+Position does not prove a relationship or indicate confidence.
+Input order does not change geometry.
+Activity, selection, indexing state, scores, and theme do not move nodes.
+
+Concept map and Force can draw soft tinted territories behind their members.
+Document folders name concept families. When these families are absent,
+shared identifier terms can name lexical families.
+The compact live popup hides territory labels.
+A territory is omitted if it would cover an unrelated node or most of the canvas.
+Territory tints use the shared palette. They are not confidence indicators.
+Radial, Layers, and Components do not draw territories.
+
+Overview group dots scale with member count.
+Aggregated group routes use four weight tiers.
+Each higher tier makes a route thicker and more opaque.
+Ungrouped result graphs keep their previous dot sizes.
+
+Every graph drawing sits in a soft canvas well and is centered in it.
+Uncolored dots use a soft neutral tone. Every dot has a thin ring in the canvas
+color. The ring separates the dot from links. A hovered dot grows slightly.
+Links are thin, low-contrast lines. In the compact live popup, arrowheads appear
+only on links of the selected or hovered node.
+Containment and project-association routes stay faint until selected or hovered.
+
+Documentation concepts take precedence over reference communities.
+The adapter reads catalog Markdown files from the local checkout.
+Document titles name concepts. Explicit paths and distinctive identifiers connect
+the documents to code files. Supported reference and folder evidence can extend
+an assignment. Broad index documents and ambiguous mentions do not seed concepts.
+At least three code files must support a concept.
+Source-directory groups remain where concept evidence is insufficient.
+Duplicate structure labels include their project or path context.
+Group rows show the source document.
+Concept cues distinguish direct mentions, reference support, and folder support.
+Assignments are map aids, not dependency declarations or semantic guarantees.
+Documentation concepts remain available when embedding states are pending or
+failed. Reference-only communities still require a complete overview.
+The reader uses at most 256 catalog Markdown files, 1 MiB per file, and 16 MiB
+in total. It skips unreadable files and paths outside the checkout.
+It does not read files through links that leave the checkout.
+This step makes no embedding requests, network searches, or model calls.
+Tern owns arrival, movement, and hover transitions.
+Nodes keep their identity across layout changes and refreshes.
+They glide to new positions when geometry changes.
+Routes and territories fade in after nodes settle.
+Dots arrive with a short staggered scale-in.
+Labels fade in after their dot.
+Observed activity fades in and out without moving the graph.
+Idle graphs have no animation loop.
+Reduced-motion mode and Motion Off disable these effects without hiding
+observations.
 
 The analysis selector also provides projects, calls and paths, symbol
 neighborhoods, value-flow boundaries and witnesses, type hierarchies, cycles,
@@ -215,6 +296,11 @@ Use A for analyses, S for appearance, I for diagnostics, and R to refresh.
 Escape returns from the chooser or diagnostics to the map. Escape on the map
 closes the page. Raw CLI output and producer diagnostics stay in the details view.
 
+The live popup and graph page show a native spinner and a shimmer label while
+the first map loads. Refresh buttons show a native spinner during a refresh.
+The graph page footer uses a native spinner while loading or working.
+Reduced-motion mode and Motion Off use static icons and labels instead.
+
 Graph-based feed results show a compact native dot graph directly.
 Node and link counts remain in the tool header. Disconnected and single-node
 results retain their native node controls. `Relationships` exposes the complete
@@ -223,12 +309,13 @@ remain visibly marked. Ordinary links are solid, imports are dashed, and
 project associations are dotted. Curved links share one continuous pattern.
 Import dashes stay at least 8 pixels long. Association marks stay at least
 4 pixels long. Short links remain single connectors instead of dense fragments.
-The layout uses the existing force engine.
+The saved layout choice also applies to these graphs.
 
 Search and lookup results keep their compact match chips. A separate graph icon
 appears when at least two distinct supplied locations can be shown.
 This includes references, callers, definitions, implementations, declaration
-search, batch lookups, and expanded source context. The graph groups returned
+search, batch lookups, and expanded source context.
+The icon trails the match chips on their last row. The graph groups returned
 matches by file and codebase. These links show locations, not inferred calls,
 dependencies, or embedding similarity. Graph selection and open match chips
 survive collapse and reopen. Opening a source preview does not fetch more data.
@@ -237,9 +324,12 @@ Graphs use Tern's native `el` elements and surface-scoped stylesheets.
 The extension checks the terminal's advertised capabilities and sends its styles
 through OMP's public terminal writer. Tern draws the elements and owns pointer
 targets, tooltips, and transitions. No patched node or status API is required.
-Tooltips use short headings and compact facts. Dot hovers show identity and state
-instead of every neighboring link. Route hovers show up to three distinct evidence
-entries and report omitted entries. Group hovers preview three member paths.
+Tooltips use short headings and compact facts.
+Most hovers have at most three lines of 88 characters each.
+Progress and diagnostic summaries can use four lines.
+Dot hovers show identity and state instead of every neighboring link.
+Route hovers show up to two evidence entries and report omitted entries.
+Group hovers show counts, catalog state, and the source document when available.
 The existing node and group controls retain the complete supplied details.
 Terminals without these capabilities keep native node navigation.
 There are no SVG graph images, extension-driven animation frames, or web
@@ -248,10 +338,12 @@ dragging of graph nodes.
 
 Concept colors stay consistent across match chips, graph nodes, and the live
 popup. Colors require a validated overview with the same codebase and exact
-path. Unknown, foreign, and unassigned paths stay neutral. The adapter loads one
-cached overview after the first observed semctx call. Manual refresh and changed
-producer job observations can refresh that catalog. Requests share one in-flight
-lookup. The adapter does not infer embedding distances.
+path. Source-directory colors fill unsupported assignments.
+The adapter loads one cached overview after the first observed semctx call.
+Manual refresh and changed producer job observations can refresh that catalog.
+Requests share one in-flight lookup. Local document reads run after the first
+map paint. Stale or cancelled reads do not replace the active concept snapshot.
+Placement does not use the server's semantic embeddings.
 
 Ordinary MCP graph metadata retains at most 64 nodes, 128 edges, 32 source
 previews, and 32 KiB. It never retains an edge without both endpoints. Large
@@ -286,8 +378,17 @@ The active highlight ends when the correlated request finishes. Embedding
 activity is aggregate producer evidence, not a per-file animation: the
 notification does not identify active files.
 The catalog can separately report a file as pending, embedded, or failed.
-Persistent graph rings show that evidence without replacing concept colors.
-Group-list tooltips count the reported states. Unknown values remain unknown;
+A small status pip at the lower right of a dot shows that evidence without
+replacing concept colors. A failed pip uses the error color. A processing pip
+uses the accent color. A pending pip is hollow.
+On an overview group dot, the failed pip gets stronger as the failed share of
+members grows. The three steps are below 25%, from 25% to 60%, and above 60%.
+The group dot tooltip states how many members failed.
+Overview group rows use a compact native stacked meter for catalog indexing
+states: ready, processing, pending, failed, and unknown.
+Exact counts remain in the tooltip.
+Hosts without meters retain the text summary.
+Unknown values remain unknown;
 missing legacy state remains unreported. Aggregate job progress never assigns
 a state to individual files.
 The native composer status opens the same status view when selected. The
@@ -301,8 +402,32 @@ Refresh and close preserve the current draft and keyboard focus.
 Native icon buttons open the full overview, configure appearance, refresh the
 map, and close the popup.
 Each button has a hover tooltip and an accessible name.
-The header shows the file count instead of a redundant overview title.
-A small warning icon exposes partial-map limits on hover.
+The grip at the upper left changes the popup size.
+Click to enlarge it. Shift+click to shrink it.
+Both controls wrap through Small, Medium, and Large.
+Double-click the title to switch between Small and Large.
+The appearance card also provides a Popup size row.
+Tern does not expose continuous drag-resize events.
+The size persists in the OMP profile.
+
+| Size | Width | Maximum height |
+| --- | ---: | ---: |
+| Small | 320 px | 420 px |
+| Medium | 480 px | 560 px |
+| Large | 680 px | 720 px |
+
+The viewport limits both dimensions.
+The drawing scales with the popup. Larger popups expose more labels and chips.
+
+The popup title is `Project map`. A subline shows `N files · M groups`.
+Hover the subline for node, link, and drawn-route counts.
+A warning icon after the subline marks a partial map. Hover it for the
+partial-map limits.
+A slim stacked indexing bar sits below the header. Its label shows `N% ready`.
+This value is the ready share of the files that report a catalog state.
+Files without a reported state do not lower it.
+The bar tooltip shows the exact counts. The map sits in the canvas well below
+the bar.
 The refresh button stays disabled while a map request is active.
 The toolbar and status footer stay visible while you scroll the graph and group list.
 The extension mounts the popup through stock OMP's widget API. It does not take
@@ -326,20 +451,36 @@ Select a dot or group to open its compact inspector below the drawing.
 The inspector keeps a fixed height. It shows member counts and incoming,
 outgoing, and internal link counts from the full supplied map, including parallel
 links and routes omitted from the drawing. Partial or loading maps stay qualified.
-Select one of the three neighboring groups with the most observed links.
+With no selection, the inspector shows a one-line legend. It explains dot size
+(files) and line weight (links). A tint entry appears only when territories are
+drawn. It distinguishes documented concept families from shared terms.
+Hover a legend item for its meaning.
+The row below the legend shows `Busiest` chips for individual groups.
+The folded remainder is excluded from this ranking.
+Small, Medium, and Large show up to three, four, and five chips.
+Select a chip to select its group.
+With a selection, the chips show neighboring groups with the most observed links.
 The neighbor count includes both directions. Hover shows each direction separately.
 The group list separates names, member counts, indexing states, and request activity.
-Hover a group for member paths. Use the expand icon for the full map.
+Each group row shows its catalog indexing states as a small stacked bar.
+Hosts without meters show a badge with the count of the most urgent state.
+Hover a group for counts and its source document. Use the expand icon for the full map.
 Selection follows group identity across refreshes. A delayed action cannot select
 a different group because the list order changed.
+When a map request fails, the `Diagnostics` disclosure retains the full error.
+The hover summary stays short.
 
-The popup keeps a fixed progress circle and a percentage below the group list.
+The popup footer uses one row below the group list.
+The row contains a fixed progress ring, a percentage, a separate warning badge,
+and request counters. Percentage digits animate when motion is allowed.
 A dash means that the producer has not reported a current percentage.
 Scanning, planning, and failure labels appear only on hover, not as changing
-footer text. A small warning badge marks a current problem without replacing
-the circle. Unknown and pending progress stay static.
-Small out/in counters show observed session traffic. Hover the counters for
-request totals. Hover the circle or warning badge for the current state and
+footer text. The warning badge appears only for a current problem.
+The badge sits beside the ring in its own space.
+Unknown and pending progress stay static.
+Small `↑` and `↓` counters show observed requests sent and returned in this
+session. Hover the counters for request totals.
+Hover the circle or warning badge for the current state and
 diagnostic. Long producer errors use a bounded preview; the full error remains
 in the status or overview diagnostics view.
 Map refresh errors do not erase separately reported producer progress.
@@ -348,7 +489,7 @@ halos and hover descriptions. Exact, codebase-matched request targets use the
 native positive green cue. Their halos use a slow, subtle opacity change after
 a short delay. Validated returned sources receive a brief green halo.
 A failed targeted request receives an error halo. Receipt halos fade without
-growing. Embedding state rings do not spin.
+growing. Status pips do not spin.
 Activity does not change category colors, node positions, or the settled labels.
 Only deliberate selection can change label priority.
 Reduced-motion mode uses static temporary halos.
@@ -370,15 +511,23 @@ close it and discard the previous context.
 Select the appearance icon in the live popup or project page. The compact native
 settings card keeps the graph visible. Changes update the preview immediately
 without another graph request or a model turn. Color applies to every graph view.
-The other settings apply to both the live popup and project page.
+Layout, detail, labels, links, and motion apply to the live popup and project page.
+Popup size applies only to the live popup.
 
-- **Layout:** Force, Radial, Layers, or Components. Force spreads connected groups.
-  Radial uses graph-distance rings. Layers uses directed ranks, keeps cycles
+- **Layout:** Concept map, Force, Radial, Layers, or Components.
+  Concept map places documented concept families and related terms near each
+  other. Force uses lexical identifier similarity and recorded links.
+  Radial uses graph-distance rings. When the largest map has at least three
+  nodes and every other component is smaller, isolated nodes sit on one outer
+  ring around that map. That ring does not show a distance. An isolated node has
+  no recorded relation. Layers uses directed ranks, keeps cycles
   adjacent, and reduces link crossings. Crowded ranks wrap to fit.
   Components separates weakly connected sets into blocks. Rows within each
   block do not imply direction or hierarchy. Layout does not add relationships.
-  Switching layouts briefly fades the complete drawing together.
-  Nodes and links do not animate to different intermediate positions.
+  Nodes keep their identity and glide to new positions across layout changes
+  and refreshes. Routes and territories fade in after nodes settle.
+  Dots arrive with a short staggered scale-in.
+  Labels fade in after their dot.
 - **Color:** Shared uses one codebase palette for overview and tool-result
   graphs. Validated concepts take precedence. Source directories supply stable
   fallback colors, including while concept evidence is unavailable.
@@ -389,10 +538,14 @@ The other settings apply to both the live popup and project page.
 - **Detail:** Calm, Balanced, or Detailed. Folded groups retain their member
   counts. The full overview still exposes every supplied node.
 - **Labels:** Key, More, or On hover. Label placement avoids collisions.
+  Documented concepts and large groups take priority over incidental hubs.
   Tooltips and group exploration remain available in every mode.
 - **Links:** Soft or Clear contrast. Direction and relation styles do not change.
 - **Motion:** System follows the terminal's reduced-motion preference.
-  Off disables graph animation. Activity updates do not move nodes.
+  Off disables graph animation, spinner rotation, shimmer, and animated
+  percentage digits. Reduced-motion mode also disables these effects.
+  Activity updates do not move nodes.
+- **Popup size:** Small, Medium, or Large. The header grip changes the same setting.
 
 Use the arrow keys or Enter to change choices. Contextual help explains the
 selected choice. Escape closes the settings card.
@@ -402,6 +555,8 @@ The default path is `~/.omp/agent/semctl/graph-appearance.json`.
 Named OMP profiles use their own agent directory. Save failures keep the active
 choices in memory and expose a Retry action. Reset defaults restores the default
 appearance; it does not change indexed state.
+Appearance files use version 2. Version 1 files retain all saved choices and
+start with the Small popup. Loading an old file does not rewrite it.
 
 ### OMP layout sync indicator
 

@@ -374,12 +374,9 @@ fn render_search_table(
     context: HitContext<'_>,
     sources: &[HitSource],
 ) {
-    // Match the native inspector: signed or unavailable scores have no ratio bar.
-    let maximum = hits
-        .iter()
-        .all(|hit| hit.score.is_finite() && hit.score >= 0.0)
-        .then(|| hits.iter().map(|hit| hit.score).fold(0.0, f64::max))
-        .filter(|maximum| *maximum > 0.0);
+    // Both scales match the native inspector and are query-relative, not confidence.
+    // Nonnegative scores use ratios; signed scores use the result set's range.
+    let scale = score_scale(hits);
     out.push_str("\n| | Match | Source |\n| --- | --- | --- |\n");
     for (index, hit) in hits.iter().enumerate() {
         let binding = match sources.get(index) {
@@ -393,7 +390,7 @@ fn render_search_table(
             out,
             "| {}\u{a0}{} | {} — {} | {} |",
             index + 1,
-            score_bar(hit.score, maximum),
+            score_bar(hit.score, scale),
             markdown_code(&hit_location(hit, context.root_for(hit))).replace('|', "\\|"),
             markdown_code(&format!("{}{}", hit_symbol(hit), write_marker(hit))).replace('|', "\\|"),
             binding,
@@ -402,11 +399,37 @@ fn render_search_table(
     }
 }
 
-fn score_bar(score: f64, maximum: Option<f64>) -> &'static str {
+#[derive(Clone, Copy)]
+enum ScoreScale {
+    Ratio(f64),
+    Range { min: f64, max: f64 },
+}
+
+fn score_scale(hits: &[api::SearchHit]) -> Option<ScoreScale> {
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    for hit in hits {
+        if !hit.score.is_finite() {
+            return None;
+        }
+        min = min.min(hit.score);
+        max = max.max(hit.score);
+    }
+    if min >= 0.0 {
+        (max > 0.0).then_some(ScoreScale::Ratio(max))
+    } else {
+        (max - min > 1e-12).then_some(ScoreScale::Range { min, max })
+    }
+}
+
+fn score_bar(score: f64, scale: Option<ScoreScale>) -> &'static str {
     const BARS: [&str; 6] = ["▱▱▱▱▱", "▰▱▱▱▱", "▰▰▱▱▱", "▰▰▰▱▱", "▰▰▰▰▱", "▰▰▰▰▰"];
-    maximum.map_or("—", |maximum| {
-        let ratio = score / maximum;
-        BARS[[0.0, 0.2, 0.4, 0.6, 0.8].partition_point(|threshold| ratio > *threshold)]
+    scale.map_or("—", |scale| {
+        let strength = match scale {
+            ScoreScale::Ratio(max) => score / max,
+            ScoreScale::Range { min, max } => 0.1 + 0.9 * (score - min) / (max - min),
+        };
+        BARS[[0.0, 0.2, 0.4, 0.6, 0.8].partition_point(|threshold| strength > *threshold)]
     })
 }
 
@@ -654,6 +677,61 @@ mod tests {
 
     fn expanded(hits: &[api::SearchHit]) -> String {
         render_hits_inner(hits, "none", HitContext::local(None), true, &[], true)
+    }
+
+    fn assert_score_bars(scores: &[f64], bars: &[&str]) {
+        assert_eq!(scores.len(), bars.len());
+        let hits: Vec<_> = scores
+            .iter()
+            .map(|&score| {
+                let mut hit = node("result", "source.rs");
+                hit.score = score;
+                hit
+            })
+            .collect();
+        let mut output = String::new();
+        super::render_search_table(&mut output, &hits, HitContext::local(None), &[]);
+        for (index, bar) in bars.iter().enumerate() {
+            assert!(
+                output.contains(&format!("| {}\u{a0}{bar} |", index + 1)),
+                "{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_bars_keep_nonnegative_ratio_thresholds() {
+        assert_score_bars(
+            &[1.0, 0.8, 0.6, 0.4, 0.2, 0.0],
+            &["▰▰▰▰▰", "▰▰▰▰▱", "▰▰▰▱▱", "▰▰▱▱▱", "▰▱▱▱▱", "▱▱▱▱▱"],
+        );
+        assert_score_bars(&[2.0, 1.0], &["▰▰▰▰▰", "▰▰▰▱▱"]);
+    }
+
+    #[test]
+    fn search_bars_scale_all_negative_scores_across_the_result_range() {
+        assert_score_bars(&[-1.59, -3.865, -6.14], &["▰▰▰▰▰", "▰▰▰▱▱", "▰▱▱▱▱"]);
+    }
+
+    #[test]
+    fn search_bars_scale_mixed_scores_across_the_result_range() {
+        assert_score_bars(&[2.0, 0.0, -2.0], &["▰▰▰▰▰", "▰▰▰▱▱", "▰▱▱▱▱"]);
+    }
+
+    #[test]
+    fn search_bars_are_unavailable_for_every_hit_when_any_score_is_nonfinite() {
+        for score in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_score_bars(&[1.0, score, -2.0], &["—", "—", "—"]);
+        }
+    }
+
+    #[test]
+    fn search_bars_are_unavailable_without_a_nonzero_scale() {
+        assert_score_bars(&[0.0, 0.0], &["—", "—"]);
+        assert_score_bars(&[-2.0, -2.0], &["—", "—"]);
+        assert_score_bars(&[-2.0], &["—"]);
+        assert_score_bars(&[-2.0, -2.0 + 5e-13], &["—", "—"]);
+        assert_score_bars(&[-2.0, -2.0 + 2e-12], &["▰▱▱▱▱", "▰▰▰▰▰"]);
     }
 
     #[test]

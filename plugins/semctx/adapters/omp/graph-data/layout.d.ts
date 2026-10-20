@@ -2,7 +2,14 @@ import type { GraphData } from "../graph";
 
 export interface GraphCategory { key: string; label: string; type: string }
 export function category(node: GraphData["nodes"][number]): GraphCategory;
+export interface SharedConceptFamily { key: string; label: string; members: string[] }
+/** Bound doc concept families with at least two members; largest first, then key. Members are sorted unique IDs. */
+export function sharedConceptFamilies(nodes: readonly GraphData["nodes"][number][]): SharedConceptFamily[];
 export function exactActivity(node: GraphData["nodes"][number], targets: ReadonlySet<string>, codebaseId: string | null): boolean;
+
+/** Aggregate size for drawing only, never wire data. */
+export function bindDrawingWeight(item: object, weight: number): void;
+export function drawingWeight(item: object): number | undefined;
 
 export type GraphRelationKind = "containment" | "association" | "import" | "reference" | "generic";
 export interface GraphRelationStyle { readonly label: string; readonly dash: readonly number[]; }

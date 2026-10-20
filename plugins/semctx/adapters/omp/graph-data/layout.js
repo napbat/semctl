@@ -1,4 +1,12 @@
 // Deterministic force geometry for native graph surfaces and settled previews.
+import { conceptFamily } from "./doc-concepts.js";
+import { graphEmbedding, semanticMap, semanticNeighbours, semanticFamilies, centroid, cosine } from "./embedding.js";
+
+// Aggregate size for drawing only, never wire data.
+const drawingWeights = new WeakMap();
+export function bindDrawingWeight(item, weight) { if (Number.isFinite(weight) && weight > 0) drawingWeights.set(item, weight); }
+export function drawingWeight(item) { return drawingWeights.get(item); }
+
 const compare = (a, b) => a < b ? -1 : a > b ? 1 : 0;
 const hash = text => { let value = 2166136261; for (const char of text) value = Math.imul(value ^ char.charCodeAt(0), 16777619); return value >>> 0; };
 const normalizePath = value => value.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "");
@@ -15,6 +23,18 @@ export function category(node) {
 	if (path) { const normalized = path.replace(/\\/g, "/"), cut = normalized.lastIndexOf("/"), directory = cut < 0 ? "." : normalized.slice(0, cut) || "/"; return { key: `path:${directory}`, label: directory, type: "Directory" }; }
 	const kind = node.category ?? node.hit?.kind;
 	return kind ? { key: `kind:${kind}`, label: kind, type: "Kind" } : { key: "structure", label: "Graph structure", type: "" };
+}
+/** Bound doc concept families with at least two members; largest first, then key. */
+export function sharedConceptFamilies(nodes) {
+	const families = new Map();
+	for (const node of [...nodes].sort((a, b) => compare(a.id, b.id))) {
+		const family = conceptFamily(node);
+		if (!family) continue;
+		if (!families.has(family.key)) families.set(family.key, { key: family.key, label: family.label, members: [] });
+		const members = families.get(family.key).members;
+		if (members.at(-1) !== node.id) members.push(node.id);
+	}
+	return [...families.values()].filter(family => family.members.length > 1).sort((a, b) => b.members.length - a.members.length || compare(a.key, b.key));
 }
 // Relation identity is independent of group color. Only known legacy labels are promoted.
 export const relations = Object.freeze({
@@ -66,7 +86,7 @@ function tree(points) {
 	}
 	accumulate(root); return root;
 }
-function groupAnchors(groups, data, categoryFor) {
+function groupAnchors(groups, data, categoryFor, vectors) {
 	const byId = new Map(data.nodes.map(node => [node.id, categoryFor(node).key]));
 	const neighbours = new Map(groups.map(group => [group.key, new Map()]));
 	for (const edge of data.edges) {
@@ -89,22 +109,38 @@ function groupAnchors(groups, data, categoryFor) {
 	}
 	const radius = group => Math.max(30, Math.sqrt(group.nodes.length) * 30);
 	const targetWidth = Math.sqrt(groups.reduce((area, group) => area + (radius(group) * 2 + 70) ** 2, 0)) * 1.3;
-	const anchors = new Map(); let x = 0, y = 0, rowHeight = 0;
-	for (const group of order) {
-		const r = radius(group), width = r * 2 + 70;
-		if (x && x + width > targetWidth) { x = 0; y += rowHeight; rowHeight = 0; }
-		anchors.set(group.key, { x: x + r + 35, y: y + r + 35, radius: r });
-		x += width; rowHeight = Math.max(rowHeight, width);
+	const groupVectors = vectors && groups.length <= 128 ? new Map(groups.map(group => [group.key, centroid(group.nodes.map(node => vectors.get(node.id)))])) : undefined;
+	const mapped = groups.length >= 3 && groupVectors && [...groupVectors.values()].filter(vector => vector.size).length >= 3 ? semanticMap(groups.map(group => group.key), groupVectors) : undefined;
+	const anchors = new Map();
+	let meanX = 0, meanY = 0, spread = 0;
+	if (mapped) {
+		for (const group of groups) { const point = mapped.get(group.key); meanX += point[0] / groups.length; meanY += point[1] / groups.length; }
+		for (const group of groups) { const point = mapped.get(group.key); spread += (point[0] - meanX) ** 2 + (point[1] - meanY) ** 2; }
+		spread = Math.sqrt(spread / groups.length);
 	}
-	// Bounded coarse relaxation: dependencies pull groups together, envelopes repel.
+	if (mapped && spread > 0) {
+		const scale = targetWidth / 2.6 / spread;
+		for (const group of groups) { const point = mapped.get(group.key); anchors.set(group.key, { x: (point[0] - meanX) * scale, y: (point[1] - meanY) * scale, radius: radius(group) }); }
+	} else {
+		let x = 0, y = 0, rowHeight = 0;
+		for (const group of order) {
+			const r = radius(group), width = r * 2 + 70;
+			if (x && x + width > targetWidth) { x = 0; y += rowHeight; rowHeight = 0; }
+			anchors.set(group.key, { x: x + r + 35, y: y + r + 35, radius: r });
+			x += width; rowHeight = Math.max(rowHeight, width);
+		}
+	}
+	// Bounded coarse relaxation: dependencies and shared terms pull groups together, envelopes repel.
 	// Large category sets keep the topology-first packing rather than doing quadratic work.
 	if (groups.length <= 128) for (let pass = 0; pass < 64; pass++) {
 		const moves = new Map(groups.map(group => [group.key, { x: 0, y: 0 }]));
 		for (let a = 0; a < groups.length; a++) for (let b = a + 1; b < groups.length; b++) {
 			const left = groups[a].key, right = groups[b].key, p = anchors.get(left), q = anchors.get(right);
-			const dx = q.x - p.x, dy = q.y - p.y, distance = Math.hypot(dx, dy) || 1, wanted = p.radius + q.radius + 70;
+			let dx = q.x - p.x, dy = q.y - p.y;
+			if (dx === 0 && dy === 0) { const angle = hash(JSON.stringify([left, right])) * .01; dx = Math.cos(angle); dy = Math.sin(angle); }
+			const distance = Math.hypot(dx, dy) || 1, wanted = p.radius + q.radius + 70;
 			const weight = neighbours.get(left).get(right) ?? 0;
-			const strength = weight / Math.max(1, Math.sqrt(degrees.get(left) * degrees.get(right)));
+			const strength = weight / Math.max(1, Math.sqrt(degrees.get(left) * degrees.get(right))) + (groupVectors ? .9 * Math.max(0, cosine(groupVectors.get(left), groupVectors.get(right)) - .12) : 0);
 			const force = distance < wanted ? (distance - wanted) * .3 : (distance - wanted) * strength * .055;
 			const mx = dx / distance * force, my = dy / distance * force;
 			moves.get(left).x += mx; moves.get(left).y += my; moves.get(right).x -= mx; moves.get(right).y -= my;
@@ -118,15 +154,29 @@ function groupAnchors(groups, data, categoryFor) {
 }
 export function createSimulation(data, previousPositions, categoryFor = category) {
 	const ordered = [...data.nodes].sort((a, b) => compare(a.id, b.id)), roots = new Set(data.roots), groups = new Map();
-	for (const node of ordered) { const info = categoryFor(node); if (!groups.has(info.key)) groups.set(info.key, { ...info, nodes: [] }); groups.get(info.key).nodes.push(node); }
+	// A shared doc concept family is the anchor of its members, so a family settles as one region.
+	const concepts = sharedConceptFamilies(ordered), familyOf = new Map(concepts.flatMap(family => family.members.map(id => [id, family])));
+	const anchorFor = node => { const family = familyOf.get(node.id); return family ? { key: family.key, label: family.label, type: "Concept family" } : categoryFor(node); };
+	for (const node of ordered) { const info = anchorFor(node); if (!groups.has(info.key)) groups.set(info.key, { ...info, nodes: [] }); groups.get(info.key).nodes.push(node); }
 	const sorted = [...groups.values()].sort((a, b) => compare(a.key, b.key)), positions = new Map();
 	const modular = ordered.some(node => node.category && typeof node.path === "string");
-	const { anchors, order: categories } = groupAnchors(sorted, data, categoryFor);
+	const embedding = ordered.length <= 256 ? graphEmbedding(data) : undefined, vectors = embedding?.informative ? embedding.vectors : undefined;
+	const ids = vectors ? ordered.map(node => node.id) : [], mapped = vectors ? semanticMap(ids, vectors) : undefined;
+	const { anchors, order: categories } = groupAnchors(sorted, data, anchorFor, vectors);
+	const maxWeight = ordered.reduce((maximum, node) => Math.max(maximum, drawingWeight(node) ?? 0), 0);
 	for (const group of categories) {
 		const anchor = anchors.get(group.key);
+		let meanX = 0, meanY = 0, extent = 0;
+		if (mapped) {
+			for (const node of group.nodes) { const point = mapped.get(node.id); meanX += point[0] / group.nodes.length; meanY += point[1] / group.nodes.length; }
+			for (const node of group.nodes) { const point = mapped.get(node.id); extent = Math.max(extent, Math.hypot(point[0] - meanX, point[1] - meanY)); }
+		}
+		const scale = extent ? (7 + Math.sqrt(group.nodes.length) * 13) / extent : 0;
 		group.nodes.forEach((node, at) => {
-			const phase = (hash(node.id) % 1000) / 1000 * .3, angle = at * 2.399963229728653 + phase, distance = 7 + Math.sqrt(at) * 13, old = previousPositions?.get(node.id);
-			positions.set(node.id, { node, category: group.key, x: old?.x ?? anchor.x + Math.cos(angle) * distance, y: old?.y ?? anchor.y + Math.sin(angle) * distance, vx: 0, vy: 0, radius: roots.has(node.id) ? 4 : 2.2, degree: 0, forceDegree: 0 });
+			const phase = (hash(node.id) % 1000) / 1000 * .3, angle = at * 2.399963229728653 + phase, distance = 7 + Math.sqrt(at) * 13, old = previousPositions?.get(node.id), point = mapped?.get(node.id);
+			const x = point ? group.nodes.length === 1 ? anchor.x : anchor.x + (point[0] - meanX) * scale + Math.cos(angle) * .3 : anchor.x + Math.cos(angle) * distance;
+			const y = point ? group.nodes.length === 1 ? anchor.y : anchor.y + (point[1] - meanY) * scale + Math.sin(angle) * .3 : anchor.y + Math.sin(angle) * distance;
+			positions.set(node.id, { node, category: group.key, x: old?.x ?? x, y: old?.y ?? y, vx: 0, vy: 0, radius: roots.has(node.id) ? 4 : 2.2, degree: 0, forceDegree: 0 });
 		});
 	}
 	const links = data.edges.map((edge, index) => ({ ...edge, index, source: positions.get(edge.from), target: positions.get(edge.to) }));
@@ -135,7 +185,19 @@ export function createSimulation(data, previousPositions, categoryFor = category
 		if (!modular || (link.kind !== "association" && link.label !== "within project root")) { link.source.forceDegree++; link.target.forceDegree++; }
 	}
 	const points = [...positions.values()];
-	for (const point of points) point.radius = Math.max(point.radius, Math.min(4.5, 2 + Math.log2(point.degree + 1) * .35));
+	for (const point of points) {
+		const weight = drawingWeight(point.node);
+		point.radius = weight === undefined ? Math.max(point.radius, Math.min(4.5, 2 + Math.log2(point.degree + 1) * .35)) : 2.5 + 5.5 * Math.sqrt(weight / maxWeight);
+	}
+	const forceLinks = [...links].sort((a, b) => compare(a.from, b.from) || compare(a.to, b.to) || compare(a.kind ?? "", b.kind ?? "") || compare(a.label ?? "", b.label ?? ""));
+	const semanticLinks = vectors ? semanticNeighbours(ids, vectors, { k: 3, minimum: .2 }).map(pair => ({ source: positions.get(pair.a), target: positions.get(pair.b), similarity: pair.similarity })) : [];
+	// Cohesion uses doc concept families when nodes share one; otherwise lexical families from the term vectors.
+	// The room is a disc with the padded area of all members, so cohesion never packs large weighted dots onto each other.
+	// Only bound weights size the room. An unweighted radius grows with every link, project associations included, so it takes its largest value.
+	const families = (concepts.length ? concepts.map(family => family.members) : vectors ? semanticFamilies(ids, vectors).map(family => family.members) : []).map(memberIds => {
+		const members = memberIds.map(id => positions.get(id));
+		return { members, memberSet: new Set(members), room: Math.sqrt(members.reduce((sum, point) => sum + ((drawingWeight(point.node) === undefined ? 4.5 : point.radius) + 9) ** 2, 0)) };
+	});
 	let spatial = tree(points), alpha = 1;
 	const stats = { visits: 0, ticks: 0 };
 	function tick() {
@@ -165,12 +227,37 @@ export function createSimulation(data, previousPositions, categoryFor = category
 			point.vx += (anchor.x - point.x) * (modular ? .045 : .002) * alpha - point.x * (modular ? 0 : .0004) * alpha;
 			point.vy += (anchor.y - point.y) * (modular ? .045 : .002) * alpha - point.y * (modular ? 0 : .0004) * alpha;
 		}
-		for (const { source: a, target: b, label, kind } of links) if (a !== b && (!modular || (kind !== "association" && label !== "within project root"))) {
+		for (const { source: a, target: b, label, kind } of forceLinks) if (a !== b && (!modular || (kind !== "association" && label !== "within project root"))) {
 			const dx = b.x - a.x, dy = b.y - a.y, distance = Math.hypot(dx, dy) || 1, local = a.category === b.category, wanted = local ? 42 : modular ? 100 : 72;
 			const reference = kind === "import" || kind === "reference" || label === "imports";
 			const strength = !modular ? .018 : local ? reference ? .008 : .012 : reference ? .0004 : .0012;
 			const force = (distance - wanted) / distance * strength * alpha, balance = Math.sqrt(Math.max(1, a.forceDegree, b.forceDegree));
 			a.vx += dx * force / balance; a.vy += dy * force / balance; b.vx -= dx * force / balance; b.vy -= dy * force / balance;
+		}
+		for (const { source: a, target: b, similarity } of semanticLinks) {
+			const dx = b.x - a.x, dy = b.y - a.y, distance = Math.hypot(dx, dy) || 1, local = a.category === b.category, wanted = local ? 30 + (1 - similarity) * 40 : 60 + (1 - similarity) * 80;
+			if (distance <= wanted) continue;
+			const strength = (local ? .006 : .0025) * similarity * alpha, balance = Math.sqrt(Math.max(1, a.forceDegree, b.forceDegree)), force = (distance - wanted) / distance * strength / balance;
+			a.vx += dx * force; a.vy += dy * force; b.vx -= dx * force; b.vy -= dy * force;
+		}
+		for (const { members, memberSet, room } of families) {
+			let x = 0, y = 0, radius = 0;
+			for (const point of members) { x += point.x / members.length; y += point.y / members.length; }
+			for (const point of members) {
+				const distance = Math.hypot(point.x - x, point.y - y), pull = distance > room ? (1 - room / distance) * .05 * alpha : 0;
+				radius = Math.max(radius, distance);
+				point.vx += (x - point.x) * pull; point.vy += (y - point.y) * pull;
+			}
+			radius += 18;
+			for (const point of points) if (!memberSet.has(point)) {
+				let dx = point.x - x, dy = point.y - y;
+				const distance = Math.hypot(dx, dy);
+				if (distance >= radius) continue;
+				if (distance) { dx /= distance; dy /= distance; }
+				else { const angle = hash(point.node.id) * .01; dx = Math.cos(angle); dy = Math.sin(angle); }
+				const force = (radius - distance) * .3 * alpha;
+				point.vx += dx * force; point.vy += dy * force;
+			}
 		}
 		for (const point of points) {
 			point.vx = Math.max(-12, Math.min(12, point.vx * .72)); point.vy = Math.max(-12, Math.min(12, point.vy * .72));
