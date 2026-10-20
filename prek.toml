@@ -30,9 +30,9 @@ hooks = [
   },
   {
     id = "cargo-test",
-    name = "cargo test --workspace --locked",
+    name = "cargo nextest run --workspace --locked",
     language = "system",
-    entry = "cargo test --workspace --locked",
+    entry = "cargo nextest run --workspace --locked",
     pass_filenames = false,
     always_run = true,
   },

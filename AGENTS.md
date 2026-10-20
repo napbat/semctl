@@ -129,7 +129,7 @@ handoff unless the environment prevents it.
 
 ```text
 cargo fmt --check
-cargo test --workspace --locked
+cargo nextest run --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items --locked
 git diff --check

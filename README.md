@@ -369,7 +369,7 @@ The configured hooks run:
 cargo fmt --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items --locked
-cargo test --workspace --locked
+cargo nextest run --workspace --locked
 mise exec -c "bun test plugins/semctx/adapters/omp/index.test.ts"
 python3 tests/bootstrap_installers.py
 ```

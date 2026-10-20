@@ -10,11 +10,11 @@
 //!
 //! The successful startup case needs a test process outside every job that
 //! forbids breakaway. On Windows, Cargo runs every test inside such a job, so
-//! that case is ignored under `cargo test`. Run it locally from the test
+//! that case is ignored under `cargo nextest run`. Run it locally from the test
 //! binary directly:
 //!
 //! ```text
-//! cargo test --locked --test daemon_windows_jobs --no-run
+//! cargo nextest run --locked --test daemon_windows_jobs --no-run
 //! target\debug\deps\daemon_windows_jobs-<hash>.exe --ignored --exact a_daemon_started_in_a_breakaway_job_outlives_that_job
 //! ```
 
@@ -523,7 +523,7 @@ fn assert_breakaway_possible() {
 #[tokio::test]
 #[ignore = "run only as the gated subprocess of an owning Windows job test"]
 async fn job_client_helper() {
-    // `cargo test -- --include-ignored` also runs this helper. Without its
+    // `cargo nextest run --run-ignored all` also runs this helper. Without its
     // parent it has no job and no isolated root, so it has nothing to test.
     let (Some(root), Ok(case)) = (std::env::var_os(ROOT_VAR), std::env::var(CASE_VAR)) else {
         eprintln!("skipped: {HELPER_TEST} runs only as the subprocess of a job test");
