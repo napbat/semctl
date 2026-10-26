@@ -3,6 +3,7 @@
 //! The stub answers over real sockets, so these tests use the real clock and
 //! small times. A paused clock would jump forward while a socket is idle.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -12,7 +13,7 @@ use super::{
     DEADLINE_MARGIN, GATEWAY_RETRY_DELAY, Idempotency, allows_wait, is_gateway_status, usable_until,
 };
 use crate::client::stub::{Reply, Stub};
-use crate::client::{ApiFailure, Client};
+use crate::client::{ApiFailure, Client, PartialAnswers};
 use crate::query::ToolError;
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -126,6 +127,142 @@ async fn a_loading_answer_is_retried_until_the_server_is_ready_without_a_deadlin
 
     assert_eq!(probe, Probe { ok: true });
     assert_eq!(stub.requests(), 2);
+}
+
+/// The log text that the client writes on this thread while a capture runs.
+#[derive(Clone, Default)]
+struct Log(Arc<Mutex<Vec<u8>>>);
+
+impl Log {
+    /// Send the log events of this thread to this log until the guard drops.
+    fn capture(&self) -> tracing::subscriber::DefaultGuard {
+        let log = self.clone();
+        tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(move || log.clone())
+                .with_ansi(false)
+                .with_target(false)
+                .without_time()
+                .with_max_level(tracing::Level::WARN)
+                .finish(),
+        )
+    }
+
+    fn text(&self) -> String {
+        let bytes = self
+            .0
+            .lock()
+            .expect("no writer panics while it holds the log");
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+impl std::io::Write for Log {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .expect("no writer panics while it holds the log")
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_partial_graph_answer_is_kept_and_recorded_without_a_retry() {
+    for (reason, repair, advice) in [
+        (
+            "providers-unavailable",
+            "none",
+            "a retry returns the same result",
+        ),
+        ("flow-truncated", "none", "a retry returns the same result"),
+        (
+            "providers-loading",
+            "pending",
+            "a later call can return more",
+        ),
+        (
+            "source-incomplete",
+            "pending",
+            "a later call can return more",
+        ),
+        ("graph-loading", "pending", "a later call can return more"),
+    ] {
+        let log = Log::default();
+        let _capture = log.capture();
+        // A retry would get the second answer, so the probe shows whether the
+        // client kept the first one.
+        let stub = Stub::serve(vec![
+            Reply::partial(reason, repair, PROBE),
+            Reply::ok(r#"{"ok":false}"#),
+        ])
+        .await;
+        let partial = PartialAnswers::default();
+
+        let probe = client(&stub)
+            .with_partial_answers(partial.clone())
+            .get::<Probe>("/v1/probe")
+            .await
+            .expect("the partial answer is a success");
+
+        assert_eq!(probe, Probe { ok: true }, "{reason}: the answer is kept");
+        assert_eq!(stub.requests(), 1, "{reason}: the answer is not retried");
+        let answers: Vec<String> = partial.answers().iter().map(ToString::to_string).collect();
+        assert!(
+            answers.len() == 1
+                && answers[0].starts_with(&format!("the graph answer is partial ({reason})"))
+                && answers[0].ends_with(advice),
+            "{reason}/{repair}: the record names the reason and the advice: {answers:?}"
+        );
+        assert_eq!(
+            log.text(),
+            "",
+            "{reason}: the caller shows a recorded answer, so the log does not"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_partial_graph_answer_without_a_record_goes_to_the_log() {
+    let log = Log::default();
+    let _capture = log.capture();
+    let stub = Stub::serve(vec![Reply::partial("flow-truncated", "none", PROBE)]).await;
+
+    client(&stub)
+        .get::<Probe>("/v1/probe")
+        .await
+        .expect("the partial answer is a success");
+
+    let text = log.text();
+    assert!(
+        text.contains("WARN")
+            && text.contains(
+                "the graph answer is partial (flow-truncated); a retry returns the same result"
+            ),
+        "{text:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_complete_graph_answer_records_and_writes_nothing() {
+    let log = Log::default();
+    let _capture = log.capture();
+    let stub = Stub::serve(vec![Reply::ok(PROBE)]).await;
+    let partial = PartialAnswers::default();
+
+    let probe = client(&stub)
+        .with_partial_answers(partial.clone())
+        .get::<Probe>("/v1/probe")
+        .await
+        .expect("the answer is a success");
+
+    assert_eq!(probe, Probe { ok: true });
+    assert_eq!(partial.answers(), Vec::new());
+    assert_eq!(log.text(), "", "a complete answer writes nothing");
 }
 
 #[tokio::test]

@@ -216,6 +216,12 @@ async fn user_prompt_context(cli: &Cli, input: &HookInput) -> Option<String> {
         prefer: None,
         granularity: None,
     };
+    // The client keeps no record of partial graph answers here, so the hook
+    // shows none. Its stdout is the JSON context of the model, and a hook
+    // writes nothing to stderr (see `init_tracing`): the OMP adapter drops
+    // that stream, and Claude Code and Codex do not give it to the model. The
+    // hits are only candidates. The tool that the agent calls next reports a
+    // partial answer in its own result.
     let search = async {
         let hits: Vec<api::SearchHit> = client.post("/v1/search", &body).await.ok()?;
         let stale = crate::query::stale_paths(&client, &hits).await;

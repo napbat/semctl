@@ -3,8 +3,9 @@
 use anyhow::Result;
 use clap::Args;
 
+use super::answer;
 use crate::cli::Cli;
-use crate::client;
+use crate::client::{self, PartialAnswers};
 use crate::query;
 
 #[derive(Debug, Args)]
@@ -45,7 +46,8 @@ pub struct SearchArgs {
 }
 
 pub async fn run(args: SearchArgs, cli: &Cli) -> Result<()> {
-    let mut client = client::from_cli(cli)?;
+    let partial = PartialAnswers::default();
+    let mut client = client::from_cli(cli)?.with_partial_answers(partial.clone());
 
     // Opportunistically bind the cwd's codebase so `--expand` and the staleness
     // check can use the local checkout. Harmless if it stays unbound — search
@@ -68,9 +70,5 @@ pub async fn run(args: SearchArgs, cli: &Cli) -> Result<()> {
     let out = query::search(&client, &args.query, args.top_k, &args.domains, &opts)
         .await
         .map_err(query::ToolError::into_cli_error)?;
-    print!("{out}");
-    if !out.ends_with('\n') {
-        println!();
-    }
-    Ok(())
+    answer::print(&out, &partial)
 }
