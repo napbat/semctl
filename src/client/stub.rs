@@ -54,6 +54,19 @@ impl Reply {
             body: "<html>gateway failure</html>".to_string(),
         }
     }
+
+    /// `200 OK` with `data` and the headers of a partial graph answer.
+    pub(crate) fn partial(reason: &'static str, repair: &'static str, data: &str) -> Self {
+        Self::Answer {
+            status: "200 OK",
+            headers: vec![
+                ("X-Semctx-Graph-State", "partial"),
+                ("X-Semctx-Graph-Invalidation", reason),
+                ("X-Semctx-Graph-Repair", repair),
+            ],
+            body: format!(r#"{{"success":true,"data":{data}}}"#),
+        }
+    }
 }
 
 /// A running stub. Dropping it does not stop the listener; the test runtime

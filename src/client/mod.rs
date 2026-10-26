@@ -24,6 +24,7 @@ use crate::auth;
 use crate::session::{CredentialScope, CredentialSource, SessionContext};
 
 mod failure;
+mod graph_state;
 mod retry;
 #[cfg(test)]
 pub(crate) mod stub;

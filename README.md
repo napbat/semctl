@@ -68,6 +68,17 @@ error that names the files that the server did not receive. Run `semctl index`
 again to upload them. The MCP auto-index logs the same files, and
 `semctl daemon status` shows them for each checkout.
 
+The semctx server can answer a graph or search request with a partial answer.
+It then sets the `X-Semctx-Graph-State: partial` header, gives the reason in
+`X-Semctx-Graph-Invalidation`, and gives the repair state in
+`X-Semctx-Graph-Repair`. semctl keeps the answer and does not retry it. It
+writes a warning with the reason to stderr. When the repair state is `none`
+(for example `providers-unavailable` or `flow-truncated`), the warning says that
+a retry returns the same result. When the repair state is `pending` (for
+example `providers-loading`), the warning says that a later call can return
+more. Under `semctl mcp`, the warning goes to the log of the MCP server process,
+not to the tool result.
+
 ## Grammar-native editing
 
 The server's edit operations are planners: they resolve one qualified or
