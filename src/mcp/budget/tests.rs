@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rmcp::ServiceExt;
+use rmcp::model::{CallToolResult, Content};
 use serde_json::{Value, json};
 use tokio::io::{
     AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines, ReadHalf, WriteHalf,
@@ -346,9 +347,11 @@ async fn an_edit_tool_is_never_cut_off_by_the_call_deadline() {
 }
 
 /// A coordinator keeps the client it is given for the life of the session. A
-/// deadline on that client would fail every request after the first call ended.
+/// deadline on that client would fail every request after the first call ended,
+/// and a record on it would give the partial answers of later work to a call
+/// that has ended.
 #[tokio::test(start_paused = true)]
-async fn the_binding_a_server_keeps_never_carries_a_call_deadline() {
+async fn the_binding_a_server_keeps_never_carries_a_call_deadline_or_record() {
     let server = server_with(Client::for_test("codebase", None), DEADLINE);
     let budget = CallBudget::until(Instant::now() + DEADLINE);
 
@@ -358,6 +361,7 @@ async fn the_binding_a_server_keeps_never_carries_a_call_deadline() {
         .expect("the pinned binding resolves");
 
     assert_eq!(client.deadline(), budget.deadline());
+    assert!(client.records_partial_answers());
     let kept = server
         .shared
         .bound
@@ -366,6 +370,7 @@ async fn the_binding_a_server_keeps_never_carries_a_call_deadline() {
         .clone()
         .expect("the server keeps the binding");
     assert_eq!(kept.deadline(), None);
+    assert!(!kept.records_partial_answers());
     let unbounded = CallBudget::unbounded();
     let later = server
         .bound_unchecked("rename_symbol", &unbounded)
@@ -375,5 +380,75 @@ async fn the_binding_a_server_keeps_never_carries_a_call_deadline() {
         later.deadline(),
         None,
         "no deadline carries over to a later call"
+    );
+}
+
+/// The texts of all content blocks of a `CallToolResult`.
+fn texts_of(result: &Value) -> Vec<&str> {
+    result["content"]
+        .as_array()
+        .expect("the result carries content")
+        .iter()
+        .map(|block| block["text"].as_str().expect("a text block"))
+        .collect()
+}
+
+/// The daemon serves a session through the same `serve` call as this test, so
+/// the note reaches an agent of the shared daemon too.
+#[tokio::test]
+async fn a_tool_result_notes_the_partial_graph_answers_of_its_own_call_only() {
+    let stub = Stub::serve(vec![
+        Reply::partial("providers-unavailable", "none", "[]"),
+        Reply::ok("[]"),
+    ])
+    .await;
+    let server = server_with(Client::for_test_server(&stub.url), DEADLINE);
+    let mut host = Host::connect(server).await;
+
+    let first = host.call_tool("list_domains", json!({})).await;
+    let second = host.call_tool("list_domains", json!({})).await;
+
+    assert_ne!(first["isError"], true, "{first}");
+    let texts = texts_of(&first);
+    assert_eq!(texts.len(), 2, "{first}");
+    assert_eq!(
+        texts[1],
+        "note: the graph answer is partial (providers-unavailable); a retry returns the same \
+         result"
+    );
+    assert_eq!(
+        texts_of(&second).len(),
+        1,
+        "a later call does not repeat the note: {second}"
+    );
+}
+
+#[tokio::test]
+async fn a_pending_partial_answer_notes_that_a_later_call_can_return_more() {
+    let stub = Stub::serve(vec![Reply::partial("providers-loading", "pending", "[]")]).await;
+    let budget = CallBudget::until(Instant::now() + DEADLINE);
+    budget
+        .for_call(Client::for_test_server(&stub.url))
+        .get::<Value>("/v1/codebases/c/graph/references")
+        .await
+        .expect("the partial answer is a success");
+
+    let noted = budget.with_partial_notes(CallToolResult::success(vec![Content::text("refs")]));
+    let failed = budget.with_partial_notes(CallToolResult::error(vec![Content::text("failed")]));
+
+    let noted = serde_json::to_value(noted).expect("serialize the result");
+    assert_eq!(
+        texts_of(&noted),
+        vec![
+            "refs",
+            "note: the graph answer is partial (providers-loading); the server still builds the \
+             missing part, so a later call can return more"
+        ]
+    );
+    let failed = serde_json::to_value(failed).expect("serialize the result");
+    assert_eq!(
+        texts_of(&failed),
+        vec!["failed"],
+        "an error result has no answer to qualify"
     );
 }

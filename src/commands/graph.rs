@@ -6,8 +6,9 @@
 use anyhow::Result;
 use clap::Subcommand;
 
+use super::answer;
 use crate::cli::Cli;
-use crate::client;
+use crate::client::{self, PartialAnswers};
 use crate::query;
 
 #[derive(Debug, Subcommand)]
@@ -157,7 +158,10 @@ pub enum GraphCommand {
 }
 
 pub async fn run(command: GraphCommand, cli: &Cli) -> Result<()> {
-    let client = client::for_cwd(cli).await?;
+    let partial = PartialAnswers::default();
+    let client = client::for_cwd(cli)
+        .await?
+        .with_partial_answers(partial.clone());
     let out = match command {
         GraphCommand::Imports => query::imports(&client).await,
         GraphCommand::SymbolEdges => query::symbol_edges(&client).await,
@@ -226,9 +230,5 @@ pub async fn run(command: GraphCommand, cli: &Cli) -> Result<()> {
         } => query::file_outline(&client, &path, max_depth, &kinds, include_body).await,
     };
     let out = out.map_err(query::ToolError::into_cli_error)?;
-    print!("{out}");
-    if !out.ends_with('\n') {
-        println!();
-    }
-    Ok(())
+    answer::print(&out, &partial)
 }

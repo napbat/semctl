@@ -13,7 +13,7 @@ use super::{
     DEADLINE_MARGIN, GATEWAY_RETRY_DELAY, Idempotency, allows_wait, is_gateway_status, usable_until,
 };
 use crate::client::stub::{Reply, Stub};
-use crate::client::{ApiFailure, Client};
+use crate::client::{ApiFailure, Client, PartialAnswers};
 use crate::query::ToolError;
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -172,7 +172,7 @@ impl std::io::Write for Log {
 }
 
 #[tokio::test]
-async fn a_partial_graph_answer_is_kept_and_reported_without_a_retry() {
+async fn a_partial_graph_answer_is_kept_and_recorded_without_a_retry() {
     for (reason, repair, advice) in [
         (
             "providers-unavailable",
@@ -201,36 +201,67 @@ async fn a_partial_graph_answer_is_kept_and_reported_without_a_retry() {
             Reply::ok(r#"{"ok":false}"#),
         ])
         .await;
+        let partial = PartialAnswers::default();
 
         let probe = client(&stub)
+            .with_partial_answers(partial.clone())
             .get::<Probe>("/v1/probe")
             .await
             .expect("the partial answer is a success");
 
         assert_eq!(probe, Probe { ok: true }, "{reason}: the answer is kept");
         assert_eq!(stub.requests(), 1, "{reason}: the answer is not retried");
-        let text = log.text();
+        let answers: Vec<String> = partial.answers().iter().map(ToString::to_string).collect();
         assert!(
-            text.contains("WARN")
-                && text.contains(&format!("the graph answer is partial ({reason})"))
-                && text.contains(advice),
-            "{reason}/{repair}: the warning names the reason and the advice: {text:?}"
+            answers.len() == 1
+                && answers[0].starts_with(&format!("the graph answer is partial ({reason})"))
+                && answers[0].ends_with(advice),
+            "{reason}/{repair}: the record names the reason and the advice: {answers:?}"
+        );
+        assert_eq!(
+            log.text(),
+            "",
+            "{reason}: the caller shows a recorded answer, so the log does not"
         );
     }
 }
 
 #[tokio::test]
-async fn a_complete_graph_answer_writes_no_warning() {
+async fn a_partial_graph_answer_without_a_record_goes_to_the_log() {
+    let log = Log::default();
+    let _capture = log.capture();
+    let stub = Stub::serve(vec![Reply::partial("flow-truncated", "none", PROBE)]).await;
+
+    client(&stub)
+        .get::<Probe>("/v1/probe")
+        .await
+        .expect("the partial answer is a success");
+
+    let text = log.text();
+    assert!(
+        text.contains("WARN")
+            && text.contains(
+                "the graph answer is partial (flow-truncated); a retry returns the same result"
+            ),
+        "{text:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_complete_graph_answer_records_and_writes_nothing() {
     let log = Log::default();
     let _capture = log.capture();
     let stub = Stub::serve(vec![Reply::ok(PROBE)]).await;
+    let partial = PartialAnswers::default();
 
     let probe = client(&stub)
+        .with_partial_answers(partial.clone())
         .get::<Probe>("/v1/probe")
         .await
         .expect("the answer is a success");
 
     assert_eq!(probe, Probe { ok: true });
+    assert_eq!(partial.answers(), Vec::new());
     assert_eq!(log.text(), "", "a complete answer writes nothing");
 }
 

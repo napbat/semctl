@@ -34,6 +34,7 @@ use failure::gateway_error;
 use retry::Idempotency;
 
 pub(crate) use failure::ApiFailure;
+pub(crate) use graph_state::{PartialAnswer, PartialAnswers};
 pub(crate) use retry::DEADLINE_MARGIN;
 pub(crate) use transport::HttpTransport;
 
@@ -93,6 +94,10 @@ pub struct Client {
     /// owner keeps, such as a coordinator, never does: see
     /// [`Self::with_deadline`].
     deadline: Option<Instant>,
+    /// The record of the partial graph answers of one call, when the caller
+    /// shows them to a user. Like the deadline, only a per-call clone carries
+    /// one: see [`Self::with_partial_answers`].
+    partial_answers: Option<PartialAnswers>,
 }
 
 impl Client {
@@ -149,6 +154,7 @@ impl Client {
             capabilities: Arc::new(tokio::sync::OnceCell::new()),
             remote_permits,
             deadline: None,
+            partial_answers: None,
         }
     }
 
@@ -202,10 +208,28 @@ impl Client {
         self
     }
 
+    /// The same client, with every partial graph answer put in `answers`.
+    ///
+    /// This is for one call, like [`Self::with_deadline`]. The caller reads
+    /// `answers` after the call and shows each answer to the user. Without a
+    /// record, the client writes a partial answer to the log.
+    #[must_use]
+    pub(crate) fn with_partial_answers(mut self, answers: PartialAnswers) -> Self {
+        self.partial_answers = Some(answers);
+        self
+    }
+
     /// The deadline of this client, for tests that check which clients carry one.
     #[cfg(test)]
     pub(crate) fn deadline(&self) -> Option<Instant> {
         self.deadline
+    }
+
+    /// Whether this client records partial answers, for tests that check which
+    /// clients carry a record.
+    #[cfg(test)]
+    pub(crate) fn records_partial_answers(&self) -> bool {
+        self.partial_answers.is_some()
     }
 
     /// Attach a checkout only when its source identity can be derived. A failed

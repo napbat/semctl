@@ -784,7 +784,8 @@ impl ServerHandler for McpServer {
     // parameter, and the tool passes it on explicitly. The timeout here is the
     // backstop for work that no client request bounds, such as a wait for a
     // gate. A client request fails earlier and says why. Edit tools have an
-    // unbounded budget and are never cut off.
+    // unbounded budget and are never cut off. The budget also records the
+    // partial graph answers of the call, and the result gets a note for each.
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
@@ -793,7 +794,7 @@ impl ServerHandler for McpServer {
         let tool_deadline = self.shared.context.tool_deadline;
         let budget = call_budget(&request.name, Instant::now(), tool_deadline);
         let op = tool_op(&self.tool_router, &request.name);
-        context.extensions.insert(budget);
+        context.extensions.insert(budget.clone());
         let call = self
             .tool_router
             .call(ToolCallContext::new(self, request, context));
@@ -801,6 +802,7 @@ impl ServerHandler for McpServer {
             .run(call)
             .await
             .unwrap_or_else(|_| Ok(deadline_result(op, tool_deadline)))
+            .map(|result| budget.with_partial_notes(result))
     }
 
     // Not `async`: there is nothing to await, and the trait accepts any

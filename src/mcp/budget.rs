@@ -1,28 +1,33 @@
-//! The time budget of one MCP tool call.
+//! The budget of one MCP tool call: its deadline and its record of partial
+//! graph answers.
 //!
 //! `call_tool` builds one [`CallBudget`] per call and puts it in the request's
 //! extensions. Each tool receives it and passes it on, explicitly, to the client
-//! it builds and to the first-index waits. Nothing reads a deadline from ambient
-//! state, so a client that a long-lived owner keeps never has a deadline from an
-//! earlier call.
+//! it builds and to the first-index waits. Nothing reads a deadline or a record
+//! from ambient state, so a client that a long-lived owner keeps never has a
+//! deadline or a record from an earlier call.
 
 use std::{borrow::Cow, time::Duration};
 
 use rmcp::{
     handler::server::router::tool::ToolRouter,
-    model::{CallToolResult, IntoContents},
+    model::{CallToolResult, Content, IntoContents},
 };
 use tokio::time::{Instant, error::Elapsed};
 
 use super::{DIRECT_EDIT_TOOLS, McpServer};
-use crate::client::DEADLINE_MARGIN;
+use crate::client::{Client, DEADLINE_MARGIN, PartialAnswers};
 use crate::query::{FailureKind, ToolError};
 
-/// How long one call may run, as a moment in time. An unbounded budget has no
-/// moment.
-#[derive(Clone, Copy, Debug)]
+/// How long one call may run, as a moment in time, and the partial graph
+/// answers that the call got. An unbounded budget has no moment.
+///
+/// A clone shares the record, so the copy that a tool receives adds to the
+/// record that `call_tool` reads.
+#[derive(Clone, Debug)]
 pub(crate) struct CallBudget {
     deadline: Option<Instant>,
+    partial_answers: PartialAnswers,
 }
 
 impl CallBudget {
@@ -30,6 +35,7 @@ impl CallBudget {
     pub(crate) fn until(deadline: Instant) -> Self {
         Self {
             deadline: Some(deadline),
+            partial_answers: PartialAnswers::default(),
         }
     }
 
@@ -37,10 +43,39 @@ impl CallBudget {
     /// and a call cut off after the change would report a failure for an edit
     /// that happened.
     pub(crate) fn unbounded() -> Self {
-        Self { deadline: None }
+        Self {
+            deadline: None,
+            partial_answers: PartialAnswers::default(),
+        }
     }
 
-    /// The moment the call must end by, or `None` when it is unbounded.
+    /// `client` for this call: bounded by the deadline, and with its partial
+    /// graph answers put in the record of this call. Never give the result to
+    /// an owner that outlives the call.
+    pub(crate) fn for_call(&self, client: Client) -> Client {
+        client
+            .with_deadline(self.deadline)
+            .with_partial_answers(self.partial_answers.clone())
+    }
+
+    /// `result` with one note for each partial graph answer of this call, so
+    /// the agent knows that the answer is not complete. An error result gets
+    /// no note: the agent has no answer to qualify.
+    pub(crate) fn with_partial_notes(&self, mut result: CallToolResult) -> CallToolResult {
+        if result.is_error != Some(true) {
+            result.content.extend(
+                self.partial_answers
+                    .answers()
+                    .iter()
+                    .map(|answer| Content::text(format!("note: {answer}"))),
+            );
+        }
+        result
+    }
+
+    /// The moment the call must end by, or `None` when it is unbounded, for
+    /// tests that check which clients carry it.
+    #[cfg(test)]
     pub(crate) fn deadline(&self) -> Option<Instant> {
         self.deadline
     }

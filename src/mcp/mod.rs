@@ -203,22 +203,21 @@ impl McpServer {
             .await
     }
 
-    /// The session's base client, bounded by `budget`.
+    /// The session's base client, for this call only (see
+    /// [`CallBudget::for_call`]).
     ///
     /// Use it for a request that this call makes and that nothing keeps. A
     /// client that a watcher or the binding keeps is cloned from `base` itself,
-    /// without a deadline.
+    /// without a deadline or a record.
     fn base_for(&self, budget: &CallBudget) -> Client {
-        self.shared.base.clone().with_deadline(budget.deadline())
+        budget.for_call(self.shared.base.clone())
     }
 
-    /// The bound client when this session has one, else the base client, bounded
-    /// by `budget`. Tools that list or search without a codebase use it.
+    /// The bound client when this session has one, else the base client, for
+    /// this call only. Tools that list or search without a codebase use it.
     async fn bound_or_base(&self, budget: &CallBudget) -> Client {
         let bound = self.shared.bound.lock().await.clone();
-        bound
-            .unwrap_or_else(|| self.shared.base.clone())
-            .with_deadline(budget.deadline())
+        budget.for_call(bound.unwrap_or_else(|| self.shared.base.clone()))
     }
 
     /// Ask the engine for its one update check, on this session's behalf.
@@ -343,7 +342,7 @@ impl McpServer {
         // queue and reuse one bind instead of each registering a codebase.
         let mut guard = self.shared.bound.lock().await;
         if let Some(c) = guard.as_ref() {
-            return Ok(c.clone().with_deadline(budget.deadline()));
+            return Ok(budget.for_call(c.clone()));
         }
 
         // Pinned: the codebase is already on `base`. Never associate it with the
@@ -354,7 +353,7 @@ impl McpServer {
             *guard = Some(c.clone());
             drop(guard);
             self.watch_checkout_once(&c).await;
-            return Ok(c.with_deadline(budget.deadline()));
+            return Ok(budget.for_call(c));
         }
 
         let dir = self.dir().await.clone();
@@ -423,7 +422,7 @@ impl McpServer {
         // the bound checkout only after resolution succeeds, including after a
         // login performed while this MCP server was already running.
         self.watch_checkout_once(&client).await;
-        Ok(client.with_deadline(budget.deadline()))
+        Ok(budget.for_call(client))
     }
 
     /// Resolve an optional per-call selector. Omitted means the launch/current
@@ -522,7 +521,7 @@ impl McpServer {
                 .with_codebase(resolved.id)
                 .with_local_root(Some(watch_dir.clone()));
             self.watch_once(client.clone(), watch_dir).await;
-            return Ok(client.with_deadline(budget.deadline()));
+            return Ok(budget.for_call(client));
         }
 
         match self
@@ -536,7 +535,7 @@ impl McpServer {
                     &self.shared.context.cwd,
                 );
                 self.watch_checkout_once(&client).await;
-                Ok(client.with_deadline(budget.deadline()))
+                Ok(budget.for_call(client))
             }
             Ok(None) => Err(ToolError::new(
                 op,

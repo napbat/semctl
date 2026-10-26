@@ -2,6 +2,7 @@
 //! clap args plus a `run` entry point — dispatched from [`crate::cli`].
 //! (`uninstall` lives in [`install`], next to the install logic it reverses.)
 
+mod answer;
 pub mod auth;
 pub mod daemon;
 pub mod edit;

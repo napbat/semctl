@@ -19,8 +19,7 @@ use tokio::{sync::OwnedSemaphorePermit, time::Instant};
 use tracing::debug;
 
 use super::{
-    Client, failure::response_body_error, graph_state::warn_if_partial, loading_retry_delay,
-    tenant_binding_denied,
+    Client, failure::response_body_error, graph_state, loading_retry_delay, tenant_binding_denied,
 };
 
 /// How long loading retries may run when no call deadline applies.
@@ -147,7 +146,12 @@ impl Client {
             if status.is_success() {
                 // A partial graph answer is the best result the server has.
                 // A retry cannot improve it at once, so the client keeps it.
-                warn_if_partial(method.as_str(), &url, resp.headers());
+                graph_state::observe(
+                    method.as_str(),
+                    &url,
+                    resp.headers(),
+                    self.partial_answers.as_ref(),
+                );
             }
             if status != StatusCode::FORBIDDEN {
                 return Ok((resp, url));

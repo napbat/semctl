@@ -72,12 +72,22 @@ The semctx server can answer a graph or search request with a partial answer.
 It then sets the `X-Semctx-Graph-State: partial` header, gives the reason in
 `X-Semctx-Graph-Invalidation`, and gives the repair state in
 `X-Semctx-Graph-Repair`. semctl keeps the answer and does not retry it. It
-writes a warning with the reason to stderr. When the repair state is `none`
-(for example `providers-unavailable` or `flow-truncated`), the warning says that
-a retry returns the same result. When the repair state is `pending` (for
-example `providers-loading`), the warning says that a later call can return
-more. Under `semctl mcp`, the warning goes to the log of the MCP server process,
-not to the tool result.
+tells the user that the answer is partial and gives the reason:
+
+- `semctl graph` and `semctl search` print the answer on stdout. Then they
+  print one `warning:` line for each partial answer on stderr. `RUST_LOG` does
+  not hide this line.
+- An MCP tool result gets one more text block for each partial answer:
+  `note: the graph answer is partial (<reason>); …`. A result through the
+  shared daemon gets the same block. An error result gets no note.
+- `semctl hook` shows no partial answer. Its stdout is the JSON context of the
+  model, and it writes nothing to stderr. Its search hits are only candidates,
+  and the tool that the agent calls next gives the note.
+
+When the repair state is `none` (for example `providers-unavailable` or
+`flow-truncated`), the text says that a retry returns the same result. When the
+repair state is `pending` (for example `providers-loading`), the text says that
+a later call can return more.
 
 ## Grammar-native editing
 
