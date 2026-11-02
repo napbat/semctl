@@ -262,6 +262,18 @@ async fn refresh_request(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
+        // Identity refuses a refresh token with `invalid_grant` when the token
+        // was revoked or expired, or when the account's security stamp changed
+        // after the grant (password, email, MFA, or session revocation). The
+        // stored login cannot recover from that, so tell the user what to do.
+        if serde_json::from_str::<TokenErrorResponse>(&body)
+            .is_ok_and(|error| error.error == "invalid_grant")
+        {
+            bail!(
+                "{identity_url} no longer accepts the stored login (it was revoked or expired, \
+                 or the account's security settings changed) — run `semctl auth login`"
+            );
+        }
         bail!("refresh {status}: {body}");
     }
     let mut raw: TokenResponse = resp.json().await.context("parse refresh response")?;
