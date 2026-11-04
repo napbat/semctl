@@ -30,4 +30,4 @@ Example: find function definitions → `{ "pattern": "fn \\w+\\(" }`. To search 
 ## Notes
 
 - Searches the indexed snapshot, so brand-new local edits aren't reflected until the codebase re-syncs (see `sync_status`).
-- Results stop at `max`, or earlier at the byte budget of the server: by default 32 KiB of path and line text in one response. The server cuts each line at 512 bytes by default. Narrow with `path` before raising `max`.
+- Results stop at `max`, or earlier at the byte budget of the server: by default 32 KiB of path and line text in one response. The server cuts each line at 512 bytes by default. When the server cuts a line or drops matches, the result starts with `note: the server cut this result to its content budget …` and a `next:` step. Narrow with `path` before raising `max`.

@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::fmt::Write;
 use std::path::Path;
 
-use crate::client::api;
+use crate::client::{ResultTruncation, api};
 
 use super::inspection::GRAPH_LIST_CAP;
 
@@ -338,6 +338,41 @@ pub(super) fn render_hits_inner(
         out.push('\n');
     }
     out
+}
+
+/// A result that the content budget of the server can shorten. The budget and
+/// the next step differ between the two.
+#[derive(Clone, Copy)]
+pub(super) enum BudgetedResult {
+    Search,
+    Grep,
+}
+
+/// The first line of a result that the server shortened: what the budget is
+/// and what the agent can do. The budget values are the server defaults
+/// (`Search:ContentBudgetBytes`, `Search:GrepMaxBytes`,
+/// `Search:GrepMaxLineBytes`).
+pub(super) fn budget_note(result: BudgetedResult, truncation: &ResultTruncation) -> String {
+    let next = match result {
+        BudgetedResult::Search => "next: narrow the query, lower top_k, or search without expand.",
+        BudgetedResult::Grep => "next: narrow path or the pattern, or lower max.",
+    };
+    match (truncation, result) {
+        (ResultTruncation::ContentBudget, BudgetedResult::Search) => format!(
+            "note: the server cut this result to its content budget (32 KiB of snippet text \
+             by default). A snippet is cut, a hit is not expanded, or later hits are dropped. \
+             {next}\n"
+        ),
+        (ResultTruncation::ContentBudget, BudgetedResult::Grep) => format!(
+            "note: the server cut this result to its content budget (32 KiB of path and line \
+             text, and 512 bytes for each line, by default). A line is cut, or later matches \
+             are dropped. {next}\n"
+        ),
+        (ResultTruncation::Other(_), _) => format!(
+            "note: the server shortened this result ({}). {next}\n",
+            truncation.header()
+        ),
+    }
 }
 
 /// The expansion state of a hit of a Symbol-granularity search, for the end of

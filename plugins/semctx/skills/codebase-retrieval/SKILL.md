@@ -103,6 +103,9 @@ re-syncs do not block use of the last complete index.
   a chunk, not the whole symbol. Do not reason from it as a complete body.
   Follow the text after the reason: search again later for `GraphLoading`, or
   use `expand_chunk` / `file_outline` for the other reasons.
+- A `search_codebase` or `grep` result that starts with `note: the server cut
+  this result to its content budget` is not complete. Follow its `next:` line
+  before you conclude that something is absent.
 - A tool reports that semctl is not logged in → answer the immediate
   question with host tools, and end your reply with one line telling the user
   semctl is logged out and `semctl auth login` restores it (tools recover on

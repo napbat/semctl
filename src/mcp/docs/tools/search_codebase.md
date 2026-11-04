@@ -25,6 +25,8 @@ Hybrid (dense + lexical) retrieval over the indexed codebase. Returns ranked hit
 
 The server limits the snippet text of one search to 32 KiB by default (`Search:ContentBudgetBytes`). It cuts the snippet that reaches the limit and drops the hits after it. Ask for a small `top_k`, mainly with `expand`.
 
+When the server shortens a result, the result starts with `note: the server cut this result to its content budget …` and a `next:` step. The result is then not complete: narrow the query, lower `top_k`, or search without `expand`.
+
 With `expand`, each hit tells whether its snippet is the whole symbol:
 
 - `[expanded]` — the snippet is the body of the enclosing symbol.
