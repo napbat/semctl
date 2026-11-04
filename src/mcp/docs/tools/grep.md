@@ -8,7 +8,7 @@ Use this for exact strings and patterns: an error message, a config key, a TODO,
 - `literal` — match `pattern` as an exact substring: every character (including `. * ( ) [ ] \`) is taken verbatim, so nothing needs escaping and there are no accidental regex matches. Default false. Use it for exact code like `.unwrap()`, `foo(bar)`, or `Vec<T>`.
 - `ignore_case` — case-insensitive matching. Default false.
 - `path` — optional path substring to narrow which files are scanned (e.g. `server/`).
-- `max` — max matches to return, 1–1000. Default 100.
+- `max` — max matches to return, 1–1000. Default 100. Another value fails before the search.
 
 ## Regex syntax
 
@@ -30,4 +30,4 @@ Example: find function definitions → `{ "pattern": "fn \\w+\\(" }`. To search 
 ## Notes
 
 - Searches the indexed snapshot, so brand-new local edits aren't reflected until the codebase re-syncs (see `sync_status`).
-- Results stop at `max`. Narrow with `path` before raising it.
+- Results stop at `max`, or earlier at the byte budget of the server: by default 32 KiB of path and line text in one response. The server cuts each line at 512 bytes by default. Narrow with `path` before raising `max`.

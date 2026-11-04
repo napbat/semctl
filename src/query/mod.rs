@@ -92,6 +92,29 @@ impl SearchOpts {
     }
 }
 
+/// The values of `top_k` and of the grep `max` that the server accepts. The
+/// server answers 400 to a value outside this range, so the client refuses
+/// the value before it sends a request.
+pub(crate) const RESULT_LIMIT: std::ops::RangeInclusive<u32> = 1..=1000;
+
+/// `value` when it is in [`RESULT_LIMIT`], else the invalid-argument failure
+/// of `op` that names the argument `name`.
+pub(crate) fn result_limit(op: &'static str, name: &str, value: u32) -> Result<u32, ToolError> {
+    if RESULT_LIMIT.contains(&value) {
+        Ok(value)
+    } else {
+        Err(ToolError::new(
+            op,
+            FailureKind::InvalidArgument,
+            format!(
+                "{name} must be between {} and {}, not {value}",
+                RESULT_LIMIT.start(),
+                RESULT_LIMIT.end()
+            ),
+        ))
+    }
+}
+
 /// Cross-domain search, scoped to the launched codebase when one is set. The
 /// server applies the kind filter, ranking bias, and symbol granularity; the
 /// client sends the options, annotates local staleness, and renders.
@@ -102,6 +125,7 @@ pub async fn search(
     domains: &[String],
     opts: &SearchOpts,
 ) -> Result<String, ToolError> {
+    let top_k = result_limit("search_codebase", "top_k", top_k)?;
     let scope = opts.normalized_scope()?;
     let body = api::SearchRequestBody {
         query,
@@ -463,6 +487,7 @@ pub async fn grep(
     path: Option<&str>,
     max: u32,
 ) -> Result<String, ToolError> {
+    let max = result_limit("grep", "max", max)?;
     let cb = bound_codebase(client, "grep")?;
     let mut url = format!(
         "/v1/codebases/{cb}/grep?pattern={}&regex={regex}&ignoreCase={ignore_case}&max={max}",
@@ -667,9 +692,10 @@ fn urlencode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        SearchOpts, bound_codebase, human_bytes, is_stale, local_blake3, normalize_prefer,
-        single_file_target,
+        SearchOpts, bound_codebase, grep, human_bytes, is_stale, local_blake3, normalize_prefer,
+        search, single_file_target,
     };
+    use crate::client::stub::{Reply, Stub};
     use crate::client::{Client, api};
 
     fn at(path: &str) -> api::GrepMatch {
@@ -729,6 +755,69 @@ mod tests {
         let message = bound_codebase(&client, "trace").unwrap_err().to_string();
         assert!(message.starts_with("trace failed: no codebase for this directory"));
         assert!(message.ends_with("next: use local Read/Grep for this request."));
+    }
+
+    /// A stub that answers every request with an empty list, and a client
+    /// bound to codebase `A` on it.
+    async fn empty_list_stub() -> (Stub, Client) {
+        let stub = Stub::serve(vec![Reply::ok("[]")]).await;
+        let client = Client::for_test_server(&stub.url).with_codebase("A".to_string());
+        (stub, client)
+    }
+
+    #[tokio::test]
+    async fn a_top_k_outside_1_to_1000_is_an_invalid_argument_and_sends_nothing() {
+        let (stub, client) = empty_list_stub().await;
+        for top_k in [0, 1001] {
+            let message = search(&client, "q", top_k, &[], &SearchOpts::default())
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                message.starts_with(&format!(
+                    "search_codebase failed: top_k must be between 1 and 1000, not {top_k}"
+                )),
+                "{message}"
+            );
+            assert!(message.ends_with(CORRECT_THE_ARGUMENT), "{message}");
+        }
+        assert_eq!(stub.requests(), 0);
+
+        for top_k in [1, 1000] {
+            search(&client, "q", top_k, &[], &SearchOpts::default())
+                .await
+                .expect("a top_k from 1 to 1000 reaches the server");
+        }
+        assert_eq!(stub.requests(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_grep_max_outside_1_to_1000_is_an_invalid_argument_and_sends_nothing() {
+        let (stub, client) = empty_list_stub().await;
+        for max in [0, 1001] {
+            let message = grep(&client, "needle", false, false, None, max)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                message.starts_with(&format!(
+                    "grep failed: max must be between 1 and 1000, not {max}"
+                )),
+                "{message}"
+            );
+            assert!(message.ends_with(CORRECT_THE_ARGUMENT), "{message}");
+        }
+        assert_eq!(stub.requests(), 0);
+
+        for max in [1, 1000] {
+            grep(&client, "needle", false, false, None, max)
+                .await
+                .expect("a max from 1 to 1000 reaches the server");
+        }
+        let lines = stub.request_lines();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("&max=1 "), "{}", lines[0]);
+        assert!(lines[1].contains("&max=1000 "), "{}", lines[1]);
     }
 
     #[test]

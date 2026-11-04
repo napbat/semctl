@@ -23,7 +23,8 @@ pub struct SearchArgs {
     pub copy: Option<String>,
     /// Natural-language query.
     pub query: String,
-    /// Max hits to return. Defaults to 8.
+    /// Max hits to return, 1–1000. Defaults to 8. Another value fails before
+    /// the search.
     pub top_k: Option<u32>,
     /// Restrict to these registered domain ids. Empty / omitted = all.
     pub domains: Option<Vec<String>>,
@@ -34,8 +35,10 @@ pub struct SearchArgs {
     /// Omit for every kind.
     pub kinds: Option<Vec<String>>,
     /// Return full enclosing-symbol bodies instead of 4-line snippets. Defaults
-    /// false. Bodies stop at 30,000 characters in total; later hits stay
-    /// snippets. Do not reread files whose bodies were returned.
+    /// false. The server limits the snippet text of one search to 32 KiB by
+    /// default. Each hit is marked `[expanded]`, or `[not expanded: <reason>]`
+    /// when its snippet is only a chunk. Do not reread files whose bodies were
+    /// returned.
     pub expand: Option<bool>,
     /// Server scope lens: `local`, `personal`, `organization`, or `global`.
     /// Mutually exclusive with `codebase_ids`.
@@ -150,7 +153,8 @@ pub struct GrepArgs {
     pub ignore_case: Option<bool>,
     /// Optional path substring to narrow which files are searched.
     pub path: Option<String>,
-    /// Max matches to return, 1–1000. Defaults to 100.
+    /// Max matches to return, 1–1000. Defaults to 100. Another value fails
+    /// before the search.
     pub max: Option<u32>,
 }
 

@@ -15,6 +15,20 @@ fn parses_real_snake_case_payload() {
 }
 
 #[test]
+fn the_prompt_search_never_asks_for_a_top_k_outside_1_to_1000() {
+    assert_eq!(prompt_top_k(None), Some(5), "the default");
+    assert_eq!(prompt_top_k(Some(0)), None, "0 turns the search off");
+    assert_eq!(prompt_top_k(Some(1)), Some(1));
+    assert_eq!(prompt_top_k(Some(1000)), Some(1000));
+    assert_eq!(prompt_top_k(Some(1001)), None, "the server refuses it");
+    assert_eq!(
+        prompt_top_k(Some(usize::MAX)),
+        None,
+        "the server refuses it"
+    );
+}
+
+#[test]
 fn unindexed_startup_notice_requires_opt_in_and_names_the_tool() {
     let message = unindexed_notice(std::path::Path::new("/repo"));
     assert!(message.contains("not indexed"), "{message}");

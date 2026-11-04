@@ -15,11 +15,26 @@ Hybrid (dense + lexical) retrieval over the indexed codebase. Returns ranked hit
 ## Parameters
 
 - `query` (required) — the natural-language search.
-- `top_k` — max hits to return (default 8).
+- `top_k` — max hits to return, 1–1000 (default 8). Another value fails before the search. The content budget of the server can return fewer hits.
 - `domains` — restrict to specific registered domain ids. Omit to fan out across every registered domain (run `list_domains` to see what's available).
 - `prefer` — ranking bias: `"code"` demotes documentation (markdown) so the implementation leads; `"docs"` does the reverse. Omit for the unbiased hybrid ranking. Use `"code"` for "how is X implemented", leave off for "explain X conceptually".
 - `kinds` — restrict to chunk kinds: `function`, `container` (type/class/module), or `block` (free text, incl. prose). Omit for every kind.
-- `expand` — return the **full enclosing-symbol body** per hit instead of a 4-line snippet. Block hits snap to their enclosing function/type. Default false. Bodies stop at 30,000 characters in total; later hits stay snippets. Expand a small `top_k`, and do not reread files whose bodies were returned.
+- `expand` — return the **full enclosing-symbol body** per hit instead of a 4-line snippet. Block hits snap to their enclosing function/type. Default false. Expand a small `top_k`, and do not reread files whose bodies were returned.
+
+## Result budget and expanded hits
+
+The server limits the snippet text of one search to 32 KiB by default (`Search:ContentBudgetBytes`). It cuts the snippet that reaches the limit and drops the hits after it. Ask for a small `top_k`, mainly with `expand`.
+
+With `expand`, each hit tells whether its snippet is the whole symbol:
+
+- `[expanded]` — the snippet is the body of the enclosing symbol.
+- `[not expanded: <reason> — …]` — the snippet is the chunk only. Do not treat it as the whole symbol. The reasons:
+  - `SymbolChunk` — the hit is a function or type chunk, and the snippet is that chunk.
+  - `NoEnclosingSymbol` — no named declaration contains the hit.
+  - `GraphLoading` — the graph is not ready. Search again later for the body.
+  - `Deadline` — the expansion deadline of the server passed. Use `expand_chunk`.
+  - `ContentBudget` — the body does not fit in the content budget. Use `expand_chunk`.
+  - `MultipleProjects` — the search spans more than one codebase. Only a search of one codebase expands hits.
 
 ## Result freshness
 

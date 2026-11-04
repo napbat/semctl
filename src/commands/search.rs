@@ -13,7 +13,7 @@ pub struct SearchArgs {
     /// Natural-language query.
     pub query: String,
 
-    /// Max hits to return. Server clamps at 1000.
+    /// Max hits to return, 1 to 1000. Another value fails before the search.
     #[arg(long, default_value_t = 20)]
     pub top_k: u32,
 
@@ -32,6 +32,8 @@ pub struct SearchArgs {
     pub kinds: Vec<String>,
 
     /// Render the full enclosing-symbol body per hit instead of a short snippet.
+    /// Each hit is marked `[expanded]`, or `[not expanded: <reason>]` when its
+    /// snippet is only a chunk.
     #[arg(long)]
     pub expand: bool,
 
