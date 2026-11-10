@@ -724,6 +724,11 @@ pub struct SyncContentRequest {
 /// `GET /v1/jobs/{id}` — an index job's progress. `completed_at` is the
 /// terminal signal (set once the worker finishes, success or fail);
 /// `error` is set only on failure.
+///
+/// The server embeds nothing itself: docstore derives the chunks and the
+/// embeddings of the staged snapshot. `files_embedded` counts the files that
+/// docstore reports ready, so it grows while docstore derives, not while the
+/// client uploads. The job completes after the code graph of the snapshot.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JobStatus {
@@ -735,10 +740,21 @@ pub struct JobStatus {
     #[serde(default)]
     pub files_deleted: i64,
     pub files_failed: i64,
+    /// The chunk count of the copy's published snapshot. Set when docstore
+    /// completed the derivations of the job.
     #[serde(default)]
     pub chunk_count: Option<i64>,
     #[serde(default)]
     pub error: Option<String>,
+    /// The worker stage: `Deriving` while docstore derives the staged files,
+    /// `Graph` while the published snapshot waits for its code graph. Absent
+    /// from a server older than these stages.
+    #[serde(default)]
+    pub current_stage: Option<String>,
+    /// Files per second: the latest sample while docstore derives, then the
+    /// average of the job.
+    #[serde(default)]
+    pub operations_per_second: Option<f64>,
     /// Set once the worker picks the job up (i.e. it's running).
     #[serde(default)]
     pub started_at: Option<String>,

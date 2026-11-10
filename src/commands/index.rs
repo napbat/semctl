@@ -145,6 +145,18 @@ fn poll_interval(elapsed: std::time::Duration) -> std::time::Duration {
     }
 }
 
+/// The phase that the heartbeat names. Docstore derives the staged files while
+/// the server reports `Deriving`; their count grows only then. In `Graph` the
+/// files are searchable and the job waits for the code graph of the snapshot.
+fn phase(job: &api::JobStatus) -> &'static str {
+    match job.current_stage.as_deref() {
+        Some("Graph") => "building graph",
+        Some("Paused") => "paused",
+        _ if job.started_at.is_some() => "embedding",
+        _ => "queued",
+    }
+}
+
 /// Poll the index job until the worker finishes embedding, reporting the
 /// outcome. The job runs server-side regardless of whether we keep waiting, so
 /// a timeout here isn't a failure — just stop watching.
@@ -161,6 +173,7 @@ async fn wait_for_job(client: &Client, job_id: &str) -> Result<()> {
                 embedded = job.files_embedded,
                 failed = job.files_failed,
                 chunks = job.chunk_count.unwrap_or(0),
+                files_per_sec = job.operations_per_second.unwrap_or(0.0),
                 "indexed",
             );
             return Ok(());
@@ -169,7 +182,8 @@ async fn wait_for_job(client: &Client, job_id: &str) -> Result<()> {
             info!(
                 %job_id,
                 secs = JOB_WAIT.as_secs(),
-                "still embedding; continues server-side — check back with search",
+                "still {}; continues server-side — check back with search",
+                phase(&job),
             );
             return Ok(());
         }
@@ -177,18 +191,15 @@ async fn wait_for_job(client: &Client, job_id: &str) -> Result<()> {
         let now = std::time::Instant::now();
         if now >= next_progress {
             let progress = JobProgress::from(&job);
-            let phase = if job.started_at.is_some() {
-                "embedding"
-            } else {
-                "queued"
-            };
             info!(
                 %job_id,
                 elapsed_secs = start.elapsed().as_secs(),
                 embedded = progress.embedded,
                 deleted = progress.deleted,
                 failed = progress.failed,
-                "{phase}: {}/{} processed",
+                files_per_sec = job.operations_per_second.unwrap_or(0.0),
+                "{}: {}/{} processed",
+                phase(&job),
                 progress.processed,
                 progress.total,
             );
@@ -201,7 +212,7 @@ async fn wait_for_job(client: &Client, job_id: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{JobProgress, api, poll_interval, terminal_result};
+    use super::{JobProgress, api, phase, poll_interval, terminal_result};
 
     #[test]
     fn polling_is_responsive_for_fast_jobs_then_backs_off() {
@@ -228,6 +239,8 @@ mod tests {
             files_failed: failed,
             chunk_count: Some(21),
             error: error.map(str::to_owned),
+            current_stage: Some("Deriving".into()),
+            operations_per_second: Some(1.5),
             started_at: Some("2026-07-14T00:00:00Z".into()),
             completed_at: completed.then(|| "2026-07-14T00:01:00Z".into()),
         }
@@ -236,6 +249,17 @@ mod tests {
     #[test]
     fn incomplete_job_is_not_terminal() {
         assert!(!terminal_result("job-1", &job(false, 0, None)).unwrap());
+    }
+
+    #[test]
+    fn heartbeat_names_the_native_stage_of_the_job() {
+        let mut deriving = job(false, 0, None);
+        assert_eq!(phase(&deriving), "embedding");
+        deriving.current_stage = Some("Graph".into());
+        assert_eq!(phase(&deriving), "building graph");
+        deriving.current_stage = None;
+        deriving.started_at = None;
+        assert_eq!(phase(&deriving), "queued");
     }
 
     #[test]
