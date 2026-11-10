@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::fmt::Write;
 use std::path::Path;
 
-use crate::client::api;
+use crate::client::{ResultTruncation, api};
 
 use super::inspection::GRAPH_LIST_CAP;
 
@@ -247,8 +247,10 @@ pub(super) fn render_hits(
 /// As [`render_hits`], but annotates any hit whose codebase-relative path is in
 /// `stale` (its local file no longer matches the index), and — when `full_body`
 /// — prints the whole snippet instead of the first four lines (for `--expand`,
-/// where the server already returned the full enclosing-symbol body). The public
-/// [`render_hits`] passes an empty set and `false`; only `search` varies them.
+/// where the server returns the enclosing-symbol body, or the chunk snippet and
+/// the reason). The server bounds the snippet text of the response by its
+/// content budget. The public [`render_hits`] passes an empty set and `false`;
+/// only `search` varies them.
 pub(super) fn render_hits_inner(
     hits: &[api::SearchHit],
     empty_msg: &str,
@@ -269,8 +271,6 @@ pub(super) fn render_hits_inner(
 
     let mut out = String::new();
     let mut separated = false;
-    let mut expanded_chars = 0_usize;
-    let mut snipped = 0_usize;
     for h in hits {
         let root = context.root_for(h);
         if let Some(floor) = weak_below
@@ -319,46 +319,106 @@ pub(super) fn render_hits_inner(
         };
         writeln!(
             out,
-            "[{}{lang}]{codebase} {}  {sym}{kind}{}{score}{stale_mark}",
+            "[{}{lang}]{codebase} {}  {sym}{kind}{}{score}{stale_mark}{}",
             h.domain_id,
             hit_location(h, root),
-            write_marker(h)
+            write_marker(h),
+            expansion_marker(h)
         )
         .expect("writing to a String cannot fail");
         // Skip leading blank lines so the declaration/signature leads the snippet
         // rather than whitespace. `--expand` shows the whole body; otherwise the
         // first few lines, enough to judge relevance without flooding context.
         let lines = h.snippet.lines().skip_while(|l| l.trim().is_empty());
-        let expand = full_body
-            && (expanded_chars == 0 || expanded_chars + h.snippet.len() <= EXPANDED_BODY_CHARS);
-        if expand {
-            expanded_chars += h.snippet.len();
-        } else if full_body {
-            snipped += 1;
-        }
-        for line in lines.take(if expand { usize::MAX } else { 4 }) {
+        for line in lines.take(if full_body { usize::MAX } else { 4 }) {
             out.push_str("    ");
             out.push_str(line);
             out.push('\n');
         }
         out.push('\n');
     }
-    if snipped > 0 {
-        writeln!(
-            out,
-            "{snipped} hit(s) shown as snippets: expanded bodies stop at \
-             {EXPANDED_BODY_CHARS} characters. Use expand_chunk for one of them."
-        )
-        .expect("writing to a String cannot fail");
-    }
     out
 }
 
-/// The total length of expanded bodies in one search answer. The first hit is
-/// always expanded; a later hit that does not fit is shown as a snippet. The
-/// server has no size limit of its own, and one expanded search with a broad
-/// `top_k` can otherwise return tens of thousands of characters.
-const EXPANDED_BODY_CHARS: usize = 30_000;
+/// A result that the content budget of the server can shorten. The budget and
+/// the next step differ between the two.
+#[derive(Clone, Copy)]
+pub(super) enum BudgetedResult {
+    Search,
+    Grep,
+}
+
+/// The first line of a result that the server shortened: what the budget is
+/// and what the agent can do. The budget values are the server defaults
+/// (`Search:ContentBudgetBytes`, `Search:GrepMaxBytes`,
+/// `Search:GrepMaxLineBytes`).
+pub(super) fn budget_note(result: BudgetedResult, truncation: &ResultTruncation) -> String {
+    let next = match result {
+        BudgetedResult::Search => "next: narrow the query, lower top_k, or search without expand.",
+        BudgetedResult::Grep => "next: narrow path or the pattern, or lower max.",
+    };
+    match (truncation, result) {
+        (ResultTruncation::ContentBudget, BudgetedResult::Search) => format!(
+            "note: the server cut this result to its content budget (32 KiB of snippet text \
+             by default). A snippet is cut, a hit is not expanded, or later hits are dropped. \
+             {next}\n"
+        ),
+        (ResultTruncation::ContentBudget, BudgetedResult::Grep) => format!(
+            "note: the server cut this result to its content budget (32 KiB of path and line \
+             text, and 512 bytes for each line, by default). A line is cut, or later matches \
+             are dropped. {next}\n"
+        ),
+        (ResultTruncation::Other(_), _) => format!(
+            "note: the server shortened this result ({}). {next}\n",
+            truncation.header()
+        ),
+    }
+}
+
+/// The expansion state of a hit of a Symbol-granularity search, for the end of
+/// its header line. An agent must know when a snippet is a chunk and not the
+/// whole symbol. Empty for a hit without the state: a Chunk-granularity search
+/// or a graph lookup.
+fn expansion_marker(h: &api::SearchHit) -> String {
+    match (h.expanded, h.expansion_reason) {
+        (Some(true), _) => "  [expanded]".to_string(),
+        (Some(false), Some(reason)) => {
+            let (name, why) = expansion_reason_text(reason);
+            format!("  [not expanded: {name} — {why}]")
+        }
+        (Some(false), None) => "  [not expanded]".to_string(),
+        (None, _) => String::new(),
+    }
+}
+
+/// The wire name of `reason` and what it means for the agent.
+fn expansion_reason_text(reason: api::ExpansionReason) -> (&'static str, &'static str) {
+    match reason {
+        api::ExpansionReason::SymbolChunk => (
+            "SymbolChunk",
+            "the snippet is the function or type chunk itself",
+        ),
+        api::ExpansionReason::NoEnclosingSymbol => {
+            ("NoEnclosingSymbol", "no named declaration contains the hit")
+        }
+        api::ExpansionReason::GraphLoading => (
+            "GraphLoading",
+            "the graph is not ready; search again later for the body",
+        ),
+        api::ExpansionReason::Deadline => (
+            "Deadline",
+            "the expansion deadline passed; use expand_chunk for more context",
+        ),
+        api::ExpansionReason::ContentBudget => (
+            "ContentBudget",
+            "the body does not fit in the content budget of the server; use expand_chunk",
+        ),
+        api::ExpansionReason::MultipleProjects => (
+            "MultipleProjects",
+            "a search of more than one codebase does not expand hits",
+        ),
+    }
+}
 
 /// A hit scoring below this fraction of the top hit's score is sorted under the
 /// "weaker matches" separator. Relative (not absolute) because raw hybrid
@@ -421,9 +481,7 @@ pub(super) fn hit_location(h: &api::SearchHit, root: Option<&Path>) -> String {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{
-        EXPANDED_BODY_CHARS, HitContext, api, render_hits_inner, render_job, strip_verbatim_prefix,
-    };
+    use super::{HitContext, api, render_hits_inner, render_job, strip_verbatim_prefix};
 
     /// A `SearchHit` with a chosen chunk id + path — for the render test that
     /// keys on those.
@@ -454,6 +512,8 @@ mod tests {
             codebase_id: None,
             kind: "function".into(),
             snippet: String::new(),
+            expanded: None,
+            expansion_reason: None,
         }
     }
 
@@ -495,32 +555,83 @@ mod tests {
         )
     }
 
-    #[test]
-    fn expanded_bodies_stop_at_the_limit_and_later_hits_that_fit_still_expand() {
-        // 2,000 + 1,500 + 500 lines of 10 characters: the second body would pass
-        // 30,000 characters, the third still fits after it is skipped.
-        let out = expanded(&[body("a", 2_000), body("b", 1_500), body("c", 500)]);
-
-        assert_eq!(out.matches("a-body-ln").count(), 2_000);
-        assert_eq!(out.matches("b-body-ln").count(), 4, "shown as a snippet");
-        assert_eq!(out.matches("c-body-ln").count(), 500);
-        assert!(
-            out.ends_with(&format!(
-                "1 hit(s) shown as snippets: expanded bodies stop at {EXPANDED_BODY_CHARS} \
-                 characters. Use expand_chunk for one of them.\n"
-            )),
-            "{out}"
-        );
+    /// The hits of a Symbol search as the server sends them: one expanded hit,
+    /// one hit for each reason, and one hit without the fields.
+    fn symbol_search_hits() -> Vec<api::SearchHit> {
+        let hit = |id: &str, fields: &str| {
+            format!(
+                r#"{{"domainId":"code","id":"{id}","score":1.0,"path":"{id}.rs","lineStart":1,
+                    "lineEnd":2,"kind":"block","snippet":"{id}-snippet\n"{fields}}}"#
+            )
+        };
+        let mut hits = vec![hit("body", r#","expanded":true"#)];
+        for reason in [
+            "SymbolChunk",
+            "NoEnclosingSymbol",
+            "GraphLoading",
+            "Deadline",
+            "ContentBudget",
+            "MultipleProjects",
+        ] {
+            hits.push(hit(
+                reason,
+                &format!(r#","expanded":false,"expansionReason":"{reason}""#),
+            ));
+        }
+        hits.push(hit("plain", ""));
+        serde_json::from_str(&format!("[{}]", hits.join(",")))
+            .expect("the hits of a Symbol search parse")
     }
 
     #[test]
-    fn the_first_expanded_body_is_never_cut_and_small_answers_have_no_note() {
-        let oversized = expanded(&[body("a", 4_000)]);
-        assert_eq!(oversized.matches("a-body-ln").count(), 4_000);
-        assert!(!oversized.contains("shown as snippets"), "{oversized}");
+    fn an_expanded_search_tells_for_each_hit_whether_it_is_the_symbol_body_and_why_not() {
+        let out = expanded(&symbol_search_hits());
+        let header = |id: &str| {
+            out.lines()
+                .find(|line| line.contains(&format!(" {id}.rs:1-2")))
+                .unwrap_or_else(|| panic!("no header for {id}: {out}"))
+        };
 
-        let small = expanded(&[body("a", 10), body("b", 10)]);
-        assert!(!small.contains("shown as snippets"), "{small}");
+        assert!(header("body").ends_with("  [expanded]"), "{out}");
+        for (reason, why) in [
+            (
+                "SymbolChunk",
+                "the snippet is the function or type chunk itself",
+            ),
+            ("NoEnclosingSymbol", "no named declaration contains the hit"),
+            (
+                "GraphLoading",
+                "the graph is not ready; search again later for the body",
+            ),
+            (
+                "Deadline",
+                "the expansion deadline passed; use expand_chunk for more context",
+            ),
+            (
+                "ContentBudget",
+                "the body does not fit in the content budget of the server; use expand_chunk",
+            ),
+            (
+                "MultipleProjects",
+                "a search of more than one codebase does not expand hits",
+            ),
+        ] {
+            assert!(
+                header(reason).ends_with(&format!("  [not expanded: {reason} — {why}]")),
+                "{out}"
+            );
+        }
+        assert!(!header("plain").contains("expanded"), "{out}");
+    }
+
+    #[test]
+    fn expanded_bodies_render_in_full_because_the_server_owns_the_budget() {
+        let out = expanded(&[body("a", 2_000), body("b", 1_500), body("c", 500)]);
+
+        assert_eq!(out.matches("a-body-ln").count(), 2_000);
+        assert_eq!(out.matches("b-body-ln").count(), 1_500);
+        assert_eq!(out.matches("c-body-ln").count(), 500);
+        assert!(!out.contains("shown as snippets"), "{out}");
     }
 
     #[test]

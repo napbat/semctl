@@ -191,10 +191,12 @@ fn resets_segment(event: &str, source: &str) -> bool {
 /// prompts. Direct graph/tool requests and prompts that can rely on supplied
 /// context remain model-routed, avoiding a generic search before a precise call.
 async fn user_prompt_context(cli: &Cli, input: &HookInput) -> Option<String> {
-    let top_k = env_parse::<usize>("SEMCTX_HOOK_TOP_K").unwrap_or(5);
-    if top_k == 0 {
+    let Some(top_k) = prompt_top_k(env_parse::<usize>("SEMCTX_HOOK_TOP_K")) else {
+        debug(format_args!(
+            "prompt search is off or SEMCTX_HOOK_TOP_K is above 1000"
+        ));
         return None;
-    }
+    };
     let prompt = input.prompt.trim();
     // A global UserPromptSubmit hook fires on every message. Keep this path
     // high-precision: the skill and MCP metadata route exact operations, while
@@ -206,7 +208,7 @@ async fn user_prompt_context(cli: &Cli, input: &HookInput) -> Option<String> {
     let (client, codebase) = connect(cli, &input.cwd).await?;
     let body = api::SearchRequestBody {
         query: prompt,
-        top_k: u32::try_from(top_k).unwrap_or(u32::MAX),
+        top_k,
         codebase_id: Some(&codebase),
         codebase_ids: None,
         scope: None,
@@ -243,7 +245,7 @@ async fn user_prompt_context(cli: &Cli, input: &HookInput) -> Option<String> {
     let hits: Vec<&api::SearchHit> = hits
         .iter()
         .filter(|h| min_score.is_none_or(|m| h.score >= f64::from(m)))
-        .take(top_k)
+        .take(top_k as usize)
         .collect();
     if hits.is_empty() {
         return None;
@@ -281,6 +283,15 @@ async fn user_prompt_context(cli: &Cli, input: &HookInput) -> Option<String> {
             .expect("writing to a String cannot fail");
     }
     Some(out)
+}
+
+/// The `topK` of the prompt search: `SEMCTX_HOOK_TOP_K`, else 5. `None` when
+/// the value is 0, which turns the search off, or when the value is above the
+/// limit of the server, which answers 400 to it.
+fn prompt_top_k(configured: Option<usize>) -> Option<u32> {
+    u32::try_from(configured.unwrap_or(5))
+        .ok()
+        .filter(|top_k| crate::query::RESULT_LIMIT.contains(top_k))
 }
 
 const HOOK_SEARCH_TIMEOUT_SECS: u64 = 6;

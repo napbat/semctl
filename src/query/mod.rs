@@ -33,8 +33,8 @@ pub use advanced::*;
 
 pub use render::render_projects;
 use render::{
-    HitContext, hit_location, local_path, render_boundaries, render_compact, render_hits,
-    render_hits_inner,
+    BudgetedResult, HitContext, budget_note, hit_location, local_path, render_boundaries,
+    render_compact, render_hits, render_hits_inner,
 };
 
 /// Map the user's `--prefer` value to the server's `SearchPreference` enum name
@@ -92,6 +92,29 @@ impl SearchOpts {
     }
 }
 
+/// The values of `top_k` and of the grep `max` that the server accepts. The
+/// server answers 400 to a value outside this range, so the client refuses
+/// the value before it sends a request.
+pub(crate) const RESULT_LIMIT: std::ops::RangeInclusive<u32> = 1..=1000;
+
+/// `value` when it is in [`RESULT_LIMIT`], else the invalid-argument failure
+/// of `op` that names the argument `name`.
+pub(crate) fn result_limit(op: &'static str, name: &str, value: u32) -> Result<u32, ToolError> {
+    if RESULT_LIMIT.contains(&value) {
+        Ok(value)
+    } else {
+        Err(ToolError::new(
+            op,
+            FailureKind::InvalidArgument,
+            format!(
+                "{name} must be between {} and {}, not {value}",
+                RESULT_LIMIT.start(),
+                RESULT_LIMIT.end()
+            ),
+        ))
+    }
+}
+
 /// Cross-domain search, scoped to the launched codebase when one is set. The
 /// server applies the kind filter, ranking bias, and symbol granularity; the
 /// client sends the options, annotates local staleness, and renders.
@@ -102,6 +125,7 @@ pub async fn search(
     domains: &[String],
     opts: &SearchOpts,
 ) -> Result<String, ToolError> {
+    let top_k = result_limit("search_codebase", "top_k", top_k)?;
     let scope = opts.normalized_scope()?;
     let body = api::SearchRequestBody {
         query,
@@ -125,12 +149,17 @@ pub async fn search(
             .map(str::to_string),
         granularity: opts.expand.then(|| "Symbol".to_string()),
     };
-    let hits = client
-        .post_read::<_, Vec<api::SearchHit>>("/v1/search", &body)
+    let (hits, truncation) = client
+        .post_read_budgeted::<_, Vec<api::SearchHit>>("/v1/search", &body)
         .await
         .map_err(|e| ToolError::from_client("search_codebase", &e))?;
+    // The note leads, so an agent reads it before it reasons from the hits.
+    let mut out = truncation
+        .map(|truncation| budget_note(BudgetedResult::Search, &truncation))
+        .unwrap_or_default();
     if hits.is_empty() {
-        return Ok("no results".to_string());
+        out.push_str("no results");
+        return Ok(out);
     }
 
     // Staleness is the one shaping the client owns — only it has the local bytes.
@@ -140,14 +169,15 @@ pub async fn search(
         opts.scope.is_none() && opts.codebase_ids.is_empty() && client.codebase_raw().is_some(),
     );
     let stale = stale_paths_in_context(client, &hits, context).await;
-    Ok(render_hits_inner(
+    out.push_str(&render_hits_inner(
         &hits,
         "no results",
         context,
         true,
         &stale,
         opts.expand,
-    ))
+    ));
+    Ok(out)
 }
 
 fn normalize_scope(scope: &str) -> Option<&'static str> {
@@ -463,6 +493,7 @@ pub async fn grep(
     path: Option<&str>,
     max: u32,
 ) -> Result<String, ToolError> {
+    let max = result_limit("grep", "max", max)?;
     let cb = bound_codebase(client, "grep")?;
     let mut url = format!(
         "/v1/codebases/{cb}/grep?pattern={}&regex={regex}&ignoreCase={ignore_case}&max={max}",
@@ -471,15 +502,18 @@ pub async fn grep(
     if let Some(p) = path.filter(|p| !p.is_empty()) {
         write!(url, "&path={}", urlencode(p)).expect("writing to a String cannot fail");
     }
-    let matches = client
-        .get::<Vec<api::GrepMatch>>(&url)
+    let (matches, truncation) = client
+        .get_budgeted::<Vec<api::GrepMatch>>(&url)
         .await
         .map_err(|e| ToolError::from_client("grep", &e))?;
+    let mut out = truncation
+        .map(|truncation| budget_note(BudgetedResult::Grep, &truncation))
+        .unwrap_or_default();
     if matches.is_empty() {
-        return Ok(format!("no matches for `{pattern}`"));
+        write!(out, "no matches for `{pattern}`").expect("writing to a String cannot fail");
+        return Ok(out);
     }
     let root = client.local_root();
-    let mut out = String::new();
     if let Some(file) = single_file_target(path, &matches)
         && root.is_some_and(|root| root.join(file).is_file())
     {
@@ -667,9 +701,10 @@ fn urlencode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        SearchOpts, bound_codebase, human_bytes, is_stale, local_blake3, normalize_prefer,
-        single_file_target,
+        SearchOpts, bound_codebase, grep, human_bytes, is_stale, local_blake3, normalize_prefer,
+        search, single_file_target,
     };
+    use crate::client::stub::{Reply, Stub};
     use crate::client::{Client, api};
 
     fn at(path: &str) -> api::GrepMatch {
@@ -729,6 +764,160 @@ mod tests {
         let message = bound_codebase(&client, "trace").unwrap_err().to_string();
         assert!(message.starts_with("trace failed: no codebase for this directory"));
         assert!(message.ends_with("next: use local Read/Grep for this request."));
+    }
+
+    /// A stub that answers every request with an empty list, and a client
+    /// bound to codebase `A` on it.
+    async fn empty_list_stub() -> (Stub, Client) {
+        let stub = Stub::serve(vec![Reply::ok("[]")]).await;
+        let client = Client::for_test_server(&stub.url).with_codebase("A".to_string());
+        (stub, client)
+    }
+
+    #[tokio::test]
+    async fn a_top_k_outside_1_to_1000_is_an_invalid_argument_and_sends_nothing() {
+        let (stub, client) = empty_list_stub().await;
+        for top_k in [0, 1001] {
+            let message = search(&client, "q", top_k, &[], &SearchOpts::default())
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                message.starts_with(&format!(
+                    "search_codebase failed: top_k must be between 1 and 1000, not {top_k}"
+                )),
+                "{message}"
+            );
+            assert!(message.ends_with(CORRECT_THE_ARGUMENT), "{message}");
+        }
+        assert_eq!(stub.requests(), 0);
+
+        for top_k in [1, 1000] {
+            search(&client, "q", top_k, &[], &SearchOpts::default())
+                .await
+                .expect("a top_k from 1 to 1000 reaches the server");
+        }
+        assert_eq!(stub.requests(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_grep_max_outside_1_to_1000_is_an_invalid_argument_and_sends_nothing() {
+        let (stub, client) = empty_list_stub().await;
+        for max in [0, 1001] {
+            let message = grep(&client, "needle", false, false, None, max)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                message.starts_with(&format!(
+                    "grep failed: max must be between 1 and 1000, not {max}"
+                )),
+                "{message}"
+            );
+            assert!(message.ends_with(CORRECT_THE_ARGUMENT), "{message}");
+        }
+        assert_eq!(stub.requests(), 0);
+
+        for max in [1, 1000] {
+            grep(&client, "needle", false, false, None, max)
+                .await
+                .expect("a max from 1 to 1000 reaches the server");
+        }
+        let lines = stub.request_lines();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("&max=1 "), "{}", lines[0]);
+        assert!(lines[1].contains("&max=1000 "), "{}", lines[1]);
+    }
+
+    const ONE_HIT: &str = r#"[{"domainId":"code","id":"x","score":1.0,"path":"a.rs",
+        "lineStart":1,"lineEnd":2,"kind":"block","snippet":"s"}]"#;
+    const ONE_MATCH: &str = r#"[{"path":"a.rs","lineNumber":1,"line":"needle"}]"#;
+
+    /// A stub whose every answer is `data` with `X-Semctx-Result-Truncated:
+    /// value`, or without the header when `value` is `None`.
+    async fn truncated_stub(value: Option<&'static str>, data: &str) -> (Stub, Client) {
+        let stub = Stub::serve(vec![Reply::Answer {
+            status: "200 OK",
+            headers: value
+                .map(|value| vec![("X-Semctx-Result-Truncated", value)])
+                .unwrap_or_default(),
+            body: format!(r#"{{"success":true,"data":{data}}}"#),
+        }])
+        .await;
+        let client = Client::for_test_server(&stub.url).with_codebase("A".to_string());
+        (stub, client)
+    }
+
+    #[tokio::test]
+    async fn a_search_that_the_server_cut_names_the_budget_and_the_next_step() {
+        let next = "next: narrow the query, lower top_k, or search without expand.";
+        let (_stub, client) = truncated_stub(Some("content-budget"), ONE_HIT).await;
+        let out = search(&client, "q", 8, &[], &SearchOpts::default())
+            .await
+            .expect("a cut result is a success");
+        assert!(
+            out.starts_with(&format!(
+                "note: the server cut this result to its content budget (32 KiB of snippet \
+                 text by default). A snippet is cut, a hit is not expanded, or later hits \
+                 are dropped. {next}\n"
+            )),
+            "{out}"
+        );
+        assert!(out.contains("a.rs:1-2"), "the hits stay: {out}");
+
+        let (_stub, client) = truncated_stub(Some("other-budget"), ONE_HIT).await;
+        let out = search(&client, "q", 8, &[], &SearchOpts::default())
+            .await
+            .expect("a cut result is a success");
+        assert!(
+            out.starts_with(&format!(
+                "note: the server shortened this result \
+                 (X-Semctx-Result-Truncated: other-budget). {next}\n"
+            )),
+            "{out}"
+        );
+
+        let (_stub, client) = truncated_stub(None, ONE_HIT).await;
+        let out = search(&client, "q", 8, &[], &SearchOpts::default())
+            .await
+            .expect("a complete result is a success");
+        assert!(!out.contains("note:"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn a_grep_that_the_server_cut_names_the_budget_and_the_next_step() {
+        let next = "next: narrow path or the pattern, or lower max.";
+        let (_stub, client) = truncated_stub(Some("content-budget"), ONE_MATCH).await;
+        let out = grep(&client, "needle", false, false, None, 100)
+            .await
+            .expect("a cut result is a success");
+        assert!(
+            out.starts_with(&format!(
+                "note: the server cut this result to its content budget (32 KiB of path and \
+                 line text, and 512 bytes for each line, by default). A line is cut, or later \
+                 matches are dropped. {next}\n"
+            )),
+            "{out}"
+        );
+        assert!(out.contains("a.rs:1: needle"), "the matches stay: {out}");
+
+        let (_stub, client) = truncated_stub(Some("other-budget"), ONE_MATCH).await;
+        let out = grep(&client, "needle", false, false, None, 100)
+            .await
+            .expect("a cut result is a success");
+        assert!(
+            out.starts_with(&format!(
+                "note: the server shortened this result \
+                 (X-Semctx-Result-Truncated: other-budget). {next}\n"
+            )),
+            "{out}"
+        );
+
+        let (_stub, client) = truncated_stub(None, ONE_MATCH).await;
+        let out = grep(&client, "needle", false, false, None, 100)
+            .await
+            .expect("a complete result is a success");
+        assert!(!out.contains("note:"), "{out}");
     }
 
     #[test]

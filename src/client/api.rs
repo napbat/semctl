@@ -108,6 +108,35 @@ pub struct SearchHit {
     #[serde(default)]
     pub kind: String,
     pub snippet: String,
+    /// Symbol-granularity searches only: `true` when `snippet` is the body of
+    /// the enclosing symbol, `false` when the hit keeps its chunk snippet.
+    /// Absent on every other hit.
+    #[serde(default)]
+    pub expanded: Option<bool>,
+    /// Why a Symbol-granularity hit keeps its chunk snippet. Set only when
+    /// `expanded` is `false`.
+    #[serde(default)]
+    pub expansion_reason: Option<ExpansionReason>,
+}
+
+/// Why a hit of a Symbol-granularity search keeps its chunk snippet instead of
+/// the body of its enclosing symbol. The server sends the variant name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum ExpansionReason {
+    /// The hit is a function or type chunk. Its snippet is that declaration
+    /// chunk.
+    SymbolChunk,
+    /// No named declaration contains the hit.
+    NoEnclosingSymbol,
+    /// The graph of the snapshot is not complete or not reachable.
+    GraphLoading,
+    /// The expansion deadline of the server passed.
+    Deadline,
+    /// The body does not fit in the content budget of the response.
+    ContentBudget,
+    /// The search spans more than one codebase. Only a search of one codebase
+    /// expands hits.
+    MultipleProjects,
 }
 
 /// `GET /v1/codebases/{id}/graph/outline` response — a file's table of

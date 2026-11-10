@@ -29,6 +29,7 @@ mod retry;
 #[cfg(test)]
 pub(crate) mod stub;
 pub(crate) mod transport;
+mod truncation;
 
 use failure::gateway_error;
 use retry::Idempotency;
@@ -37,6 +38,7 @@ pub(crate) use failure::ApiFailure;
 pub(crate) use graph_state::{PartialAnswer, PartialAnswers};
 pub(crate) use retry::DEADLINE_MARGIN;
 pub(crate) use transport::HttpTransport;
+pub(crate) use truncation::ResultTruncation;
 
 const TENANT_HEADER: &str = "X-Tenant-Id";
 /// The checkout a request is made from. The server prefers that copy of a
@@ -437,6 +439,19 @@ impl Client {
         unwrap_envelope(resp, "GET", &url).await
     }
 
+    /// Like [`Self::get`], for a search or grep result that the content budget
+    /// of the server can shorten. Also returns the truncation that the answer
+    /// reports, if any.
+    pub async fn get_budgeted<T: DeserializeOwned>(
+        &self,
+        path: &str,
+    ) -> Result<(T, Option<ResultTruncation>)> {
+        let (resp, url) = self
+            .send(reqwest::Method::GET, path, None, Idempotency::Idempotent)
+            .await?;
+        unwrap_budgeted(resp, "GET", &url).await
+    }
+
     /// Like [`Self::get`], but returns `Ok(None)` on a 404 instead of erroring —
     /// for "does this still exist?" probes (e.g. validating a cached codebase id
     /// before trusting it against the current server).
@@ -491,6 +506,26 @@ impl Client {
         body: &B,
     ) -> Result<T> {
         self.post_with(path, body, Idempotency::Idempotent).await
+    }
+
+    /// Like [`Self::post_read`], for a search result that the content budget
+    /// of the server can shorten. Also returns the truncation that the answer
+    /// reports, if any.
+    pub async fn post_read_budgeted<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<(T, Option<ResultTruncation>)> {
+        let body = serde_json::to_value(body).context("serialize POST body")?;
+        let (resp, url) = self
+            .send(
+                reqwest::Method::POST,
+                path,
+                Some(body),
+                Idempotency::Idempotent,
+            )
+            .await?;
+        unwrap_budgeted(resp, "POST", &url).await
     }
 
     async fn post_with<B: Serialize, T: DeserializeOwned>(
@@ -580,6 +615,16 @@ async fn unwrap_envelope<T: DeserializeOwned>(
     envelope
         .data
         .ok_or_else(|| anyhow!("{method} {url} -> {status}: success but no data"))
+}
+
+/// [`unwrap_envelope`], with the truncation that the headers report.
+async fn unwrap_budgeted<T: DeserializeOwned>(
+    resp: reqwest::Response,
+    method: &str,
+    url: &str,
+) -> Result<(T, Option<ResultTruncation>)> {
+    let truncation = ResultTruncation::from_headers(resp.headers());
+    Ok((unwrap_envelope(resp, method, url).await?, truncation))
 }
 
 /// Read one envelope answer. A failure by status or by the envelope's own flag
