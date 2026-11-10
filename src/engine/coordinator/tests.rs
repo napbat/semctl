@@ -747,6 +747,8 @@ fn job(completed: bool, failed: i64, error: Option<&str>) -> api::JobStatus {
         files_failed: failed,
         chunk_count: completed.then_some(12),
         error: error.map(str::to_string),
+        current_stage: None,
+        operations_per_second: None,
         started_at: Some("2026-07-31T00:00:00Z".into()),
         completed_at: completed.then(|| "2026-07-31T00:00:01Z".into()),
     }

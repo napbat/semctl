@@ -740,6 +740,8 @@ mod tests {
             files_failed: 3,
             chunk_count: None,
             error: None,
+            current_stage: None,
+            operations_per_second: None,
             started_at: Some("2026-07-14T00:00:00Z".into()),
             completed_at: None,
         };
