@@ -2,11 +2,13 @@ use std::fmt::Write as _;
 use std::time::Duration;
 
 use reqwest::StatusCode;
+use rmcp::handler::server::tool::IntoCallToolResult;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::{ApiFailure, first_error_code, gateway_error, response_body_error, retry_after};
 use crate::client::{unwrap_envelope, unwrap_page};
+use crate::query::ToolError;
 
 /// Answer one local request with a fixed HTTP response, and return what a
 /// client reads from it. The test needs no network beyond the loopback.
@@ -208,15 +210,23 @@ fn a_structured_denial_keeps_its_code() {
         "GET",
         url,
         StatusCode::FORBIDDEN,
+        None,
         r#"{"success":false,"errors":[{"code":"TenantBindingDenied"}]}"#,
     );
     let bare = response_body_error(
         "GET",
         url,
         StatusCode::FORBIDDEN,
+        None,
         r#"{"code":"TenantBindingDenied","message":"denied"}"#,
     );
-    let page = response_body_error("GET", url, StatusCode::FORBIDDEN, "<html>forbidden</html>");
+    let page = response_body_error(
+        "GET",
+        url,
+        StatusCode::FORBIDDEN,
+        None,
+        "<html>forbidden</html>",
+    );
 
     assert_eq!(
         typed(&enveloped).code.as_deref(),
@@ -262,4 +272,146 @@ fn only_a_conflict_with_a_loading_code_is_a_loading_state() {
     assert!(!failure(StatusCode::CONFLICT, Some("Other")).is_loading());
     assert!(!failure(StatusCode::CONFLICT, None).is_loading());
     assert!(!failure(StatusCode::BAD_GATEWAY, Some("GraphLoading")).is_loading());
+}
+
+#[tokio::test]
+async fn a_bare_loading_error_keeps_native_details_and_mcp_retry_guidance() {
+    let body = r#"{"code":"GraphLoading","details":"The native graph of the selected immutable snapshot is not ready.","message":"This code graph is still loading from storage. Retry shortly."}"#;
+    for paged in [false, true] {
+        for (headers, seconds) in [(vec![], 1), (vec![("Retry-After", "3")], 3)] {
+            let (response, url) = answered("409 Conflict", &headers, body).await;
+            let error = if paged {
+                unwrap_page::<serde_json::Value>(response, "GET", &url)
+                    .await
+                    .unwrap_err()
+            } else {
+                unwrap_envelope::<serde_json::Value>(response, "GET", &url)
+                    .await
+                    .unwrap_err()
+            };
+
+            let failure = typed(&error);
+            assert_eq!(failure.status(), StatusCode::CONFLICT);
+            assert_eq!(failure.code.as_deref(), Some("GraphLoading"));
+            assert_eq!(
+                failure.retry_after(),
+                (!headers.is_empty()).then_some(Duration::from_secs(seconds))
+            );
+            let failed: Result<String, ToolError> =
+                Err(ToolError::from_client("find_definition", &error));
+            let result = failed.into_call_tool_result().unwrap();
+            assert_eq!(result.is_error, Some(true));
+            assert_eq!(result.content.len(), 1);
+            assert_eq!(
+                result.content[0].as_text().unwrap().text,
+                format!(
+                    "find_definition failed: GET {url} -> 409 Conflict: {body}\n\
+                     next: retry this call once after {seconds} s. If it fails again, \
+                     use local Read/Grep for this request."
+                )
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_paged_error_needs_no_success_data_or_page_fields() {
+    let body = r#"{"success":false,"errors":[{"code":"FileLoading","message":"loading","details":"The selected file is not ready."}]}"#;
+    let (response, url) = answered("409 Conflict", &[("Retry-After", "2")], body).await;
+    let error = unwrap_page::<serde_json::Value>(response, "GET", &url)
+        .await
+        .unwrap_err();
+
+    assert_eq!(typed(&error).code.as_deref(), Some("FileLoading"));
+    assert_eq!(typed(&error).retry_after(), Some(Duration::from_secs(2)));
+    assert_eq!(
+        ToolError::from_client("list_files", &error).to_string(),
+        format!(
+            "list_files failed: GET {url} -> 409 Conflict: {body}\n\
+             next: retry this call once after 2 s. If it fails again, \
+             use local Read/Grep for this request."
+        )
+    );
+}
+
+#[tokio::test]
+async fn failure_decoding_does_not_require_the_success_data_type() {
+    let body = r#"{"success":false,"errors":[{"code":"FileLoading","details":"File not ready."}],"data":{}}"#;
+    let (response, url) = answered("409 Conflict", &[("Retry-After", "2")], body).await;
+    let error = unwrap_envelope::<Vec<String>>(response, "GET", &url)
+        .await
+        .unwrap_err();
+
+    assert_eq!(typed(&error).code.as_deref(), Some("FileLoading"));
+    assert_eq!(typed(&error).retry_after(), Some(Duration::from_secs(2)));
+    assert!(
+        ToolError::from_client("read_source", &error)
+            .to_string()
+            .contains(body)
+    );
+}
+
+#[tokio::test]
+async fn a_bare_conflict_without_a_loading_code_keeps_local_fallback_guidance() {
+    for body in [
+        r#"{"code":"SnapshotMismatch","message":"GraphLoading is not the cause."}"#,
+        r#"{"message":"GraphLoading is not a typed code here."}"#,
+    ] {
+        let (response, url) = answered("409 Conflict", &[("Retry-After", "2")], body).await;
+        let error = unwrap_envelope::<serde_json::Value>(response, "GET", &url)
+            .await
+            .unwrap_err();
+
+        assert!(!typed(&error).is_loading());
+        assert_eq!(typed(&error).retry_after(), Some(Duration::from_secs(2)));
+        assert_eq!(
+            ToolError::from_client("trace", &error).to_string(),
+            format!(
+                "trace failed: GET {url} -> 409 Conflict: {body}\n\
+                 next: use local Read/Grep for this request."
+            )
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_paged_plain_text_gateway_error_keeps_its_cause_and_delay() {
+    let (response, url) = answered(
+        "503 Service Unavailable",
+        &[("Retry-After", "7")],
+        "upstream unavailable",
+    )
+    .await;
+    let error = unwrap_page::<serde_json::Value>(response, "GET", &url)
+        .await
+        .unwrap_err();
+
+    assert_eq!(typed(&error).status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(typed(&error).code, None);
+    assert_eq!(typed(&error).retry_after(), Some(Duration::from_secs(7)));
+    let text = ToolError::from_client("list_files", &error).to_string();
+    assert!(text.contains("the server is unavailable behind the gateway"));
+    assert!(text.contains("response was not JSON: \"upstream unavailable\""));
+    assert!(text.ends_with("next: use local Read/Grep for this request."));
+}
+
+#[tokio::test]
+async fn success_responses_keep_standard_and_legacy_data_shapes() {
+    let (response, url) = answered("200 OK", &[], r#"{"success":true,"data":["ok"]}"#).await;
+    assert_eq!(
+        unwrap_envelope::<Vec<String>>(response, "GET", &url)
+            .await
+            .unwrap(),
+        ["ok"]
+    );
+    for field in ["data", "items"] {
+        let body =
+            format!(r#"{{"success":true,"{field}":["ok"],"page":1,"pageSize":25,"total":1}}"#);
+        let (response, url) = answered("200 OK", &[], &body).await;
+        let page = unwrap_page::<String>(response, "GET", &url).await.unwrap();
+        assert_eq!(page.items, ["ok"]);
+        assert_eq!(page.number, 1);
+        assert_eq!(page.size, 25);
+        assert_eq!(page.total, 1);
+    }
 }

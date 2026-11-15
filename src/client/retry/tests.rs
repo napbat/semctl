@@ -494,3 +494,27 @@ async fn a_server_that_never_answers_fails_before_the_deadline_and_names_it() {
     );
     assert_eq!(stub.requests(), 1, "a timed-out read is not retried");
 }
+
+#[tokio::test]
+async fn a_forbidden_response_keeps_its_delay_without_a_retry() {
+    let body =
+        r#"{"code":"AccessDenied","message":"denied","details":"The request is not allowed."}"#;
+    let stub = Stub::serve(vec![Reply::Answer {
+        status: "403 Forbidden",
+        headers: vec![("Retry-After", "7")],
+        body: body.to_owned(),
+    }])
+    .await;
+
+    let error = client(&stub)
+        .get::<Probe>("/v1/probe")
+        .await
+        .expect_err("the server refused this request");
+
+    assert_eq!(failure(&error).status(), reqwest::StatusCode::FORBIDDEN);
+    assert_eq!(failure(&error).retry_after(), Some(Duration::from_secs(7)));
+    assert_eq!(stub.requests(), 1);
+    let text = ToolError::from_client("trace", &error).to_string();
+    assert!(text.contains(body));
+    assert!(text.ends_with("next: use local Read/Grep for this request."));
+}

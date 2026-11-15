@@ -31,7 +31,7 @@ pub(crate) mod stub;
 pub(crate) mod transport;
 mod truncation;
 
-use failure::gateway_error;
+use failure::response_body_error;
 use retry::Idempotency;
 
 pub(crate) use failure::ApiFailure;
@@ -641,10 +641,10 @@ async fn read_envelope<T: DeserializeOwned>(
         .text()
         .await
         .with_context(|| format!("{method} {url}: read body"))?;
-    // Not the envelope: attribute it to whatever answered instead of blaming
-    // the parser. See `gateway_error`.
+    // A native failure need not have the endpoint's success shape. Preserve
+    // its code, full JSON body, and delay before considering a gateway error.
     let Ok(envelope) = serde_json::from_str::<ApiEnvelope<T>>(&body) else {
-        return Err(gateway_error(method, url, status, retry_after, &body));
+        return Err(response_body_error(method, url, status, retry_after, &body));
     };
     if !status.is_success() || !envelope.success {
         let errors = envelope.errors.as_deref().unwrap_or_default();
@@ -680,9 +680,8 @@ async fn unwrap_page<T: DeserializeOwned>(
         .text()
         .await
         .with_context(|| format!("{method} {url}: read body"))?;
-    let env: PageEnvelope<T> = serde_json::from_str(&body).with_context(|| {
-        format!("{method} {url} -> {status}: parse paginated envelope ({body})")
-    })?;
+    let env: PageEnvelope<T> = serde_json::from_str(&body)
+        .map_err(|_| response_body_error(method, url, status, retry_after, &body))?;
     if !status.is_success() || !env.success {
         let errors = env.errors.as_deref().unwrap_or_default();
         return Err(ApiFailure::from_errors(method, url, status, retry_after, errors).into());
@@ -797,8 +796,9 @@ mod tests {
 
     use serde::Deserialize;
 
+    use super::failure::gateway_error;
     use super::{
-        Client, CredentialSource, HttpTransport, PageEnvelope, gateway_error, loading_retry_delay,
+        Client, CredentialSource, HttpTransport, PageEnvelope, loading_retry_delay,
         tenant_binding_denied, tenant_selection,
     };
 

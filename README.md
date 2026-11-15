@@ -151,6 +151,14 @@ most 5 seconds for a first index before it reports that the index is still
 running. The edit actions have no deadline: a limit that fired after the files
 changed would report a failed edit that was applied.
 
+Failed reads preserve the server's error code, message, details, and
+`Retry-After` delay. This applies to normal error envelopes, bare JSON errors,
+and paginated errors without success data or page fields. A typed `409`
+`GraphLoading` or `FileLoading` failure gives one delayed retry as the next
+step, then local Read/Grep if that call also fails. Other failures keep their
+own guidance. This error decoding does not repair the server's graph or add
+request retries.
+
 The `index_codebase` tool does not wait for the first index. It registers the
 codebase, starts the scan and upload in the background, and returns at once with
 the codebase id and the path. The `sync_status` tool then reports the first-index
