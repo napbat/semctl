@@ -154,9 +154,9 @@ pub async fn search(
         .await
         .map_err(|e| ToolError::from_client("search_codebase", &e))?;
     // The note leads, so an agent reads it before it reasons from the hits.
-    let mut out = truncation
-        .map(|truncation| budget_note(BudgetedResult::Search, &truncation))
-        .unwrap_or_default();
+    let mut out = truncation.map_or_else(String::new, |truncation| {
+        budget_note(BudgetedResult::Search, &truncation)
+    });
     if hits.is_empty() {
         out.push_str("no results");
         return Ok(out);
@@ -506,9 +506,9 @@ pub async fn grep(
         .get_budgeted::<Vec<api::GrepMatch>>(&url)
         .await
         .map_err(|e| ToolError::from_client("grep", &e))?;
-    let mut out = truncation
-        .map(|truncation| budget_note(BudgetedResult::Grep, &truncation))
-        .unwrap_or_default();
+    let mut out = truncation.map_or_else(String::new, |truncation| {
+        budget_note(BudgetedResult::Grep, &truncation)
+    });
     if matches.is_empty() {
         write!(out, "no matches for `{pattern}`").expect("writing to a String cannot fail");
         return Ok(out);
@@ -839,8 +839,7 @@ mod tests {
         let stub = Stub::serve(vec![Reply::Answer {
             status: "200 OK",
             headers: value
-                .map(|value| vec![("X-Semctx-Result-Truncated", value)])
-                .unwrap_or_default(),
+                .map_or_else(Vec::new, |value| vec![("X-Semctx-Result-Truncated", value)]),
             body: format!(r#"{{"success":true,"data":{data}}}"#),
         }])
         .await;

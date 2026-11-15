@@ -157,6 +157,7 @@ impl Client {
                 return Ok((resp, url));
             }
 
+            let retry_after = super::failure::retry_after(resp.headers());
             let response_body = resp
                 .text()
                 .await
@@ -177,6 +178,7 @@ impl Client {
                 method.as_str(),
                 &url,
                 status,
+                retry_after,
                 &response_body,
             ));
         }

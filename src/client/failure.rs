@@ -125,19 +125,20 @@ pub(super) fn summarize_errors(errors: &[serde_json::Value]) -> String {
         .join("; ")
 }
 
-/// Preserve a structured JSON denial even when it is not wrapped in the
-/// resource server's usual API envelope. Tenant binding failures can be emitted
-/// by middleware before controller envelope handling runs.
+/// Preserve a structured JSON failure even when it does not match the
+/// endpoint's success envelope. Errors can omit success data and page fields,
+/// or arrive as bare objects from middleware.
 pub(super) fn response_body_error(
     method: &str,
     url: &str,
     status: StatusCode,
+    retry_after: Option<Duration>,
     body: &str,
 ) -> anyhow::Error {
     let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) else {
-        return gateway_error(method, url, status, None, body);
+        return gateway_error(method, url, status, retry_after, body);
     };
-    // The denial is either the envelope or a bare error object.
+    // The failure is either the envelope or a bare error object.
     let errors = parsed
         .get("errors")
         .and_then(serde_json::Value::as_array)
@@ -145,7 +146,7 @@ pub(super) fn response_body_error(
     anyhow::Error::new(ApiFailure::new(
         status,
         first_error_code(errors),
-        None,
+        retry_after,
         format!("{method} {url} -> {status}: {body}"),
     ))
 }
