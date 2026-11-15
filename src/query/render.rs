@@ -289,8 +289,7 @@ pub(super) fn render_hits_inner(
         let lang = h
             .language
             .as_deref()
-            .map(|l| format!(" {l}"))
-            .unwrap_or_default();
+            .map_or_else(String::new, |l| format!(" {l}"));
         let score = if show_score {
             format!("  (score {:.3})", h.score)
         } else {
@@ -312,8 +311,7 @@ pub(super) fn render_hits_inner(
         let codebase = if show_score {
             h.codebase_id
                 .as_deref()
-                .map(|id| format!(" [codebase {id}]"))
-                .unwrap_or_default()
+                .map_or_else(String::new, |id| format!(" [codebase {id}]"))
         } else {
             String::new()
         };

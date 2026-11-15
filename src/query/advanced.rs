@@ -21,8 +21,10 @@ async fn codebases_for_source(client: &Client, source_id: &str) -> Vec<String> {
             urlencode(source_id)
         ))
         .await
-        .map(|page| page.items.into_iter().map(|row| row.id).collect())
-        .unwrap_or_default()
+        .map_or_else(
+            |_| Vec::new(),
+            |page| page.items.into_iter().map(|row| row.id).collect(),
+        )
 }
 
 /// How this codebase's copies relate to the checkout we are standing in.
@@ -452,8 +454,7 @@ fn render_type_hierarchy(client: &Client, hierarchy: &api::TypeHierarchy) -> Str
         hierarchy
             .caveat
             .as_deref()
-            .map(|caveat| format!(" ({caveat})"))
-            .unwrap_or_default()
+            .map_or_else(String::new, |caveat| format!(" ({caveat})"))
     );
     writeln!(out, "nodes ({})", hierarchy.nodes.len()).expect("writing to a String cannot fail");
     for node in &hierarchy.nodes {
@@ -503,8 +504,7 @@ async fn graph_clusters(
                     group
                         .hash
                         .as_deref()
-                        .map(|hash| format!(" hash={hash}"))
-                        .unwrap_or_default()
+                        .map_or_else(String::new, |hash| format!(" hash={hash}"))
                 )
                 .expect("writing to a String cannot fail");
                 for hit in &group.chunks {

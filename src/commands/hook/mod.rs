@@ -272,13 +272,11 @@ async fn user_prompt_context(cli: &Cli, input: &HookInput) -> Option<String> {
         let sym = h
             .symbol
             .as_deref()
-            .map(|s| format!("  {s}"))
-            .unwrap_or_default();
+            .map_or_else(String::new, |s| format!("  {s}"));
         let lang = h
             .language
             .as_deref()
-            .map(|l| format!("  ·  {l}"))
-            .unwrap_or_default();
+            .map_or_else(String::new, |l| format!("  ·  {l}"));
         writeln!(out, "- {path}{loc}{sym}{lang}  ({:.3}){freshness}", h.score)
             .expect("writing to a String cannot fail");
     }

@@ -422,8 +422,7 @@ impl Client {
             .get_or_init(|| async {
                 self.get::<api::Whoami>("/v1/whoami")
                     .await
-                    .map(|whoami| whoami.capabilities)
-                    .unwrap_or_default()
+                    .map_or_else(|_| Vec::new(), |whoami| whoami.capabilities)
             })
             .await;
 
