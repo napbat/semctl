@@ -187,14 +187,17 @@ fn pairs_below_the_shared_threshold_without_direct_hits_are_dropped() {
 }
 
 #[test]
-fn summary_counts_files_pairs_unindexed_and_loading() {
+fn summary_distinguishes_search_misses_empty_results_and_loading() {
+    let ranked = strings(&["a.md", "other.md"]);
+    let entries = [
+        AffinityFile::new("a.md", QuerySource::Content, Some(&ranked)),
+        AffinityFile::new("b.md", QuerySource::Content, Some(&ranked)),
+        AffinityFile::new("c.md", QuerySource::Content, Some(&[])),
+        AffinityFile::new("d.md", QuerySource::Content, None),
+    ];
     assert_eq!(
-        summary(2, 1, 0, 0),
-        "Semantic affinity: 2 files, 1 related pair."
-    );
-    assert_eq!(
-        summary(12, 18, 5, 2),
-        "Semantic affinity: 12 files, 18 related pairs. 5 files are not indexed; their profiles still use indexed neighbours. 2 searches were unavailable while the backend loads."
+        summary(&entries, 1, 1),
+        "Semantic affinity: 4 files, 1 related pair. Input files returned: 1 of 3 completed searches. 1 search returned no result files. 1 search was unavailable while the backend loads."
     );
 }
 
@@ -249,7 +252,7 @@ async fn command_profiles_files_and_falls_back_from_a_missing_outline_to_the_nam
     .unwrap();
     assert_eq!(
         output.text,
-        "Semantic affinity: 3 files, 3 related pairs. 1 file is not indexed; its profile still uses indexed neighbours."
+        "Semantic affinity: 3 files, 3 related pairs. Input files returned: 2 of 3 completed searches."
     );
     let display = output.display.unwrap();
     assert_eq!(display["version"], 1);
@@ -258,9 +261,9 @@ async fn command_profiles_files_and_falls_back_from_a_missing_outline_to_the_nam
     assert_eq!(
         display["files"],
         json!([
-            {"path":"src/c.rs","query":"name","indexed":true,"results":4},
-            {"path":"docs/b.md","query":"content","indexed":false,"results":4},
-            {"path":"docs/a.md","query":"content","indexed":true,"results":4}
+            {"path":"src/c.rs","query":"name","indexed":true,"results":4,"search":"self_match"},
+            {"path":"docs/b.md","query":"content","indexed":false,"results":4,"search":"other_matches"},
+            {"path":"docs/a.md","query":"content","indexed":true,"results":4,"search":"self_match"}
         ])
     );
     assert_eq!(
@@ -311,7 +314,43 @@ async fn loading_searches_leave_files_without_profiles_and_add_caveats() {
     assert_eq!(display["pairs"], json!([]));
     assert_eq!(display["files"][0]["results"], 0);
     assert_eq!(display["files"][0]["indexed"], false);
+    assert_eq!(display["files"][0]["search"], "loading");
     assert_eq!(display["caveats"].as_array().unwrap().len(), 3);
+    assert_eq!(stub.requests(), 2);
+}
+
+#[tokio::test]
+async fn a_completed_empty_search_is_distinct_from_a_loading_search() {
+    let directory = checkout();
+    let stub = Stub::serve(vec![search_reply(&[]), Reply::loading("5")]).await;
+    let client = Client::for_test_server(&stub.url)
+        .with_codebase("A".into())
+        .with_test_local_root(directory.path().to_path_buf());
+    let output = affinity(
+        &client,
+        &strings(&["docs/a.md", "docs/b.md"]),
+        QueryPresentation::Inspector,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        output.text,
+        "Semantic affinity: 2 files, 0 related pairs. Input files returned: 0 of 1 completed search. 1 search returned no result files. 1 search was unavailable while the backend loads."
+    );
+    let display = output.display.unwrap();
+    let mut searches: Vec<_> = display["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| {
+            assert_eq!(file["results"], 0);
+            assert_eq!(file["indexed"], false);
+            file["search"].as_str().unwrap()
+        })
+        .collect();
+    searches.sort_unstable();
+    assert_eq!(searches, ["empty", "loading"]);
+    assert_eq!(display["pairs"], json!([]));
     assert_eq!(stub.requests(), 2);
 }
 

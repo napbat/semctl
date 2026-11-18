@@ -1,6 +1,6 @@
 import * as path from "node:path";
 import type { Component, DescribeContext, NativeNode, NativeScroll, NativeUiEvent } from "@oh-my-pi/pi-tui";
-import type { Display } from "./inspector";
+import { SemctlInspector, type Display } from "./inspector";
 import type { GraphActivity } from "./graph-activity";
 import type { GraphAppearanceStore } from "./graph-appearance";
 import type { GraphAppearanceKeyMatcher } from "./graph-appearance-panel";
@@ -79,10 +79,12 @@ export class GraphPage implements Component {
 		this.inspector?.dispose?.();
 	}
 	invalidate(): void { this.inspector?.invalidate?.(); }
+	private get readingLabel(): string { return this.options.operation.id === "overview" ? "Reading indexed project map" : "Running analysis"; }
 	private togglePanel(panel: "menu" | "diagnostics"): void {
 		const open = !this[panel];
 		this.menu = panel === "menu" && open;
 		this.diagnostics = panel === "diagnostics" && open;
+		this.offset = 0;
 		this.scroll = { by: "start", n: this.scroll.n + 1 };
 		this.options.requestRender();
 	}
@@ -152,10 +154,11 @@ export class GraphPage implements Component {
 		const reading = request.loading && !request.text && motion && cx.supports("spinner") && cx.supports("shimmer");
 		const body: (NativeNode | Component)[] = this.menu ? [this.chooser(cx)] : this.diagnostics ? [] : this.inspector ? [this.inspector] :
 			reading ? [{ k: "row", key: "reading", p: { role: "semctl.graph.loading", gap: "sm", align: "center" }, c: [
-				{ k: "spinner", p: { style: "dots", tone: "muted", aria: "Reading indexed project map" } },
-				{ k: "shimmer", p: { text: "Reading indexed project map", tone: "muted" } },
+				{ k: "spinner", p: { style: "dots", tone: "muted", aria: this.readingLabel } },
+				{ k: "shimmer", p: { text: this.readingLabel, tone: "muted" } },
 			] }]
-			: [text(request.text || (request.loading ? "Reading indexed project map…" : "No result text returned."), { tone: request.loading ? "muted" : undefined })];
+			: [text(request.text || request.error || (request.loading ? `${this.readingLabel}…` : "No result text returned."),
+				{ tone: !request.text && request.error ? "error" : request.loading ? "muted" : undefined })];
 		if (this.diagnostics) {
 			body.push(text(`Read-only · configured semctl CLI · ${cwd}`, { tone: "muted" }));
 			if (activity.operations.length) body.push(text(`Observed semctx requests: ${activity.operations.join(", ")}`, { tone: "muted" }));
@@ -166,20 +169,36 @@ export class GraphPage implements Component {
 		if (!this.menu && request.warnings?.length) body.unshift({ k: "col", key: "query-warnings", p: { gap: "xs" },
 			c: request.warnings.map(warning => text(`Warning: ${warning}`, { tone: "warning" })) });
 		out.push({ k: "col", key: "body", p: { role: "semctl.graph.body", min: { h: "12lines" }, max: { h: "28lines" } }, scroll: this.scroll, c: body });
-		out.push(graphStatus(cx, { request, activity, motion: appearance.state.value.motion }));
-		out.push(text(this.menu ? "←/→ groups · ↑/↓ analyses · Enter run · Esc return to map"
-			: this.diagnostics ? "PgUp/PgDn scroll · I or Esc return to map"
-				: "↑/↓ nodes · PgUp/PgDn scroll · A analyses · S appearance · I details · R refresh · Esc close",
+		out.push(graphStatus(cx, { request, activity, motion: appearance.state.value.motion, subject: operation.id === "overview" ? "Map" : "Analysis" }));
+		const display = request.display;
+		const hasMatches = display?.kind === "search" ? display.hits.length > 0
+			: display?.kind === "batch" && display.symbols.some(symbol => symbol.hits.length > 0);
+		const navigation = hasMatches ? "↑/↓ matches · Enter source" : display?.kind === "graph" ? "↑/↓ nodes" : "↑/↓ scroll";
+		out.push(text(this.menu ? "←/→ groups · ↑/↓ analyses · Enter run · Esc return to result"
+			: this.diagnostics ? "PgUp/PgDn scroll · I or Esc return to result"
+				: `${navigation} · PgUp/PgDn scroll · A analyses · S appearance · I details · R refresh · Esc close`,
 		{ role: "semctl.graph.hint", tone: "muted" }));
 		return { k: "col", p: { gap: "xs" }, c: out };
 	}
 	render(width: number): readonly string[] {
-		const state = this.options.state(), rows = [this.options.operation.label,
-			...(this.menu ? [groups[this.group].label, ...this.groupOperations().map(operation => `${operation.id === this.selectedMenu ? ">" : " "} ${operation.label}`)] : []),
-			...(state.loading ? [state.display ? "Refreshing · last available map retained" : "Reading indexed project map…"] : []),
-			...(state.error ? [state.error] : []), ...(state.warnings?.map(warning => `Warning: ${warning}`) ?? []), ...clean(state.text).split(/\r?\n/),
+		const state = this.options.state();
+		this.syncInspector();
+		const source = !this.diagnostics && !this.menu && this.inspector instanceof SemctlInspector ? this.inspector.returnedSource() : undefined;
+		const body = this.menu ? [
+			"←/→ groups · ↑/↓ analyses · Enter run · Esc return to result",
+			groups.map((group, index) => this.group === index ? `[${group.label}]` : group.label).join(" · "),
+			...this.groupOperations().map(operation => `${operation.id === this.selectedMenu ? ">" : " "} ${operation.label}`),
+		] : [
+			this.diagnostics ? "↑/↓ or PgUp/PgDn scroll · I or Esc return to result"
+				: "A analyses · ↑/↓ or PgUp/PgDn scroll · S appearance · I details · R refresh · Esc close",
+			...(source ? ["Returned source follows the original result."] : []),
 			...(this.diagnostics ? [`Read-only · configured semctl CLI · ${this.options.cwd}`] : []),
-		].flatMap(line => clean(line).split(/\r?\n/)).flatMap(line => line.length ? Array.from({ length: Math.ceil(line.length / Math.max(1, width)) }, (_, index) => line.slice(index * Math.max(1, width), (index + 1) * Math.max(1, width))) : [""]);
+			...(state.loading ? [state.display ? "Refreshing · last available result retained" : `${this.readingLabel}…`] : []),
+			...(state.error ? [state.error] : []), ...(state.warnings?.map(warning => `Warning: ${warning}`) ?? []), state.text,
+			...(source ? ["", source] : []),
+		];
+		const rows = [this.options.operation.label, ...body]
+			.flatMap(line => clean(line).split(/\r?\n/)).flatMap(line => line.length ? Array.from({ length: Math.ceil(line.length / Math.max(1, width)) }, (_, index) => line.slice(index * Math.max(1, width), (index + 1) * Math.max(1, width))) : [""]);
 		this.offset = Math.max(0, Math.min(this.offset, rows.length - this.options.height()));
 		return rows.slice(this.offset, this.offset + this.options.height());
 	}
@@ -220,6 +239,9 @@ export class GraphPage implements Component {
 		if (data === "s" || data === "S") { this.options.showAppearance(); return; }
 		if (data === "i" || data === "I") { this.togglePanel("diagnostics"); return; }
 		if ((data === "r" || data === "R") && !this.menu) { if (!this.options.state().loading) this.options.refresh(); return; }
+		const results = !this.menu && !this.diagnostics && this.inspector instanceof SemctlInspector ? this.inspector : undefined;
+		if ((data === "e" || data === "E") && results?.handlePageKey("expand")) return;
+		if (matches(data, "confirm") && results?.handlePageKey("confirm")) return;
 		if (this.menu && matches(data, "confirm")) { this.options.close(this.selectedMenu); return; }
 		if (this.menu && (this.options.appearanceKey?.(data, "left") || data === "\x1b[D" || this.options.appearanceKey?.(data, "right") || data === "\x1b[C" || data === "\t")) {
 			const left = this.options.appearanceKey?.(data, "left") || data === "\x1b[D";
@@ -231,8 +253,12 @@ export class GraphPage implements Component {
 				const operations = this.groupOperations(), at = operations.findIndex(operation => operation.id === this.selectedMenu);
 				this.selectedMenu = operations[Math.max(0, Math.min(operations.length - 1, at + delta))].id;
 				this.menuRevision++;
-			} else if (!this.diagnostics && this.inspector && "move" in this.inspector && typeof this.inspector.move === "function") this.inspector.move(delta);
-			else { this.offset += delta; this.scroll = { by: delta > 0 ? "line-down" : "line-up", n: this.scroll.n + 1 }; }
+			} else {
+				// The terminal fallback scrolls the complete text, even when native arrows select matches.
+				this.offset += delta;
+				if (results?.handlePageKey(delta > 0 ? "down" : "up")) return;
+				this.scroll = { by: delta > 0 ? "line-down" : "line-up", n: this.scroll.n + 1 };
+			}
 		} else if (matches(data, "pageUp") || matches(data, "pageDown")) {
 			const down = matches(data, "pageDown"); this.offset += down ? this.options.height() : -this.options.height(); this.scroll = { by: down ? "page-down" : "page-up", n: this.scroll.n + 1 };
 		} else return;

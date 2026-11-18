@@ -508,6 +508,90 @@ describe("per-card native renderer", () => {
 	});
 });
 
+describe("standalone analysis results", () => {
+	test("folds batch results in request order and restores late match previews without losing misses", () => {
+		const payload: Display = { version: 1, kind: "batch", identity: search().identity, symbols: [
+			{ symbol: "early-miss", hits: [] },
+			{ symbol: "many", hits: Array.from({ length: 5 }, (_, i) => match({ path: `src/${i}.ts` })) },
+			{ symbol: "late-miss", hits: [] },
+			{ symbol: "one", hits: [match({ path: "src/late.ts" })] },
+		] };
+		const view = new SemctlInspector(payload, () => {}, undefined, "", "body", "overview");
+		const compact = ["batch-miss-0", "batch-group-1", ...Array.from({ length: 5 }, (_, i) => `match-${i}`)];
+		const visibleRows = () => nodes(view.describe(native)).filter(n => /^(batch-|match-\d)/.test(n.key ?? "") && !n.p?.hidden);
+		const caption = () => nodes(view.describe(native)).find(n => n.key === "result-rows")?.p?.aria;
+		expect(visibleRows().map(n => n.key)).toEqual(compact);
+		expect(caption()).toBe("Show 2 more results (E)");
+		activate(view, "result-rows");
+		expect(visibleRows().map(n => n.key)).toEqual([...compact, "batch-miss-2", "batch-group-3", "match-5"]);
+		expect(visibleRows().filter(n => n.key?.startsWith("batch-")).map(textContent))
+			.toEqual(["early-miss · no match", "many · 5 matches", "late-miss · no match", "one · 1 match"]);
+		expect(caption()).toBe("Show fewer results (E)");
+		activate(view, "hit-5");
+		activate(view, "result-rows");
+		expect(visibleRows().map(n => n.key)).toEqual(compact);
+		activate(view, "result-rows");
+		expect(visibleRows().flatMap(nodes).find(n => n.k === "code")?.p?.path).toBe("src/late.ts");
+	});
+
+	test("offers expansion when the only remaining result is a miss", () => {
+		const payload: Display = { version: 1, kind: "batch", identity: search().identity,
+			symbols: Array.from({ length: 7 }, (_, i) => ({ symbol: `missing-${i}`, hits: [] })) };
+		const view = new SemctlInspector(payload, () => {}, undefined, "", "body", "overview");
+		const visible = () => nodes(view.describe(native)).filter(n => n.key?.startsWith("batch-miss") && !n.p?.hidden).map(textContent);
+		expect(visible()).toHaveLength(6);
+		expect(nodes(view.describe(native)).find(n => n.key === "result-rows")?.p?.aria).toBe("Show 1 more result (E)");
+		view.handlePageKey("expand");
+		expect(visible().at(-1)).toBe("missing-6 · no match");
+	});
+
+	test("renders full selected source in native code and plain native text without changing the feed preview", () => {
+		const snippet = Array.from({ length: 30 }, (_, i) => `returned line ${i + 1}`).join("\n");
+		const payload = search([match({ snippet, snippetStartLine: 100, snippetEndLine: 129, focusLine: 120 })]);
+		const view = new SemctlInspector(payload, () => {}, undefined, "", "body", "overview");
+		expect(nodes(view.describe(native)).some(n => n.k === "code")).toBe(false);
+		view.handlePageKey("confirm");
+		const body = nodes(view.describe(native));
+		expect(body.find(n => n.k === "code")?.p).toMatchObject({
+			text: snippet, start: 100, numbers: true, wrap: true, marks: [{ line: 120, tone: "accent" }],
+		});
+		expect(body.map(textContent).join("\n")).not.toContain("expand tool");
+		const plain = { ...native, supports: (kind: string) => kind === "col" || kind === "row" || kind === "text" };
+		expect(nodes(view.describe(plain)).find(n => textContent(n) === snippet)?.p).toMatchObject({ wrap: "word" });
+		const feed = renderer(), value = result(payload), card = component(feed, value);
+		activate(card, "hit-0");
+		expect(nodes(card.describe(native)).map(textContent)).toContain("12 of 30 lines · expand tool for full result");
+		expect(nodes(card.describe(native)).some(n => n.key === "result-rows")).toBe(false);
+		expect(component(feed, value, { ...compact, expanded: true })).toBe(card);
+		expect(nodes(card.describe(native)).find(n => n.k === "code")?.p).toMatchObject({ text: snippet, wrap: false });
+	});
+
+	test("shows the entire direct source window without hiding upstream truncation", () => {
+		const source = Array.from({ length: 20 }, (_, i) => `source line ${i + 1}`).join("\n");
+		const payload: Display = { version: 1, kind: "source", identity: search().identity, path: "src/main.ts", text: source,
+			language: "typescript", sourceOrigin: "content-plane", contentHash: "hash", encoding: "utf-8",
+			binary: false, truncated: true, byteStart: 0, byteEnd: source.length, fileSize: source.length + 100, lineStart: 1, lineEnd: 20 };
+		const view = new SemctlInspector(payload, () => {}, undefined, "", "body", "overview");
+		const body = nodes(view.describe(native));
+		expect(body.find(n => n.k === "code")?.p).toMatchObject({ text: source, start: 1 });
+		expect(body.map(textContent).join("\n")).toContain(" · truncated");
+	});
+
+	test("opens a graph node with the complete returned source", () => {
+		const snippet = Array.from({ length: 20 }, (_, i) => `node line ${i + 1}`).join("\n");
+		const payload: Display = { version: 1, kind: "graph", identity: search().identity, title: "Graph", query: null,
+			nodes: [{ id: "main", label: "main", detail: null, hit: match({ snippet, snippetStartLine: 10, snippetEndLine: 29 }) }],
+			edges: [], roots: ["main"], caveats: [], truncated: false };
+		const view = new SemctlInspector(payload, () => {}, undefined, "", "body", "overview");
+		const graph = view.describe(native)?.c?.[0];
+		if (!(graph instanceof GraphInspector)) throw new Error("Missing graph inspector");
+		view.handlePageKey("down");
+		const preview = nodes(graph.describe(native)).flatMap(n => n.c ?? []).find(child => child instanceof SemctlInspector);
+		if (!(preview instanceof SemctlInspector)) throw new Error("Missing match preview");
+		expect(nodes(preview.describe(native)).find(n => n.k === "code")?.p).toMatchObject({ text: snippet, start: 10 });
+	});
+});
+
 describe("native provenance presentation", () => {
 	test("selection does not change retained source metadata", () => {
 		const payload = search([match(), match({ path: "other.ts" })]);

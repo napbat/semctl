@@ -525,7 +525,7 @@ describe("native graph navigation", () => {
 		settle.resolve({ display: { version: 1, kind: "affinity", files: runs[0].map(path => ({ path, query: "content", indexed: false, results: 4 })),
 			pairs: [{ a, b, direct: 0, shared: .6 }], caveats: [] } });
 		await settle.promise; await Promise.resolve();
-		expect(content(nodes(view.describe(cx)).find(node => node.key === "semantic")!)).toContain("1 related pair · 0 of 60 files indexed");
+		expect(content(nodes(view.describe(cx)).find(node => node.key === "semantic")!)).toContain("1 related pair · 0 of 60 files in their own search results");
 		const state = view.navigation();
 		expect(state.trail).toHaveLength(1);
 		const refreshed = graph();
@@ -537,6 +537,28 @@ describe("native graph navigation", () => {
 		const back = nodes(after.describe(cx));
 		expect(back.some(node => node.key === "crumb-1")).toBe(false);
 		expect(after.navigation().trail).toBeUndefined();
+	});
+	test.each([
+		["empty", "Affinity searches returned no result files · terms and links"],
+		["loading", "Affinity searches unavailable while the backend loads · terms and links"],
+		["partial", "Partial semantic placement · 1 related pair"],
+	])("affinity with %s searches reports what evidence the view can use", async (search, expected) => {
+		const data = graph();
+		data.nodes = Array.from({ length: 30 }, (_, n) => {
+			const path = `docs/specifications/layout-${n}.md`;
+			return { id: String(n), label: path, path, category: "file", detail: null, hit: null };
+		});
+		data.edges = []; data.roots = ["0"];
+		setAffinityRunner(async paths => ({ display: { version: 1, kind: "affinity", files: paths.map((path, index) => {
+			const evidence = search === "partial" ? index === 0 ? "other_matches" : "loading" : search;
+			return { path, query: "name", indexed: false, results: evidence === "other_matches" ? 1 : 0, search: evidence };
+		}), pairs: search === "partial" ? [{ a: paths[0], b: paths[1], direct: .5, shared: 0 }] : [], caveats: [] } }));
+		const view = new GraphInspector(data, () => {}, () => { throw new Error("No source supplied"); }, "hv", undefined, "body", "overview");
+		view.describe(native);
+		action(view, "group:0");
+		expect(content(nodes(view.describe(native)).find(node => node.key === "semantic")!)).toBe("Semantic placement loading · terms and links for now");
+		await Promise.resolve();
+		expect(content(nodes(view.describe(native)).find(node => node.key === "semantic")!)).toBe(expected);
 	});
 	test("appearance edits retain drilldown, exact selected source and relationship navigation", () => {
 		const data = graph(); let previews = 0;

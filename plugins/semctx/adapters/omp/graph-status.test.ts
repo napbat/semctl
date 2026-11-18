@@ -74,7 +74,7 @@ describe("compact live progress", () => {
 		for (const producer of phases) {
 			const view = graphStatus(native, { request: settled(), activity: { ...idle(), producer }, presentation: "icon" });
 			expect(visibleText(view)).toBe("—");
-			expect(nodes(view).find(node => node.k === "meter")?.p?.value).toBeNull();
+			expect(nodes(view).some(node => node.k === "meter" || node.k === "spinner")).toBe(false);
 			expect(nodes(view).some(node => node.p?.title?.includes(producer.text))).toBe(true);
 			expect(warningSlot(view) !== undefined).toBe(producer.symbol === "status.error");
 			if (producer.diagnostic) expect(nodes(view).some(node => node.p?.title?.includes(producer.diagnostic!))).toBe(true);
@@ -115,7 +115,7 @@ describe("compact live progress", () => {
 			text: "scanning", symbol: "status.running", tone: "warning", diagnostic, details: `Full producer snapshot\n${diagnostic}`,
 		} } });
 		expect(warningSlot(view)).toBeDefined();
-		const tooltip = nodes(view).find(node => node.k === "meter")?.p?.title ?? "";
+		const tooltip = warningSlot(view)?.p?.title ?? "";
 		expect(tooltip).toContain("Provider rejected embedding");
 		expect(tooltip).not.toContain("Full producer snapshot");
 		expect(tooltip).not.toContain("Full trace");

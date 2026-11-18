@@ -322,15 +322,20 @@ export class GraphInspector implements Component {
 	}
 	/** What placed the open group: semctx search profiles, or terms and links while they are unavailable. */
 	private semanticStatus(view: ScopeView): NativeNode {
-		const { status, files, indexed, pairs, error } = view.semantic;
+		const { status, files, indexed: selfMatches, pairs, error } = view.semantic;
 		const how = "Each file is described by one semctx search of its headings, outline or name. Files that retrieve each other or share results sit together.";
-		const label = status === "ready" ? `Semantic placement · ${pairs} related pair${pairs === 1 ? "" : "s"} · ${indexed} of ${files} files indexed`
+		const related = `${pairs} related pair${pairs === 1 ? "" : "s"}`;
+		const label = status === "ready" ? pairs > 0 ? `Semantic placement · ${related} · ${selfMatches} of ${files} files in their own search results`
+			: "No related pairs for placement · terms and links"
+			: status === "empty" ? "Affinity searches returned no result files · terms and links"
+			: status === "partial" ? pairs > 0 ? `Partial semantic placement · ${related}` : "Incomplete affinity search evidence · terms and links"
+			: status === "backend-loading" ? "Affinity searches unavailable while the backend loads · terms and links"
 			: status === "loading" ? "Semantic placement loading · terms and links for now"
 			: status === "failed" ? "Semantic placement unavailable · terms and links"
 			: files > AFFINITY_MAX_FILES ? `Terms and links · open a subconcept of at most ${AFFINITY_MAX_FILES} files for semantic placement`
 			: "Terms and links";
-		return { ...text(label, { role: "semctl.graph.semantic", tone: status === "failed" ? "warning" : "muted", wrap: "none", truncate: "end",
-			title: compactTooltip(status === "failed" && error ? error : how, "Retrieval evidence for placement, not a dependency or a confidence score") }), key: "semantic" };
+		return { ...text(label, { role: "semctl.graph.semantic", tone: status === "failed" || status === "partial" ? "warning" : "muted", wrap: "none", truncate: "end",
+			title: compactTooltip(status === "failed" && error ? error : how, "Search results do not measure index coverage or show dependencies") }), key: "semantic" };
 	}
 	/** The subconcepts of the open group, largest first. Selecting one opens it as the next level. */
 	private subconceptRows(cx: DescribeContext): NativeNode[] {

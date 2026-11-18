@@ -3,9 +3,8 @@
 //! The server returns no raw embedding vectors. Each file therefore gets a
 //! retrieval profile: the ranked result files of one search whose query
 //! describes the file. Two files are related when their profiles overlap, or
-//! when one file occurs in the results of the other. A file that the server has
-//! not embedded still gets a profile, because its query retrieves indexed
-//! neighbours.
+//! when one file occurs in the results of the other. A file can have a useful
+//! profile even when its own bounded ranking does not return it.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -80,22 +79,10 @@ pub async fn affinity(
         .iter()
         .zip(&descriptions)
         .zip(&ranked)
-        .map(|((&path, (_, query)), paths)| AffinityFile {
-            path,
-            query: *query,
-            indexed: paths
-                .as_ref()
-                .is_some_and(|paths| paths.iter().any(|result| result == path)),
-            results: paths.as_ref().map_or(0, Vec::len),
-        })
+        .map(|((&path, (_, query)), paths)| AffinityFile::new(path, *query, paths.as_deref()))
         .collect();
-    let unindexed = entries
-        .iter()
-        .zip(&ranked)
-        .filter(|(entry, paths)| paths.is_some() && !entry.indexed)
-        .count();
-    let text = summary(entries.len(), pairs.len(), unindexed, caveats.len());
-    caveats.push("Affinity compares the ranked result files of one hybrid search per file. It is retrieval evidence, not a structural relationship.".into());
+    let text = summary(&entries, pairs.len(), caveats.len());
+    caveats.push("Affinity compares the ranked result files of one bounded hybrid search per file. The results do not measure index coverage or show structural relationships.".into());
     let display = if presentation == QueryPresentation::Inspector {
         Some(project_affinity(client, entries, pairs, caveats)?)
     } else {
@@ -210,7 +197,7 @@ async fn describe(
     Ok((name_query(&path), QuerySource::Name))
 }
 
-/// An unindexed or loading file has no outline. Other failures are fatal.
+/// An absent or loading outline falls back to the file name. Other failures are fatal.
 fn outline_absent(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause.downcast_ref::<ApiFailure>().is_some_and(|failure| {
@@ -576,18 +563,26 @@ fn humanize(name: &str) -> String {
     spaced.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn summary(files: usize, pairs: usize, unindexed: usize, loading: usize) -> String {
+fn summary(entries: &[AffinityFile<'_>], pairs: usize, loading: usize) -> String {
+    let files = entries.len();
     let mut text = format!(
         "Semantic affinity: {files} files, {pairs} related {}.",
         if pairs == 1 { "pair" } else { "pairs" }
     );
-    if unindexed > 0 {
-        let (count, verb) = if unindexed == 1 {
-            ("1 file is".to_owned(), "its profile still uses")
-        } else {
-            (format!("{unindexed} files are"), "their profiles still use")
-        };
-        write!(text, " {count} not indexed; {verb} indexed neighbours.")
+    let completed = files - loading;
+    if completed > 0 {
+        let self_matches = entries.iter().filter(|entry| entry.self_match).count();
+        let searches = if completed == 1 { "search" } else { "searches" };
+        write!(
+            text,
+            " Input files returned: {self_matches} of {completed} completed {searches}."
+        )
+        .expect("writing to a String cannot fail");
+    }
+    let empty = entries.iter().filter(|entry| entry.is_empty()).count();
+    if empty > 0 {
+        let searches = if empty == 1 { "search" } else { "searches" };
+        write!(text, " {empty} {searches} returned no result files.")
             .expect("writing to a String cannot fail");
     }
     if loading > 0 {

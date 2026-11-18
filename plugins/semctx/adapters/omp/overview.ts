@@ -104,6 +104,7 @@ export interface GraphRequestState {
 	loading: boolean;
 	text: string;
 	error?: string;
+	retainedAfterError?: true;
 	warnings?: readonly string[];
 	display?: Display;
 }
@@ -191,8 +192,8 @@ export class GraphRequest {
 		} catch (error) {
 			if (!current()) return;
 			this.state = { loading: false, text: retained?.text ?? "", ...(retained?.display ? { display: retained.display } : {}),
-				...(retained?.warnings ? { warnings: retained.warnings } : {}),
-				error: [error instanceof Error ? error.message : String(error), ...(retained ? ["Showing the last available graph for this request."] : [])].join("\n") };
+				...(retained?.warnings ? { warnings: retained.warnings } : {}), ...(retained ? { retainedAfterError: true as const } : {}),
+				error: [error instanceof Error ? error.message : String(error), ...(retained ? ["Showing the last available result for this request."] : [])].join("\n") };
 		} finally {
 			// A pending doc read keeps the controller, so `cancel` also stops the read.
 			if (current()) { if (!concepts) this.controller = undefined; this.changed(); }

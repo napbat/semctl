@@ -1,5 +1,6 @@
 import type { GraphData } from "./graph";
 import { DEFAULT_GRAPH_APPEARANCE, type GraphAppearance } from "./graph-appearance";
+import { GRAPH_CANVAS } from "./graph-canvas";
 import { bindTermVector, centroid, cosine, graphEmbedding, semanticFamilies, semanticMap, similarityMap } from "./graph-data/embedding.js";
 import { affinityOf, bindAffinity, bindDrawingWeight, drawingWeight, edgeGeometry, isRemainder, layoutGraph, relationKind, representativeLinks, sharedConceptFamilies, type GraphPosition, type GraphRelationKind, type SharedConceptFamily } from "./graph-data/layout.js";
 import { conceptPalette } from "./graph-data/palette.js";
@@ -587,8 +588,7 @@ export function nativeGraphLayout(data: GraphData, size: GraphPreviewSize, choic
 		const weight = weights.get(point.node.id);
 		return weight ? Math.round((3.5 + (size === "compact" ? 4 : 6) * Math.sqrt(weight / heaviest)) * 2) / 2 : 3.5;
 	};
-	const width = size === "compact" ? 280 : size === "overview" ? 760 : 560;
-	const height = size === "compact" ? 176 : size === "overview" ? 320 : data.nodes.length <= 8 ? 156 : data.nodes.length <= 24 ? 216 : 264;
+	const { width, height } = GRAPH_CANVAS[size !== "inline" ? size : data.nodes.length <= 8 ? "small" : data.nodes.length <= 24 ? "medium" : "inline"];
 	let positions: Map<string, GraphPosition>, project: (x: number, y: number) => NativeGraphPoint;
 	let geometries: NativeCurve[];
 	if (mode === "force" && size !== "compact") {

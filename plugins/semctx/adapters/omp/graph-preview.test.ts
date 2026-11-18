@@ -675,6 +675,18 @@ test("key/more labels obey collision-aware budgets while hover labels remain ava
 	expect(hover.every(node => node?.p.class?.includes("sg-label-transient"))).toBe(true);
 });
 
+test("a narrow live drawing keeps a long name on hover when the label cannot fit", () => {
+	const data = graph();
+	data.nodes = [{ ...data.nodes[0], category: "group", label: "serialization and reconciliation" }];
+	data.edges = [];
+	const preview = (labelWidth: number) => graphPreview(data, cx, { size: "overview", labelWidth, appearance: DEFAULT_GRAPH_APPEARANCE });
+	const wide = preview(760), narrow = preview(150);
+	expect(elements(wide, "sg-label-transient")).toHaveLength(0);
+	expect(elements(narrow, "sg-label-transient")).toHaveLength(1);
+	expect(targets(narrow)[0].p.title).toContain("serialization and reconciliation");
+	expect(targets(narrow)[0].p.class).toBe(targets(wide)[0].p.class);
+});
+
 test("passive activity and receipt changes preserve every settled label and node position", () => {
 	const data = graph();
 	data.nodes = Array.from({ length: 24 }, (_, index) => ({ id: String(index), label: String.fromCharCode(65 + index), hit: null, detail: null, category: "group" }));

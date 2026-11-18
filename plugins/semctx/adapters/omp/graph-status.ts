@@ -12,6 +12,8 @@ interface GraphStatusInput {
 	activity: GraphActivity;
 	motion?: GraphAppearance["motion"];
 	presentation?: "label" | "icon";
+	counts?: GraphIndexingCounts;
+	subject?: "Map" | "Analysis";
 }
 const clean = (value: string) => value.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "");
 const text = (value: string, props: Record<string, unknown> = {}): NativeNode => ({ k: "text", p: { text: clean(value), ...props } });
@@ -27,7 +29,7 @@ export function readyShare(counts: GraphIndexingCounts | undefined): ReadyShare 
 }
 
 /** Current evidence wins over a previous receipt. A queued observation never implies active work. */
-export function graphStatusModel({ request, activity }: GraphStatusInput) {
+export function graphStatusModel({ request, activity, subject = "Map" }: GraphStatusInput) {
 	const { producer, requests } = activity;
 	const active = activity.operations.length;
 	const latest = (activity.recent ?? []).reduce<NonNullable<GraphActivity["recent"]>[number] | undefined>(
@@ -38,9 +40,9 @@ export function graphStatusModel({ request, activity }: GraphStatusInput) {
 		: producer?.symbol === "status.success" ? "ready" : request.loading || layersLoading ? "loading"
 		: active ? "working" : producer?.tone === "warning" ? "warning"
 		: latest?.outcome === "failed" ? "failed" : latest?.outcome === "returned" ? "returned" : "idle";
-	const label = request.error ? request.display ? "Map refresh failed" : "Map unavailable"
+	const label = request.error ? request.retainedAfterError ? `${subject} refresh failed` : request.display || request.text ? `${subject} diagnostic` : `${subject} unavailable`
 		: producer ? producer.symbol === "status.success" ? "Current job embedded" : producer.text
-		: request.loading ? request.display ? "Refreshing project map" : "Reading project map"
+		: request.loading ? subject === "Analysis" ? request.display ? "Refreshing analysis" : "Running analysis" : request.display ? "Refreshing project map" : "Reading project map"
 		: layersLoading ? "Relationship layers loading"
 		: active ? `${active} active ${active === 1 ? "request" : "requests"}`
 		: latest ? `${operationLabel(latest.operation)} · ${latest.outcome}` : "No active requests";
@@ -55,7 +57,8 @@ export function graphStatus(cx: DescribeContext, input: GraphStatusInput): Nativ
 	const compact = input.presentation === "icon";
 	// The compact ring shows the same ready share as the popup header. Map refresh errors do not invalidate
 	// separately reported producer progress, which stays in the tooltip.
-	const share = compact && input.request.display?.kind === "graph" ? readyShare(indexingCounts(input.request.display.nodes)) : undefined;
+	const display = input.request.display;
+	const share = compact && display?.kind === "graph" ? readyShare(input.counts ?? indexingCounts(display.nodes)) : undefined;
 	const progress = compact ? share?.value ?? input.activity.producer?.progress : model.progress;
 	const warning = mode === "failed" || mode === "warning" || input.activity.producer?.tone === "warning";
 	const { producer, operations } = input.activity;
@@ -66,9 +69,9 @@ export function graphStatus(cx: DescribeContext, input: GraphStatusInput): Nativ
 	const activityTitle = compactTooltip(traffic, operations.length ? `Active: ${[...new Set(operations)].join(", ")}` : undefined);
 	const styled = supportsElements(cx) && cx.feature("styles");
 	const motion = input.motion !== "off" && !cx.reduceMotion;
-	const mark: NativeNode = (compact || progress !== undefined) && cx.supports("meter")
-		? { k: "meter", key: "progress", p: { value: progress ?? null, style: "ring", size: "sm",
-			tone: compact ? progress === undefined ? "muted" : progress === 1 ? "success" : "accent" : tone,
+	const mark: NativeNode = progress !== undefined && cx.supports("meter")
+		? { k: "meter", key: "progress", p: { value: progress, style: "ring", size: "sm",
+			tone: compact ? progress === 1 ? "success" : "accent" : tone,
 			title: detail, aria: share ? "Share of reported files that are ready" : "Producer-reported embedding and sync progress" } }
 		: !compact && cx.supports("icon") && (mode === "failed" || mode === "warning")
 			? { k: "icon", key: "warning", p: { name: "warn", tone, title: detail, aria: detail } }
@@ -91,7 +94,11 @@ export function graphStatus(cx: DescribeContext, input: GraphStatusInput): Nativ
 			...compact ? { shrink: 0, min: { w: "4ch" } } : { grow: 1, basis: 0, min: { w: 0 } }, tone: compact ? "muted" : tone,
 			wrap: "none", truncate: "end", title: boundedTooltip([detail, progress === undefined ? "Progress unknown" : undefined], 4),
 		}),
-		...(compact ? [{ k: "row" as const, key: "spacer", p: { grow: 1, basis: 0, min: { w: 0 } } }, ...alert] : []),
+		...(compact ? [{ k: "row" as const, key: "spacer", p: { grow: 1, basis: 0, min: { w: 0 } },
+			c: display?.kind === "graph" && (input.request.error || display.loading) ? [text(input.request.error ? input.request.retainedAfterError ? "Showing last map" : "Map diagnostic" : "Relationship layers loading", {
+				role: "semctl.live.map-state", min: { w: 0 }, tone: input.request.error ? "warning" : "muted", wrap: "none", truncate: "end",
+				title: compactTooltip(input.request.error ?? display.caveats[0]),
+			})] : [] }, ...alert] : []),
 		...(requests && requests.sent > 0 ? [{ k: "row" as const, p: {
 			role: "semctl.live.traffic", gap: "sm" as const, shrink: 0, align: "center" as const, title: activityTitle,
 			aria: `${requests.sent} observed requests sent, ${requests.received} returned${requests.failed ? `, ${requests.failed} failed` : ""}`,
@@ -110,6 +117,7 @@ export const GRAPH_STATUS_STYLES = { name: "semctl-graph-status", css: `
 .semctl-graph-status[data-presentation=icon]{box-sizing:content-box;height:22px;min-height:22px;padding-top:4px}
 .semctl-live-progress{display:flex;align-items:center;justify-content:center;width:20px;height:20px;flex:0 0 20px}
 [data-role="semctl.live.progress-value"]{font-size:11px;font-variant-numeric:tabular-nums}
+[data-role="semctl.live.map-state"]{font-size:11px}
 .semctl-graph-status[data-motion=full] [data-role="semctl.live.progress-value"]{-stencil-text-effect:numeric;-stencil-text-duration:320ms}
 [data-role="semctl.live.warning"]{display:flex;align-items:center;justify-content:center;flex:none;width:12px;height:12px}
 [data-role="semctl.live.warning"] .ico{width:12px;height:12px}

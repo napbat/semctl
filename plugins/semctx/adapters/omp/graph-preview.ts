@@ -19,6 +19,8 @@ export interface GraphPreviewOptions {
 	feedback?: ReadonlyMap<string, GraphFeedback>;
 	selected?: string;
 	size?: GraphPreviewSize;
+	/** Available width for fixed-pixel labels. Does not change node or route positions. */
+	labelWidth?: number;
 	appearance?: Readonly<GraphAppearance>;
 	nodeAction?: (id: string) => string | undefined;
 }
@@ -115,8 +117,18 @@ function routeNode(route: NativeGraphRoute, layout: NativeGraphLayout, title?: s
 }
 
 interface GraphLabelBox { left: number; top: number; right: number; bottom: number }
+type LabelFrame = Pick<NativeGraphLayout, "width" | "height" | "dots" | "territories">;
 
-function territoryLabels(layout: NativeGraphLayout, size: GraphPreviewSize): Map<string, { below: boolean; box: GraphLabelBox }> {
+/** Native fonts and dot radii stay fixed when the plot shrinks. Test their bounds in display pixels. */
+function labelFrame(layout: NativeGraphLayout, width = layout.width): LabelFrame {
+	if (width >= layout.width) return layout;
+	const scale = width / layout.width;
+	return { width, height: layout.height * scale, dots: layout.dots.map(dot => ({ ...dot, x: dot.x * scale, y: dot.y * scale })),
+		territories: layout.territories.map(territory => ({ ...territory, x: territory.x * scale, y: territory.y * scale,
+			rx: territory.rx * scale, ry: territory.ry * scale })) };
+}
+
+function territoryLabels(layout: LabelFrame, size: GraphPreviewSize): Map<string, { below: boolean; box: GraphLabelBox }> {
 	const labels = new Map<string, { below: boolean; box: GraphLabelBox }>();
 	const boxes: GraphLabelBox[] = [];
 	if (size === "compact") return labels;
@@ -136,7 +148,7 @@ function territoryLabels(layout: NativeGraphLayout, size: GraphPreviewSize): Map
 	return labels;
 }
 
-function graphLabels(layout: NativeGraphLayout, options: Pick<GraphPreviewOptions, "appearance" | "selected" | "size" | "codebaseId">, obstacles: readonly GraphLabelBox[]): Map<string, { text: string; classes: string }> {
+function graphLabels(layout: LabelFrame, options: Pick<GraphPreviewOptions, "appearance" | "selected" | "size" | "codebaseId">, obstacles: readonly GraphLabelBox[]): Map<string, { text: string; classes: string }> {
 	const mode = options.appearance?.labels;
 	// Group maps reserve room for their labels, so they can name more groups than an ordinary result graph.
 	const grouped = layout.dots.every(dot => dot.node.category === "group");
@@ -195,8 +207,9 @@ export function graphPreview(data: GraphData, cx: DescribeContext, options: Grap
 	for (const route of layout.routes) if (route.link.from === selected || route.link.to === selected) {
 		connected.add(route.link.from); connected.add(route.link.to);
 	}
-	const chips = territoryLabels(layout, size);
-	const labels = graphLabels(layout, { ...options, selected }, [...chips.values()].map(chip => chip.box));
+	const frame = labelFrame(layout, options.labelWidth);
+	const chips = territoryLabels(frame, size);
+	const labels = graphLabels(frame, { ...options, selected }, [...chips.values()].map(chip => chip.box));
 	const arrival = new Map([...layout.dots].sort((a, b) => Number(b.root) - Number(a.root) || b.degree - a.degree ||
 		(a.node.id < b.node.id ? -1 : a.node.id > b.node.id ? 1 : 0)).map((dot, rank) => [dot.node.id, Math.min(7, Math.floor(rank / Math.ceil(layout.dots.length / 8)))]));
 	const territories = layout.territories.map(territory => {

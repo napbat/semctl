@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as path from "node:path";
 import type { ExecOptions, ExecResult, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { Component, DescribeContext, NativeNode, NativeUiEvent, TUI } from "@oh-my-pi/pi-tui";
-import { readDisplay, SemctlInspector, type Display } from "./inspector";
+import { readDisplay, SemctlInspector, type Display, type Hit } from "./inspector";
 import { readStatusUpdate } from "./status";
 import { GRAPH_OPERATIONS, GraphRequest, createGraphOverview, graphArguments, type GraphOverviewDependencies } from "./overview";
 import { GraphAppearanceStore } from "./graph-appearance";
@@ -428,6 +428,74 @@ describe("native overview popup", () => {
 		expect(h.pending[1].args).toEqual(["graph", "--json", "call-path", "--", "start", "finish"]);
 		h.overview.reset(); await open;
 	});
+	test("the standalone references page exposes late matches and complete returned source with or without native rendering", async () => {
+		const h = harness({ readDisplay, createInspector: (display, render, raw, presentation) =>
+			new SemctlInspector(display, render, undefined, raw, "body", presentation) });
+		const open = h.overview.open(h.ctx);
+		try {
+			h.pending[0].response.resolve(result(JSON.stringify({ text: "Original overview" })));
+			await settle();
+			const overview = h.views[0];
+			expect(overview.render(120).join("\n")).toContain("A analyses");
+			h.answers.push("main");
+			overview.handleInput("a");
+			overview.handleInput("\x1b[C");
+			overview.handleInput("tui.select.down");
+			overview.handleInput("tui.select.down");
+			const chooser = overview.render(120).join("\n");
+			expect(chooser).toContain("[Symbols]");
+			expect(chooser).toContain("> References");
+			expect(chooser).not.toContain("Original overview");
+			overview.handleInput("tui.select.confirm");
+			await settle();
+			expect(h.pending[1].args).toEqual(["graph", "--json", "references", "--", "main"]);
+
+			const snippet = Array.from({ length: 20 }, (_, i) => `returned source line ${i + 1}`).join("\n");
+			const hits: Hit[] = Array.from({ length: 8 }, (_, i) => ({
+				path: `src/match-${i + 1}.ts`, symbol: "main", qualifiedName: null, language: "typescript", kind: null, score: null,
+				startLine: 1, endLine: 1, startByte: null, endByte: null, codebaseId: "current",
+				snippet: i === 7 ? snippet : null, snippetStartLine: i === 7 ? 1 : null, snippetEndLine: i === 7 ? 20 : null,
+				snippetStartByte: null, snippetEndByte: null, focusLine: null, focusByte: null,
+				binding: { state: "not-probed", reason: null },
+			}));
+			const display: Display = { version: 1, kind: "batch", identity: { codebaseId: "current", name: null, localRoot: cwd, copy: "checkout" },
+				symbols: [{ symbol: "main", hits }] };
+			h.pending[1].response.resolve(result(JSON.stringify({ text: "Original reference locations", display })));
+			await settle();
+			const view = h.views[1];
+			const described = () => nodes(view.describe(native));
+			const visible = () => described().filter(n => /^match-\d+$/.test(n.key ?? "") && !n.p?.hidden);
+			expect(visible()).toHaveLength(6);
+			const heading = described().find(n => n.key === "batch-group-0");
+			expect(heading?.p).toMatchObject({ spans: [{ t: "main · 8 matches", s: "muted" }] });
+			expect(content(view.describe(native))).toContain("↑/↓ matches · Enter source");
+			expect(described().find(n => n.key === "result-rows")?.p?.aria).toBe("Show 2 more results (E)");
+			view.handleInput("e");
+			expect(visible()).toHaveLength(8);
+			for (let i = 0; i < hits.length; i++) view.handleInput("tui.select.down");
+			view.handleInput("tui.select.confirm");
+			expect(described().find(n => n.key === "hit-7")?.reveal?.at).toBe("nearest");
+			expect(visible().flatMap(nodes).find(n => n.k === "code")?.p).toMatchObject({ text: snippet, wrap: true });
+			const fold = described().find(n => n.key === "result-rows")?.p?.actions?.click;
+			if (!fold) throw new Error("Missing fold action");
+			action(view, fold);
+			expect(visible()).toHaveLength(6);
+			view.handleInput("E");
+			expect(visible().flatMap(nodes).find(n => n.k === "code")?.p?.text).toBe(snippet);
+			view.handleInput("tui.select.pageDown");
+			expect(described().find(n => n.key === "body")?.scroll?.by).toBe("page-down");
+
+			view.handleInput("a");
+			view.handleInput("tui.select.cancel");
+			const firstPage = view.render(120);
+			expect(firstPage).toContain("Original reference locations");
+			expect(firstPage).toContain("Returned source");
+			expect(firstPage).not.toContain("returned source line 20");
+			view.handleInput("tui.select.pageDown");
+			expect(view.render(120).join("\n")).toContain("returned source line 20");
+			expect(h.pending).toHaveLength(2);
+		} finally { h.overview.reset(); await open; }
+	});
 	test("appearance popup and refresh retain the existing inspector and selected node without extra requests", async () => {
 		const appearance = new GraphAppearanceStore(); let inspectors = 0;
 		const h = harness({ appearance, readDisplay, createInspector: (display, render, raw, presentation) => {
@@ -496,6 +564,21 @@ describe("native overview popup", () => {
 			expect(content(view.describe(native))).toContain(`Warning: ${warning}`);
 		} finally { h.overview.reset(); await open; }
 	});
+	test("a failed standalone analysis shows its error in the result pane", async () => {
+		const h = harness(), open = h.overview.open(h.ctx);
+		try {
+			action(h.views[0], "analyses");
+			h.views[0].handleNativeEvent({ type: "activate", key: "analyses", item: "projects" });
+			await settle();
+			const view = h.views[1];
+			expect(content(view.describe(native))).toContain("Running analysis");
+			h.pending[1].response.resolve(result("", { code: 1, stderr: "Project graph is still loading" }));
+			await settle();
+			const body = nodes(view.describe(native)).find(n => n.key === "body")!;
+			expect(content(body)).toContain("Project graph is still loading");
+			expect(content(view.describe(native))).toContain("Analysis unavailable");
+		} finally { h.overview.reset(); await open; }
+	});
 	test("provenance and original producer diagnostics stay out of the map until requested", async () => {
 		const h = harness({ readDisplay, readStatusUpdate: params => params && typeof params === "object" && "root" in params
 			? { root: String(params.root), indicator: { text: "Producer is ready", tone: "success", symbol: "status.success" }, details: "Raw producer job identity" } : undefined });
@@ -554,7 +637,6 @@ describe("native overview popup", () => {
 		h.pending[0].response.resolve(result("", { code: 1, stderr: "graph service unavailable" })); await settle();
 		const failed = h.views[0].describe(native);
 		expect(nodes(failed).some(node => node.p?.title?.includes("graph service unavailable"))).toBe(true);
-		expect(content(failed)).not.toContain("graph service unavailable");
 		action(h.views[0], "info");
 		expect(content(h.views[0].describe(native))).toContain("graph service unavailable");
 		h.views[0].handleInput("tui.select.pageDown");
@@ -925,13 +1007,13 @@ describe("native observation engine", () => {
 		const observe = (changes: Record<string, unknown>) => {
 			h.overview.observe({ server: "semctx", method: "notifications/semctl/sync_status",
 				params: { version: 1, status: { ...status, ...changes } } }, h.ctx);
-			return nodes(h.views[0].describe(native)).filter(node => node.k === "meter").map(node => node.p?.value);
+			return nodes(h.views[0].describe(native)).find(node => node.p?.role === "semctl.live.progress-value")?.p?.text;
 		};
 		try {
-			expect(observe({ running: true, sync_progress: { uploading: { uploaded_files: 3, total_files: 3 } } })).toEqual([0.99]);
-			expect(observe({})).toEqual([null]);
-			expect(observe({ last_job_id: "new", embedding: { ...job, job_id: "new", state: "running", files_embedded: 0, files_to_embed: 5 } })).toEqual([0]);
-			expect(observe({ last_job_id: "new", embedding: { ...job, job_id: "new", files_embedded: 5, files_to_embed: 5 } })).toEqual([1]);
+			expect(observe({ running: true, sync_progress: { uploading: { uploaded_files: 3, total_files: 3 } } })).toBe("99%");
+			expect(observe({})).toBe("—");
+			expect(observe({ last_job_id: "new", embedding: { ...job, job_id: "new", state: "running", files_embedded: 0, files_to_embed: 5 } })).toBe("0%");
+			expect(observe({ last_job_id: "new", embedding: { ...job, job_id: "new", files_embedded: 5, files_to_embed: 5 } })).toBe("100%");
 		} finally { h.overview.reset(); }
 	});
 	test("popup Overview opens the native analysis surface and keeps catalog work single-flight", async () => {

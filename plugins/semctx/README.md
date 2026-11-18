@@ -281,14 +281,15 @@ level with 2 to 64 files, the adapter runs
 `semctl graph --json affinity -- <paths>` once. The command describes each file
 with one search: its Markdown headings, its outline names, or its file name.
 Two files are related when their ranked result files overlap, or when one file
-is in the results of the other. A file that the server has not indexed still
-gets a profile from its indexed neighbours. The adapter measures each pair
-against the median pair of the level, so hub files that most searches return do
-not join everything. The line under the breadcrumb shows the state: loading,
-the number of related pairs and indexed files, or terms and links only.
-Results stay cached until the checkout changes. A failed request shows a
-warning, and the level uses terms and links. Semantic affinity is retrieval
-evidence for placement. It is not a dependency or a confidence score.
+appears in the results for the other. A search can return related files without
+returning the file that supplied its query. This does not establish whether the
+file is indexed. The adapter measures each pair against the median pair of the
+level so that common results do not join unrelated groups.
+The line below the breadcrumb distinguishes returned matches, empty searches,
+and searches that could not run while the backend loaded. Partial results keep
+their usable pairs. A later request for the same level can retry a loading
+result after ten seconds. No timer starts another search. A failed request
+shows a warning. The level can still use terms and recorded links.
 
 Concept map and Force can draw soft tinted territories behind their members.
 A documentation family has a solid border. A home-folder region has a dashed
@@ -351,6 +352,11 @@ neighborhoods, value-flow boundaries and witnesses, type hierarchies, cycles,
 duplicate groups, unused definitions, file imports, symbol bindings, external
 links, and file outlines. Lookup views use compact, independently expandable
 matches with the same score bars and diagnostic tooltips as the feed.
+On the standalone page, press E or use the `Show more` control to see rows
+beyond the first six. Batch misses keep their place in request order. Use the
+arrow keys to select a match and press Enter to open its full returned source.
+Folding the list preserves open previews. In a plain terminal, use PgUp and
+PgDn to scroll the original result and its returned source.
 
 The compact toolbar opens analyses, appearance, refresh, diagnostics, and close.
 Analyses use native tabs for Project, Symbols, Calls, Flow & types, Quality,
@@ -360,8 +366,10 @@ A refresh that changes the map keeps the open group, its open subconcepts, and
 the selected file when they still exist. Group rows show key terms beside the
 group name.
 Use A for analyses, S for appearance, I for diagnostics, and R to refresh.
-Escape returns from the chooser or diagnostics to the map. Escape on the map
-closes the page. Raw CLI output and producer diagnostics stay in the details view.
+Escape returns from the chooser or diagnostics to the result. Escape on the
+result closes the page. If a request fails before returning a result, the page
+shows the CLI error in the result pane. Details retains the original output
+and producer diagnostics.
 
 The live popup and graph page show a native spinner and a shimmer label while
 the first map loads. A refresh button shows a native spinner only during a
@@ -488,15 +496,16 @@ The size persists in the OMP profile.
 | Large | 680 px | 720 px |
 
 The viewport limits both dimensions.
-When a new Tern session centers the composer, the popup uses the space above
-it. The header stays in view while the map scrolls.
-The drawing scales with the popup. Larger popups expose more labels and chips.
+When a new Tern session centers the composer, the popup fits its drawing
+above the draft without changing the shape of routes. A wide popup places the
+selected group and the group directory beside the drawing. A narrow popup
+stacks them below it. Labels without enough room remain available on hover.
 
 The popup title is `Project map`. A subline shows `N files · M groups`.
 Hover the subline for node, link, and drawn-route counts.
 A warning icon after the subline marks a partial map. Hover it for the
 partial-map limits.
-A slim stacked indexing bar sits below the header. Its label shows `N% ready`.
+A slim stacked indexing bar shares the header with the file and group counts. Its label shows `N% ready`.
 This value is the ready share of the files that report a catalog state.
 Files without a reported state do not lower it.
 The bar tooltip shows the exact counts. The map sits in the canvas well below
@@ -521,9 +530,8 @@ groups. The detail setting controls the number of displayed groups and routes:
 | Detailed | 24 | 72 |
 
 The preview retains direction, relation kind, internal link counts, and omission counts.
-Select a dot or group to open its compact inspector below the drawing.
-The inspector keeps a fixed height. It shows member counts and incoming,
-outgoing, and internal link counts from the full supplied map, including parallel
+Select a dot or group row to inspect it. The inspector shows member counts
+and incoming, outgoing, and internal link counts from the full supplied map, including parallel
 links and routes omitted from the drawing. Partial or loading maps stay qualified.
 With a selection, the second row also shows the key terms of the group.
 With no selection, the inspector shows a one-line legend. It explains dot size
@@ -562,8 +570,10 @@ reported state do not count. The hover names this measure and also shows the
 producer-reported job progress.
 Without reported states, the ring shows the producer-reported progress.
 A dash means that the producer has not reported a current percentage.
-Scanning, planning, and failure labels appear only on hover, not as changing
-footer text. The warning badge appears only for a current problem.
+Producer phases appear in the tooltip. If relationship layers are loading, the
+footer says so even when all reported files are ready. A failed refresh says
+`Showing last map` while the retained map is visible. The warning badge marks
+a current problem.
 The badge sits beside the ring in its own space.
 Unknown and pending progress stay static.
 Small `↑` and `↓` counters show observed requests sent and returned in this

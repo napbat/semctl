@@ -25,11 +25,13 @@ const POPUP_STYLES: NativeStylesheet = { name: "semctl-popups", css: `
 .sf-overlay[data-role="omp.overlay.semctl-live"].sz-md{--semctl-popup-height:min(560px,var(--semctl-popup-room));width:min(480px,92vw) !important}
 .sf-overlay[data-role="omp.overlay.semctl-live"].sz-lg{--semctl-popup-height:min(720px,var(--semctl-popup-room));width:min(680px,92vw) !important}
 /* A fresh session seats the composer in the middle, not at the foot of the pane. */
-.sf-overlay[data-role="omp.overlay.semctl-live"]:is(.sf-fresh *){--semctl-popup-room:max(120px,calc(50vh - 160px))}
+.sf-overlay[data-role="omp.overlay.semctl-live"]:is(.sf-fresh *){--semctl-popup-room:max(144px,calc(50vh - 132px))}
 .sf-overlay[data-role="omp.overlay.semctl-live"]>.sf-ov-card{width:100%;max-width:100%;max-height:var(--semctl-popup-height);margin:0;pointer-events:auto}
 [data-role="omp.overlay.semctl-live"] .sf-ov-body{overflow:hidden}
-[data-role="semctl.live.body"]{min-width:0;overflow-x:hidden;overflow-y:auto;max-height:calc(var(--semctl-popup-height) - 120px)}
-[data-role="omp.overlay.semctl-live"] .semctl-graph-well .semctl-graph{max-width:none}
+[data-role="semctl.live.body"]{--semctl-body-room:max(44px,calc(var(--semctl-popup-height) - 120px));min-width:0;overflow-x:hidden;overflow-y:auto;max-height:var(--semctl-body-room)}
+/* Limit width rather than flattening the plot: native route angles assume the original aspect ratio. */
+[data-role="semctl.live.workspace"] .semctl-graph-well{margin:0;min-width:0;align-self:stretch;align-items:center}
+[data-role="semctl.live.workspace"] .semctl-graph{max-width:calc((var(--semctl-body-room) - 14px) * var(--sg-aspect))}
 .semctl-live-empty{height:176px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;text-align:center;font-size:12px}
 [data-role="omp.overlay.semctl-live"].sz-md .semctl-live-empty{height:188px}
 [data-role="omp.overlay.semctl-live"].sz-lg .semctl-live-empty{height:288px}
@@ -38,10 +40,9 @@ const POPUP_STYLES: NativeStylesheet = { name: "semctl-popups", css: `
 [data-role="semctl.live.title"]{font-size:13px;font-weight:600;color:var(--t1);cursor:default;user-select:none}
 [data-role="semctl.live.subline"]{font-size:11px;line-height:16px;color:var(--t2);font-variant-numeric:tabular-nums}
 [data-role="semctl.live.partial"],[data-role="semctl.live.partial"] .ico{width:12px;height:12px;flex:none}
-[data-role="semctl.live.indexing-row"]{padding:4px 0}
+[data-role="semctl.live.indexing-row"]{flex:1 1 0;min-width:0;margin-left:4px}
 .sf-text[data-role="semctl.live.indexing"]{padding:4px 0;font-size:11px;color:var(--t2)}
 [data-role="semctl.live.indexing-label"]{font-family:var(--sans);font-size:11px;color:var(--t2);font-variant-numeric:tabular-nums}
-[data-role="semctl.live.body"]>.semctl-graph-well{flex:none;margin:2px 0}
 [data-role="semctl.live.selection"]{height:66px;min-height:66px;max-height:66px;flex:none;box-sizing:border-box;gap:1px;padding-top:4px;border-top:1px solid var(--l2);overflow:hidden;font-size:11px}
 [data-role="semctl.live.selection"]>:first-child{height:20px;min-height:20px;flex:0 0 20px}
 [data-role="semctl.live.selection"]>:nth-child(2){height:16px;min-height:16px;flex:0 0 16px}
@@ -82,6 +83,13 @@ const POPUP_STYLES: NativeStylesheet = { name: "semctl-popups", css: `
 .semctl-icon-action[data-role="semctl.live.resize"]{width:20px;color:var(--t3);cursor:nwse-resize}
 .semctl-icon-action[data-role="semctl.live.resize"]:hover,.semctl-icon-action[data-role="semctl.live.resize"]:focus-visible{color:var(--t1)}
 @media (prefers-reduced-motion:reduce){.semctl-icon-action,.semctl-live-group[data-motion]{transition:none}}
+/* Flex bases use the card width, not the window width. Narrow panes stack the controls below the drawing. */
+[data-role="semctl.live.workspace"]{flex-direction:row;flex-wrap:wrap;align-items:flex-start}
+[data-role="semctl.live.workspace"]>.semctl-graph-well{flex:3 1 278px;align-self:flex-start}
+[data-role="semctl.live.details"]{flex:2 1 212px;min-width:0;max-height:var(--semctl-body-room);overflow-y:auto;overflow-x:hidden}
+[data-role="semctl.live.details"] [data-role="semctl.live.selection"]{height:auto;max-height:none;min-height:0;padding:0;border:0}
+[data-role="semctl.live.details"] [data-role="semctl.live.selection"]>:last-child{flex:0 0 auto;height:auto;flex-wrap:wrap;min-width:0}
+[data-role="semctl.live.details"] .semctl-live-neighbor{flex:1 1 62px;max-width:100%}
 [data-role="semctl.status.snapshot"],[data-role="semctl.graph.body"]{overflow:auto}
 .sf-overlay[data-role="omp.overlay.semctl-graph"]>.sf-ov-card{width:min(800px,calc(100vw - 40px))}
 [data-role="semctl.graph.body"]{height:min(448px,calc(100vh - 220px));min-width:0;min-height:120px;max-height:calc(100vh - 180px);overflow-x:hidden}

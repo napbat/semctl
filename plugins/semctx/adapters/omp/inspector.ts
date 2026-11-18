@@ -192,6 +192,11 @@ export class SemctlInspector implements Component {
 	private readonly supplementaryGraph: boolean;
 	private comparisonHits?: readonly Hit[];
 	private readonly hits: Hit[];
+	private readonly resultRowCount: number;
+	private readonly compactHitCount: number;
+	private showAllRows = false;
+	private selectedHit = -1;
+	private selectionRevision = 0;
 	private rowsCache: { mask: number; dark: boolean; revision: number; comparison: readonly Hit[]; nodes: NativeNode[] } | undefined;
 	private static repaintConcepts(owner: SemctlInspector): void { owner.requestRender(); }
 	constructor(
@@ -200,17 +205,28 @@ export class SemctlInspector implements Component {
 		private readonly fallbackBody: () => readonly NativeChild[] = () => [],
 		private readonly fallbackText = "",
 		graphSummary: "header" | "body" = "body",
-		presentation: "inline" | "overview" = "inline",
+		private readonly presentation: "inline" | "overview" = "inline",
 		private readonly expandedResult: () => boolean = () => false,
 	) {
 		this.hits = display.kind === "search" ? display.hits : display.kind === "batch" ? display.symbols.flatMap(group => group.hits) :
 			display.kind === "graph" ? display.nodes.flatMap(node => node.hit ? [node.hit] : []) : [];
+		this.resultRowCount = this.hits.length;
+		this.compactHitCount = Math.min(this.hits.length, COMPACT_MATCHES);
+		if (presentation === "overview" && display.kind === "batch") {
+			let rows = 0, compactHits = 0;
+			for (const group of display.symbols) {
+				compactHits += Math.max(0, Math.min(group.hits.length, COMPACT_MATCHES - rows));
+				rows += Math.max(1, group.hits.length);
+			}
+			this.resultRowCount = rows;
+			this.compactHitCount = compactHits;
+		}
 		subscribeConcepts(this, SemctlInspector.repaintConcepts);
 		const graph = display.kind === "graph" ? display : resultGraph(display);
 		this.supplementaryGraph = display.kind !== "graph" && graph !== undefined;
 		if (graph) this.graph = new GraphInspector(graph, requestRender, hit => {
 			const preview = new SemctlInspector({ version: 1, identity: display.identity, kind: "search",
-				query: "", hits: [hit], indexWarning: null }, requestRender, undefined, undefined, "body", "inline", this.expandedResult);
+				query: "", hits: [hit], indexWarning: null }, requestRender, undefined, undefined, "body", presentation, this.expandedResult);
 			// A graph selection is still ranked against its original result, not a one-hit query.
 			preview.comparisonHits = this.hits;
 			preview.expandedHits.add(0);
@@ -223,22 +239,62 @@ export class SemctlInspector implements Component {
 	setAppearance(appearance: Readonly<GraphAppearance>): void { this.graph?.setAppearance(appearance); }
 	navigation(): GraphNavigation | undefined { return this.graph?.navigation(); }
 	restoreNavigation(state: GraphNavigation): void { this.graph?.restoreNavigation(state); }
+	private get standalone(): boolean { return this.presentation === "overview"; }
+	private get allRows(): boolean { return this.standalone ? this.showAllRows : this.expandedResult(); }
+	private get visibleHitCount(): number { return this.allRows ? this.hits.length : this.compactHitCount; }
+	private toggleResultRows(): boolean {
+		if (!this.standalone || this.resultRowCount <= COMPACT_MATCHES || (this.display.kind !== "batch" && this.display.kind !== "search")) return false;
+		this.showAllRows = !this.showAllRows;
+		if (this.selectedHit >= this.visibleHitCount) {
+			this.selectedHit = -1;
+			this.rowsCache = undefined;
+		}
+		this.requestRender();
+		return true;
+	}
+	private toggleHit(index: number): void {
+		if (this.expandedHits.has(index)) this.expandedHits.delete(index);
+		else this.expandedHits.add(index);
+		if (this.standalone) this.selectedHit = index;
+		this.rowsCache = undefined;
+		this.requestRender();
+	}
+	/** The page maps host key bindings to these result actions. */
+	handlePageKey(key: "up" | "down" | "confirm" | "expand"): boolean {
+		if (!this.standalone) return false;
+		if (key === "expand") return this.toggleResultRows();
+		if (this.display.kind === "graph") {
+			if (key === "confirm" || this.display.nodes.length === 0) return false;
+			this.move(key === "up" ? -1 : 1);
+			return true;
+		}
+		if ((this.display.kind !== "search" && this.display.kind !== "batch") || !this.visibleHitCount) return false;
+		if (key === "confirm") this.toggleHit(Math.max(0, this.selectedHit));
+		else {
+			const next = this.selectedHit < 0 ? 0 : this.selectedHit + (key === "up" ? -1 : 1);
+			this.selectedHit = Math.max(0, Math.min(this.visibleHitCount - 1, next));
+			this.selectionRevision++;
+			this.rowsCache = undefined;
+			this.requestRender();
+		}
+		return true;
+	}
 	handleNativeEvent(event: NativeUiEvent): void {
 		if (event.type === "toggle" && event.key !== "") {
 			const key = event.key.slice(event.key.lastIndexOf("/") + 1);
 			if (event.collapsed) this.expandedSections.delete(key);
 			else this.expandedSections.add(key);
+		} else if (event.type === "action" && event.act === "result-rows") {
+			this.toggleResultRows();
+			return;
 		} else if (event.type === "action" && event.act === "graph") {
 			if (this.expandedSections.has("graph")) this.expandedSections.delete("graph");
 			else this.expandedSections.add("graph");
 		} else if (event.type === "action" && event.act.startsWith("hit:")) {
 			const n = Number(event.act.slice(4));
-			const d = this.display;
-			const count = d.kind === "search" ? d.hits.length : d.kind === "batch" ? d.symbols.reduce((sum, s) => sum + s.hits.length, 0) : 0;
-			if (Number.isSafeInteger(n) && n >= 0 && n < count) {
-				if (this.expandedHits.has(n)) this.expandedHits.delete(n);
-				else this.expandedHits.add(n);
-			}
+			if ((this.display.kind === "search" || this.display.kind === "batch") && Number.isSafeInteger(n) &&
+				n >= 0 && n < (this.standalone ? this.visibleHitCount : this.hits.length)) this.toggleHit(n);
+			return;
 		} else return;
 		this.rowsCache = undefined;
 		this.requestRender();
@@ -256,7 +312,7 @@ export class SemctlInspector implements Component {
 		}
 		if (h.snippet) out.push(...this.sourceNodes(h.snippet, { path: h.path ?? undefined, language: h.language ?? undefined,
 			start: w?.start, focus: w?.focus ?? w?.mark?.[0], mark: w?.mark,
-			limit: this.expandedResult() ? Math.max(12, lineCount(h.snippet)) : 12 }, cx));
+			limit: this.standalone || this.expandedResult() ? undefined : 12 }, cx));
 		else out.push(text("No source preview in this result.", { tone: "muted" }));
 		return out;
 	}
@@ -279,37 +335,38 @@ export class SemctlInspector implements Component {
 			: items.map(item => text(`${item.k}: ${item.v}`));
 		return this.section(`match-details-${index}`, "Details", details, cx);
 	}
-	private sourceNodes(source: string, info: { path?: string; language?: string; start?: number; focus?: number; mark?: readonly [number, number]; limit: number }, cx: DescribeContext): NativeNode[] {
-		// The host owns full-result expansion; each open match keeps a bounded source window.
-		const lines = source.match(/[^\n]*\n|[^\n]+$/g) ?? [];
+	private sourceNodes(source: string, info: { path?: string; language?: string; start?: number; focus?: number; mark?: readonly [number, number]; limit?: number }, cx: DescribeContext): NativeNode[] {
+		const lines = info.limit === undefined ? undefined : source.match(/[^\n]*\n|[^\n]+$/g) ?? [];
+		const total = lines?.length ?? lineCount(source);
+		const count = Math.min(info.limit ?? total, total);
 		const focusIndex = info.start !== undefined && info.focus !== undefined ? info.focus - info.start : 0;
-		const offset = lines.length > info.limit
-			? Math.max(0, Math.min(lines.length - info.limit, focusIndex - Math.floor(info.limit / 2))) : 0;
+		const offset = Math.max(0, Math.min(total - count, focusIndex - Math.floor(count / 2)));
 		// A final line terminator is not another source line. Preserve intentional blank lines.
-		const shown = lines.slice(offset, offset + info.limit).join("").replace(/\r?\n$/, "");
+		const shown = (lines && count < total ? lines.slice(offset, offset + count).join("") : source).replace(/\r?\n$/, "");
 		const start = info.start !== undefined ? info.start + offset : undefined;
 		const marks: { line: number; tone: "accent" }[] = [];
 		if (start !== undefined && info.mark) {
-			const end = Math.min(info.mark[1], start + Math.min(info.limit, lines.length - offset) - 1);
+			const end = Math.min(info.mark[1], start + count - 1);
 			for (let line = Math.max(start, info.mark[0]); line <= end; line++) marks.push({ line, tone: "accent" });
 		}
 		const result: NativeNode[] = [cx.supports("code") ? {
 			k: "code", key: "source", p: { text: clean(shown), path: info.path, lang: info.language, start,
-				numbers: start !== undefined, wrap: false, marks: marks.length ? marks : undefined },
-		} : { k: "text", p: { text: clean(shown), wrap: "none" } }];
-		if (lines.length > info.limit) result.push(text(`${info.limit} of ${lines.length} lines · expand tool for full result`, { tone: "muted" }));
+				numbers: start !== undefined, wrap: this.standalone, marks: marks.length ? marks : undefined },
+		} : { k: "text", p: { text: clean(shown), wrap: this.standalone ? "word" : "none" } }];
+		if (count < total) result.push(text(`${count} of ${total} lines · expand tool for full result`, { tone: "muted" }));
 		return result;
 	}
 	private hitRows(d: Display, rows: Hit[], cx: DescribeContext): NativeNode[] {
 		const compared = this.comparisonHits ?? rows;
 		let mask = (Number(cx.feature("styles")) << ROW_CAPABILITIES.length) |
-			(Number(cx.reduceMotion) << (ROW_CAPABILITIES.length + 1)) | (Number(this.expandedResult()) << (ROW_CAPABILITIES.length + 2));
+			(Number(cx.reduceMotion) << (ROW_CAPABILITIES.length + 1)) | (Number(this.allRows) << (ROW_CAPABILITIES.length + 2));
 		for (const [index, kind] of ROW_CAPABILITIES.entries()) if (kind === "el" ? supportsElements(cx) : cx.supports(kind)) mask |= 1 << index;
 		const revision = conceptRevision(), cached = this.rowsCache;
 		if (cached && cached.mask === mask && cached.dark === cx.dark && cached.revision === revision && cached.comparison === compared) return cached.nodes;
 		const scales = strengths(compared);
 		const result = rows.map((h, i): NativeNode => {
 			const expanded = this.expandedHits.has(i);
+			const selected = this.standalone && this.selectedHit === i;
 			const rank = this.comparisonHits ? compared.indexOf(h) : i;
 			const strength = scales[rank];
 			const indicator = matchScoreIndicator(h, rank, strength ?? null, cx, `hit:${i}`);
@@ -327,7 +384,9 @@ export class SemctlInspector implements Component {
 				{ t: label(location(h).slice((h.path ?? "Path unavailable").length)), s: "muted" },
 			], shrink: 1, min: { w: 0 }, wrap: "none", truncate: "middle",
 				title: compactTooltip(location(h), href && (h.binding.state === "bound" ? "Open checkout file" : UNVERIFIED_FILE_LINK)) } };
-			const chip: NativeNode = { k: "row", key: `hit-${i}`, p: { role: "omp.tool.chip", gap: "xs", align: "center", wrap: false, mark: expanded ? "pick" : undefined, max: { w: 1 }, actions: { click: `hit:${i}` }, title: tip, aria: `${expanded ? "Collapse" : "Expand"} match ${i + 1}: ${location(h)}. ${label(context)}` }, c: [
+			const chip: NativeNode = { k: "row", key: `hit-${i}`,
+				reveal: selected && this.selectionRevision > 0 ? { at: "nearest", n: this.selectionRevision } : undefined,
+				p: { role: "omp.tool.chip", gap: "xs", align: "center", wrap: false, mark: expanded || selected ? "pick" : undefined, max: { w: 1 }, actions: { click: `hit:${i}` }, title: tip, aria: `${expanded ? "Collapse" : "Expand"} match ${i + 1}: ${location(h)}. ${label(context)}` }, c: [
 				cue ? nativeElement({ ...cue, k: "el", p: { ...cue.p, actions: { click: `hit:${i}` } } }) : text(expanded ? "▾" : "▸", { tone: "muted", wrap: "none", shrink: 0 }),
 				...(cx.supports("icon") ? [{ k: "icon" as const, key: "file-icon", p: { name: "file", shrink: 0, aria: file } }] : []),
 				filename,
@@ -336,7 +395,7 @@ export class SemctlInspector implements Component {
 			] };
 			return { k: "col", key: `match-${i}`, p: { role: expanded ? "semctl.match.expanded" : "semctl.match",
 				basis: expanded ? undefined : "content", grow: 0, shrink: 1, min: { w: 0 }, max: { w: 1 },
-				hidden: !this.expandedResult() && i >= COMPACT_MATCHES }, c: [
+				hidden: i >= this.visibleHitCount }, c: [
 				chip,
 				...(expanded ? [{ k: "col" as const, key: "preview", p: { role: "semctl.match.preview", gap: "xs" as const }, c: [
 					text(context, { tone: "muted", wrap: "none", truncate: "end", title: compactTooltip(
@@ -350,7 +409,8 @@ export class SemctlInspector implements Component {
 	}
 	describe(cx: DescribeContext): NativeNode | null {
 		if (!(["col", "row", "text"] as const).every(k => cx.supports(k))) {
-			return { k: "col", c: [...this.fallbackBody()] };
+			const source = this.returnedSource();
+			return { k: "col", c: [...this.fallbackBody(), ...(source ? [{ k: "text" as const, p: { text: source, wrap: "word" as const } }] : [])] };
 		}
 		const d = this.display;
 		if (d.kind === "graph") return { k: "col", p: { gap: "sm" }, c: [this.graph!] };
@@ -364,23 +424,35 @@ export class SemctlInspector implements Component {
 				children.push(text(d.budgetNote ? "No matches returned" : "No matches"));
 				if (!d.budgetNote) children.push(text("Try a symbol name or a shorter description.", { tone: "muted" }));
 			}
+			if (this.standalone && d.kind === "batch" && d.symbols.length === 0) children.push(text("No symbols returned."));
 			const entries: NativeNode[] = [];
 			if (d.kind === "batch") {
-				let offset = 0;
+				let offset = 0, slot = 0;
 				for (const [index, s] of d.symbols.entries()) {
-					if (d.symbols.length > 1 || s.hits.length === 0) {
-						entries.push({ ...text(`${s.symbol} · ${s.hits.length ? `${s.hits.length} matches` : "no match"}`, {
+					if (this.standalone || d.symbols.length > 1 || s.hits.length === 0) {
+						const first = this.standalone ? slot : s.hits.length ? offset : index;
+						const matches = s.hits.length === 0 ? "no match" : s.hits.length === 1 ? "1 match" : `${s.hits.length} matches`;
+						entries.push({ ...text(`${s.symbol} · ${matches}`, {
 							role: "semctl.batch.heading", basis: "100%", tone: "muted", wrap: "none", truncate: "end",
-							hidden: !this.expandedResult() && (s.hits.length ? offset : index) >= COMPACT_MATCHES,
-						}),
-							key: `${s.hits.length ? "batch-group" : "batch-miss"}-${index}` });
+							hidden: !this.allRows && first >= COMPACT_MATCHES,
+						}), key: `${s.hits.length ? "batch-group" : "batch-miss"}-${index}` });
 					}
-					entries.push(...rendered.slice(offset, offset + s.hits.length)); offset += s.hits.length;
+					entries.push(...rendered.slice(offset, offset + s.hits.length));
+					offset += s.hits.length;
+					slot += Math.max(1, s.hits.length);
 				}
 			} else entries.push(...rendered);
+			const remaining = this.resultRowCount - COMPACT_MATCHES;
+			if (this.standalone && remaining > 0) {
+				const noun = d.kind === "search" ? "match" : "result", plural = d.kind === "search" ? "matches" : "results";
+				const caption = this.showAllRows ? `Show fewer ${plural} (E)` : `Show ${remaining} more ${remaining === 1 ? noun : plural} (E)`;
+				const props = { actions: { click: "result-rows" }, aria: caption };
+				children.push(styled ? nativeElement({ k: "el", key: "result-rows", p: { tag: "button", ...props,
+					attrs: { "aria-expanded": this.showAllRows } }, c: [text(caption)] })
+					: { ...text(caption, { ...props, tone: "accent" }), key: "result-rows" });
+			}
 			if (this.supplementaryGraph) entries.push(this.graphControl(cx, styled));
-			// Keep stable match nodes and selection while the native tool header
-			// switches between the compact preview and the complete result.
+			// Keep stable match nodes and selection across result expansion.
 			// Styled hosts gate chip arrival and score easing on data-motion, which only an element carries.
 			children.push(styled ? nativeElement({ k: "el", key: "matches", p: { tag: "div", role: "semctl.matches",
 				attrs: { "data-motion": cx.reduceMotion ? "reduced" : "full" } }, c: entries })
@@ -394,7 +466,7 @@ export class SemctlInspector implements Component {
 			children.push(cue ? { k: "row", p: { gap: "sm", align: "center" }, c: [cue, header] } : header);
 			const numbered = d.lineStart !== null && d.lineStart > 0 && d.lineEnd !== null && lineCount(d.text) === d.lineEnd - d.lineStart + 1;
 			children.push(...this.sourceNodes(d.text, { path: d.path, language: d.language ?? undefined, start: numbered ? d.lineStart! : undefined,
-				limit: this.expandedResult() ? Math.max(16, lineCount(d.text)) : 16 }, cx));
+				limit: this.standalone || this.expandedResult() ? undefined : 16 }, cx));
 		} else children.push(...this.status(d, cx));
 		return { k: "col", p: { gap: "sm" }, c: children };
 	}
@@ -429,6 +501,14 @@ export class SemctlInspector implements Component {
 		if (cx.supports("section")) out.push({ k: "section", key: "snapshot", p: { head: "Snapshot details", collapsible: true, collapsed: !this.expandedSections.has("snapshot") }, c: [details] });
 		else out.push(details);
 		return out;
+	}
+	/** The plain page retains the CLI output and adds source absent from summaries such as batch lookup. */
+	returnedSource(): string | undefined {
+		if (!this.standalone) return undefined;
+		if (this.display.kind === "source") return this.display.text ? clean(`Returned source · ${this.display.path}\n${this.display.text}`) : undefined;
+		const sections: string[] = [];
+		for (const h of this.hits) if (h.snippet) sections.push(`${location(h)} · ${label(h.qualifiedName ?? h.symbol ?? "Match")}\n${h.snippet.replace(/\r?\n$/, "")}`);
+		return sections.length ? clean(`Returned source\n${sections.join("\n\n")}`) : undefined;
 	}
 	render(width: number): readonly string[] {
 		return clean(this.fallbackText).split(/\r?\n/).map(line => line.slice(0, Math.max(0, Math.floor(width))));

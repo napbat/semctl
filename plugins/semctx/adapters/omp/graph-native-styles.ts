@@ -1,3 +1,4 @@
+import { GRAPH_CANVAS } from "./graph-canvas";
 import { conceptSwatches } from "./graph-data/palette.js";
 import type { NativeStylesheet } from "./native-surface";
 
@@ -68,11 +69,8 @@ export const GRAPH_STYLES: readonly NativeStylesheet[] = Object.freeze([Object.f
 .semctl-graph-well .semctl-graph{flex:1 1 auto;width:100%}
 .semctl-graph.sg-compact{max-width:280px}
 .semctl-graph.sg-overview{max-width:760px}
-.semctl-graph .sg-ratio{height:0;padding-bottom:47.142857%}
-.semctl-graph.sg-small .sg-ratio{padding-bottom:27.857143%}
-.semctl-graph.sg-medium .sg-ratio{padding-bottom:38.571429%}
-.semctl-graph.sg-compact .sg-ratio{padding-bottom:62.857143%}
-.semctl-graph.sg-overview .sg-ratio{padding-bottom:42.105263%}
+${Object.entries(GRAPH_CANVAS).map(([name, { width, height }]) => `.semctl-graph.sg-${name}{--sg-aspect:${width / height}}`).join("")}
+.semctl-graph .sg-ratio{height:0;padding-bottom:calc(100% / var(--sg-aspect))}
 .semctl-graph .sg-plane,.semctl-graph .sg-territories,.semctl-graph .sg-routes,.semctl-graph .sg-route,.semctl-graph .sg-node,.semctl-graph .sg-hover-links{position:absolute;inset:0;pointer-events:none}
 .semctl-graph .sg-plane{overflow:hidden}
 .semctl-graph .sg-territory{position:absolute;transform:translate(-50%,-50%);box-sizing:border-box;border-radius:50%;background:radial-gradient(closest-side,rgb(from var(--sg-tint) r g b / 12%),rgb(from var(--sg-tint) r g b / 5%) 72%,transparent);border:1px solid rgb(from var(--sg-tint) r g b / 16%);pointer-events:none}

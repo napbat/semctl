@@ -257,7 +257,8 @@ A warning icon after the subline marks a partial map.
 A slim stacked indexing bar shows `N% ready`.
 This value is the ready share of the files that report a catalog state.
 The bar tooltip shows the exact counts.
-The map sits in the canvas well.
+The drawing fits the popup without stretching routes. The group inspector sits
+beside the map when it fits, and below the map in narrow panes.
 With no selection, a one-line legend explains dot size (files) and line weight
 (links). It names the drawn territory kinds only when territories are drawn.
 The `Busiest` chips select individual groups with many cross-group
@@ -274,7 +275,8 @@ The popup footer uses one row for a fixed progress ring, a percentage, a separat
 warning badge, and request counters.
 The counters show `↑` for sent requests and `↓` for returned requests.
 Percentage digits animate when motion is allowed.
-Phase changes stay in tooltips.
+Producer phases stay in tooltips. The footer identifies loading relationship
+layers and failed refreshes that leave the previous map on screen.
 The warning badge appears only for a current problem.
 It sits beside the ring in its own space.
 The live popup and graph page show a native spinner and a shimmer label while

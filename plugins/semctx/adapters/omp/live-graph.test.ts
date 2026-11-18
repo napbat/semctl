@@ -291,7 +291,6 @@ describe("live group inspection", () => {
 			const chips = tree(row).filter(node => node.p?.role === "semctl.live.busiest");
 			expect(chips.map(node => [node.key, asNativeElement(node)?.p.class])).toEqual(expected.map(id => [`busiest-${id}`, "semctl-live-neighbor"]));
 			expect(chips.map(chip => tree(chip).filter(node => node.k === "text").map(node => node.p?.text))).toEqual(expected.map(id => [names.get(id)]));
-			expect(chips.every(node => node.p?.grow === 1 && node.p?.basis === 0)).toBe(true);
 			expect(chips[0].p?.title).toContain("src/api");
 			expect(chips[0].p?.title).toContain("3 cross-group links · 0 incoming · 3 outgoing");
 			expect(chips[0].p?.aria).toContain("3 cross-group links · 0 incoming links · 3 outgoing links");
@@ -637,16 +636,20 @@ describe("compact live popup observations", () => {
 	});
 	test("renders available graph and group actions while typed relationship layers load", () => {
 		const data: Overview = { ...overview(["src/api/a.ts", "src/db/b.ts"]), loading: true, truncated: true, caveats: ["Import layer is loading"] };
+		data.nodes[0].indexing = "ready";
 		const view = popup(popupState(data));
 		try {
 			const rendered = view.describe(native);
 			expect(dots(rendered)).toHaveLength(2);
+			expect(content(rendered)).toContain("100% ready");
+			expect(tree(rendered).find(node => node.p?.role === "semctl.live.map-state")?.p?.text).toBe("Relationship layers loading");
 			expect(tree(rendered).some(node => node.p?.title?.includes(data.caveats[0]))).toBe(true);
 			expect(dots(rendered).some(node => node.p.class?.includes("sg-active") || node.p.class?.includes("sg-indexing-"))).toBe(false);
 			action(view, dots(rendered)[0].p.actions!.click!);
 			expect(dots(view.describe(native)).some(node => node.p.attrs?.["aria-pressed"] === true)).toBe(true);
 			view.update(popupState({ ...data, loading: false, truncated: false, caveats: [] }));
 			expect(dots(view.describe(native))).toHaveLength(2);
+			expect(tree(view.describe(native)).some(node => node.p?.role === "semctl.live.map-state")).toBe(false);
 		} finally { view.dispose(); }
 	});
 
@@ -727,14 +730,15 @@ describe("compact live popup observations", () => {
 			expect(tree(active).find(node => node.k === "meter")?.p).toMatchObject({ value: 0 });
 			expect(tree(active).find(node => node.key === "graph-preview")?.p).toMatchObject({ attrs: { "data-motion": "reduced" } });
 			view.update({ ...popupState(data, { requests: { sent: 2, received: 1, failed: 1 } }),
-				request: { loading: false, text: "", display: data, error: "Private backend diagnostic: connection refused" } });
+				request: { loading: false, text: "", display: data, retainedAfterError: true, error: "Private backend diagnostic: connection refused" } });
 			const failed = view.describe(native);
 			const warning = tree(failed).find(node => node.p?.role === "semctl.live.warning");
 			expect(warning?.p?.text).toBe("!");
 			expect(tree(tree(failed).find(node => node.key === "status-slot")!).some(node => node === warning)).toBe(false);
 			expect(content(failed)).not.toContain("Private backend diagnostic");
 			expect(tree(failed).some(node => node.k === "text" && node.p?.title?.includes("Private backend diagnostic"))).toBe(true);
-			expect(tree(failed).find(node => node.k === "meter")?.p?.value).toBeNull();
+			expect(content(failed)).toContain("Showing last map");
+			expect(tree(failed).some(node => node.k === "meter" || node.k === "spinner")).toBe(false);
 		} finally { view.dispose(); }
 	});
 	test("loading states use native spinner and shimmer when supported and keep static fallbacks", () => {

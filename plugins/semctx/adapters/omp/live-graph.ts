@@ -178,6 +178,7 @@ const lastNeighborPage = (count: number, chips: number) => Math.max(0, Math.ceil
 /** Passive native UI. The renderer owns motion; this component never animates or takes keyboard focus. */
 export class LiveGraphPopup implements Component {
 	private display?: Overview;
+	private counts?: GraphIndexingCounts;
 	private summary?: ProjectSummary;
 	private links = new Map<string, GroupLinks>();
 	private revision = -1;
@@ -185,6 +186,7 @@ export class LiveGraphPopup implements Component {
 	private groupsOpen: boolean | undefined;
 	private diagnosticsOpen = false;
 	private selected: string | undefined;
+	private selectionRevision = 0;
 	private neighborPage = 0;
 	private activityDirty = true;
 	private readonly active = new Set<string>();
@@ -201,6 +203,7 @@ export class LiveGraphPopup implements Component {
 	private groupAction(id: string): string { return `group:${JSON.stringify([this.display?.identity.codebaseId, id])}`; }
 	private selectGroup(id: string | undefined): void {
 		this.selected = id;
+		if (id !== undefined) this.selectionRevision++;
 		this.neighborPage = 0;
 	}
 	private synchronizeSummary(): void {
@@ -208,6 +211,7 @@ export class LiveGraphPopup implements Component {
 		const revision = conceptRevision(), detail = (this.state.appearance ?? DEFAULT_GRAPH_APPEARANCE).detail;
 		if (display === this.display && this.revision === revision && this.detail === detail) return;
 		if (display?.identity.codebaseId !== this.display?.identity.codebaseId) this.selectGroup(undefined);
+		if (display !== this.display) this.counts = display && indexingCounts(display.nodes);
 		this.display = display; this.revision = revision; this.detail = detail;
 		this.summary = display ? projectSummary(display, display.identity.codebaseId, detail) : undefined;
 		this.links = display && this.summary ? groupLinks(display, this.summary) : new Map();
@@ -270,7 +274,7 @@ export class LiveGraphPopup implements Component {
 	private groupChip(cx: DescribeContext, kind: "neighbor" | "busiest", group: GraphGroup, title: string, aria: string, count?: number): NativeNode {
 		const cue = this.groupCue(cx, group), key = `${kind}-${group.id}`;
 		const props = { role: `semctl.live.${kind}`, actions: { click: this.groupAction(group.id) }, title, aria,
-			grow: 1, basis: 0, min: { w: 0 }, gap: "xs" as const, align: "center" as const };
+			grow: 1, basis: "8ch" as const, min: { w: 0 }, gap: "xs" as const, align: "center" as const };
 		const label = kind === "busiest" ? group.label.split("/").filter(Boolean).at(-1) ?? group.label : group.label;
 		const children = [...(cue ? [cue] : []), text(label, { grow: 1, min: { w: 0 }, wrap: "none", truncate: "end" }),
 			...(count !== undefined ? [text(String(count), { tone: "muted", shrink: 0 })] : [])];
@@ -301,7 +305,8 @@ export class LiveGraphPopup implements Component {
 			.map(({ group, incoming, outgoing }) => this.groupChip(cx, "busiest", group,
 				compactTooltip(group.label, `${incoming + outgoing} cross-group links · ${incoming} incoming · ${outgoing} outgoing`),
 				`Inspect ${clean(group.label).slice(0, 160)} · ${incoming + outgoing} cross-group links · ${incoming} incoming links · ${outgoing} outgoing links`));
-		return { k: "col", key: "selection", p: { role: "semctl.live.selection", gap: "xs", min: { h: "3.75lines" } }, c: [
+		return { k: "col", key: "selection", reveal: selected ? { at: "nearest", n: this.selectionRevision } : undefined,
+			p: { role: "semctl.live.selection", gap: "xs", min: { h: "3.75lines" } }, c: [
 			{ k: "row", key: "identity", p: { gap: "xs", align: "center", min: { h: "1.25lines" } }, c: [
 				...(cue ? [cue] : []),
 				text(selected?.label ?? "Select a group to inspect links", {
@@ -325,7 +330,7 @@ export class LiveGraphPopup implements Component {
 					aria: spoken(sourceScope(display), ...display.caveats.slice(0, 2)),
 				})] : []),
 			] },
-			{ k: "row", key: "neighbors", p: { gap: "xs", align: "center", min: { h: "1.25lines" } }, c: selected ? [
+			{ k: "row", key: "neighbors", p: { gap: "xs", align: "center", wrap: true, min: { h: "1.25lines" } }, c: selected ? [
 				...neighbors,
 				...(!neighbors.length ? [text(display.loading ? "No neighboring groups observed yet"
 					: display.truncated ? "No neighboring groups in this partial map" : "No neighboring groups in this map", {
@@ -421,6 +426,9 @@ export class LiveGraphPopup implements Component {
 		const caveats = this.summary?.graph.caveats ?? [];
 		const partial = display?.truncated && !display.loading ? { tone: "warning" as const, shrink: 0,
 			title: compactTooltip("Partial indexed map", caveats[0]), aria: spoken("Partial indexed map", ...caveats) } : undefined;
+		const counts = this.counts;
+		const meter = counts && indexingMeter(cx, "indexing", counts, { role: "semctl.live.indexing", grow: 1, min: { w: 0 } }, true);
+		const indexing = counts && !meter ? indexingSummary(counts) : undefined;
 		const subline: NativeNode[] = display && this.summary ? [{ k: "row", key: "subline", p: { gap: "xs", align: "center" }, c: [
 			text(`${plural(this.summary.files, "file")} · ${plural(this.summary.groups.length, "group")}`, {
 				role: "semctl.live.subline", tone: "muted", min: { w: 0 }, wrap: "none", truncate: "end",
@@ -429,6 +437,8 @@ export class LiveGraphPopup implements Component {
 			}),
 			...(partial ? [cx.supports("icon") ? { k: "icon" as const, key: "partial", p: { ...partial, role: "semctl.live.partial", name: "warn" } }
 				: { ...text("Partial map", partial), key: "partial" }] : []),
+			...(meter ? [meter] : indexing ? [text(indexing.replace(/^Indexing: /, ""), { role: "semctl.live.indexing", tone: "muted",
+				min: { w: 0 }, wrap: "none", truncate: "end", title: compactTooltip(indexing, CATALOG_STATES) })] : []),
 		] }] : [];
 		// The grip sits at the top-left corner, the corner that moves: the popup is pinned at its bottom right edge.
 		const header: NativeNode = { k: "col", key: "header", p: { role: "semctl.live.header" }, c: [
@@ -455,12 +465,6 @@ export class LiveGraphPopup implements Component {
 			title: compactTooltip(...warnings.slice(0, 2), "Open Diagnostics for all warnings"),
 		}), key: "query-warning" });
 		if (display && this.summary) {
-			const counts = indexingCounts(display.nodes), indexing = indexingSummary(counts);
-			const meter = indexingMeter(cx, "indexing", counts, { role: "semctl.live.indexing", grow: 1, min: { w: 0 } }, true);
-			if (meter) children.push(meter);
-			else if (indexing) children.push(text(indexing.replace(/^Indexing: /, ""), {
-				role: "semctl.live.indexing", tone: "muted", wrap: "none", truncate: "end", title: compactTooltip(indexing, CATALOG_STATES),
-			}));
 			const diagramKey = JSON.stringify([this.observationKey, this.selected, cx.dark, cx.reduceMotion,
 				supportsElements(cx), cx.feature("styles"), appearance, graphColorRevision()]);
 			if (this.diagramKey !== diagramKey) {
@@ -468,6 +472,7 @@ export class LiveGraphPopup implements Component {
 				const preview = graphPreview(this.summary.graph, cx, {
 					codebaseId: display.identity.codebaseId, activeIds: this.active, feedback: this.feedback,
 					size: size.preview, selected: this.selected, nodeAction: this.diagramAction, appearance,
+					labelWidth: appearance.popup === "small" ? 200 : 280,
 				});
 				// Previews exist only on styled element hosts, so the well needs no fallback.
 				this.diagram = preview && nativeElement({ k: "el", key: "graph-well", p: { tag: "div", class: "semctl-graph-well" }, c: [preview] });
@@ -475,16 +480,19 @@ export class LiveGraphPopup implements Component {
 				const territories = preview ? nativeGraphLayout(this.summary.graph, size.preview, appearance.layout).territories : [];
 				this.tints = (["family", "module", "lexical"] as const).filter(kind => territories.some(territory => territory.kind === kind));
 			}
-			if (this.diagram) children.push(this.diagram);
-			children.push(this.selectionInspector(cx, display, this.tints, size.chips));
+			const details = [this.selectionInspector(cx, display, this.tints, size.chips)];
 			// Small popups keep the row for names, counts and states; wider popups also show key terms.
 			const groupsOpen = this.groupsOpen ?? !this.diagram;
 			const groups = groupsOpen || !sections ? this.groupList(cx, motion, size.chips > 3) : [];
 			const regions = this.summary.regions.length;
-			if (sections) children.push({ k: "section", key: "groups", p: {
+			if (sections) details.push({ k: "section", key: "groups", p: {
 				head: `Explore ${plural(this.summary.groups.length, "group")}${regions ? ` in ${plural(regions, "region")}` : ""}`, collapsible: true, collapsed: !groupsOpen,
 			}, c: groups });
-			else children.push(...groups);
+			else details.push(...groups);
+			if (this.diagram) children.push({ k: "col", key: "workspace", p: { role: "semctl.live.workspace", gap: "sm" }, c: [
+				this.diagram, { k: "col", key: "details", p: { role: "semctl.live.details", gap: "xs" }, c: details },
+			] });
+			else children.push(...details);
 		} else {
 			const emptyText = request.error ? "The indexed map is unavailable" : request.loading ? "Reading the indexed map" : "No indexed map available";
 			const reading = request.loading && !request.error && motion;
@@ -511,7 +519,7 @@ export class LiveGraphPopup implements Component {
 		}
 		return { k: "col", p: { gap: "sm" }, c: [
 			header, { k: "col", key: "body", p: { role: "semctl.live.body", gap: "sm" }, c: children },
-			graphStatus(cx, { request, activity, motion: appearance.motion, presentation: "icon" }),
+			graphStatus(cx, { request, activity, motion: appearance.motion, presentation: "icon", counts }),
 		] };
 	}
 	render(width: number): readonly string[] {
