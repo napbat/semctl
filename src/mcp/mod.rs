@@ -38,7 +38,9 @@ use crate::session::SessionContext;
 
 mod budget;
 mod indexing;
+mod presentation;
 pub(crate) mod readiness;
+mod sync_notifications;
 mod tool_types;
 mod tools;
 
@@ -46,6 +48,7 @@ use budget::CallBudget;
 use readiness::{
     InitialIndexGate, SessionLeases, initial_gate_for_path, ready_for_codebases, wait_for_gate,
 };
+use sync_notifications::{SyncNotifications, SyncStatusSession};
 
 use tool_types::{InsertSymbolArgs, applied_edit_text};
 
@@ -116,6 +119,7 @@ struct Shared {
     /// only once that job is terminal so repeated searches don't re-poll. See
     /// [`McpServer::index_freshness`].
     freshness: FreshnessCache,
+    sync_notifications: Arc<SyncNotifications>,
 }
 
 impl McpServer {
@@ -179,9 +183,15 @@ impl McpServer {
                 engine,
                 leases: RwLock::new(HashMap::new()),
                 freshness: Arc::new(Mutex::new(None)),
+                sync_notifications: Arc::new(SyncNotifications::default()),
             }),
             tool_router: tools::router(),
         }
+    }
+
+    /// Tie observers to the connection, even if handler clones outlive it.
+    pub(crate) fn sync_status_session(&self) -> SyncStatusSession {
+        SyncStatusSession(self.shared.sync_notifications.clone())
     }
 
     /// This session's launch working-copy root: what the current codebase is
@@ -274,15 +284,20 @@ impl McpServer {
         self.shared.engine.update_note().lock().await.take()
     }
 
-    /// A freshness warning for search results, derived from the most recent
-    /// index job this session queued — **only** when there's something to flag
-    /// (a sync running or failed), so a clean index adds no per-search noise.
-    /// `None` too when no sync ran this session: we don't fabricate a freshness
-    /// claim for a codebase indexed earlier (that caveat lives in `sync_status`).
-    /// Cached once the job is terminal, keyed by job id so a later sync recomputes.
+    /// Warn when this checkout's local sync or server job failed.
+    /// Check local failures before the cache because a failed upload may have
+    /// no new server job. Cache terminal server results by job id. A clean
+    /// index and a checkout without a recorded sync add no warning.
     async fn index_freshness(&self, client: &Client, budget: &CallBudget) -> Option<String> {
         client.local_root()?;
-        let job_id = self.checkout_status(client).await?.last_job_id?;
+        let checkout = self.checkout_status(client).await?;
+        if checkout.last_error.is_some() {
+            return Some(
+                "(index freshness: the last local sync FAILED — results may be stale; run sync_status)"
+                    .to_string(),
+            );
+        }
+        let job_id = checkout.last_job_id?;
         if let Some((id, footer)) = self.shared.freshness.lock().await.as_ref()
             && *id == job_id
         {
@@ -636,12 +651,9 @@ impl McpServer {
         let key = lease.key().clone();
         // A second lease on the same checkout is dropped here, which releases
         // it again: one session holds one lease per checkout.
-        self.shared
-            .leases
-            .write()
-            .await
-            .entry(key.clone())
-            .or_insert(lease);
+        let mut leases = self.shared.leases.write().await;
+        let lease = leases.entry(key.clone()).or_insert(lease);
+        self.shared.sync_notifications.observe(lease.coordinator());
         Ok(key)
     }
 
@@ -661,7 +673,9 @@ impl McpServer {
             .attach_first_index(client, dir, self.shared.context.resync_secs)
             .await?;
         let key = lease.key().clone();
-        self.shared.leases.write().await.entry(key).or_insert(lease);
+        let mut leases = self.shared.leases.write().await;
+        let lease = leases.entry(key).or_insert(lease);
+        self.shared.sync_notifications.observe(lease.coordinator());
         Ok(gate)
     }
 
@@ -883,6 +897,12 @@ impl McpServer {
         } else {
             ToolAnnotations::new().read_only(true).open_world(false)
         });
+        if let Some(title) = presentation::tool_title(&tool.name) {
+            tool.title = Some(title.into());
+            if let Some(annotations) = &mut tool.annotations {
+                annotations.title = Some(title.into());
+            }
+        }
         tool
     }
 }
@@ -913,6 +933,7 @@ pub async fn run(cli: &Cli) -> Result<()> {
     // the type and the ownership are the same either way.
     let engine = Engine::new(EngineSettings::from_environment())?;
     let server = McpServer::new(context, engine)?;
+    let _sync_status = server.sync_status_session();
 
     // Detached, best-effort check for a newer published CLI.
     server.start_update_check();

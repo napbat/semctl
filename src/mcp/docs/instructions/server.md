@@ -43,12 +43,22 @@ It never waits for embedding. Retrieval, catalog, and graph tools never serve a
 partial first index. They wait at most 5 seconds for it to complete. If it still
 runs, they fail with a "still running" error. `sync_status` stays callable. It
 reports the first-index phase: registering, syncing, embedding, ready, or failed.
-While the phase is syncing, its `current sync:` line shows how many files the
-upload has sent. Call it every 60 seconds, and use local Read/Grep until
-the phase is ready.
-If the phase is failed, call `index_codebase` for the same path to retry. Later
-re-syncs do not block retrieval and continue to expose the last complete
-snapshot with freshness warnings.
+It also reports the latest local scan/upload step when available. Read named
+evidence, not a fixed line layout. Missing server counters are unknown; reported
+embedded/deleted/failed and planned counts are not a processed/total ratio.
+Call it every 60 seconds, and use local Read/Grep until the phase is ready.
+If the phase is failed, inspect and correct the reported cause, then call
+`index_codebase` for the same path to retry. Later re-syncs do not block retrieval
+and continue to expose the last complete snapshot with freshness warnings.
+
+Search source binding requires a local byte snapshot to match the ready
+content-plane full-file hash, plus exact snippet bytes and supplied byte/line
+coordinates in that snapshot. It does not verify semantic symbol/focus identity
+or guarantee that the file stays unchanged. Changed bytes, mismatched ranges,
+and unavailable verification remain explicit, with native diagnostics preserved.
+Use local Read/Grep for current locations when binding is not established.
+Verification does not trigger reindexing. Active checkouts use the existing
+watcher and periodic reconciliation; inspect `sync_status` before recovery.
 
 ## Workflow
 

@@ -39,6 +39,9 @@ use windows_sys::Win32::System::Threading::{
     CREATE_BREAKAWAY_FROM_JOB, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
+#[path = "support/mcp.rs"]
+mod mcp;
+
 const DEAD_SERVER: &str = "http://127.0.0.1:9";
 const TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_STEP: Duration = Duration::from_millis(25);
@@ -429,12 +432,8 @@ async fn initialize(client: &mut tokio::process::Child) {
         if message.get("id").is_none() {
             continue;
         }
-        let line = tokio::time::timeout(TIMEOUT, stdout.next_line())
-            .await
-            .expect("MCP response has a bounded wait")
-            .expect("read an MCP response")
-            .expect("the MCP client answers before it closes output");
-        let response: Value = serde_json::from_str(&line).expect("parse an MCP response");
+        let (_, response) =
+            mcp::response(&mut stdout, TIMEOUT, "MCP response has a bounded wait").await;
         assert_eq!(response["id"], message["id"]);
         if message["id"] == 1 {
             assert!(

@@ -96,10 +96,8 @@ pub struct Client {
     /// owner keeps, such as a coordinator, never does: see
     /// [`Self::with_deadline`].
     deadline: Option<Instant>,
-    /// The record of the partial graph answers of one call, when the caller
-    /// shows them to a user. Like the deadline, only a per-call clone carries
-    /// one: see [`Self::with_partial_answers`].
-    partial_answers: Option<PartialAnswers>,
+    /// Snapshot views use available layers without waiting for graph restores.
+    wait_for_loading: bool,
 }
 
 impl Client {
@@ -156,7 +154,7 @@ impl Client {
             capabilities: Arc::new(tokio::sync::OnceCell::new()),
             remote_permits,
             deadline: None,
-            partial_answers: None,
+            wait_for_loading: true,
         }
     }
 
@@ -282,6 +280,14 @@ impl Client {
     /// Effective resource-server base URL. Contains no credentials.
     pub fn server_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// Read the currently available snapshot. Other retry and auth policy stays
+    /// unchanged; typed loading responses reach the caller without a wait.
+    pub(crate) fn available_snapshot(&self) -> Self {
+        let mut client = self.clone();
+        client.wait_for_loading = false;
+        client
     }
 
     /// The same client, authorized differently. Tests use it to build the two
@@ -439,30 +445,21 @@ impl Client {
         unwrap_envelope(resp, "GET", &url).await
     }
 
-    /// Like [`Self::get`], for a search or grep result that the content budget
-    /// of the server can shorten. Also returns the truncation that the answer
-    /// reports, if any.
-    pub async fn get_budgeted<T: DeserializeOwned>(
-        &self,
-        path: &str,
-    ) -> Result<(T, Option<ResultTruncation>)> {
-        let (resp, url) = self
-            .send(reqwest::Method::GET, path, None, Idempotency::Idempotent)
-            .await?;
-        unwrap_budgeted(resp, "GET", &url).await
-    }
-
-    /// Like [`Self::get`], but returns `Ok(None)` on a 404 instead of erroring —
+    /// Like [`Self::get`], but returns `Ok(None)` on an API 404 instead of erroring —
     /// for "does this still exist?" probes (e.g. validating a cached codebase id
     /// before trusting it against the current server).
     pub async fn get_opt<T: DeserializeOwned>(&self, path: &str) -> Result<Option<T>> {
-        let (resp, url) = self
-            .send(reqwest::Method::GET, path, None, Idempotency::Idempotent)
-            .await?;
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
+        match self.get(path).await {
+            Ok(data) => Ok(Some(data)),
+            Err(error)
+                if error.downcast_ref::<ApiFailure>().is_some_and(|failure| {
+                    failure.status() == reqwest::StatusCode::NOT_FOUND && failure.is_api_response()
+                }) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
         }
-        unwrap_envelope(resp, "GET", &url).await.map(Some)
     }
 
     /// Like [`Self::get`] but tolerates a successful `data: null` — returns
@@ -641,12 +638,15 @@ async fn read_envelope<T: DeserializeOwned>(
         .text()
         .await
         .with_context(|| format!("{method} {url}: read body"))?;
+    if !status.is_success() {
+        return Err(envelope_failure(method, url, status, retry_after, &body));
+    }
     // Not the envelope: attribute it to whatever answered instead of blaming
     // the parser. See `gateway_error`.
     let Ok(envelope) = serde_json::from_str::<ApiEnvelope<T>>(&body) else {
-        return Err(gateway_error(method, url, status, retry_after, &body));
+        return Err(envelope_failure(method, url, status, retry_after, &body));
     };
-    if !status.is_success() || !envelope.success {
+    if !envelope.success {
         let errors = envelope.errors.as_deref().unwrap_or_default();
         return Err(ApiFailure::from_errors(method, url, status, retry_after, errors).into());
     }
@@ -662,6 +662,30 @@ struct ApiEnvelope<T> {
     data: Option<T>,
     #[serde(default)]
     errors: Option<Vec<serde_json::Value>>,
+}
+
+/// Failed responses use the common API envelope, even when the requested
+/// success shape is a page or its payload cannot deserialize as `T`.
+fn envelope_failure(
+    method: &str,
+    url: &str,
+    status: reqwest::StatusCode,
+    retry_after: Option<Duration>,
+    body: &str,
+) -> anyhow::Error {
+    if let Ok(envelope) = serde_json::from_str::<ApiEnvelope<serde::de::IgnoredAny>>(body)
+        && (!status.is_success() || !envelope.success)
+    {
+        return ApiFailure::from_errors(
+            method,
+            url,
+            status,
+            retry_after,
+            envelope.errors.as_deref().unwrap_or_default(),
+        )
+        .into();
+    }
+    gateway_error(method, url, status, retry_after, body)
 }
 
 /// Unwrap a flat paginated envelope (`PaginatedApiResponse<T>` —
@@ -680,10 +704,13 @@ async fn unwrap_page<T: DeserializeOwned>(
         .text()
         .await
         .with_context(|| format!("{method} {url}: read body"))?;
-    let env: PageEnvelope<T> = serde_json::from_str(&body).with_context(|| {
-        format!("{method} {url} -> {status}: parse paginated envelope ({body})")
-    })?;
-    if !status.is_success() || !env.success {
+    if !status.is_success() {
+        return Err(envelope_failure(method, url, status, retry_after, &body));
+    }
+    let Ok(env) = serde_json::from_str::<PageEnvelope<T>>(&body) else {
+        return Err(envelope_failure(method, url, status, retry_after, &body));
+    };
+    if !env.success {
         let errors = env.errors.as_deref().unwrap_or_default();
         return Err(ApiFailure::from_errors(method, url, status, retry_after, errors).into());
     }

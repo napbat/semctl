@@ -10,10 +10,5 @@
   "license": "MIT OR Apache-2.0",
   "keywords": ["search", "code-search", "rust", "dotnet", "mcp", "tree-sitter", "embeddings"],
   "skills": "./skills/",
-  "mcpServers": {
-    "semctx": {
-      "command": "semctl",
-      "args": ["mcp"]
-    }
-  }
+  "mcpServers": "./.mcp.json"
 }

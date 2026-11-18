@@ -21,6 +21,9 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
+#[path = "support/mcp.rs"]
+mod mcp;
+
 /// A port nothing listens on: every request fails without a network wait.
 const DEAD_SERVER: &str = "http://127.0.0.1:9";
 
@@ -331,12 +334,13 @@ impl McpClient {
     }
 
     async fn receive(&mut self) -> Value {
-        let line = tokio::time::timeout(RESPONSE_TIMEOUT, self.stdout.next_line())
-            .await
-            .expect("an MCP response timed out")
-            .expect("read an MCP response")
-            .expect("the client closed its output before it answered");
-        serde_json::from_str(&line).expect("parse an MCP response")
+        mcp::response(
+            &mut self.stdout,
+            RESPONSE_TIMEOUT,
+            "an MCP response timed out",
+        )
+        .await
+        .1
     }
 
     /// Complete the MCP handshake and list the tools.

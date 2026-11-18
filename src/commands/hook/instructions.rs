@@ -11,8 +11,7 @@ enum Action {
     Reset,
 }
 
-/// Run after context retrieval so a network timeout cannot consume the delivery flag.
-pub(super) async fn context(input: &HookInput) -> Option<String> {
+fn delivery_action(input: &HookInput) -> Option<Action> {
     let action = match input.hook_event_name.as_str() {
         "PostCompact" => Action::Reset,
         "SessionStart" if resets_segment(&input.hook_event_name, &input.source) => {
@@ -21,6 +20,16 @@ pub(super) async fn context(input: &HookInput) -> Option<String> {
         "SessionStart" | "UserPromptSubmit" => Action::Ensure,
         _ => return None,
     };
+    match (action, input.has_semctx_tools()) {
+        (Action::Ensure, false) => None,
+        (Action::ResetAndEnsure, false) => Some(Action::Reset),
+        _ => Some(action),
+    }
+}
+
+/// Run after context retrieval so a network timeout cannot consume the delivery flag.
+pub(super) async fn context(input: &HookInput) -> Option<String> {
+    let action = delivery_action(input)?;
     if input.session_id.is_empty() {
         return None;
     }
@@ -71,7 +80,49 @@ fn take(store: &state::Store, session_id: &str, action: Action) -> Option<&'stat
 
 #[cfg(test)]
 mod tests {
+    use super::super::OmpMcpTools;
     use super::*;
+
+    #[test]
+    fn unavailable_tools_preserve_resets_and_later_manual_delivery() {
+        for (event, source) in [
+            ("SessionStart", "compact"),
+            ("SessionStart", "clear"),
+            ("PostCompact", ""),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = state::Store::with_dir(directory.path().to_path_buf());
+            let mut input: HookInput = serde_json::from_value(serde_json::json!({
+                "host": "omp",
+                "omp_mcp_tools": "unavailable",
+                "hook_event_name": "SessionStart",
+                "session_id": "session",
+            }))
+            .unwrap();
+            assert!(delivery_action(&input).is_none());
+            assert!(!store.load(&input.session_id).server_instructions_emitted);
+
+            input.omp_mcp_tools = Some(OmpMcpTools::Native);
+            assert_eq!(
+                take(&store, &input.session_id, delivery_action(&input).unwrap()),
+                Some(SERVER_INSTRUCTIONS)
+            );
+            input.omp_mcp_tools = Some(OmpMcpTools::Unavailable);
+            input.hook_event_name = event.into();
+            input.source = source.into();
+            assert!(take(&store, &input.session_id, delivery_action(&input).unwrap()).is_none());
+            assert!(!store.load(&input.session_id).server_instructions_emitted);
+
+            input.hook_event_name = "UserPromptSubmit".into();
+            assert!(delivery_action(&input).is_none());
+            input.omp_mcp_tools = Some(OmpMcpTools::Native);
+            assert_eq!(
+                take(&store, &input.session_id, delivery_action(&input).unwrap()),
+                Some(SERVER_INSTRUCTIONS)
+            );
+            assert!(take(&store, &input.session_id, delivery_action(&input).unwrap()).is_none());
+        }
+    }
 
     #[test]
     fn concurrent_claims_emit_the_manual_once() {

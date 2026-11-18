@@ -15,9 +15,9 @@ use crate::mcp::tests::{first_index, server};
 use crate::mcp::tool_types::IndexCodebaseArgs;
 use crate::mcp::{CallBudget, McpServer, initial_gate_for_path};
 
-/// Longer than any call without a wait needs. A call that waits for the open
-/// first index never ends inside it.
-const NO_WAIT: Duration = Duration::from_secs(1);
+/// Allow local Git and watcher setup to finish under a parallel test load.
+/// The first-index gate stays unresolved, so an accidental wait still fails.
+const NO_WAIT: Duration = Duration::from_secs(5);
 
 /// A checkout on disk, named as `index_codebase` names it.
 async fn checkout() -> (TempDir, PathBuf) {

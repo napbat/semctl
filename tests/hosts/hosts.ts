@@ -91,9 +91,8 @@ const omp: HostAdapter = {
 			"--mode",
 			"json",
 			"--no-session",
-			// A package directory resolves through its `package.json`
-			// `omp.extensions` manifest, as a marketplace install does, but it
-			// writes no plugin state.
+			// The package root loads both omp.extensions and native MCP
+			// sub-discovery. Loading only the adapter file would miss MCP.
 			"--no-extensions",
 			"--extension",
 			PLUGIN_ROOT,

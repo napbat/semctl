@@ -22,6 +22,7 @@ mod upload;
 pub(crate) mod walker;
 
 pub(crate) use cache::SyncCache;
+pub(crate) use walker::MAX_FILE_BYTES;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -34,7 +35,7 @@ use tracing::{debug, warn};
 
 use crate::client::{Client, api};
 use scan::ScanResult;
-use upload::UploadFailure;
+pub(crate) use upload::UploadFailure;
 
 /// The process-wide bounds one sync must respect.
 ///

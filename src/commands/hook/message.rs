@@ -26,6 +26,8 @@ pub enum ToolNameStyle {
     /// Claude Code qualifies plugin MCP servers with both the plugin and server
     /// names: `mcp__plugin_semctx_semctx__<tool>`.
     ClaudePlugin,
+    /// OMP exposes a native package server named `semctx` without a plugin prefix.
+    OmpNative,
     /// OMP namespaces a marketplace server as `semctx:semctx`, which its tool
     /// bridge sanitizes to `mcp__semctx_semctx_<tool>`.
     OmpMarketplace,
@@ -36,6 +38,7 @@ impl ToolNameStyle {
         match self {
             Self::CodexPlugin => "mcp__semctx__",
             Self::ClaudePlugin => "mcp__plugin_semctx_semctx__",
+            Self::OmpNative => "mcp__semctx_",
             Self::OmpMarketplace => "mcp__semctx_semctx_",
         }
     }
@@ -262,6 +265,7 @@ mod tests {
         for names in [
             ToolNameStyle::CodexPlugin,
             ToolNameStyle::ClaudePlugin,
+            ToolNameStyle::OmpNative,
             ToolNameStyle::OmpMarketplace,
         ] {
             let all = format!(
@@ -285,6 +289,13 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn omp_native_uses_the_package_server_prefix() {
+        let message = tier1(ToolNameStyle::OmpNative);
+        assert!(message.contains("`mcp__semctx_search_codebase`"));
+        assert!(!message.contains("mcp__semctx_semctx_"));
     }
 
     #[test]

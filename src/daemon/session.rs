@@ -50,6 +50,7 @@ pub(super) async fn serve(
             return;
         }
     };
+    let _sync_status = server.sync_status_session();
 
     // Counted from here: the session exists, and the answer below promises it.
     let session = Sessions::attach(daemon.sessions().clone(), daemon.pid());

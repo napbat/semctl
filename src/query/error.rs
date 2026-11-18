@@ -75,7 +75,7 @@ fn classify(failure: &ApiFailure) -> FailureKind {
         };
     }
     match failure.status().as_u16() {
-        400 | 404 | 422 => FailureKind::InvalidArgument,
+        400 | 404 | 422 if failure.is_api_response() => FailureKind::InvalidArgument,
         _ => FailureKind::Unavailable,
     }
 }

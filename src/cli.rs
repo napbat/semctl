@@ -60,8 +60,7 @@ pub enum Command {
     /// Exact code intelligence for the current codebase — definitions,
     /// references, callers, implementations, call/value-flow paths, and the
     /// resolution layer (imports / symbol-edges / external-links).
-    #[command(subcommand)]
-    Graph(commands::graph::GraphCommand),
+    Graph(commands::graph::GraphArgs),
 
     /// Grammar-native symbolic edit planning plus verified local apply/undo.
     #[command(subcommand)]

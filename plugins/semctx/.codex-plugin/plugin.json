@@ -9,12 +9,7 @@
   "repository": "https://github.com/napbat/semctl",
   "license": "MIT OR Apache-2.0",
   "keywords": ["search", "code-search", "rust", "dotnet", "mcp", "tree-sitter", "embeddings"],
-  "mcpServers": {
-    "semctx": {
-      "command": "semctl",
-      "args": ["mcp"]
-    }
-  },
+  "mcpServers": "./.mcp.json",
   "skills": "./skills/",
   "interface": {
     "displayName": "semctx",

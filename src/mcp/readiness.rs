@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -16,6 +16,7 @@ use tokio::sync::{Mutex, Notify, RwLock, RwLockReadGuard};
 use tokio::time::Instant;
 
 use super::CallBudget;
+use crate::engine::coordinator::ProgressSlot;
 use crate::engine::{CheckoutKey, CoordinatorLease};
 use crate::query::{FailureKind, ToolError};
 
@@ -180,6 +181,7 @@ pub(super) async fn initial_gate_for_path(
 pub(crate) struct InitialIndexGate {
     state: Mutex<InitialIndexState>,
     changed: Notify,
+    status: OnceLock<Weak<ProgressSlot>>,
 }
 
 #[derive(Clone, Default)]
@@ -250,6 +252,18 @@ impl InitialIndexGate {
         Self {
             state: Mutex::new(InitialIndexState::default()),
             changed: Notify::new(),
+            status: OnceLock::new(),
+        }
+    }
+
+    /// The coordinator owns the publisher. A gate must not keep it alive.
+    pub(crate) fn observe_status(&self, progress: &Arc<ProgressSlot>) {
+        self.status.get_or_init(|| Arc::downgrade(progress));
+    }
+
+    fn notify_status(&self) {
+        if let Some(progress) = self.status.get().and_then(Weak::upgrade) {
+            progress.notify_status();
         }
     }
 
@@ -257,6 +271,7 @@ impl InitialIndexGate {
     pub(crate) async fn register_codebase(&self, id: String) {
         self.state.lock().await.codebase_id = Some(id);
         self.changed.notify_waiters();
+        self.notify_status();
     }
 
     pub(crate) async fn wait(&self) -> Result<(), String> {
@@ -294,6 +309,8 @@ impl InitialIndexGate {
             return false;
         }
         state.polling = true;
+        drop(state);
+        self.notify_status();
         true
     }
 
@@ -368,6 +385,7 @@ impl InitialIndexGate {
         state.result = Some(result);
         drop(state);
         self.changed.notify_waiters();
+        self.notify_status();
     }
 }
 

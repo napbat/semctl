@@ -63,16 +63,16 @@ pub async fn run(cmd: FilesCommand, cli: &Cli) -> Result<()> {
         FilesCommand::List(a) => {
             query::list_files(&client, a.filter.as_deref(), a.page, a.page_size).await
         }
-        FilesCommand::Read(a) => {
-            query::read_source(
-                &client,
-                &a.path,
-                a.revision.as_deref(),
-                a.byte_start.zip(a.byte_end),
-                a.line_start.zip(a.line_end),
-            )
-            .await
-        }
+        FilesCommand::Read(a) => query::read_source(
+            &client,
+            &a.path,
+            a.revision.as_deref(),
+            a.byte_start.zip(a.byte_end),
+            a.line_start.zip(a.line_end),
+            query::QueryPresentation::Plain,
+        )
+        .await
+        .map(|output| output.text),
     };
     let out = out.map_err(query::ToolError::into_cli_error)?;
     print!("{out}");
