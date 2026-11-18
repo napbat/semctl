@@ -511,6 +511,12 @@ fn render_job_counts(out: &mut String, job: &api::JobStatus) {
             None => out.push_str("unknown"),
         }
     }
+    if let Some(stage) = job.current_stage.as_deref() {
+        write!(out, "; stage {}", markdown_code(stage)).expect("writing to a String cannot fail");
+    }
+    if let Some(rate) = job.operations_per_second {
+        write!(out, "; {rate} files/s").expect("writing to a String cannot fail");
+    }
 }
 
 /// A recorded server job may predate the current local attempt. Preserve its
@@ -584,16 +590,26 @@ fn sync_summary(
         return "**Server indexing failed — indexed results may be stale**";
     }
     if matches!(first, Some(FirstIndexPhase::Embedding { .. })) {
-        return "**First index embedding — retrieval not ready**";
+        if phase == Some(JobPhase::Done) {
+            return "**First index awaiting readiness — retrieval not ready**";
+        }
+        return match job.and_then(|job| job.current_stage.as_deref()) {
+            Some("Graph") => "**First index building graph — retrieval not ready**",
+            Some("Paused") => "**First index paused — retrieval not ready**",
+            _ => "**First index embedding — retrieval not ready**",
+        };
     }
     if unavailable {
         return "**Status incomplete — server state unknown**";
     }
     if matches!(phase, Some(JobPhase::Pending | JobPhase::Running)) {
-        return if phase == Some(JobPhase::Running) {
-            "**Server indexing running — not yet complete**"
-        } else {
-            "**Server indexing queued — not yet complete**"
+        return match job.and_then(|job| job.current_stage.as_deref()) {
+            Some("Graph") => "**Server building graph — not yet complete**",
+            Some("Paused") => "**Server indexing paused — not yet complete**",
+            _ if phase == Some(JobPhase::Running) => {
+                "**Server indexing running — not yet complete**"
+            }
+            _ => "**Server indexing queued — not yet complete**",
         };
     }
     if checkout.is_some_and(|status| status.pending_triggers > 0 || status.trigger_overflow) {

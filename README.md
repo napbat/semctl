@@ -49,7 +49,7 @@ semctl index        # register + sync the current repo for indexing
 | ----------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
 | `semctl search <query>`                               | Cross-domain semantic search.                                                                                         |
 | `semctl index`                                        | Register the current Git worktree (or selected non-Git folder) and sync its files.                                    |
-| `semctl graph …`                                      | Exact code intelligence plus symbol search, type hierarchy, call graphs, cycles, unused, duplicates, and rich outlines. |
+| `semctl graph …`                                      | Exact code intelligence plus symbol search, type hierarchy, call graphs, cycles, unused, duplicates, rich outlines, and search-based file affinity (`semctl graph --json affinity -- <paths>`). |
 | `semctl edit …`                                       | Grammar-native rename/delete/body/insertion planning and verified local apply/undo.                                   |
 | `semctl files …`                                      | File catalog (`tree` / filtered `list`) and revision-pinned line/byte source reads.                                    |
 | `semctl inspect …`                                    | Projects/domains plus visible codebases and the effective server/tenant/index/graph context.                          |
@@ -216,7 +216,9 @@ The client cannot retrieve the server's stored embedding vectors.
 
 Concept map is the default layout for new profiles.
 It combines documentation concepts, lexical term vectors, and recorded links.
-Related concept families form soft islands when the drawing has enough space.
+The overview arranges groups in regions: documentation families first, then
+groups that share a home folder (such as `hv/`), then linked groups with shared
+identifier terms. Each region is one island, and the islands do not overlap.
 Force also uses shared terms and family cohesion.
 Term frequency and inverse document frequency weight paths, labels, and resolved
 symbol names. Classical multidimensional scaling supplies stable coordinates.
@@ -224,21 +226,26 @@ The vectors are not the server's semantic embeddings.
 Position does not prove a relationship or indicate confidence.
 Input order does not change geometry.
 Activity, selection, indexing state, scores, and theme do not move nodes.
+Each group shows up to three key terms: identifier terms that are frequent in
+the group and rare in the other groups.
 Concept map and Force can draw soft tinted territories.
-Document folders name concept families. Without these families, shared terms
-can name lexical families. A territory is omitted if it would cover an unrelated
-node or most of the canvas. Compact popups hide territory labels.
+Documentation families have a solid border; home-folder regions have a dashed
+border. Without regions, shared terms can name lexical families. A territory is
+omitted if it would cover an unrelated node or most of the canvas. Compact
+popups hide territory labels.
 Radial, Layers, and Components draw no territories.
 Overview group dots scale with member count.
 Aggregated group routes use four weight tiers.
 Each higher tier makes a route thicker and more opaque.
+The folded remainder is a hollow dot in the lower right corner without routes.
 In Radial, isolated nodes sit on one outer ring around the largest map when that
 map has at least three nodes and every other component is smaller.
 That ring does not show a distance. An isolated node has no recorded relation.
 Ungrouped result graphs keep their previous dot sizes.
 Nodes keep their identity across layout changes and refreshes.
 They glide to new positions when geometry changes.
-Routes and territories fade in after nodes settle.
+Routes and territories fade in after nodes settle. A refresh with the same
+geometry does not replay the fade.
 Dots arrive with a short staggered scale-in.
 Labels fade in after their dot.
 Reduced-motion mode and Motion Off disable these graph effects.
@@ -252,9 +259,10 @@ This value is the ready share of the files that report a catalog state.
 The bar tooltip shows the exact counts.
 The map sits in the canvas well.
 With no selection, a one-line legend explains dot size (files) and line weight
-(links). It identifies concept families or shared terms only when territories
-are drawn. The `Busiest` chips select individual groups with many cross-group
+(links). It names the drawn territory kinds only when territories are drawn.
+The `Busiest` chips select individual groups with many cross-group
 links. The folded remainder does not compete with individual groups.
+The group list follows the map regions, with a heading per region.
 Small, medium, and large popups show up to three, four, and five chips.
 Select the grip at the upper left to enlarge the popup.
 Shift+click makes it smaller. Both controls wrap through the three sizes.

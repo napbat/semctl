@@ -348,6 +348,32 @@ fn job_phases_keep_queued_running_and_completed_distinct() {
 }
 
 #[test]
+fn server_stages_and_rates_preserve_reported_units_and_first_index_readiness() {
+    let mut job = completed_job();
+    job.completed_at = None;
+    job.started_at = Some("started".into());
+    assert!(!render_job("job", &job).contains("files/s"));
+    let first = checkout(
+        Some(FirstIndexPhase::Embedding {
+            job_id: Some("job".into()),
+        }),
+        None,
+    );
+    job.operations_per_second = Some(1.25);
+    for (stage, summary) in [("Graph", "building graph"), ("Paused", "paused")] {
+        job.current_stage = Some(stage.into());
+        let text = render_job("job", &job);
+        assert!(
+            text.contains(&format!("stage `{stage}`; 1.25 files/s")),
+            "{text}"
+        );
+        assert!(sync_summary(None, Some(&job), false).contains(summary));
+        let first_summary = sync_summary(Some(&first), Some(&job), false);
+        assert!(first_summary.contains(summary) && first_summary.contains("not ready"));
+    }
+}
+
+#[test]
 fn missing_job_counts_are_unknown_and_only_explicit_zero_plan_is_no_work() {
     let missing = completed_job();
     assert_eq!(missing.files_to_embed, None);

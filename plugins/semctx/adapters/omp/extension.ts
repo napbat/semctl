@@ -266,6 +266,6 @@ export function createSemctxExtension(invoker: HookInvoker = createSemctlHookInv
 		});
 		pi.on("tool_result", (event, ctx) => overview.observe(event, ctx));
 		pi.on("mcp_notification", (event, ctx) => overview.observe(event, ctx));
-		installSyncStatus(pi, (ctx, mode) => mode === "live" ? overview.togglePopup(ctx) : overview.open(ctx));
+		installSyncStatus(pi, (ctx, mode) => mode === "live" ? overview.togglePopup(ctx) : overview.open(ctx), overview.readiness);
 	};
 }

@@ -137,6 +137,17 @@ async fn loading_layers_return_catalog_immediately_without_waiting_or_inventing_
     assert!(output.text.contains("Projects unavailable"));
     assert!(output.text.contains("Resolved imports unavailable"));
     assert!(output.text.contains("Resolved symbol bindings unavailable"));
+    assert!(
+        output
+            .text
+            .contains("resolved file imports (total unknown)")
+    );
+    assert!(
+        output
+            .text
+            .contains("resolved symbol bindings (total unknown)")
+    );
+    assert!(!output.text.contains("0 of 0"));
     assert_eq!(stub.requests(), 5);
 }
 

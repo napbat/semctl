@@ -11,8 +11,10 @@ use crate::engine::CoordinatorStatus;
 use super::render::{HitContext, strip_verbatim_prefix};
 use super::source::HitSource;
 
+mod affinity;
 mod graph;
 mod overview;
+pub(super) use affinity::{AffinityFile, AffinityPair, QuerySource, project_affinity};
 pub(super) use graph::{GraphInput, project_graph};
 pub(super) use overview::{OverviewInput, project_overview};
 
@@ -94,6 +96,8 @@ struct Display<'a> {
 enum Data<'a> {
     Search {
         query: &'a str,
+        #[serde(rename = "budgetNote", skip_serializing_if = "Option::is_none")]
+        budget_note: Option<&'a str>,
         hits: Vec<Hit<'a>>,
     },
     Source {
@@ -124,6 +128,10 @@ enum Data<'a> {
     Graph {
         #[serde(flatten)]
         graph: graph::Graph<'a>,
+    },
+    Affinity {
+        #[serde(flatten)]
+        affinity: affinity::Affinity<'a>,
     },
     Status {
         coordinator: Option<&'a CoordinatorStatus>,
@@ -158,6 +166,10 @@ struct Hit<'a> {
     start_byte: Option<u32>,
     end_byte: Option<u32>,
     snippet: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expanded: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expansion_reason: Option<&'static str>,
     snippet_start_line: Option<u32>,
     snippet_end_line: Option<u32>,
     snippet_start_byte: Option<u32>,
@@ -216,6 +228,10 @@ impl<'a> Hit<'a> {
             start_byte: hit.byte_start,
             end_byte: hit.byte_end,
             snippet: Some(&hit.snippet),
+            expanded: hit.expanded,
+            expansion_reason: hit
+                .expansion_reason
+                .map(|r| super::completeness::expansion_reason_text(r).0),
             snippet_start_line: hit.snippet_line_start,
             snippet_end_line: hit.snippet_line_end,
             snippet_start_byte: hit.snippet_byte_start,
@@ -253,6 +269,8 @@ impl<'a> Hit<'a> {
             start_byte: Some(hit.byte_start),
             end_byte: Some(hit.byte_end),
             snippet: None,
+            expanded: None,
+            expansion_reason: None,
             snippet_start_line: None,
             snippet_end_line: None,
             snippet_start_byte: None,
@@ -293,6 +311,10 @@ struct Job<'a> {
     files_failed: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     chunk_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_stage: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operations_per_second: Option<f64>,
     error: Option<&'a str>,
     started_at: Option<&'a str>,
     completed_at: Option<&'a str>,
@@ -362,11 +384,13 @@ pub(super) fn search(
     hits: &[api::SearchHit],
     sources: &[HitSource],
     context: HitContext<'_>,
+    budget_note: Option<&str>,
 ) -> Option<Value> {
     if hits.len() > MAX_DISPLAY_HITS
-        || hits.iter().fold(query.len(), |total, hit| {
-            total.saturating_add(search_hit_bytes(hit))
-        }) > MAX_DISPLAY_BYTES
+        || hits.iter().fold(
+            query.len().saturating_add(budget_note.map_or(0, str::len)),
+            |total, hit| total.saturating_add(search_hit_bytes(hit)),
+        ) > MAX_DISPLAY_BYTES
     {
         return None;
     }
@@ -378,6 +402,7 @@ pub(super) fn search(
         ),
         data: Data::Search {
             query,
+            budget_note,
             hits: hits
                 .iter()
                 .enumerate()
@@ -559,6 +584,8 @@ pub(super) fn status(
                 files_deleted: status.files_deleted,
                 files_failed: status.files_failed,
                 chunk_count: status.chunk_count,
+                current_stage: status.current_stage.as_deref(),
+                operations_per_second: status.operations_per_second,
                 error: status.error.as_deref(),
                 started_at: status.started_at.as_deref(),
                 completed_at: status.completed_at.as_deref(),

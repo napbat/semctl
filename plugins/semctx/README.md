@@ -115,6 +115,10 @@ A missing or malformed warning field falls back
 to the complete native result, so older producer metadata cannot hide a warning.
 Missing/invalid metadata, wrong origins, errors, partial results, and
 cancellation also retain native rendering.
+When the server returns a partial graph, the card shows the server warning
+above the result. A search budget notice appears before the matches.
+An open match distinguishes an expanded symbol from a chunk when the server
+reports the expansion state.
 
 The exact query appears in the native `Code search` header. Each match uses a
 native file chip with a file icon, linked filename, line range, and verification
@@ -128,7 +132,7 @@ The native tool-header disclosure opens the entire result.
 A muted badge in the native tool header shows the codebase identity.
 The badge text is the display name. Canonical copies add `· canonical`.
 The badge tooltip shows the codebase ID, checkout path, and copy.
-The result body starts with the match chips.
+Complete results start with the match chips.
 No second result-list disclosure appears between chips.
 Hosts without the required native primitives use the original result body.
 ANSI and noninteractive output retain the original renderer.
@@ -222,10 +226,26 @@ hint tells you to select a dot for details.
 
 Concept map is the default layout for profiles without a saved choice.
 It combines documentation concepts, shared terms, and recorded links.
-Concept families use folders of source documents, such as `Architecture`.
-The layout separates families when space permits.
+The overview arranges its groups in regions. A region holds at least two drawn
+groups, in this order of precedence:
+
+1. A documentation family: the naming documents share a folder, such as
+   `Architecture`.
+2. A home folder: most member files of each group are under the same top
+   folder, such as `hv/` or `tools/`. When one folder would hold more than 70%
+   of the groups, the next folder level splits it.
+3. Linked terms: the groups have recorded links and share at least one
+   identifier term.
+
+A group's home folder is the deepest folder that holds at least 60% of its
+member folders. The overview draws at most 6 regions, largest first.
+Each region is one island. The islands are placed by their similarity, and
+the layout packs them so that they do not overlap. Inside an island, related
+groups sit side by side. Dot labels reserve room when the canvas allows it.
 Force also uses lexical similarity and family cohesion.
-Terms come from paths, labels, resolved symbol names, and concept headings.
+Terms come from paths, labels, resolved symbol names, concept headings, and the
+headings of each catalog Markdown file. Hex content digests in file names are
+not terms.
 Term frequency and inverse document frequency weight the terms.
 Classical multidimensional scaling supplies stable coordinates.
 These vectors are not the server's semantic embeddings.
@@ -234,18 +254,58 @@ Position does not prove a relationship or indicate confidence.
 Input order does not change geometry.
 Activity, selection, indexing state, scores, and theme do not move nodes.
 
+Each group shows up to three key terms. A key term is frequent in the member
+files of that group and rare in the other groups. Words of the group label are
+not repeated. Key terms are identifier evidence, not a summary of behavior.
+They appear in group rows, in the selected-group inspector, and in dot hovers.
+
+Select a group to open it. The open group splits into subconcepts:
+
+1. Child folders: members in several child folders split by folder. Folders
+   beyond the detail budget fold into one last `N other folders` subconcept.
+2. Content clusters: members of one folder split into clusters. A child folder
+   that holds at least 70% of the members, and at least 12 members, also splits
+   into clusters. A cluster joins files with related names, Markdown headings,
+   recorded links, and semantic affinity. Words that every member shares, such
+   as a common manual title, do not separate clusters.
+
+Calm shows at most 6 subconcepts, Balanced 8, and Detailed 12. A group with more
+than 24 nodes draws one dot per subconcept. Select a subconcept dot or row to
+open the next level. A group with 24 nodes or fewer draws its members inside
+tinted subconcept territories. The breadcrumb returns to each open level.
+A refresh keeps the open levels when they still exist.
+
+Semantic affinity comes from semctx search profiles. The server gives no
+embedding vectors, so the adapter uses its hybrid search ranking. For an open
+level with 2 to 64 files, the adapter runs
+`semctl graph --json affinity -- <paths>` once. The command describes each file
+with one search: its Markdown headings, its outline names, or its file name.
+Two files are related when their ranked result files overlap, or when one file
+is in the results of the other. A file that the server has not indexed still
+gets a profile from its indexed neighbours. The adapter measures each pair
+against the median pair of the level, so hub files that most searches return do
+not join everything. The line under the breadcrumb shows the state: loading,
+the number of related pairs and indexed files, or terms and links only.
+Results stay cached until the checkout changes. A failed request shows a
+warning, and the level uses terms and links. Semantic affinity is retrieval
+evidence for placement. It is not a dependency or a confidence score.
+
 Concept map and Force can draw soft tinted territories behind their members.
-Document folders name concept families. When these families are absent,
-shared identifier terms can name lexical families.
+A documentation family has a solid border. A home-folder region has a dashed
+border and a monospace folder label. When no region exists, shared identifier
+terms can name lexical families.
 The compact live popup hides territory labels.
 A territory is omitted if it would cover an unrelated node or most of the canvas.
 Territory tints use the shared palette. They are not confidence indicators.
 Radial, Layers, and Components do not draw territories.
 
-Overview group dots scale with member count.
-Aggregated group routes use four weight tiers.
+Overview group dots scale with member count. The compact popup uses a smaller
+size range. Aggregated group routes use four weight tiers.
 Each higher tier makes a route thicker and more opaque.
 Ungrouped result graphs keep their previous dot sizes.
+The folded remainder (`N other groups`) is a hollow dashed dot in the lower
+right corner. It joins unrelated small groups, so the map draws no routes to it
+and gives it no label priority. Its links stay in the inspector counts.
 
 Every graph drawing sits in a soft canvas well and is centered in it.
 Uncolored dots use a soft neutral tone. Every dot has a thin ring in the canvas
@@ -261,6 +321,8 @@ the documents to code files. Supported reference and folder evidence can extend
 an assignment. Broad index documents and ambiguous mentions do not seed concepts.
 At least three code files must support a concept.
 Source-directory groups remain where concept evidence is insufficient.
+A source-directory group shows the color of its home folder, also when its
+members are in different subfolders.
 Duplicate structure labels include their project or path context.
 Group rows show the source document.
 Concept cues distinguish direct mentions, reference support, and folder support.
@@ -274,7 +336,9 @@ This step makes no embedding requests, network searches, or model calls.
 Tern owns arrival, movement, and hover transitions.
 Nodes keep their identity across layout changes and refreshes.
 They glide to new positions when geometry changes.
-Routes and territories fade in after nodes settle.
+Routes and territories fade in after nodes settle. A refresh that produces the
+same geometry keeps the routes and territories in place and does not replay the
+fade.
 Dots arrive with a short staggered scale-in.
 Labels fade in after their dot.
 Observed activity fades in and out without moving the graph.
@@ -292,12 +356,16 @@ The compact toolbar opens analyses, appearance, refresh, diagnostics, and close.
 Analyses use native tabs for Project, Symbols, Calls, Flow & types, Quality,
 and Source. The map, chooser, and diagnostics share a stable viewing area.
 Switching views keeps the selected node and source preview.
+A refresh that changes the map keeps the open group, its open subconcepts, and
+the selected file when they still exist. Group rows show key terms beside the
+group name.
 Use A for analyses, S for appearance, I for diagnostics, and R to refresh.
 Escape returns from the chooser or diagnostics to the map. Escape on the map
 closes the page. Raw CLI output and producer diagnostics stay in the details view.
 
 The live popup and graph page show a native spinner and a shimmer label while
-the first map loads. Refresh buttons show a native spinner during a refresh.
+the first map loads. A refresh button shows a native spinner only during a
+refresh that you start.
 The graph page footer uses a native spinner while loading or working.
 Reduced-motion mode and Motion Off use static icons and labels instead.
 
@@ -393,6 +461,9 @@ missing legacy state remains unreported. Aggregate job progress never assigns
 a state to individual files.
 The native composer status opens the same status view when selected. The
 `Project graph` action opens the overview without starting a model turn.
+The composer shows static marks for idle, pending, warning, and failed states.
+Reduced motion suppresses indeterminate animation. Hosts without meters keep
+the status action and show progress with a fixed-width mark.
 
 #### Live overview popup
 
@@ -417,6 +488,8 @@ The size persists in the OMP profile.
 | Large | 680 px | 720 px |
 
 The viewport limits both dimensions.
+When a new Tern session centers the composer, the popup uses the space above
+it. The header stays in view while the map scrolls.
 The drawing scales with the popup. Larger popups expose more labels and chips.
 
 The popup title is `Project map`. A subline shows `N files · M groups`.
@@ -428,7 +501,8 @@ This value is the ready share of the files that report a catalog state.
 Files without a reported state do not lower it.
 The bar tooltip shows the exact counts. The map sits in the canvas well below
 the bar.
-The refresh button stays disabled while a map request is active.
+The refresh button shows a spinner and stays disabled only while a refresh that
+you started from the popup is active. Background map reads do not change the button.
 The toolbar and status footer stay visible while you scroll the graph and group list.
 The extension mounts the popup through stock OMP's widget API. It does not take
 keyboard focus or create a separate terminal page. Status, details, and the full
@@ -451,20 +525,29 @@ Select a dot or group to open its compact inspector below the drawing.
 The inspector keeps a fixed height. It shows member counts and incoming,
 outgoing, and internal link counts from the full supplied map, including parallel
 links and routes omitted from the drawing. Partial or loading maps stay qualified.
+With a selection, the second row also shows the key terms of the group.
 With no selection, the inspector shows a one-line legend. It explains dot size
 (files) and line weight (links). A tint entry appears only when territories are
-drawn. It distinguishes documented concept families from shared terms.
-Hover a legend item for its meaning.
+drawn. Its label names the drawn kind: `concepts` for documentation families,
+`folders` for home-folder regions, and `shared terms` for lexical families.
+Several kinds show `regions`. Hover a legend item for its meaning.
 The row below the legend shows `Busiest` chips for individual groups.
 The folded remainder is excluded from this ranking.
 Small, Medium, and Large show up to three, four, and five chips.
 Select a chip to select its group.
 With a selection, the chips show neighboring groups with the most observed links.
+Use the previous and next controls to see the other neighboring groups
+without changing the selected group.
 The neighbor count includes both directions. Hover shows each direction separately.
+The group list follows the map: each region has a heading with its territory
+tint and group count, and its groups follow by size. An `Outside regions`
+heading precedes the other groups. The folded remainder stays last.
 The group list separates names, member counts, indexing states, and request activity.
+Medium and Large popups also show the key terms of each group.
 Each group row shows its catalog indexing states as a small stacked bar.
 Hosts without meters show a badge with the count of the most urgent state.
-Hover a group for counts and its source document. Use the expand icon for the full map.
+Hover a group for counts, key terms, region, and its source document.
+Use the expand icon for the full map.
 Selection follows group identity across refreshes. A delayed action cannot select
 a different group because the list order changed.
 When a map request fails, the `Diagnostics` disclosure retains the full error.
@@ -473,6 +556,11 @@ The hover summary stays short.
 The popup footer uses one row below the group list.
 The row contains a fixed progress ring, a percentage, a separate warning badge,
 and request counters. Percentage digits animate when motion is allowed.
+When the map reports indexing states, the ring and the percentage show the
+ready share. This is the same share as the header bar. Nodes without a
+reported state do not count. The hover names this measure and also shows the
+producer-reported job progress.
+Without reported states, the ring shows the producer-reported progress.
 A dash means that the producer has not reported a current percentage.
 Scanning, planning, and failure labels appear only on hover, not as changing
 footer text. The warning badge appears only for a current problem.
@@ -498,9 +586,16 @@ The popup retains producer history so an old completed embedding job cannot
 fill the progress ring after a newer upload. It does not invent per-file
 embedding activity or a reranking phase.
 Refresh keeps the last map visible, including when the refresh fails.
-Reopening the popup retries an initial failed lookup. Changed embedding job
-observations can refresh the map before the job completes. While the popup is
-open, a typed loading response schedules another map read after 10 seconds.
+A map read that returns the same output keeps the current map. The popup does not
+rebuild it. Equal doc concepts do not rebuild the map either.
+Reopening the popup retries an initial failed lookup. A new embedding job or a
+changed job state refreshes the map at once while the popup is open.
+Progress counts of the same job start one map read after 30 seconds.
+More progress in that interval does not start more reads.
+While the popup is open, a typed loading response schedules another map read
+after 10 seconds. Each unchanged loading response doubles the interval, to a
+maximum of 60 seconds. A changed response, a refresh that you start, or a
+reopened popup sets the interval to 10 seconds again.
 These reads stop when loading clears, a request fails, or the popup closes.
 Pending or failed file states alone do not start a polling loop.
 Closing the popup does not start a model turn. Checkout and session changes
@@ -533,8 +628,10 @@ Popup size applies only to the live popup.
   fallback colors, including while concept evidence is unavailable.
   Structure uses the shared directory palette without concept assignments.
   Neutral removes category colors but retains status and selection cues.
-  Mixed or unidentified groups stay neutral. Color is not a similarity or
-  confidence score. Palette changes do not move nodes.
+  A source-directory group with members in several subfolders shows the color
+  of its home folder. Other mixed or unidentified groups, and the folded
+  remainder, stay neutral. Color is not a similarity or confidence score.
+  Palette changes do not move nodes.
 - **Detail:** Calm, Balanced, or Detailed. Folded groups retain their member
   counts. The full overview still exposes every supplied node.
 - **Labels:** Key, More, or On hover. Label placement avoids collisions.
@@ -571,7 +668,16 @@ The composer indicator sits above the native composer controls. Its compact
 button uses the native interface font and keeps a fixed width and height.
 It does not consume space in the host's status row.
 The widget, progress circle, and `semctl` label stay mounted across notifications.
-Reported percentages update directly from producer counts.
+When the extension has a cached project map for the checkout, the progress
+circle shows the ready share of that map. This is the same share as the live
+popup header. Nodes without a reported state do not count.
+Without a cached map, or without reported states, the circle shows the
+producer-reported progress.
+The hover names the measure, for example `Ring: 224 of 1617 files ready (13%)`.
+The widget does not start a map read to get this share. The map loads after the
+first observed semctx call. During embedding, progress observations of the same
+job refresh the cached map at most once in 30 seconds, also while the popup is closed.
+Tone, symbol, and label text stay producer-driven.
 Active work with an unknown total uses a slow, subtle opacity change.
 Queued work, warnings, errors, and idle states do not animate continuously.
 Completion returns the button to a quieter appearance with a brief fade.
@@ -580,7 +686,8 @@ Plain terminals retain one Unicode progress mark.
 Hover and status details retain the exact producer counts.
 The indicator's context menu also opens details, the project graph, or the live popup.
 
-A full circle requires observed embedding completion and an active watcher.
+With producer progress, a full circle requires observed embedding completion and an active watcher.
+With a ready share, a full circle requires that every reported node is ready.
 Routine preparing, scanning, and planning retain the last completed-job ring,
 with an explicit checking description. New uploads invalidate that completion
 until a newer job is observed. Pending work, errors, and unavailable evidence

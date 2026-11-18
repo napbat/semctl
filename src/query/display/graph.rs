@@ -572,6 +572,8 @@ fn location(path: Option<&str>) -> Hit<'_> {
         start_byte: None,
         end_byte: None,
         snippet: None,
+        expanded: None,
+        expansion_reason: None,
         snippet_start_line: None,
         snippet_end_line: None,
         snippet_start_byte: None,

@@ -1,10 +1,13 @@
 import * as path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { Component, DescribeContext, NativeNode, NativeUiEvent } from "@oh-my-pi/pi-tui";
 import type { StatusUpdate } from "./status";
 import type { Display } from "./inspector";
+import { indexingCounts, type GraphIndexingCounts } from "./graph-indexing";
 import { GraphActivityTracker, type GraphActivity } from "./graph-activity";
 import { resetConcepts, setConceptSnapshot } from "./concept-colors";
+import { setAffinityRunner } from "./graph-affinity";
 import { readDocSources } from "./doc-sources";
 import type { DocSource } from "./graph-data/doc-concepts.js";
 import { LiveGraphPopup, livePopupOverlay, type LiveGraphState } from "./live-graph";
@@ -12,6 +15,7 @@ import { NativeSurface } from "./native-surface";
 import { GraphAppearanceStore } from "./graph-appearance";
 import { GraphAppearancePanel, type GraphAppearanceKeyMatcher } from "./graph-appearance-panel";
 import { GraphPage } from "./graph-page";
+import { readWarnings } from "./partial-answers";
 
 interface Operation { id: string; label: string; operation: string; fields: readonly string[] }
 export const GRAPH_OPERATIONS: readonly Operation[] = [
@@ -69,6 +73,23 @@ function within(root: string, cwd: string): boolean {
 	const relative = path.relative(root, cwd);
 	return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
+function semctlFailure(result: { stdout: string; stderr: string; code: number; killed?: boolean }): Error {
+	return new Error([result.stderr.trim(), result.stdout.trim()].filter(Boolean).join("\n") || `semctl exited with code ${result.code}${result.killed ? " (cancelled or timed out)" : ""}`);
+}
+
+// A malformed warning envelope is evidence of a bad response, not a reason to drop a valid display.
+const INVALID_QUERY_WARNINGS = ["CLI warnings are invalid or exceed the interactive limit."] as const;
+
+/** The CLI echoes structured warnings at the end of stderr. Leave unrelated diagnostics intact. */
+function queryDiagnostic(stderr: string, warnings: readonly string[] | undefined): string | undefined {
+	if (warnings?.length && warnings !== INVALID_QUERY_WARNINGS) {
+		const echo = warnings.map(warning => `warning: ${warning}\n`).join("");
+		const start = stderr.length - echo.length;
+		if (start >= 0 && (start === 0 || stderr[start - 1] === "\n") && stderr.endsWith(echo)) stderr = stderr.slice(0, start);
+	}
+	return stderr.trim() || undefined;
+}
+
 export interface GraphOverviewDependencies {
 	readDisplay(value: unknown, operation: string, localOverview?: boolean): Display | undefined;
 	createInspector(display: Display, requestRender: () => void, rawText: string, presentation?: "overview"): Component;
@@ -79,7 +100,18 @@ export interface GraphOverviewDependencies {
 	/** Reads the checkout docs of a validated overview. The default reads the local files. */
 	readDocSources?(display: Display, signal: AbortSignal): Promise<readonly DocSource[]>;
 }
-export interface GraphRequestState { loading: boolean; text: string; error?: string; display?: Display }
+export interface GraphRequestState {
+	loading: boolean;
+	text: string;
+	error?: string;
+	warnings?: readonly string[];
+	display?: Display;
+}
+/** Reported indexing counts of the cached catalog map under a checkout root. Listeners run when that map changes. */
+export interface GraphReadiness {
+	read(root: string): GraphIndexingCounts | undefined;
+	subscribe(listener: () => void): () => void;
+}
 
 /** One cancellable read-only request. Generation + cwd checks reject even abort-ignoring executors. */
 export class GraphRequest {
@@ -87,13 +119,19 @@ export class GraphRequest {
 	private controller: AbortController | undefined;
 	private generation = 0;
 	private requestKey: string | undefined;
+	/** The stdout of the last valid structured result for `requestKey`. Equal output keeps that display object. */
+	private lastOutput: string | undefined;
+	private sameOutput = false;
 	constructor(private readonly exec: ExtensionAPI["exec"], private readonly dependencies: GraphOverviewDependencies,
 		private readonly changed: () => void, cached?: GraphRequest) {
 		if (cached?.state.display) {
 			this.state = { ...cached.state, loading: false };
 			this.requestKey = cached.requestKey;
+			this.lastOutput = cached.lastOutput;
 		}
 	}
+	/** True when the last completed run kept the same structured result. */
+	get unchanged(): boolean { return this.sameOutput; }
 	cancel(): void {
 		this.generation++;
 		this.controller?.abort();
@@ -102,6 +140,7 @@ export class GraphRequest {
 	}
 	async run(operation: Operation, args: string[], cwd: string, currentCwd: () => string): Promise<void> {
 		this.cancel();
+		this.sameOutput = false;
 		const root = graphRoot(cwd), generation = this.generation;
 		const controller = new AbortController();
 		this.controller = controller;
@@ -115,28 +154,44 @@ export class GraphRequest {
 			({ operation, args } = graphArguments(operation.id, args));
 			const key = JSON.stringify([root, operation.id, args]);
 			if (key === this.requestKey && previous.display) retained = previous;
+			if (key !== this.requestKey) this.lastOutput = undefined;
 			this.requestKey = key;
-			this.state = { loading: true, text: retained?.text ?? "", ...(retained?.display ? { display: retained.display } : {}) };
+			this.state = { loading: true, text: retained?.text ?? "", ...(retained?.display ? { display: retained.display } : {}),
+				...(retained?.warnings ? { warnings: retained.warnings } : {}) };
 			this.changed();
 			const result = await this.exec("semctl", ["graph", "--json", operation.id, "--", ...args], { cwd, signal: controller.signal, timeout: 60_000 });
 			if (!current()) return;
-			if (result.killed || result.code !== 0) throw new Error([result.stderr.trim(), result.stdout.trim()].filter(Boolean).join("\n") || `semctl exited with code ${result.code}${result.killed ? " (cancelled or timed out)" : ""}`);
+			if (result.killed || result.code !== 0) throw semctlFailure(result);
 			if (Buffer.byteLength(result.stdout, "utf8") > 4 * 1024 * 1024) {
+				this.lastOutput = undefined;
 				this.state = { loading: false, text: result.stdout, error: "CLI JSON exceeds the 4 MiB interactive limit; showing original output." };
+			} else if (retained?.display && result.stdout === this.lastOutput) {
+				// Equal output gives an equal display. Keeping the object lets views skip a full rebuild.
+				this.sameOutput = true;
+				this.state = { loading: false, text: retained.text, display: retained.display, error: queryDiagnostic(result.stderr, retained.warnings),
+					...(retained.warnings ? { warnings: retained.warnings } : {}) };
+				if (operation.id === "overview" && retained.display.kind === "graph" && !retained.display.loading) concepts = retained.display;
 			} else {
 				let value: unknown;
 				try { value = JSON.parse(result.stdout); } catch { throw new Error(`semctl did not return valid JSON.\n${[result.stdout, result.stderr].filter(Boolean).join("\n")}`); }
 				if (!object(value) || typeof value.text !== "string") throw new Error(`semctl returned an invalid QueryOutput JSON object.\n${result.stdout}`);
-				const display = this.dependencies.readDisplay(value.display, operation.operation, operation.id === "overview");
+				const warnings = readWarnings(value.warnings) ?? INVALID_QUERY_WARNINGS;
+				// JSON formatting and the accompanying prose can change without changing the graph.
+				// Compare the whole graph, including catalog state, caveats and ordered arrays.
+				const sameGraph = retained?.display?.kind === "graph" && isDeepStrictEqual(value.display, retained.display);
+				const display = sameGraph ? retained?.display : this.dependencies.readDisplay(value.display, operation.operation, operation.id === "overview");
 				const displayRoot = display?.identity.localRoot ? graphRoot(display.identity.localRoot) : undefined;
 				if (display?.identity.localRoot && (!displayRoot || !within(displayRoot, root))) throw new Error("CLI display belongs to a different checkout; result was not opened.");
-				this.state = { loading: false, text: value.text, display,
-					error: [value.display && !display ? "Structured preview unavailable or invalid; showing original result." : "", result.stderr.trim()].filter(Boolean).join("\n") || undefined };
+				this.lastOutput = display ? result.stdout : undefined;
+				this.sameOutput = sameGraph;
+				this.state = { loading: false, text: value.text, display, ...(warnings.length ? { warnings } : {}),
+					error: [value.display && !display ? "Structured preview unavailable or invalid; showing original result." : "", queryDiagnostic(result.stderr, warnings)].filter(Boolean).join("\n") || undefined };
 				if (operation.id === "overview" && display?.kind === "graph" && !display.loading) concepts = display;
 			}
 		} catch (error) {
 			if (!current()) return;
 			this.state = { loading: false, text: retained?.text ?? "", ...(retained?.display ? { display: retained.display } : {}),
+				...(retained?.warnings ? { warnings: retained.warnings } : {}),
 				error: [error instanceof Error ? error.message : String(error), ...(retained ? ["Showing the last available graph for this request."] : [])].join("\n") };
 		} finally {
 			// A pending doc read keeps the controller, so `cancel` also stops the read.
@@ -209,21 +264,53 @@ export function createGraphOverview(pi: ExtensionAPI, dependencies: GraphOvervie
 	let catalog: { root: string; request: GraphRequest; settled: boolean; queued: boolean; pending?: Promise<void>; last?: GraphRequestState } | undefined;
 	let cancelLoadingRefresh: (() => void) | undefined;
 	const stopLoadingRefresh = () => { cancelLoadingRefresh?.(); cancelLoadingRefresh = undefined; };
+	// Unchanged loading results double the poll delay up to the cap. A changed result, a user refresh or a reopened popup starts again at the minimum.
+	const LOADING_DELAY = 10_000, LOADING_DELAY_CAP = 60_000;
+	let loadingDelay = LOADING_DELAY, userRefresh = false;
+	// Embedding progress changes per-file state in small steps. One trailing refresh per window replaces a refresh per step.
+	const PROGRESS_DELAY = 30_000;
+	let cancelProgressRefresh: (() => void) | undefined;
+	const stopProgressRefresh = () => { cancelProgressRefresh?.(); cancelProgressRefresh = undefined; };
 	const scheduleRefresh = dependencies.scheduleRefresh ?? ((callback: () => void, delay: number) => {
 		const timer = setTimeout(callback, delay);
 		return () => clearTimeout(timer);
 	});
 	const renderActivity = () => { live?.render("activity"); popup?.render("activity"); };
+	// Readiness readers see the cached catalog map only. They never start a CLI run.
+	const readinessListeners = new Set<() => void>();
+	let readinessDisplay: Display | undefined;
+	const catalogDisplay = () => catalog?.request.state.display ?? catalog?.last?.display;
+	const notifyReadiness = () => {
+		const display = catalogDisplay();
+		if (display === readinessDisplay) return;
+		readinessDisplay = display;
+		for (const listener of readinessListeners) listener();
+	};
 	const tracker = new GraphActivityTracker(graphRoot, dependencies.readDisplay, renderActivity);
+	// Semantic placement of opened groups uses one read-only CLI run per file set. The cache lives until the checkout changes.
+	let affinityRoot: string | undefined;
+	const bindAffinityRoot = (root: string) => {
+		if (affinityRoot === root) return;
+		affinityRoot = root;
+		setAffinityRunner(async (paths, signal) => {
+			const result = await pi.exec("semctl", ["graph", "--json", "affinity", "--", ...paths], { cwd: root, signal, timeout: 120_000 });
+			if (result.killed || result.code !== 0) throw semctlFailure(result);
+			return JSON.parse(result.stdout) as unknown;
+		});
+	};
 	const statuses = new Map<string, StatusUpdate>();
 	const reset = () => {
 		generation++;
 		closeAppearance?.();
 		stopLoadingRefresh();
+		stopProgressRefresh();
+		loadingDelay = LOADING_DELAY; userRefresh = false;
 		popupGeneration++;
 		popup?.close(); popup = undefined;
 		catalog?.request.cancel(); catalog = undefined;
+		notifyReadiness();
 		resetConcepts();
+		setAffinityRunner(undefined); affinityRoot = undefined;
 		tracker.reset();
 		live?.request.cancel();
 		live?.close();
@@ -249,13 +336,26 @@ export function createGraphOverview(pi: ExtensionAPI, dependencies: GraphOvervie
 		cancelLoadingRefresh = scheduleRefresh(() => {
 			cancelLoadingRefresh = undefined;
 			if (catalog === entry && popup?.root === entry.root && graphRoot(ctx.cwd) === entry.root) void warm(ctx, true);
-		}, 10_000);
+		}, loadingDelay);
+	};
+	// The trailing refresh also runs while the popup is closed, so cached readiness advances during embedding.
+	const scheduleProgressRefresh = (ctx: ExtensionContext, entry: NonNullable<typeof catalog>) => {
+		if (cancelProgressRefresh) return;
+		const cancel = scheduleRefresh(() => {
+			if (cancelProgressRefresh !== cancel) return;
+			cancelProgressRefresh = undefined;
+			if (catalog === entry && graphRoot(ctx.cwd) === entry.root) void warm(ctx, true);
+		}, PROGRESS_DELAY);
+		cancelProgressRefresh = cancel;
 	};
 	const warm = (ctx: ExtensionContext, refresh = false): Promise<void> => {
 		const root = graphRoot(ctx.cwd);
 		if (!ctx.hasUI || !root || typeof pi.exec !== "function" || (observedCwd !== undefined && observedCwd !== root)) return Promise.resolve();
+		bindAffinityRoot(root);
 		if (catalog?.root !== root) {
 			stopLoadingRefresh();
+			stopProgressRefresh();
+			loadingDelay = LOADING_DELAY;
 			catalog?.request.cancel();
 			const entry: NonNullable<typeof catalog> = {
 				root, settled: false, queued: false,
@@ -263,11 +363,15 @@ export function createGraphOverview(pi: ExtensionAPI, dependencies: GraphOvervie
 					if (catalog !== entry) return;
 					if (entry.request.state.display) entry.last = entry.request.state;
 					popup?.render("state");
+					notifyReadiness();
 				}),
 			};
 			catalog = entry;
+			notifyReadiness();
 		}
 		const entry = catalog;
+		// An immediate refresh includes the progress that a pending trailing refresh waits for.
+		if (refresh) stopProgressRefresh();
 		if (entry.pending) { entry.queued ||= refresh; return entry.pending; }
 		if (entry.settled && !refresh && !entry.request.state.error) {
 			refreshLoadingLayers(ctx, entry);
@@ -277,14 +381,27 @@ export function createGraphOverview(pi: ExtensionAPI, dependencies: GraphOvervie
 		entry.pending = entry.request.run(GRAPH_OPERATIONS[0], [], ctx.cwd, () => observedCwd ?? ctx.cwd).finally(() => {
 			if (catalog !== entry) return;
 			entry.pending = undefined; entry.settled = true;
-			if (entry.queued) { entry.queued = false; void warm(ctx, true); }
-			else refreshLoadingLayers(ctx, entry);
+			if (entry.queued) { entry.queued = false; void warm(ctx, true); return; }
+			loadingDelay = entry.request.unchanged && !userRefresh ? Math.min(loadingDelay * 2, LOADING_DELAY_CAP) : LOADING_DELAY;
+			userRefresh = false;
+			refreshLoadingLayers(ctx, entry);
 		});
 		return entry.pending;
+	};
+	const readiness: GraphReadiness = {
+		read(root) {
+			const key = graphRoot(root), display = catalogDisplay();
+			return key && catalog && within(key, catalog.root) && display?.kind === "graph" ? indexingCounts(display.nodes) : undefined;
+		},
+		subscribe(listener) {
+			readinessListeners.add(listener);
+			return () => { readinessListeners.delete(listener); };
+		},
 	};
 	return {
 		reset,
 		warm,
+		readiness,
 		observe(event: unknown, ctx: ExtensionContext): void {
 			const currentRoot = graphRoot(ctx.cwd);
 			if (observedCwd !== undefined && observedCwd !== currentRoot) reset();
@@ -307,8 +424,10 @@ export function createGraphOverview(pi: ExtensionAPI, dependencies: GraphOvervie
 					const root = graphRoot(update.root);
 					if (root && within(root, observedCwd ?? "")) {
 						const key = `${event.server}\0${root}`, prior = statuses.get(key);
-						const jobChanged = update.graphRevision !== undefined && update.graphRevision !== prior?.graphRevision;
+						const jobChanged = update.graphJob !== undefined && update.graphJob !== prior?.graphJob;
+						const progressed = update.graphRevision !== undefined && update.graphRevision !== prior?.graphRevision;
 						if (catalog && (update.indicator?.tone === "success" && prior?.indicator?.tone !== "success" || popup && jobChanged)) void warm(ctx, true);
+						else if (catalog && catalog.root === observedCwd && progressed) scheduleProgressRefresh(ctx, catalog);
 						changed = prior?.indicator?.text !== update.indicator?.text || prior?.indicator?.tone !== update.indicator?.tone ||
 							prior?.indicator?.symbol !== update.indicator?.symbol || prior?.indicator?.progress !== update.indicator?.progress ||
 							prior?.summary !== update.summary || prior?.details !== update.details;
@@ -332,6 +451,7 @@ export function createGraphOverview(pi: ExtensionAPI, dependencies: GraphOvervie
 			}
 			if (observedCwd !== undefined && observedCwd !== root) reset();
 			observedCwd = root;
+			loadingDelay = LOADING_DELAY;
 			const owner = ++popupGeneration;
 			const current = () => owner === popupGeneration && observedCwd === root && graphRoot(ctx.cwd) === root;
 			const snapshot = (): LiveGraphState => {
@@ -348,7 +468,7 @@ export function createGraphOverview(pi: ExtensionAPI, dependencies: GraphOvervie
 				unsubscribeAppearance?.();
 				view?.dispose();
 				surface?.dispose();
-				if (owner === popupGeneration) { closeAppearance?.(); stopLoadingRefresh(); popup = undefined; popupGeneration++; if (!live) tracker.clearReceipts(); }
+				if (owner === popupGeneration) { closeAppearance?.(); stopLoadingRefresh(); stopProgressRefresh(); popup = undefined; popupGeneration++; if (!live) tracker.clearReceipts(); }
 			};
 			const close = () => {
 				if (closed) return;
@@ -364,7 +484,7 @@ export function createGraphOverview(pi: ExtensionAPI, dependencies: GraphOvervie
 					surface = new NativeSurface(tui);
 					view = new LiveGraphPopup(snapshot(), () => tui.requestRender(), {
 						close,
-						refresh: () => { if (current()) void warm(ctx, true); },
+						refresh: () => { if (current()) { userRefresh = true; void warm(ctx, true); } },
 						expand: () => { if (current()) void this.open(ctx); },
 						appearance: () => { if (current()) void showAppearance(ctx); },
 						resize: size => { if (current()) void appearance.update({ popup: size }); },
@@ -400,6 +520,7 @@ export function createGraphOverview(pi: ExtensionAPI, dependencies: GraphOvervie
 			live?.request.cancel(); live?.close();
 			const owner = ++generation;
 			observedCwd = root;
+			bindAffinityRoot(root);
 			let operation = GRAPH_OPERATIONS[0], args: string[] = [];
 			while (owner === generation && graphRoot(ctx.cwd) === root) {
 				let currentRequest: GraphRequest | undefined;

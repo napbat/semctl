@@ -64,7 +64,7 @@ impl DaemonMode {
     /// safe for a typo: `auto` serves the session in this process when no
     /// daemon can serve it.
     fn parse(raw: Option<&str>) -> Self {
-        let value = raw.map(str::trim).unwrap_or_default();
+        let value = raw.map_or_default(str::trim);
         if value.is_empty() {
             return Self::Auto;
         }

@@ -9,6 +9,7 @@ import { GraphAppearanceStore } from "./graph-appearance";
 import { conceptRevision, lookupConcept, resetConcepts } from "./concept-colors";
 import { inferConcepts } from "./graph-data/concepts.js";
 import type { DocSource } from "./graph-data/doc-concepts.js";
+import { asNativeElement } from "./native-elements";
 
 const cwd = path.resolve("graph-overview-checkout");
 const native: DescribeContext = { cols: 88, dark: true, reduceMotion: false, supports: () => true, feature: () => false };
@@ -166,6 +167,51 @@ describe("read-only graph requests", () => {
 		expect(request.state.display).toBeUndefined();
 		expect(request.state.text).not.toContain("First symbol graph");
 	});
+	test("equivalent graph output retains the display while result text and diagnostics change", async () => {
+		const host = pendingExecutor(), overview = GRAPH_OPERATIONS[0];
+		let reads = 0;
+		const request = new GraphRequest(host.exec, { ...deps, readDocSources: async () => [],
+			readDisplay: (value, operation, local) => { reads++; return readDisplay(value, operation, local); } }, () => {});
+		const run = async (stdout: string, stderr = "") => {
+			const pending = request.run(overview, [], cwd, () => cwd);
+			host.pending.at(-1)!.response.resolve(result(stdout, { stderr }));
+			await pending;
+		};
+		const graph = indexedOverview(2);
+		const same = JSON.stringify({ text: "Map", display: graph });
+		await run(same);
+		const display = request.state.display;
+		expect(display).toBeDefined(); expect(request.unchanged).toBe(false);
+		await run(same);
+		expect(request.state.display).toBe(display); expect(request.state.text).toBe("Map");
+		expect(request.unchanged).toBe(true); expect(reads).toBe(1);
+		const { nodes: files, ...rest } = graph;
+		const warnings = ["the graph answer is partial (project imports are incomplete)"];
+		const wrapped = JSON.stringify({ warnings, display: { nodes: files, ...rest }, text: "Fresh result text" }, null, 2);
+		const echo = `warning: ${warnings[0]}\n`;
+		await run(wrapped, `separate CLI diagnostic\n${echo}`);
+		expect(request.state.display).toBe(display);
+		expect(request.state).toMatchObject({ text: "Fresh result text", error: "separate CLI diagnostic", warnings });
+		expect(request.unchanged).toBe(true); expect(reads).toBe(1);
+		await run(wrapped, echo);
+		expect(request.state.display).toBe(display);
+		expect(request.state.warnings).toEqual(warnings);
+		expect(request.state.error).toBeUndefined();
+		await run(JSON.stringify({ text: "Map", display: indexedOverview(3) }));
+		expect(request.state.display).not.toBe(display); expect(request.unchanged).toBe(false); expect(reads).toBe(2);
+		expect(request.state.warnings).toBeUndefined();
+	});
+	test("reports malformed or oversized warning metadata without discarding a validated graph", async () => {
+		for (const warnings of [null, "warning", [123], [""], ["é".repeat(2049)], Array.from({ length: 9 }, () => "warning")]) {
+			const request = new GraphRequest(async () => result(JSON.stringify({ text: "Projects", display: indexedOverview(2), warnings })),
+				{ ...deps, readDisplay }, () => {});
+			await request.run(projects, [], cwd, () => cwd);
+			expect(request.state.display?.kind).toBe("graph");
+			expect(request.state.text).toBe("Projects");
+			expect(request.state.error).toBeUndefined();
+			expect(request.state.warnings).toEqual(["CLI warnings are invalid or exceed the interactive limit."]);
+		}
+	});
 });
 
 const DOCS: readonly DocSource[] = [{ path: "docs/dispatch.md", text: "# Dispatch\n\nQueue in `src/dispatch/queue.ts`; workers live in `src/dispatch/`.\n" }];
@@ -320,14 +366,16 @@ describe("native overview popup", () => {
 	test("defaults to complete indexed overview, shows configured CLI evidence and cancels immediately on Escape", async () => {
 		const h = harness(); const open = h.overview.open(h.ctx);
 		expect(h.pending[0].args).toEqual(["graph", "--json", "overview", "--"]);
-		const body = h.views[0].describe(native), toolbar = nodes(body).find(node => node.key === "toolbar");
-		expect(toolbar && nodes(toolbar).some(node => node.p?.title?.includes(`configured semctl CLI · ${cwd}`))).toBe(true);
+		const body = h.views[0].describe(native);
 		expect(content(body)).not.toContain(cwd);
 		expect(nodes(body).find(node => node.key === "activity")).toBeDefined();
 		expect(nodes(body).some(node => node.k === "spinner")).toBe(true);
 		const still = h.views[0].describe({ ...native, reduceMotion: true });
 		expect(nodes(still).find(node => node.key === "activity")).toBeDefined();
 		expect(nodes(still).some(node => node.k === "spinner")).toBe(false);
+		action(h.views[0], "info");
+		expect(content(h.views[0].describe(native))).toContain(cwd);
+		action(h.views[0], "info");
 		h.views[0].handleInput("tui.select.cancel");
 		await open;
 		expect(h.pending[0].options?.signal?.aborted).toBe(true);
@@ -421,6 +469,32 @@ describe("native overview popup", () => {
 		const before = appearance.state.value;
 		action(h.views[1], "appearance:layout:layers");
 		expect(appearance.state.value).toBe(before);
+	});
+	test("project analyses show structured warnings in native and terminal output without replacing the inspector", async () => {
+		const h = harness({ readDisplay, createInspector: () => ({
+			describe: () => ({ k: "text", p: { text: "Validated projects inspector" } }), render: () => ["Validated projects inspector"],
+		}) });
+		const open = h.overview.open(h.ctx);
+		try {
+			h.pending[0].response.resolve(result(JSON.stringify({ text: "Overview", display: null })));
+			await settle();
+			action(h.views[0], "analyses");
+			h.views[0].handleNativeEvent({ type: "activate", key: "analyses", item: "projects" });
+			await settle();
+			expect(h.pending[1].args).toEqual(["graph", "--json", "projects", "--"]);
+			const warning = "the graph answer is partial (project imports are incomplete)";
+			h.pending[1].response.resolve(result(JSON.stringify({ text: "Project records", display: indexedOverview(2), warnings: [warning] }),
+				{ stderr: `warning: ${warning}\n` }));
+			await settle();
+			const view = h.views[1];
+			const body = content(view.describe(native));
+			expect(body).toContain("Validated projects inspector");
+			expect(body).toContain(`Warning: ${warning}`);
+			expect(body).not.toContain("Map refresh failed");
+			expect(view.render(120)).toEqual(expect.arrayContaining([`Warning: ${warning}`, "Project records"]));
+			action(view, "info");
+			expect(content(view.describe(native))).toContain(`Warning: ${warning}`);
+		} finally { h.overview.reset(); await open; }
 	});
 	test("provenance and original producer diagnostics stay out of the map until requested", async () => {
 		const h = harness({ readDisplay, readStatusUpdate: params => params && typeof params === "object" && "root" in params
@@ -555,6 +629,52 @@ describe("native overview popup", () => {
 });
 
 describe("native live graph popup", () => {
+	test("keeps the selected preview mounted for equivalent results and updates warnings, indexing and motion", async () => {
+		const h = harness({ readDisplay, readDocSources: async () => [] });
+		const styled: DescribeContext = { ...native, feature: name => name === "styles" };
+		const graph = indexedOverview(2);
+		graph.identity.codebaseId = "equivalent-live-refresh";
+		graph.nodes[0].path = "src/api/a.ts"; graph.nodes[1].path = "src/db/b.ts";
+		const show = (view: View, cx = styled) => nodes(view.describe(cx));
+		try {
+			await h.overview.togglePopup(h.ctx);
+			const view = h.views[0], warm = h.overview.warm(h.ctx);
+			h.pending[0].response.resolve(result(JSON.stringify({ text: "Map", display: graph })));
+			await warm;
+			const dot = show(view).map(asNativeElement).find(node => node?.p.attrs?.["data-node"]);
+			action(view, dot!.p.actions!.click!);
+			const selected = show(view), well = selected.find(node => node.key === "graph-well");
+			expect(well).toBeDefined();
+
+			action(view, "refresh");
+			const warning = "the graph answer is partial (catalog coverage is incomplete)";
+			const { nodes: files, ...rest } = graph;
+			const refresh = h.overview.warm(h.ctx);
+			h.pending[1].response.resolve(result(JSON.stringify({ display: { nodes: files, ...rest }, text: "Updated report", warnings: [warning] }, null, 2),
+				{ stderr: `warning: ${warning}\n` }));
+			await refresh;
+			const stable = show(view);
+			expect(stable.find(node => node.key === "graph-well")).toBe(well);
+			expect(stable.find(node => node.key === "query-warning")?.p?.text).toBe(`Warning: ${warning}`);
+			expect(stable.some(node => node.p?.role === "semctl.live.warning")).toBe(false);
+			expect(view.render(120)).toContain(`Warning: ${warning}`);
+			expect(asNativeElement(stable.find(node => node.key === "graph-preview")!)?.p.attrs?.["data-motion"]).toBe("full");
+			const stillContext = { ...styled, reduceMotion: true };
+			const still = show(view, stillContext);
+			expect(asNativeElement(still.find(node => node.key === "graph-preview")!)?.p.attrs?.["data-motion"]).toBe("reduced");
+
+			action(view, "refresh");
+			const changed = h.overview.warm(h.ctx);
+			h.pending[2].response.resolve(result(JSON.stringify({ text: "File failed", display: {
+				...graph, nodes: graph.nodes.map(node => ({ ...node, indexing: "failed" })),
+			} })));
+			await changed;
+			const updated = show(view, stillContext);
+			expect(updated.find(node => node.key === "query-warning")).toBeUndefined();
+			expect(asNativeElement(updated.find(node => node.key === "graph-preview")!)?.p.attrs?.["data-motion"]).toBe("reduced");
+			expect(updated.map(asNativeElement).some(node => node?.p.attrs?.["aria-pressed"] === true && node.p.attrs["data-indexing"] === "failed")).toBe(true);
+		} finally { h.overview.reset(); }
+	});
 	test("keeps the last valid map through refresh failure and cancels queued work on checkout reset", async () => {
 		const display: Display = { version: 1, kind: "graph", identity: { codebaseId: "popup-current", localRoot: cwd, name: null, copy: "checkout" },
 			title: "Project overview", query: null, nodes: [{ id: "a", label: "a.ts", category: "file", path: "src/a.ts", detail: null, hit: null }],
@@ -670,6 +790,109 @@ describe("native live graph popup", () => {
 		expect(content(h.views[1].describe(native))).toContain("2 files");
 		expect(nodes(h.views[1].describe(native)).some(node => node.p?.title?.includes("Permission denied"))).toBe(true);
 		h.overview.reset();
+	});
+	test("progress counts of one job coalesce into one trailing refresh; a job state change refreshes at once", async () => {
+		const scheduled: { callback: () => void; delay: number; cancelled: boolean }[] = [];
+		const h = harness({ readDisplay, readStatusUpdate, readDocSources: async () => [], scheduleRefresh(callback, delay) {
+			const timer = { callback, delay, cancelled: false }; scheduled.push(timer);
+			return () => { timer.cancelled = true; };
+		} });
+		await h.overview.togglePopup(h.ctx);
+		const map = JSON.stringify({ text: "Available files", display: indexedOverview(2) });
+		h.pending[0].response.resolve(result(map)); await settle();
+		const status = { root: cwd, codebase_id: "A", running: false, pending_triggers: 0, last_error: null,
+			first_index: { embedding: { job_id: "current" } }, sync_progress: null, watcher: "active", last_job_id: "current",
+			embedding: { job_id: "current", state: "running", files_embedded: 0, files_to_embed: 10, files_failed: 0, error: null } };
+		const observe = (value: Record<string, unknown>) => h.overview.observe({
+			server: "semctx", method: "notifications/semctl/sync_status", params: { version: 1, status: value },
+		}, h.ctx);
+		const progress = (files_embedded: number) => observe({ ...status, embedding: { ...status.embedding, files_embedded } });
+		const progressTimers = () => scheduled.filter(timer => timer.delay === 30_000);
+		observe(status);
+		expect(h.pending).toHaveLength(2);
+		h.pending[1].response.resolve(result(map)); await settle();
+		for (const files of [1, 2, 3, 4]) progress(files);
+		expect(h.pending).toHaveLength(2);
+		expect(progressTimers()).toHaveLength(1);
+		progressTimers()[0].callback();
+		expect(h.pending).toHaveLength(3);
+		h.pending[2].response.resolve(result(map)); await settle();
+		progress(5); progress(6);
+		expect(progressTimers()).toHaveLength(2);
+		expect(h.pending).toHaveLength(3);
+		observe({ ...status, embedding: { ...status.embedding, files_embedded: 6, state: "failed", files_failed: 4 } });
+		expect(progressTimers()[1].cancelled).toBe(true);
+		expect(h.pending).toHaveLength(4);
+		progressTimers()[1].callback();
+		expect(h.pending).toHaveLength(4);
+		h.pending[3].response.resolve(result(map)); await settle();
+		observe({ ...status, embedding: { ...status.embedding, files_embedded: 7, state: "failed", files_failed: 3 } });
+		expect(progressTimers()).toHaveLength(3);
+		action(h.views[0], "close");
+		expect(progressTimers()[2].cancelled).toBe(true);
+		progressTimers()[2].callback();
+		expect(h.pending).toHaveLength(4);
+		h.overview.reset();
+	});
+	test("unchanged loading results back off the poll to a 60 second cap and a change resets it", async () => {
+		const scheduled: { callback: () => void; delay: number }[] = [];
+		const h = harness({ readDisplay, scheduleRefresh(callback, delay) { scheduled.push({ callback, delay }); return () => {}; } });
+		await h.overview.togglePopup(h.ctx);
+		const loading = (count: number) => JSON.stringify({ text: "Links restoring", display: { ...indexedOverview(count), loading: true, truncated: true } });
+		h.pending[0].response.resolve(result(loading(2))); await settle();
+		const poll = async (stdout: string) => {
+			scheduled.at(-1)!.callback();
+			h.pending.at(-1)!.response.resolve(result(stdout)); await settle();
+		};
+		for (let index = 0; index < 4; index++) await poll(loading(2));
+		expect(scheduled.map(timer => timer.delay)).toEqual([10_000, 20_000, 40_000, 60_000, 60_000]);
+		await poll(loading(3));
+		expect(scheduled.at(-1)!.delay).toBe(10_000);
+		await poll(loading(3));
+		expect(scheduled.at(-1)!.delay).toBe(20_000);
+		action(h.views[0], "refresh");
+		h.pending.at(-1)!.response.resolve(result(loading(3))); await settle();
+		expect(scheduled.at(-1)!.delay).toBe(10_000);
+		await poll(loading(3));
+		expect(scheduled.at(-1)!.delay).toBe(20_000);
+		action(h.views[0], "close");
+		await h.overview.togglePopup(h.ctx);
+		expect(scheduled.at(-1)!.delay).toBe(10_000);
+		h.overview.reset();
+	});
+	test("readiness reads the cached catalog map and progress refreshes it while the popup is closed", async () => {
+		const scheduled: { callback: () => void; delay: number }[] = [];
+		const h = harness({ readDisplay, readStatusUpdate, readDocSources: async () => [],
+			scheduleRefresh(callback, delay) { scheduled.push({ callback, delay }); return () => {}; } });
+		let notices = 0;
+		h.overview.readiness.subscribe(() => notices++);
+		const map = (ready: number) => {
+			const value = indexedOverview(4);
+			return JSON.stringify({ text: "Map", display: { ...value, nodes: value.nodes.map((node, index) => ({ ...node, indexing: index < ready ? "ready" : "pending" })) } });
+		};
+		const startup = h.overview.warm(h.ctx);
+		expect(h.overview.readiness.read(cwd)).toBeUndefined();
+		h.pending[0].response.resolve(result(map(1))); await startup; await settle();
+		expect(notices).toBe(1);
+		expect(h.overview.readiness.read(cwd)).toMatchObject({ ready: 1, pending: 3 });
+		expect(h.overview.readiness.read(path.dirname(cwd))).toMatchObject({ ready: 1 });
+		expect(h.overview.readiness.read(path.resolve("unrelated-checkout"))).toBeUndefined();
+		const status = { root: cwd, codebase_id: "A", running: false, pending_triggers: 0, last_error: null,
+			first_index: { embedding: { job_id: "current" } }, sync_progress: null, watcher: "active", last_job_id: "current",
+			embedding: { job_id: "current", state: "running", files_embedded: 1, files_to_embed: 4, files_failed: 0, error: null } };
+		const observe = (files_embedded: number) => h.overview.observe({ server: "semctx", method: "notifications/semctl/sync_status",
+			params: { version: 1, status: { ...status, embedding: { ...status.embedding, files_embedded } } } }, h.ctx);
+		observe(1); observe(2);
+		expect(h.pending).toHaveLength(1);
+		expect(scheduled.map(timer => timer.delay)).toEqual([30_000]);
+		scheduled[0].callback();
+		expect(h.pending).toHaveLength(2);
+		h.pending[1].response.resolve(result(map(2))); await settle();
+		expect(notices).toBe(2);
+		expect(h.overview.readiness.read(cwd)).toMatchObject({ ready: 2, pending: 2 });
+		h.overview.reset();
+		expect(notices).toBe(3);
+		expect(h.overview.readiness.read(cwd)).toBeUndefined();
 	});
 });
 

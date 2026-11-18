@@ -12,6 +12,26 @@ fn hit(codebase: Option<&str>, snippet: &str) -> api::SearchHit {
     .unwrap()
 }
 
+#[test]
+fn search_projects_only_the_expansion_state_reported_for_each_hit() {
+    let client = Client::for_test("A", None);
+    let scope = HitContext::search(None, Some("A"), true);
+    let legacy = hit(Some("A"), "chunk");
+    let mut body = hit(Some("A"), "symbol body");
+    body.expanded = Some(true);
+    let mut chunk = hit(Some("A"), "chunk");
+    chunk.expanded = Some(false);
+    chunk.expansion_reason = Some(api::ExpansionReason::GraphLoading);
+    let wire = search(&client, "query", &[legacy, body, chunk], &[], scope, None).unwrap();
+    assert!(wire.get("budgetNote").is_none());
+    let hits = wire["hits"].as_array().unwrap();
+    assert!(hits[0].get("expanded").is_none() && hits[0].get("expansionReason").is_none());
+    assert_eq!(hits[1]["expanded"], true);
+    assert!(hits[1].get("expansionReason").is_none());
+    assert_eq!(hits[2]["expanded"], false);
+    assert_eq!(hits[2]["expansionReason"], "GraphLoading");
+}
+
 fn content() -> api::FileContent {
     serde_json::from_value(serde_json::json!({
         "path": "src/lib.rs", "contentHash": "pinned", "content": "",
@@ -126,7 +146,7 @@ fn symbol_search_retains_real_score_project_and_coordinates_without_source_claim
     let hits = [hit(Some("A"), "")];
     let scope = HitContext::search(None, Some("A"), true);
     assert_eq!(
-        search(&client, query, &hits, &[], scope).unwrap()["hits"][0]["score"],
+        search(&client, query, &hits, &[], scope, None).unwrap()["hits"][0]["score"],
         2.0
     );
     assert!(lookup(&client, query, &hits).unwrap()["symbols"][0]["hits"][0]["score"].is_null());
@@ -251,24 +271,35 @@ fn search_query_counts_toward_the_whole_serialized_display_cap() {
     let client = Client::for_test("A", None);
     let scope = HitContext::search(None, Some("A"), true);
     let hits = [hit(Some("A"), "source")];
-    let empty = search(&client, "", &hits, &[], scope).unwrap();
+    let empty = search(&client, "", &hits, &[], scope, None).unwrap();
     let overhead = serde_json::to_vec(&empty).unwrap().len();
     let exact = "x".repeat(MAX_DISPLAY_BYTES - overhead);
-    let display = search(&client, &exact, &hits, &[], scope).unwrap();
+    let display = search(&client, &exact, &hits, &[], scope, None).unwrap();
     assert_eq!(display["query"].as_str(), Some(exact.as_str()));
     assert_eq!(
         serde_json::to_vec(&display).unwrap().len(),
         MAX_DISPLAY_BYTES
     );
-    assert!(search(&client, &(exact + "x"), &hits, &[], scope).is_none());
-    assert!(search(&client, &"x".repeat(MAX_DISPLAY_BYTES + 1), &[], &[], scope).is_none());
+    assert!(search(&client, &(exact + "x"), &hits, &[], scope, None).is_none());
+    assert!(
+        search(
+            &client,
+            &"x".repeat(MAX_DISPLAY_BYTES + 1),
+            &[],
+            &[],
+            scope,
+            None
+        )
+        .is_none()
+    );
     assert!(
         search(
             &client,
             &"\n".repeat(MAX_DISPLAY_BYTES / 2),
             &hits,
             &[],
-            scope
+            scope,
+            None,
         )
         .is_none()
     );
@@ -279,7 +310,7 @@ fn late_index_warning_obeys_the_encoded_cap_without_losing_native_text() {
     let client = Client::for_test("A", None);
     let scope = HitContext::search(None, Some("A"), true);
     let warning = "stale \"snapshot\"\né›ª";
-    let mut empty = QueryOutput::new(String::new(), search(&client, "", &[], &[], scope));
+    let mut empty = QueryOutput::new(String::new(), search(&client, "", &[], &[], scope, None));
     empty.set_index_warning(Some(warning.into()));
     let overhead = serde_json::to_vec(empty.display.as_ref().unwrap())
         .unwrap()
@@ -288,7 +319,7 @@ fn late_index_warning_obeys_the_encoded_cap_without_losing_native_text() {
         let query = "x".repeat(MAX_DISPLAY_BYTES - overhead + extra);
         let mut output = QueryOutput::new(
             "complete native result".into(),
-            search(&client, &query, &[], &[], scope),
+            search(&client, &query, &[], &[], scope, None),
         );
         assert!(output.display.is_some());
         output.set_index_warning(Some(warning.into()));
@@ -312,21 +343,22 @@ fn byte_and_hit_caps_are_independent_and_all_or_nothing() {
     let scope = HitContext::search(None, Some("A"), true);
     let hits: Vec<_> = (0..MAX_DISPLAY_HITS).map(|_| hit(Some("A"), "")).collect();
     assert_eq!(
-        search(&client, "query", &hits, &[], scope).unwrap()["hits"]
+        search(&client, "query", &hits, &[], scope, None).unwrap()["hits"]
             .as_array()
             .unwrap()
             .len(),
         32
     );
     let too_many: Vec<_> = (0..=MAX_DISPLAY_HITS).map(|_| hit(Some("A"), "")).collect();
-    assert!(search(&client, "query", &too_many, &[], scope).is_none());
+    assert!(search(&client, "query", &too_many, &[], scope, None).is_none());
     assert!(
         search(
             &client,
             "query",
             &[hit(Some("A"), &"x".repeat(MAX_DISPLAY_BYTES))],
             &[],
-            scope
+            scope,
+            None,
         )
         .is_none()
     );
@@ -369,7 +401,7 @@ fn search_preserves_coordinates_and_binding_without_cross_copy_roots() {
     let client = Client::for_test("A", Some(root.path().to_path_buf()));
     let scope = HitContext::search(client.local_root(), Some("A"), true);
     let hits = [hit(Some("A"), "first\nsecond")];
-    let bound = search(&client, "query", &hits, &[HitSource::Bound], scope).unwrap();
+    let bound = search(&client, "query", &hits, &[HitSource::Bound], scope, None).unwrap();
     assert!(bound["identity"]["localRoot"].is_string());
     assert_eq!(bound["hits"][0]["binding"]["state"], "bound");
     assert_eq!(bound["hits"][0]["startLine"], 8);
@@ -384,18 +416,20 @@ fn search_preserves_coordinates_and_binding_without_cross_copy_roots() {
         ),
     ];
     for (state, expected) in states {
-        let display = search(&client, "query", &hits, &[state], scope).unwrap();
+        let display = search(&client, "query", &hits, &[state], scope, None).unwrap();
         assert_eq!(display["hits"][0]["binding"]["state"], expected);
         assert!(display["hits"][0]["binding"]["reason"].is_string());
     }
     let mixed = [hit(Some("A"), ""), hit(Some("B"), "")];
     assert!(
-        search(&client, "query", &mixed, &[], scope).unwrap()["identity"]["localRoot"].is_null()
+        search(&client, "query", &mixed, &[], scope, None).unwrap()["identity"]["localRoot"]
+            .is_null()
     );
     let legacy = [hit(None, "")];
     let broad = HitContext::search(client.local_root(), Some("A"), false);
     assert!(
-        search(&client, "query", &legacy, &[], broad).unwrap()["identity"]["localRoot"].is_null()
+        search(&client, "query", &legacy, &[], broad, None).unwrap()["identity"]["localRoot"]
+            .is_null()
     );
     let canonical = client.for_canonical();
     let display = search(
@@ -404,6 +438,7 @@ fn search_preserves_coordinates_and_binding_without_cross_copy_roots() {
         &hits,
         &[],
         HitContext::search(None, Some("A"), true),
+        None,
     )
     .unwrap();
     assert_eq!(display["identity"]["copy"], "canonical");
@@ -426,7 +461,7 @@ fn search_preserves_coordinates_and_binding_without_cross_copy_roots() {
     incomplete.line_start = None;
     incomplete.snippet_line_start = None;
     incomplete.score = f64::NAN;
-    let display = search(&client, "query", &[incomplete], &[], scope).unwrap();
+    let display = search(&client, "query", &[incomplete], &[], scope, None).unwrap();
     assert!(display["hits"][0]["startLine"].is_null());
     assert!(display["hits"][0]["snippetStartLine"].is_null());
     assert!(display["hits"][0]["score"].is_null());
@@ -471,7 +506,8 @@ fn status_preserves_unknown_counters_failures_and_snapshot_copy_identity() {
     }))
     .unwrap();
     let job = Ok(serde_json::from_value::<api::JobStatus>(serde_json::json!({
-        "filesEmbedded": 7, "filesFailed": 2, "error": "embedding failed"
+        "filesEmbedded": 7, "filesFailed": 2, "error": "embedding failed",
+        "currentStage": "Deriving", "operationsPerSecond": 1.5
     }))
     .unwrap());
     let totals = Ok((100, 4096));
@@ -480,6 +516,8 @@ fn status_preserves_unknown_counters_failures_and_snapshot_copy_identity() {
     assert_eq!(display["catalog"]["files"], 100);
     assert_eq!(display["job"]["filesEmbedded"], 7);
     assert_eq!(display["job"]["filesFailed"], 2);
+    assert_eq!(display["job"]["currentStage"], "Deriving");
+    assert_eq!(display["job"]["operationsPerSecond"], 1.5);
     assert!(display["job"].get("filesToEmbed").is_none());
     assert!(display["job"].get("filesDeleted").is_none());
     assert!(display["job"].get("chunkCount").is_none());

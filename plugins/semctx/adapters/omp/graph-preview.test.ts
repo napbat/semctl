@@ -9,7 +9,7 @@ import { readDisplay, type Hit } from "./inspector";
 import { GRAPH_STYLES, positionClasses, quantizedSegment, routeStrokeClasses } from "./graph-native-styles";
 import { asNativeElement, type NativeElement } from "./native-elements";
 import { DEFAULT_GRAPH_APPEARANCE, type GraphAppearance } from "./graph-appearance";
-import { projectSummary } from "./graph-projection";
+import { projectSummary, REMAINDER_GROUP } from "./graph-projection";
 import { graphColorRevision, lookupGraphColor, setGraphColorMode } from "./graph-colors";
 import { bindDrawingWeight } from "./graph-data/layout.js";
 import { bindIndexingCounts, boundIndexingCounts, indexingCounts } from "./graph-indexing";
@@ -213,10 +213,10 @@ test("layout changes retain the plane and node keys while remounting routes and 
 		.toEqual(targets(radial).map(target => target.p.class?.match(/sg-x\d+ sg-y\d+ sg-fx\d+ sg-fy\d+/)?.[0]));
 	const resized = graphPreview(data, cx, { size: "compact", appearance: DEFAULT_GRAPH_APPEARANCE });
 	const refreshed = graphPreview({ ...data, nodes: [...data.nodes], edges: [...data.edges] }, cx, { appearance: DEFAULT_GRAPH_APPEARANCE });
-	for (const changed of [resized, refreshed]) {
-		expect(elements(changed, "sg-routes")[0].key).not.toBe(elements(force, "sg-routes")[0].key);
-		expect(nodeKeys(changed)).toEqual(nodeKeys(force));
-	}
+	expect(elements(resized, "sg-routes")[0].key).not.toBe(elements(force, "sg-routes")[0].key);
+	// A refresh with the same geometry keeps the layers mounted, so their fade-in does not replay.
+	for (const className of ["sg-routes", "sg-territories"]) expect(elements(refreshed, className)[0].key).toBe(elements(force, className)[0].key);
+	for (const changed of [resized, refreshed]) expect(nodeKeys(changed)).toEqual(nodeKeys(force));
 });
 
 test("node morph transitions include explicit durations and dense map styles keep lighter low-tier links and compact fills", () => {
@@ -669,8 +669,9 @@ test("key/more labels obey collision-aware budgets while hover labels remain ava
 	expect(key).toHaveLength(24); expect(more).toHaveLength(24); expect(hover).toHaveLength(24);
 	const keyVisible = key.filter(node => !node?.p.class?.includes("sg-label-transient")).length;
 	const moreVisible = more.filter(node => !node?.p.class?.includes("sg-label-transient")).length;
-	expect(keyVisible).toBeGreaterThan(0); expect(keyVisible).toBeLessThanOrEqual(3);
-	expect(moreVisible).toBeGreaterThan(keyVisible); expect(moreVisible).toBeLessThanOrEqual(6);
+	// Group maps reserve label room, so the compact budget names one more group than an ordinary graph.
+	expect(keyVisible).toBeGreaterThan(0); expect(keyVisible).toBeLessThanOrEqual(4);
+	expect(moreVisible).toBeGreaterThan(keyVisible); expect(moreVisible).toBeLessThanOrEqual(8);
 	expect(hover.every(node => node?.p.class?.includes("sg-label-transient"))).toBe(true);
 });
 
@@ -761,11 +762,12 @@ test("detail budgets retain every source node and account truthfully for every f
 		for (const node of summary.graph.nodes) {
 			expect(boundIndexingCounts(node)).toBe(summary.groups.find(group => group.id === node.id)?.indexing);
 		}
+		// The folded remainder is never a root: it aggregates unrelated groups.
 		const expectedRoots = data.roots.map(id => {
 			const group = summary.groupOf.get(id);
 			if (group === undefined) throw new Error(`Root ${id} has no projected group`);
 			return group;
-		});
+		}).filter(id => id !== REMAINDER_GROUP);
 		expect(summary.graph.roots).toEqual([...new Set(expectedRoots)]);
 		expect(summary.omitted).toBeGreaterThan(0); expect(summary.graph.truncated).toBe(true);
 		expect(summary.graph.caveats).toContain(data.caveats[0]);

@@ -7,8 +7,9 @@ use std::borrow::Cow;
 use std::fmt::Write;
 use std::path::Path;
 
-use crate::client::{ResultTruncation, api};
+use crate::client::api;
 
+use super::completeness::write_expansion_marker;
 use super::inspection::GRAPH_LIST_CAP;
 use super::source::HitSource;
 
@@ -301,8 +302,6 @@ pub(super) fn render_hits_inner(
     if show_score {
         render_search_table(&mut out, hits, context, sources);
     }
-    let mut expanded_chars = 0_usize;
-    let mut shortened_hits = 0_usize;
     for (index, h) in hits.iter().enumerate() {
         let root = context.root_for(h);
         if show_score {
@@ -310,16 +309,9 @@ pub(super) fn render_hits_inner(
         } else {
             render_hit_heading(&mut out, h, root);
         }
-        let expand = full_body
-            && (expanded_chars == 0 || expanded_chars + h.snippet.len() <= EXPANDED_BODY_CHARS);
-        if expand {
-            expanded_chars += h.snippet.len();
-        } else if full_body {
-            shortened_hits += 1;
-        }
         // The preview starts at the first nonblank line. Expanded bodies retain
         // all source bytes, including leading blank lines and indentation.
-        let snippet = if expand {
+        let snippet = if full_body {
             Cow::Borrowed(h.snippet.as_str())
         } else {
             Cow::Owned(
@@ -356,14 +348,6 @@ pub(super) fn render_hits_inner(
     {
         out.push_str("Verified source means matching ready-source bytes and reported coordinates, not semantic symbol/focus identity.\n");
     }
-    if shortened_hits > 0 {
-        writeln!(
-            out,
-            "{shortened_hits} hit(s) shown as snippets: expanded bodies stop at \
-             {EXPANDED_BODY_CHARS} characters. Use expand_chunk for one of them."
-        )
-        .expect("writing to a String cannot fail");
-    }
     out
 }
 
@@ -386,16 +370,17 @@ fn render_search_table(
             Some(HitSource::Unverified(_)) => "unverified",
             None => "not probed",
         };
-        writeln!(
+        write!(
             out,
-            "| {}\u{a0}{} | {} — {} | {} |",
+            "| {}\u{a0}{} | {} — {}",
             index + 1,
             score_bar(hit.score, scale),
             markdown_code(&hit_location(hit, context.root_for(hit))).replace('|', "\\|"),
             markdown_code(&format!("{}{}", hit_symbol(hit), write_marker(hit))).replace('|', "\\|"),
-            binding,
         )
         .expect("writing to a String cannot fail");
+        write_expansion_marker(out, hit);
+        writeln!(out, " | {binding} |").expect("writing to a String cannot fail");
     }
 }
 
@@ -446,6 +431,7 @@ fn render_hit_heading(out: &mut String, hit: &api::SearchHit, root: Option<&Path
     if !marker.is_empty() {
         write!(out, " {}", markdown_code(marker.trim())).expect("writing to a String cannot fail");
     }
+    write_expansion_marker(out, hit);
     out.push('\n');
 }
 
@@ -572,12 +558,6 @@ fn fence_language(language: Option<&str>) -> Cow<'_, str> {
     }
 }
 
-/// The total length of expanded bodies in one search answer. The first hit is
-/// always expanded; a later hit that does not fit is shown as a snippet. The
-/// server has no size limit of its own, and one expanded search with a broad
-/// `top_k` can otherwise return tens of thousands of characters.
-const EXPANDED_BODY_CHARS: usize = 30_000;
-
 /// The symbol column: the MATCHED symbol, qualified by the declaration that
 /// contains it when the server reports one (`dispatch in run_until`). Without
 /// the qualifier a references list reads as the same symbol repeated at
@@ -633,7 +613,7 @@ pub(super) fn hit_location(h: &api::SearchHit, root: Option<&Path>) -> String {
 #[cfg(test)]
 mod tests {
 
-    use super::{EXPANDED_BODY_CHARS, HitContext, api, render_hits_inner, strip_verbatim_prefix};
+    use super::{HitContext, api, render_hits_inner, strip_verbatim_prefix};
     use crate::query::HitSource;
 
     /// A `SearchHit` with a chosen chunk id + path — for the render test that
@@ -759,6 +739,7 @@ mod tests {
                 &format!(r#","expanded":false,"expansionReason":"{reason}""#),
             ));
         }
+        hits.push(hit("unspecified", r#","expanded":false"#));
         hits.push(hit("plain", ""));
         serde_json::from_str(&format!("[{}]", hits.join(",")))
             .expect("the hits of a Symbol search parse")
@@ -769,11 +750,12 @@ mod tests {
         let out = expanded(&symbol_search_hits());
         let header = |id: &str| {
             out.lines()
-                .find(|line| line.contains(&format!(" {id}.rs:1-2")))
+                .find(|line| line.contains(&format!("`{id}.rs:1-2`")))
                 .unwrap_or_else(|| panic!("no header for {id}: {out}"))
         };
 
-        assert!(header("body").ends_with("  [expanded]"), "{out}");
+        assert!(header("body").contains(" [expanded] |"), "{out}");
+        assert!(header("unspecified").contains(" [not expanded] |"), "{out}");
         for (reason, why) in [
             (
                 "SymbolChunk",
@@ -798,7 +780,7 @@ mod tests {
             ),
         ] {
             assert!(
-                header(reason).ends_with(&format!("  [not expanded: {reason} — {why}]")),
+                header(reason).contains(&format!(" [not expanded: {reason} — {why}] |")),
                 "{out}"
             );
         }

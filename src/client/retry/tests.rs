@@ -102,6 +102,29 @@ async fn available_snapshot_returns_typed_loading_without_changing_the_original_
 }
 
 #[tokio::test]
+async fn available_snapshot_keeps_a_partial_answer_and_its_call_record() {
+    let stub = Stub::serve(vec![Reply::partial("graph-loading", "pending", PROBE)]).await;
+    let partial = PartialAnswers::default();
+    let snapshot = client(&stub)
+        .with_partial_answers(partial.clone())
+        .available_snapshot();
+
+    let probe = snapshot
+        .get::<Probe>("/v1/probe")
+        .await
+        .expect("the snapshot can use a partial success");
+    assert_eq!(probe, Probe { ok: true });
+    assert_eq!(stub.requests(), 1);
+    let answers = partial.take();
+    assert_eq!(answers.len(), 1);
+    assert_eq!(
+        answers[0].to_string(),
+        "the graph answer is partial (graph-loading); the server still builds the \
+         missing part, so a later call can return more"
+    );
+}
+
+#[tokio::test]
 async fn a_loading_answer_that_outlasts_the_deadline_returns_retryable_before_it() {
     let stub = Stub::serve(vec![Reply::loading("1")]).await;
     let client = within(client(&stub), 3.0);

@@ -4,6 +4,11 @@ import type { TermVector } from "./embedding.js";
 export interface DocSource { path: string; text: string }
 /** Key "family:<doc folder>"; label is the humanized last folder segment. */
 export interface DocConceptFamily { key: string; label: string }
+/**
+ * A drawing family: a doc concept family, a map region of the overview projection, or a drill-down subconcept.
+ * An absent `kind` means "doc". "content" is a drill-down cluster of terms, links and semctx search-profile affinity.
+ */
+export interface BoundConceptFamily extends DocConceptFamily { kind?: "doc" | "path" | "terms" | "content" }
 /** "doc": the source doc itself. "mention": explicit doc evidence. "reference": reference/import edges or a same-stem sibling. "folder": folder plurality. */
 export type DocConceptVia = "doc" | "mention" | "reference" | "folder";
 export interface DocConcept {
@@ -29,6 +34,8 @@ export interface DocConceptResult {
 	assignments: Map<string, { key: string; via: DocConceptVia }>;
 	/** `files` counts catalog file nodes; `assigned` counts the assigned ones. `hubs` lists index docs that point at too much code to name a concept. */
 	stats: { docs: number; hubs: string[]; files: number; assigned: number };
+	/** Doc path -> L2-normalized heading terms, with the document title at half weight. Docs without a title or heading have no entry. */
+	contents: Map<string, TermVector>;
 }
 /** 256 files, 1 MiB per file, 16 MiB total. `docConcepts` applies the same bounds in path order. */
 export const DOC_SOURCE_LIMITS: Readonly<{ files: number; fileBytes: number; totalBytes: number }>;
@@ -37,5 +44,5 @@ export function isDocPath(path: string): boolean;
 /** Pure and deterministic: the result does not depend on node, edge or doc order. Docs whose path is not a catalog file node are ignored. */
 export function docConcepts(data: Pick<GraphData, "nodes" | "edges">, docs: readonly DocSource[]): DocConceptResult;
 /** WeakMap binding, like `bindTermVector`. `undefined` removes the binding. */
-export function bindConceptFamily(node: object, family: DocConceptFamily | undefined): void;
-export function conceptFamily(node: object): DocConceptFamily | undefined;
+export function bindConceptFamily(node: object, family: BoundConceptFamily | undefined): void;
+export function conceptFamily(node: object): BoundConceptFamily | undefined;

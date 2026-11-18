@@ -108,6 +108,11 @@ the last complete index.
   active. If only a codebase id is known, pass its indexed local path as the
   codebase selector to activate watching. Inspect reported watcher and retry
   state rather than assuming that a watcher is active or a failure is retryable.
+- An expanded search hit marked `[not expanded: <reason> — …]` is a chunk, not
+  the complete symbol. Follow the reported reason. For `GraphLoading`, search
+  again later. For other reasons, use `expand_chunk` or `file_outline`.
+- A `search_codebase` or `grep` result that reports a content budget cut is
+  incomplete. Follow its `next:` line before you conclude a match is absent.
 - A tool reports that semctl is not logged in → answer the immediate
   question with host tools, and end your reply with one line telling the user
   semctl is logged out and `semctl auth login` restores it (tools recover on

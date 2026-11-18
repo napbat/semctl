@@ -1,7 +1,7 @@
 import type { Display } from "./inspector";
 import { inferConcepts } from "./graph-data/concepts.js";
 import { docConcepts, type DocConceptFamily, type DocConceptVia, type DocSource } from "./graph-data/doc-concepts.js";
-import type { TermVector } from "./graph-data/embedding.js";
+import { bindContentTerms, type TermVector } from "./graph-data/embedding.js";
 import { conceptPalette, normalizeConceptPath } from "./graph-data/palette.js";
 
 /** `via` is per file; the other fields belong to the concept. */
@@ -63,8 +63,11 @@ function changed(): void {
 	notifyColorObservers();
 }
 
-/** Doc concepts assign the files and directories that they name; reference communities fill only the files that remain. */
-function conceptAssignments(display: Extract<Display, { kind: "graph" }>, docs: readonly DocSource[]): Map<string, ConceptColor> {
+/**
+ * Doc concepts assign the files and directories that they name; reference communities fill only the files that remain.
+ * `contents` holds the heading terms of each parsed document by path.
+ */
+function conceptAssignments(display: Extract<Display, { kind: "graph" }>, docs: readonly DocSource[]): { assignments: Map<string, ConceptColor>; contents: ReadonlyMap<string, TermVector> } {
 	const paths = new Map<string, string>(), files = new Set<string>();
 	for (const node of display.nodes) {
 		const path = normalizeConceptPath(node.path);
@@ -73,12 +76,14 @@ function conceptAssignments(display: Extract<Display, { kind: "graph" }>, docs: 
 		if (node.category === "file") files.add(node.id);
 	}
 	const next = new Map<string, ConceptColor>();
+	let contents: ReadonlyMap<string, TermVector> = new Map();
 	if (docs.length) {
 		const result = docConcepts(display, docs), concepts = new Map(result.concepts.map(concept => [concept.key, Object.freeze<ConceptColor>({
 			key: concept.key, label: concept.label, ...conceptPalette(concept.key),
 			reason: `Named by ${concept.source}. Docs and catalog-path evidence, not confidence or semantic similarity.`,
 			kind: "doc", title: concept.title, source: concept.source, terms: concept.terms, ...(concept.family ? { family: concept.family } : {}),
 		})]));
+		contents = result.contents;
 		const routes = new Map<string, ConceptColor>();
 		for (const [id, assignment] of result.assignments) {
 			const path = paths.get(id), shared = concepts.get(assignment.key);
@@ -104,16 +109,47 @@ function conceptAssignments(display: Extract<Display, { kind: "graph" }>, docs: 
 			}
 		}
 	}
-	return next;
+	return { assignments: next, contents };
 }
 
-/** Replace one codebase's evidence. Unsupported nodes receive no assignment. A truncated display without docs keeps the last evidence. */
+function sameTerms(a: TermVector | undefined, b: TermVector | undefined): boolean {
+	if (a === b) return true;
+	if (!a || !b || a.size !== b.size) return false;
+	for (const [term, weight] of a) if (b.get(term) !== weight) return false;
+	return true;
+}
+function sameConcept(a: ConceptColor, b: ConceptColor): boolean {
+	return a === b || a.key === b.key && a.label === b.label && a.kind === b.kind && a.via === b.via && a.source === b.source &&
+		a.title === b.title && a.family?.key === b.family?.key && a.family?.label === b.family?.label && a.light === b.light &&
+		a.dark === b.dark && a.reason === b.reason && sameTerms(a.terms, b.terms);
+}
+function sameAssignments(a: ReadonlyMap<string, ConceptColor>, b: ReadonlyMap<string, ConceptColor>): boolean {
+	if (a.size !== b.size) return false;
+	for (const [path, color] of a) {
+		const other = b.get(path);
+		if (!other || !sameConcept(color, other)) return false;
+	}
+	return true;
+}
+
+/**
+ * Replace one codebase's evidence. Unsupported nodes receive no assignment. A truncated display without docs keeps the last evidence.
+ * Document heading terms are bound to the file nodes of this display, so their lexical vectors describe what each document is about.
+ */
 export function setConceptSnapshot(display: Display, docs: readonly DocSource[] = []): void {
 	const generation = validatedOverviews.get(display), codebase = display.identity.codebaseId;
 	if (generation === undefined || !codebase || generation !== acceptedGenerations.get(codebase) ||
 		display.kind !== "graph" || display.loading || (display.truncated && !docs.length) ||
 		display.identity.copy !== "checkout" || !display.identity.localRoot) return;
-	assignments.set(codebase, conceptAssignments(display, docs));
+	const { assignments: next, contents } = conceptAssignments(display, docs), current = assignments.get(codebase);
+	let bound = false;
+	for (const node of display.nodes) {
+		const path = node.category === "file" ? normalizeConceptPath(node.path) : undefined;
+		if (path) bound = bindContentTerms(node, contents.get(path)) || bound;
+	}
+	// Equal evidence keeps the current objects and revision, so observers do not rebuild an unchanged map.
+	if (current && !bound && sameAssignments(current, next)) return;
+	assignments.set(codebase, next);
 	changed();
 }
 export function resetConcepts(): void {

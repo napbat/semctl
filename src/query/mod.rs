@@ -13,6 +13,8 @@ use std::fmt::Write;
 use crate::client::{Client, api};
 
 mod advanced;
+mod affinity;
+mod completeness;
 mod display;
 mod error;
 mod inspection;
@@ -20,6 +22,7 @@ mod overview;
 mod render;
 mod source;
 
+pub use affinity::affinity;
 pub use display::{QueryOutput, QueryPresentation};
 pub use error::{FailureKind, ToolError};
 pub use overview::overview;
@@ -34,6 +37,7 @@ pub(crate) use source::{HitSource, hit_sources};
 
 pub use advanced::*;
 
+use completeness::{BudgetedResult, budget_note};
 pub use render::render_projects;
 pub(crate) use render::render_source_diagnostic;
 use render::{
@@ -130,6 +134,7 @@ pub async fn search(
     opts: &SearchOpts,
     presentation: QueryPresentation,
 ) -> Result<QueryOutput, ToolError> {
+    let top_k = result_limit("search_codebase", "top_k", top_k)?;
     let scope = opts.normalized_scope()?;
     let body = api::SearchRequestBody {
         query,
@@ -165,18 +170,22 @@ pub async fn search(
         client.codebase_raw(),
         opts.scope.is_none() && opts.codebase_ids.is_empty() && client.codebase_raw().is_some(),
     );
-    if hits.is_empty() {
-        return Ok(QueryOutput::new(
-            format!("**Search** {}\n\nno results", markdown_code(query)),
-            if presentation == QueryPresentation::Inspector {
-                display::search(client, query, &hits, &[], context)
-            } else {
-                None
-            },
-        ));
-    }
-    let sources = source::hit_sources_in_context(client, &hits, context).await;
-    let mut text = format!("**Search** {}\n\n", markdown_code(query));
+    let sources = if hits.is_empty() {
+        Vec::new()
+    } else {
+        source::hit_sources_in_context(client, &hits, context).await
+    };
+    let mut text = truncation
+        .as_ref()
+        .map_or_default(|reason| budget_note(BudgetedResult::Search, reason));
+    let display = if presentation == QueryPresentation::Inspector {
+        let note = text.strip_suffix('\n');
+        display::search(client, query, &hits, &sources, context, note)
+    } else {
+        None
+    };
+    write!(text, "**Search** {}\n\n", markdown_code(query))
+        .expect("writing to a String cannot fail");
     text.push_str(&render_hits_inner(
         &hits,
         "no results",
@@ -185,11 +194,6 @@ pub async fn search(
         &sources,
         opts.expand,
     ));
-    let display = if presentation == QueryPresentation::Inspector {
-        display::search(client, query, &hits, &sources, context)
-    } else {
-        None
-    };
     Ok(QueryOutput::new(text, display))
 }
 
@@ -508,9 +512,8 @@ pub async fn grep(
         .get_budgeted::<Vec<api::GrepMatch>>(&url)
         .await
         .map_err(|e| ToolError::from_client("grep", &e))?;
-    let mut out = truncation
-        .map(|truncation| budget_note(BudgetedResult::Grep, &truncation))
-        .unwrap_or_default();
+    let mut out =
+        truncation.map_or_default(|truncation| budget_note(BudgetedResult::Grep, &truncation));
     if matches.is_empty() {
         write!(out, "no matches for `{pattern}`").expect("writing to a String cannot fail");
         return Ok(out);
@@ -718,7 +721,11 @@ fn urlencode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SearchOpts, bound_codebase, human_bytes, normalize_prefer, single_file_target};
+    use super::{
+        QueryPresentation, SearchOpts, bound_codebase, grep, human_bytes, normalize_prefer, search,
+        single_file_target,
+    };
+    use crate::client::stub::{Reply, Stub};
     use crate::client::{Client, api};
 
     fn at(path: &str) -> api::GrepMatch {
@@ -792,10 +799,17 @@ mod tests {
     async fn a_top_k_outside_1_to_1000_is_an_invalid_argument_and_sends_nothing() {
         let (stub, client) = empty_list_stub().await;
         for top_k in [0, 1001] {
-            let message = search(&client, "q", top_k, &[], &SearchOpts::default())
-                .await
-                .unwrap_err()
-                .to_string();
+            let message = search(
+                &client,
+                "q",
+                top_k,
+                &[],
+                &SearchOpts::default(),
+                QueryPresentation::Plain,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
             assert!(
                 message.starts_with(&format!(
                     "search_codebase failed: top_k must be between 1 and 1000, not {top_k}"
@@ -807,9 +821,16 @@ mod tests {
         assert_eq!(stub.requests(), 0);
 
         for top_k in [1, 1000] {
-            search(&client, "q", top_k, &[], &SearchOpts::default())
-                .await
-                .expect("a top_k from 1 to 1000 reaches the server");
+            search(
+                &client,
+                "q",
+                top_k,
+                &[],
+                &SearchOpts::default(),
+                QueryPresentation::Plain,
+            )
+            .await
+            .expect("a top_k from 1 to 1000 reaches the server");
         }
         assert_eq!(stub.requests(), 2);
     }
@@ -852,9 +873,7 @@ mod tests {
     async fn truncated_stub(value: Option<&'static str>, data: &str) -> (Stub, Client) {
         let stub = Stub::serve(vec![Reply::Answer {
             status: "200 OK",
-            headers: value
-                .map(|value| vec![("X-Semctx-Result-Truncated", value)])
-                .unwrap_or_default(),
+            headers: value.map_or_default(|value| vec![("X-Semctx-Result-Truncated", value)]),
             body: format!(r#"{{"success":true,"data":{data}}}"#),
         }])
         .await;
@@ -866,9 +885,21 @@ mod tests {
     async fn a_search_that_the_server_cut_names_the_budget_and_the_next_step() {
         let next = "next: narrow the query, lower top_k, or search without expand.";
         let (_stub, client) = truncated_stub(Some("content-budget"), ONE_HIT).await;
-        let out = search(&client, "q", 8, &[], &SearchOpts::default())
-            .await
-            .expect("a cut result is a success");
+        let output = search(
+            &client,
+            "q",
+            8,
+            &[],
+            &SearchOpts::default(),
+            QueryPresentation::Inspector,
+        )
+        .await
+        .expect("a cut result is a success");
+        let out = output.text;
+        assert_eq!(
+            output.display.unwrap()["budgetNote"].as_str(),
+            out.lines().next(),
+        );
         assert!(
             out.starts_with(&format!(
                 "note: the server cut this result to its content budget (32 KiB of snippet \
@@ -880,9 +911,17 @@ mod tests {
         assert!(out.contains("a.rs:1-2"), "the hits stay: {out}");
 
         let (_stub, client) = truncated_stub(Some("other-budget"), ONE_HIT).await;
-        let out = search(&client, "q", 8, &[], &SearchOpts::default())
-            .await
-            .expect("a cut result is a success");
+        let out = search(
+            &client,
+            "q",
+            8,
+            &[],
+            &SearchOpts::default(),
+            QueryPresentation::Plain,
+        )
+        .await
+        .expect("a cut result is a success")
+        .text;
         assert!(
             out.starts_with(&format!(
                 "note: the server shortened this result \
@@ -892,10 +931,35 @@ mod tests {
         );
 
         let (_stub, client) = truncated_stub(None, ONE_HIT).await;
-        let out = search(&client, "q", 8, &[], &SearchOpts::default())
-            .await
-            .expect("a complete result is a success");
+        let out = search(
+            &client,
+            "q",
+            8,
+            &[],
+            &SearchOpts::default(),
+            QueryPresentation::Plain,
+        )
+        .await
+        .expect("a complete result is a success")
+        .text;
         assert!(!out.contains("note:"), "{out}");
+
+        let (_stub, client) = truncated_stub(Some("content-budget"), "[]").await;
+        let empty = search(
+            &client,
+            "q",
+            8,
+            &[],
+            &SearchOpts::default(),
+            QueryPresentation::Inspector,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            empty.display.unwrap()["budgetNote"].as_str(),
+            empty.text.lines().next()
+        );
+        assert!(empty.text.ends_with("no results"));
     }
 
     #[tokio::test]

@@ -10,8 +10,9 @@ import { conceptClass } from "./native-concepts";
 import { DEFAULT_GRAPH_APPEARANCE, GraphAppearanceStore, type GraphAppearance } from "./graph-appearance";
 import { indexingParts, type GraphIndexingCounts } from "./graph-indexing";
 import { GraphPage } from "./graph-page";
+import { setAffinityRunner } from "./graph-affinity";
 
-afterEach(() => { resetConcepts(); setGraphColorMode("concepts"); });
+afterEach(() => { resetConcepts(); setGraphColorMode("concepts"); setAffinityRunner(undefined); });
 
 const native: DescribeContext = { cols: 80, dark: true, reduceMotion: false, supports: () => true, feature: () => false };
 function graph(): GraphData {
@@ -464,6 +465,79 @@ describe("native graph navigation", () => {
 		expect(nodes(view.describe(cx)).some(node => node.key === "selection")).toBe(false);
 		expect(nodes(view.describe(cx)).some(node => node.p?.actions?.click === "group:0")).toBe(true);
 	});
+	test("a changed refresh restores the drill-down group and selected file even when transport IDs are renumbered", () => {
+		const files = (shift: number) => Array.from({ length: 64 }, (_, index) => ({
+			id: String(index + shift), label: `File ${index}`, path: `module-${index % 2}/${index}.ts`,
+			category: "file" as const, detail: `Selected file ${index}`, hit: null,
+		}));
+		const data = graph();
+		data.nodes = files(0); data.edges = []; data.roots = ["63"];
+		const cx: DescribeContext = { ...native, feature: name => name === "styles" };
+		const before = new GraphInspector(data, () => {}, () => { throw new Error("No source supplied"); }, null, undefined, "body", "overview");
+		before.describe(cx);
+		action(before, "group:1");
+		// Ordered index 4 follows the root: File 3 in module-1.
+		action(before, "node:4");
+		const state = before.navigation();
+		expect(state.scope).toBeDefined();
+		expect(content(before.describe(cx))).toContain("Selected file 3");
+		// The refreshed overview renumbers every node and adds a new file.
+		const refreshed = graph();
+		refreshed.nodes = [{ id: "0", label: "New file", path: "module-0/new.ts", category: "file", detail: "New", hit: null }, ...files(1)];
+		refreshed.edges = []; refreshed.roots = ["1"];
+		const after = new GraphInspector(refreshed, () => {}, () => { throw new Error("No source supplied"); }, null, undefined, "body", "overview");
+		after.restoreNavigation(state);
+		const root = after.describe(cx);
+		expect(after.navigation()).toEqual(state);
+		expect(content(root)).toContain("Selected file 3");
+		expect(content(nodes(root).find(node => node.key === "graph-scope")!)).toContain("module-1");
+	});
+	test("a large group opens subconcept levels whose trail survives a refresh and whose placement uses semantic affinity", async () => {
+		const files = (shift: number) => [
+			...Array.from({ length: 60 }, (_, index) => `docs/specifications/intel/extracts/${index % 2 ? "vmcs-field" : "paging-table"}-${index}.md`),
+			...Array.from({ length: 20 }, (_, index) => `docs/specifications/amd/extracts/vmcb-${index}.md`),
+			...Array.from({ length: 10 }, (_, index) => `docs/specifications/uefi/runtime-${index}.md`),
+		].map((path, index) => ({ id: String(index + shift), label: path.split("/").at(-1)!, path, category: "file" as const, detail: path, hit: null }));
+		const runs: string[][] = [], settle = Promise.withResolvers<unknown>();
+		setAffinityRunner(paths => { runs.push([...paths]); return settle.promise; });
+		const data = graph(), cx: DescribeContext = { ...native, feature: name => name === "styles" };
+		data.nodes = files(0); data.edges = []; data.roots = ["0"];
+		const view = new GraphInspector(data, () => {}, () => { throw new Error("No source supplied"); }, "hv", undefined, "body", "overview");
+		view.describe(cx);
+		action(view, "group:0");
+		const level = nodes(view.describe(cx));
+		const subconcepts = (tree: NativeNode[]) => tree.filter(node => node.key?.startsWith("subconcept-") && node.p?.actions?.click);
+		const label = (row: NativeNode) => content(row).split("\n").find(Boolean);
+		const rows = subconcepts(level);
+		expect(rows.map(label)).toEqual(["intel", "amd", "uefi"]);
+		expect(content(level.find(node => node.key === "graph-drawing-summary")!)).toContain("3 subconcepts");
+		// 90 files exceed the affinity bound, so this level places by terms and links only.
+		expect(content(level.find(node => node.key === "semantic")!)).toContain("open a subconcept of at most 64 files");
+		action(view, rows[0].p!.actions!.click!);
+		const intel = nodes(view.describe(cx));
+		expect(intel.find(node => node.key === "crumb-0")?.p?.actions?.click).toBe("trail:0");
+		expect(content(intel.find(node => node.key === "crumb-1")!)).toBe("intel");
+		expect(subconcepts(intel).map(label).sort()).toEqual(["field · vmcs", "paging · table"]);
+		expect(runs).toHaveLength(1);
+		expect(runs[0]).toHaveLength(60);
+		expect(content(intel.find(node => node.key === "semantic")!)).toContain("loading");
+		const [a, b] = runs[0];
+		settle.resolve({ display: { version: 1, kind: "affinity", files: runs[0].map(path => ({ path, query: "content", indexed: false, results: 4 })),
+			pairs: [{ a, b, direct: 0, shared: .6 }], caveats: [] } });
+		await settle.promise; await Promise.resolve();
+		expect(content(nodes(view.describe(cx)).find(node => node.key === "semantic")!)).toContain("1 related pair · 0 of 60 files indexed");
+		const state = view.navigation();
+		expect(state.trail).toHaveLength(1);
+		const refreshed = graph();
+		refreshed.nodes = files(5); refreshed.edges = []; refreshed.roots = ["5"];
+		const after = new GraphInspector(refreshed, () => {}, () => { throw new Error("No source supplied"); }, "hv", undefined, "body", "overview");
+		after.restoreNavigation(state);
+		expect(content(nodes(after.describe(cx)).find(node => node.key === "crumb-1")!)).toBe("intel");
+		action(after, "trail:0");
+		const back = nodes(after.describe(cx));
+		expect(back.some(node => node.key === "crumb-1")).toBe(false);
+		expect(after.navigation().trail).toBeUndefined();
+	});
 	test("appearance edits retain drilldown, exact selected source and relationship navigation", () => {
 		const data = graph(); let previews = 0;
 		data.nodes = Array.from({ length: 96 }, (_, index) => ({ id: String(index), label: `File ${index}`,
@@ -565,7 +639,6 @@ test("graph toolbar gives the overview a checkout subline without changing other
 		if (!heading) throw new Error("Missing graph heading");
 		const title = nodes(heading).find(node => node.p?.role === "semctl.graph.title");
 		expect(title?.p?.text).toBe(operation.label);
-		expect(title?.p?.title).toContain("configured semctl CLI · /workspace/checkout-name");
 		const subline = nodes(heading).find(node => node.p?.role === "semctl.graph.hint");
 		if (id === "overview") {
 			expect(subline?.p?.text).toBe("checkout-name");

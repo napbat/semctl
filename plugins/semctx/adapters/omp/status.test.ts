@@ -4,6 +4,8 @@ import type { ExtensionAPI, ExtensionContext, ExtensionWidgetContent } from "@oh
 import type { Component, DescribeContext, NativeNode } from "@oh-my-pi/pi-tui";
 import { installSyncStatus, readStatusUpdate } from "./status";
 import { asNativeElement } from "./native-elements";
+import type { GraphReadiness } from "./overview";
+import type { GraphIndexingCounts } from "./graph-indexing";
 
 const root = path.resolve("status-fixture");
 const describeContext: DescribeContext = {
@@ -29,6 +31,7 @@ function indicatorNode(node: NativeNode | null | undefined): NativeNode | undefi
 function harness(cwd = root, hasUI = true, options: {
 	commands?: boolean; custom?: boolean; text?: boolean;
 	openGraph?: (ctx: ExtensionContext, mode: "overview" | "live") => Promise<void>;
+	readiness?: GraphReadiness;
 } = {}) {
 	type Handler = (event: Record<string, unknown>, ctx: ExtensionContext) => unknown;
 	type Command = (args: string, ctx: ExtensionContext) => Promise<void>;
@@ -70,7 +73,7 @@ function harness(cwd = root, hasUI = true, options: {
 			},
 		}),
 	} } as unknown as ExtensionContext;
-	installSyncStatus(pi, options.openGraph);
+	installSyncStatus(pi, options.openGraph, options.readiness);
 	const emit = (name: string, event: Record<string, unknown>, context = ctx) => { for (const handler of handlers.get(name) ?? []) handler(event, context); };
 	const native = (cx = describeContext) => indicatorNode(widget?.describe?.(cx));
 	const meter = () => {
@@ -105,6 +108,37 @@ test("status hover updates changed diagnostics without remounting or dumping the
 	const snapshot = body?.c?.find(child => "k" in child && child.key === "snapshot") as NativeNode | undefined;
 	const text = snapshot?.c?.[0] as NativeNode | undefined;
 	expect(text?.k === "text" ? text.p?.text : undefined).toContain(diagnostic);
+});
+
+test("the ring shows the ready share of the cached map and falls back to producer progress without it", () => {
+	let counts: GraphIndexingCounts | undefined;
+	const listeners = new Set<() => void>(), reads: string[] = [];
+	const readiness: GraphReadiness = {
+		read(value) { reads.push(value); return counts; },
+		subscribe(listener) { listeners.add(listener); return () => { listeners.delete(listener); }; },
+	};
+	const h = harness(root, true, { readiness });
+	const publish = () => { for (const listener of listeners) listener(); };
+	h.notify(status({ embedding: embedding({ files_embedded: 3 }) }));
+	expect(h.meter?.value).toBe(0.3);
+	expect(h.native()?.p?.title).not.toContain("files ready");
+	expect(path.relative(reads.at(-1)!, root)).toBe("");
+	counts = { ready: 224, processing: 3, pending: 1390, failed: 0, unknown: 0, unreported: 40 };
+	const renders = h.renders;
+	publish();
+	expect(h.meter?.value).toBe(224 / 1617);
+	expect(h.meter?.tone).toBe("accent");
+	expect(h.native()?.p?.title).toContain("Ring: 224 of 1617 files ready (13%)");
+	expect(h.native()?.p?.title).toContain("Reported progress: 30%");
+	expect(h.native()?.p?.aria).toBe("semctl: embedding 3/10");
+	expect(h.shown).toBe("○ semctl");
+	expect(h.renders).toBe(renders + 1);
+	publish();
+	expect(h.renders).toBe(renders + 1);
+	counts = { ready: 0, processing: 0, pending: 0, failed: 0, unknown: 0, unreported: 12 };
+	publish();
+	expect(h.meter?.value).toBe(0.3);
+	expect(h.native()?.p?.title).not.toContain("files ready");
 });
 
 describe("coordinator status evidence", () => {
@@ -311,16 +345,17 @@ describe("persistent composer widget", () => {
 			[status({ running: true, sync_progress: { planning: { files: 12 } } }), "active", null],
 			[status({ embedding: embedding({ state: "queued", files_embedded: 0 }) }), "pending", 0],
 			[status({ embedding: embedding({ files_embedded: 3 }) }), "active", 0.3],
-			[status({ last_error: "provider unavailable" }), "error", null],
-			[status({ last_error: "retry pending", retry_after_secs: 30 }), "warning", null],
+			[status({ last_error: "provider unavailable" }), "error", "×"],
+			[status({ last_error: "retry pending", retry_after_secs: 30 }), "warning", "!"],
 			[status({ embedding: embedding({ state: "completed", files_embedded: 10 }) }), "ready", 1],
 		] as const;
 		for (const [snapshot, state, progress] of scenarios) {
 			h.notify(snapshot);
 			const indicator = h.native(cx)!;
 			expect(asNativeElement(indicator)?.p.attrs?.["data-state"]).toBe(state);
-			const meter = indicator.c?.[0] as NativeNode;
-			expect(meter.k === "meter" ? meter.p?.value : undefined).toBe(progress);
+			const slot = indicator.c?.[0] as NativeNode;
+			if (typeof progress === "string") expect(slot).toMatchObject({ k: "text", p: { spans: [{ t: progress }] } });
+			else expect(slot).toMatchObject({ k: "meter", p: { value: progress } });
 		}
 		expect(h.mounts).toBe(1);
 		expect(h.unmounts).toBe(0);
@@ -331,11 +366,48 @@ describe("persistent composer widget", () => {
 		const full = h.native(cx)!;
 		expect(asNativeElement(full)?.p.attrs?.["data-motion"]).toBe("full");
 		const reduced = h.native({ ...cx, reduceMotion: true })!;
+		expect(reduced.c?.[0]).toMatchObject({ k: "text", p: { spans: [{ t: "◌" }] } });
+		expect(full.c?.[0]).toMatchObject({ k: "meter", p: { value: null } });
 		expect(asNativeElement(reduced)?.p.attrs?.["data-motion"]).toBe("reduced");
 		expect(h.native({ ...cx, reduceMotion: true })).toBe(reduced);
 		expect(asNativeElement(h.native(cx)!)?.p.attrs?.["data-motion"]).toBe("full");
 		expect(h.mounts).toBe(1);
 		expect(h.unmounts).toBe(0);
+	});
+	test("static slots distinguish idle, pending, warnings and failure in stock and styled consumers", () => {
+		const h = harness();
+		const contexts = [describeContext, { ...describeContext, feature: () => true }];
+		for (const [snapshot, mark, tone] of [
+			[status(), "○", "muted"],
+			[status({ pending_triggers: 1 }), "◌", "accent"],
+			[status({ watcher: { unavailable: "watch failed" } }), "!", "warning"],
+			[status({ running: true, last_error: "retrying", sync_progress: "preparing" }), "!", "warning"],
+			[status({ last_error: "failed" }), "×", "error"],
+		] as const) {
+			h.notify(snapshot);
+			for (const cx of contexts) {
+				const indicator = h.native(cx)!;
+				expect(indicator.c?.[0]).toMatchObject({ k: "text", key: "progress", p: { spans: [{ t: mark, s: tone }] } });
+				expect(indicator.p?.actions).toMatchObject({ click: "status" });
+			}
+			expect(h.shown).toBe(`${mark} semctl`);
+		}
+	});
+	test("reduced motion and missing meter capability preserve status and actions", async () => {
+		const h = harness();
+		const reduced = { ...describeContext, reduceMotion: true };
+		const noMeter = { ...describeContext, supports: (kind: string) => kind !== "meter" };
+		h.notify(status({ running: true, sync_progress: "preparing" }));
+		for (const cx of [reduced, noMeter]) {
+			expect(h.native(cx)?.c?.[0]).toMatchObject({ k: "text", p: { spans: [{ t: "◌" }] } });
+			expect(h.native(cx)?.p?.actions).toMatchObject({ click: "status" });
+		}
+		await h.activate();
+		expect(h.view?.render(80).join("\n")).toContain("semctl status");
+		h.notify(status({ embedding: embedding({ files_embedded: 3 }) }));
+		expect(h.native(reduced)?.c?.[0]).toMatchObject({ k: "meter", p: { value: 0.3 } });
+		expect(h.native(noMeter)?.c?.[0]).toMatchObject({ k: "text", p: { spans: [{ t: "◔" }] } });
+		expect(h.shown).toBe("◔ semctl");
 	});
 	test("repeated observations keep component, node identity and render demand stable", () => {
 		const h = harness();
@@ -353,7 +425,7 @@ describe("persistent composer widget", () => {
 		expect(h.native()?.c?.map(child => (child as NativeNode).key)).toEqual(["progress", "label"]);
 		expect(h.shown).toBe("◕ semctl");
 	});
-	test("width and capability changes preserve geometry, while unknown remains a distinct static ring", () => {
+	test("width and capability changes preserve geometry, with static unknown fallback", () => {
 		const h = harness();
 		h.notify(status({ embedding: embedding({ files_embedded: 3 }) }));
 		const widget = h.widget, node = h.native();
@@ -363,15 +435,14 @@ describe("persistent composer widget", () => {
 		}
 		expect(widget?.describe?.({ ...describeContext, supports: () => false })).toBeNull();
 		expect(h.native()).toBe(node);
-		for (const update of [
-			status({ embedding: embedding({ files_embedded: null, files_to_embed: null }) }),
-			status({ running: true, sync_progress: { scanning: { root } } }),
-			{ version: 1, root, status: null },
-		]) {
+		for (const [update, kind] of [
+			[status({ embedding: embedding({ files_embedded: null, files_to_embed: null }) }), "meter"],
+			[status({ running: true, sync_progress: { scanning: { root } } }), "meter"],
+			[{ version: 1, root, status: null }, "text"],
+		] as const) {
 			h.notify(update);
-			expect(h.meter).toMatchObject({
-				style: "ring", size: "sm", value: null, shrink: 0,
-				min: { w: "2ch", h: "1lines" }, max: { w: "2ch", h: "1lines" },
+			expect(h.native()?.c?.[0]).toMatchObject({
+				k: kind, p: { shrink: 0, min: { w: "2ch", h: "1lines" }, max: { w: "2ch", h: "1lines" } },
 			});
 			expect(h.native()).toMatchObject({
 				p: { role: "semctl.sync", min: { h: "1lines" } },
@@ -401,7 +472,7 @@ describe("persistent composer widget", () => {
 		]) {
 			h.notify(update);
 			labels.push(h.shown!);
-			expect(h.native()).toMatchObject({ c: [{ key: "progress", k: "meter" }, { key: "label", k: "text" }] });
+			expect(h.native()).toMatchObject({ c: [{ key: "progress" }, { key: "label", k: "text" }] });
 			expect(h.widget?.render(4).every(row => row.length <= 4)).toBe(true);
 		}
 		expect(new Set(labels.map(label => label.length)).size).toBe(1);
@@ -434,7 +505,7 @@ describe("persistent composer widget", () => {
 		h.notify(status({ embedding: complete }));
 		expect(h.meter?.value).not.toBe(1);
 		h.notify(status({ last_error: "current attempt failed" }));
-		expect(h.meter).toMatchObject({ tone: "error", value: null });
+		expect(h.native()?.c?.[0]).toMatchObject({ k: "text", p: { spans: [{ t: "×", s: "error" }] } });
 	});
 	test("other producers, malformed unbound observations and eviction cannot replace owned evidence", () => {
 		const h = harness(); h.notify(status({ embedding: embedding({ files_embedded: 3 }) }));
@@ -447,15 +518,15 @@ describe("persistent composer widget", () => {
 		expect(h.native()).toBe(original);
 		expect(h.mounts).toBe(1);
 		h.notify({ version: 2, status: status().status });
-		expect(h.meter).toMatchObject({ tone: "muted", value: null });
+		expect(h.native()?.c?.[0]).toMatchObject({ k: "text", p: { spans: [{ t: "○", s: "muted" }] } });
 	});
 	test("a detached nested checkout stays unknown instead of inheriting parent progress", () => {
 		const child = path.join(root, "nested"), h = harness(path.join(child, "src"));
 		h.notify(status({ embedding: embedding({ state: "completed", files_embedded: 10 }) }));
 		h.notify(status({ root: child }));
-		expect(h.meter).toMatchObject({ tone: "muted", value: null });
+		expect(h.native()?.c?.[0]).toMatchObject({ k: "text", p: { spans: [{ t: "○", s: "muted" }] } });
 		h.notify({ version: 1, root: child, status: null });
-		expect(h.meter).toMatchObject({ tone: "muted", value: null });
+		expect(h.native()?.c?.[0]).toMatchObject({ k: "text", p: { spans: [{ t: "○", s: "muted" }] } });
 		expect(h.mounts).toBe(1);
 	});
 	test("clearing or unknown snapshots erases completion without unmounting the observed slot", async () => {
@@ -469,7 +540,7 @@ describe("persistent composer widget", () => {
 		for (const update of [{ version: 1, root, status: null }, { version: 1, status: null },
 			{ version: 2, status: status().status }, status()]) {
 			h.notify(update);
-			expect(h.meter).toMatchObject({ tone: "muted", value: null });
+			expect(h.native()?.c?.[0]).toMatchObject({ k: "text", p: { spans: [{ t: "○", s: "muted" }] } });
 			expect(h.widget).toBe(widget);
 			await h.command("status");
 			expect(h.view?.render(100).join("\n")).not.toContain("10/10");
@@ -500,7 +571,7 @@ describe("persistent composer widget", () => {
 	});
 	if (process.platform === "win32") test("extended roots and ordinary cwd resolve to the same owner", () => {
 		const h = harness(root); h.notify(status({ root: `\\\\?\\${root}` }));
-		expect(h.meter).toMatchObject({ tone: "muted", value: null });
+		expect(h.native()?.c?.[0]).toMatchObject({ k: "text", p: { spans: [{ t: "○", s: "muted" }] } });
 	});
 });
 

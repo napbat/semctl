@@ -117,9 +117,9 @@ async fn available_pages<T: serde::de::DeserializeOwned>(
     label: &str,
     caveats: &mut Vec<String>,
     loading: &mut bool,
-) -> Result<(Vec<T>, u32), ToolError> {
+) -> Result<(Vec<T>, Option<usize>), ToolError> {
     let mut rows = Vec::new();
-    let mut total = 0;
+    let mut total = None;
     for page in 0.. {
         let path = format!("{endpoint}?page={page}&pageSize={FILES_PAGE_MAX}");
         let result = match client.get_page::<T>(&path).await {
@@ -136,21 +136,24 @@ async fn available_pages<T: serde::de::DeserializeOwned>(
                 format!("{label} returned invalid pagination metadata."),
             ));
         }
-        total = result.total;
+        let reported = result.total as usize;
+        total = Some(reported);
         let got = result.items.len();
         rows.extend(result.items);
-        if rows.len() > total as usize {
+        if rows.len() > reported {
             return Err(ToolError::new(
                 "overview",
                 FailureKind::Unavailable,
                 format!("{label} returned more rows than its reported total."),
             ));
         }
-        if got == 0 || rows.len() >= total as usize || rows.len() >= GRAPH_LIST_CAP {
+        if got == 0 || rows.len() >= reported || rows.len() >= GRAPH_LIST_CAP {
             break;
         }
     }
-    if rows.len() != total as usize {
+    if let Some(total) = total
+        && rows.len() != total
+    {
         caveats.push(format!("{label} incomplete: received {} of {total} reported rows (local fetch limit {GRAPH_LIST_CAP}). Available rows are retained.", rows.len()));
     }
     Ok((rows, total))

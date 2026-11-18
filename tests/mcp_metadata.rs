@@ -86,10 +86,11 @@ async fn mcp_discovers_search_and_reports_invalid_source_ranges_as_tool_errors()
     let listed = receive(&mut stdout).await;
     assert_eq!(listed["id"], 2);
     let tools = listed["result"]["tools"].as_array().expect("tool list");
-    tools
+    let search = tools
         .iter()
         .find(|tool| tool["name"] == "search_codebase")
         .expect("stable search tool name");
+    assert_eq!(search["title"], "Search code");
 
     send(
         &mut stdin,

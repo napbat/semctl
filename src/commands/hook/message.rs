@@ -113,7 +113,7 @@ pub fn tier2(
         ),
         SearchKind::Content => match classify(pattern) {
             QueryKind::Symbol => {
-                let sym = pattern.map(str::trim).unwrap_or_default();
+                let sym = pattern.map_or_default(str::trim);
                 format!(
                     "For unresolved cross-file evidence about `{sym}`, \
                      `{prefix}find_definition` / `{prefix}find_references` / \

@@ -883,7 +883,8 @@ impl ServerHandler for McpServer {
     // backstop for work that no client request bounds, such as a wait for a
     // gate. A client request fails earlier and says why. Edit tools have an
     // unbounded budget and are never cut off. The budget also records the
-    // partial graph answers of the call, and the result gets a note for each.
+    // partial graph answers of the call, which qualify the result for both
+    // the model-facing content and the native inspector.
     async fn call_tool(
         &self,
         request: CallToolRequestParams,

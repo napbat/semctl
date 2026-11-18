@@ -56,7 +56,7 @@ for (let step = 0; step < POSITION_STEPS; step++) geometry.push(`.semctl-graph .
 for (let step = 0; step <= 8; step++) geometry.push(`.semctl-graph .sg-cc${step}{--sg-arc-carry:${step}}.semctl-graph .sg-tc${step}{--sg-total-carry:${step}}`);
 for (let step = 7; step <= 19; step++) geometry.push(`.semctl-graph .sg-target.sg-s${step}{--sg-d:${step}px}`);
 for (let step = 0; step <= 200; step++) geometry.push(`.semctl-graph .sg-tw${step}{width:${step / 2}%}.semctl-graph .sg-th${step}{height:${step / 2}%}`);
-for (const swatch of conceptSwatches) for (const tint of [swatch.light, swatch.dark]) geometry.push(`.semctl-graph .sg-tint-${tint.slice(1)}{--sg-tint:${tint}}`);
+for (const swatch of conceptSwatches) for (const tint of [swatch.light, swatch.dark]) geometry.push(`.semctl-graph .sg-tint-${tint.slice(1)},.semctl-region-swatch.sg-tint-${tint.slice(1)}{--sg-tint:${tint}}`);
 for (const [index, scale] of [1, 1.35, 1.8, 2.4].entries()) geometry.push(`.semctl-graph .sg-route.sg-w${index + 1}{--sg-weight-opacity:${[.55, .85, 1.1, 1.4][index]}}.semctl-graph .sg-w${index + 1} .sg-stroke{transform:scaleY(${scale})}`);
 for (let step = 0; step < 8; step++) geometry.push(`.semctl-graph[data-motion=full] .sg-d${step} .sg-dot{animation-delay:${step * 40}ms}.semctl-graph[data-motion=full] .sg-d${step} .sg-label{animation-delay:${step * 40 + 380}ms}`);
 
@@ -82,6 +82,8 @@ export const GRAPH_STYLES: readonly NativeStylesheet[] = Object.freeze([Object.f
 .semctl-graph .sg-territory.sg-territory-family{background:radial-gradient(closest-side,rgb(from var(--sg-tint) r g b / 16%),rgb(from var(--sg-tint) r g b / 8%) 74%,rgb(from var(--sg-tint) r g b / 3%));border:1px solid rgb(from var(--sg-tint) r g b / 26%)}
 .semctl-graph.sg-compact .sg-territory.sg-territory-family{background:radial-gradient(closest-side,rgb(from var(--sg-tint) r g b / 12%),rgb(from var(--sg-tint) r g b / 6%) 74%,rgb(from var(--sg-tint) r g b / 2%))}
 .semctl-graph .sg-territory-family .sg-territory-label{border:1px solid rgb(from var(--sg-tint) r g b / 30%);background:color-mix(in oklab, var(--sg-tint) 10%, var(--sg-bg))}
+.semctl-graph .sg-territory.sg-territory-module{background:radial-gradient(closest-side,rgb(from var(--sg-tint) r g b / 11%),rgb(from var(--sg-tint) r g b / 5%) 74%,rgb(from var(--sg-tint) r g b / 2%));border:1px dashed rgb(from var(--sg-tint) r g b / 30%)}
+.semctl-graph .sg-territory-module .sg-territory-label{font-family:var(--mono,ui-monospace,monospace);font-weight:500}
 .semctl-graph.sg-neutral .sg-territory{--sg-tint:var(--sg-edge)}
 .semctl-graph.sg-focused .sg-territories{--sg-layer-opacity:.3;opacity:.3}
 .semctl-graph .sg-route{color:var(--sg-edge);opacity:calc(.28 * var(--sg-weight-opacity,1))}
@@ -108,6 +110,8 @@ export const GRAPH_STYLES: readonly NativeStylesheet[] = Object.freeze([Object.f
 .semctl-graph.sg-neutral .sg-target{color:var(--sg-node)}
 .semctl-graph .sg-dot{position:absolute;left:50%;top:50%;width:var(--sg-d);height:var(--sg-d);transform:translate(-50%,-50%) scale(var(--sg-dot-scale,1));border-radius:50%;background:currentColor;box-shadow:0 0 0 1.5px var(--sg-bg);pointer-events:none}
 .semctl-graph .sg-root .sg-dot{outline:1px solid var(--sg-accent);outline-offset:1px}
+.semctl-graph .sg-remainder .sg-dot{background:transparent;border:1.5px dashed var(--sg-node);box-sizing:border-box;box-shadow:none}
+.semctl-graph .sg-remainder .sg-label{color:var(--t3);font-style:italic}
 .semctl-graph .sg-halo{position:absolute;left:50%;top:50%;width:calc(var(--sg-d) + 10px);height:calc(var(--sg-d) + 10px);transform:translate(-50%,-50%);border:1px solid currentColor;border-radius:50%;opacity:0;pointer-events:none}
 .semctl-graph .sg-active .sg-halo{color:var(--sg-positive);opacity:.65}
 .semctl-graph .sg-feedback{position:absolute;left:50%;top:50%;width:calc(var(--sg-d) + 11px);height:calc(var(--sg-d) + 11px);transform:translate(-50%,-50%);border:2px solid currentColor;border-radius:50%;opacity:.75;pointer-events:none}

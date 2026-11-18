@@ -106,14 +106,14 @@ describe("deterministic force layout", () => {
 		while (shuffled.tick()) { /* Use the same finite cooling as settled previews. */ }
 		expect(coordinates(simulation.positions)).toEqual(coordinates(shuffled.positions));
 	});
-	test("shared doc concept families keep families with two or more members, largest first", () => {
+	test("shared families keep families with two or more members, largest first, and default to the doc kind", () => {
 		const family = key => ({ key: `family:${key}`, label: key }), nodes = ["c", "a", "b", "d", "e", "f"].map(id => ({ id, label: id, hit: null }));
 		bindConceptFamily(nodes[0], family("docs/zeta")); bindConceptFamily(nodes[1], family("docs/zeta"));
-		for (const node of nodes.slice(2, 5)) bindConceptFamily(node, family("docs/alpha"));
+		for (const node of nodes.slice(2, 5)) bindConceptFamily(node, { ...family("docs/alpha"), kind: "path" });
 		bindConceptFamily(nodes[5], family("docs/single"));
 		expect(sharedConceptFamilies(nodes)).toEqual([
-			{ key: "family:docs/alpha", label: "docs/alpha", members: ["b", "d", "e"] },
-			{ key: "family:docs/zeta", label: "docs/zeta", members: ["a", "c"] }]);
+			{ key: "family:docs/alpha", label: "docs/alpha", kind: "path", members: ["b", "d", "e"] },
+			{ key: "family:docs/zeta", label: "docs/zeta", kind: "doc", members: ["a", "c"] }]);
 		expect(sharedConceptFamilies([...nodes].reverse())).toEqual(sharedConceptFamilies(nodes));
 		expect(sharedConceptFamilies(nodes.map(node => ({ ...node })))).toEqual([]);
 	});

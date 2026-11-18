@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { resetConcepts, setConceptSnapshot } from "./concept-colors";
-import { projectSummary, type GraphGroup } from "./graph-projection";
+import { projectSummary, REMAINDER_GROUP, type GraphGroup } from "./graph-projection";
+import { graphGroupColor, lookupGraphColor } from "./graph-colors";
+import { isRemainder } from "./graph-data/layout.js";
 import { conceptFamily, docConcepts, type DocSource } from "./graph-data/doc-concepts.js";
 import { centroid, graphEmbedding } from "./graph-data/embedding.js";
 import { readDisplay, type Display } from "./inspector";
@@ -45,7 +47,9 @@ describe("doc concept projection", () => {
 			const node = summary.graph.nodes.find(entry => entry.id === group!.id)!;
 			expect(node.label).toBe(concept.label);
 			expect(node.detail).toContain(`From ${concept.source}`);
-			expect(conceptFamily(node)).toEqual(concept.family);
+			// Two drawn concepts of one doc folder form one documentation region.
+			expect(conceptFamily(node)).toEqual({ ...concept.family, kind: "doc" });
+			expect(group!.region).toMatchObject({ key: concept.family!.key, label: concept.family!.label, kind: "doc" });
 			// Equal weights: the doc terms and the member centroid, then L2-normalized.
 			const vector = projected.get(node.id)!, expected = centroid([concept.terms, centroid(group!.members.map(member => members.get(member.id)))]);
 			expect([...vector.keys()]).toEqual([...expected.keys()]);
@@ -108,5 +112,66 @@ describe("doc concept projection", () => {
 		const again = projectSummary({ ...value, nodes: [...value.nodes].reverse(), edges: [...value.edges].reverse() }, "projection-labels", "calm");
 		expect(again.graph).toEqual(summary.graph);
 		expect(shape(again.allGroups)).toEqual(shape(summary.allGroups));
+	});
+});
+
+describe("structure organization", () => {
+	afterEach(resetConcepts);
+	const codebase = "projection-structure";
+	/** Two hv modules and two tools modules, plus one module that stands alone. */
+	function modules(): Overview {
+		const value = overview(codebase);
+		const file = (id: string, project: string, path: string, symbol?: string): Overview["nodes"][number] =>
+			({ id, label: path.slice(path.lastIndexOf("/") + 1), detail: null, hit: null, category: "file", path: `${project}/${path}`, project });
+		value.nodes = [
+			file("exit", "hv", "src/vtx/exit_handler.cpp"), file("vmcs", "hv", "src/vtx/vmcs_fields.cpp"), file("nested", "hv", "src/vtx/nested/vmcs_shadow.cpp"),
+			file("vmcb", "hv", "src/svm/vmcb_layout.cpp"), file("npt", "hv", "src/svm/npt_walker.cpp"),
+			file("lab", "tools", "lib/lab_runner.py"), file("guest", "tools", "lib/guest_probe.py"),
+			file("crate", "tools", "rust/crate_loader.rs"), file("adapter", "tools", "rust/adapter_data.rs"),
+			file("cmake", "cmake", "test/contract_check.cmake"),
+		];
+		value.roots = ["exit"];
+		value.edges = [{ from: "exit", to: "vmcb", label: "references", kind: "reference", symbol: "VmExit", moniker: "hv::VmExit" }];
+		return value;
+	}
+	test("groups that share a home folder form a region, and every group names distinctive key terms", () => {
+		const summary = projectSummary(modules(), codebase), group = (id: string) => summary.allGroups.find(entry => entry.members.some(node => node.id === id))!;
+		expect(summary.regions.map(region => [region.label, region.kind, region.groups.map(id => summary.allGroups.find(entry => entry.id === id)!.label).sort()])).toEqual([
+			["hv", "path", ["src/svm", "src/vtx"]], ["tools", "path", ["lib", "rust"]],
+		]);
+		expect(group("cmake").region).toBeUndefined();
+		expect(group("exit").home).toBe("hv/src/vtx");
+		expect(group("exit").terms).toContain("vmcs");
+		// The reference also diffuses "vmcb" into the vtx group, so the svm group's rarest term is "npt".
+		expect(group("vmcb").terms[0]).toBe("npt");
+		// Label words never repeat as key terms.
+		for (const entry of summary.allGroups) for (const term of entry.terms) expect(entry.label.toLowerCase()).not.toContain(term);
+		const node = summary.graph.nodes.find(entry => entry.id === group("lab").id)!;
+		expect(conceptFamily(node)).toEqual({ key: "region:path:tools", label: "tools", kind: "path" });
+	});
+	test("a source-structure group with mixed member folders shows its home folder color", () => {
+		const value = modules(), summary = projectSummary(value, codebase);
+		const vtx = summary.allGroups.find(entry => entry.members.some(node => node.id === "nested"))!;
+		const node = summary.graph.nodes.find(entry => entry.id === vtx.id)!, home = value.nodes.find(entry => entry.id === "exit")!;
+		for (const mode of ["concepts", "structure"] as const) {
+			expect(lookupGraphColor(codebase, node, mode)?.key).toBe(lookupGraphColor(codebase, home, mode)!.key);
+			expect(graphGroupColor(codebase, vtx.members, mode, vtx.folder)?.key).toBe(lookupGraphColor(codebase, home, mode)!.key);
+		}
+		expect(lookupGraphColor(codebase, node, "neutral")).toBeUndefined();
+	});
+	test("the folded remainder draws no routes, is no root, and keeps its links in the omitted count", () => {
+		const value = modules();
+		for (let index = 0; index < 20; index++) {
+			value.nodes.push({ id: `extra-${index}`, label: "x.ts", detail: null, hit: null, category: "file", path: `extra-${index}/x.ts` });
+			value.edges.push({ from: "exit", to: `extra-${index}`, label: "imports", kind: "import" });
+		}
+		value.roots.push("extra-19");
+		const summary = projectSummary(value, codebase, "calm"), remainder = summary.graph.nodes.find(node => node.id === REMAINDER_GROUP)!;
+		expect(isRemainder(remainder)).toBe(true);
+		expect(summary.graph.edges.some(edge => edge.from === REMAINDER_GROUP || edge.to === REMAINDER_GROUP)).toBe(false);
+		expect(summary.graph.roots).not.toContain(REMAINDER_GROUP);
+		expect(summary.regions.flatMap(region => region.groups)).not.toContain(REMAINDER_GROUP);
+		expect(summary.groups.reduce((sum, group) => sum + group.internal, 0) + summary.drawnLinks + summary.omitted).toBe(value.edges.length);
+		expect(summary.omitted).toBeGreaterThan(0);
 	});
 });

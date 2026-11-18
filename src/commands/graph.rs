@@ -13,7 +13,7 @@ use crate::query;
 
 #[derive(Debug, Args)]
 pub struct GraphArgs {
-    /// Emit the original text and bounded native presentation as JSON.
+    /// Emit the original text, bounded native presentation, and any warnings as JSON.
     #[arg(long)]
     json: bool,
     #[command(subcommand)]
@@ -24,6 +24,13 @@ pub struct GraphArgs {
 pub enum GraphCommand {
     /// Complete indexed file/directory overview with detected projects and resolved imports.
     Overview,
+    /// Semantic affinity between files, from the overlap of the server's hybrid
+    /// search results for one descriptive query per file.
+    Affinity {
+        /// 2 to 64 codebase-relative paths, after `--`.
+        #[arg(num_args = 2..=64, last = true, required = true)]
+        paths: Vec<String>,
+    },
     /// File→file import edges (the resolution layer). Rust resolves these; C#
     /// has no file-level imports; C++ include edges are not resolved yet.
     Imports,
@@ -177,7 +184,10 @@ pub enum GraphCommand {
 }
 
 pub async fn run(args: GraphArgs, cli: &Cli) -> Result<()> {
-    let client = client::for_cwd(cli).await?;
+    let partial = PartialAnswers::default();
+    let client = client::for_cwd(cli)
+        .await?
+        .with_partial_answers(partial.clone());
     let presentation = if args.json {
         query::QueryPresentation::Inspector
     } else {
@@ -187,15 +197,10 @@ pub async fn run(args: GraphArgs, cli: &Cli) -> Result<()> {
         .await
         .map_err(query::ToolError::into_cli_error)?;
     if args.json {
-        serde_json::to_writer(std::io::stdout().lock(), &output)?;
-        println!();
+        answer::print_json(&output, &partial)
     } else {
-        print!("{}", output.text);
-        if !output.text.ends_with('\n') {
-            println!();
-        }
+        answer::print(&output.text, &partial)
     }
-    Ok(())
 }
 
 async fn dispatch(
@@ -205,6 +210,7 @@ async fn dispatch(
 ) -> Result<query::QueryOutput, query::ToolError> {
     match command {
         GraphCommand::Overview => query::overview(client, presentation).await,
+        GraphCommand::Affinity { paths } => query::affinity(client, &paths, presentation).await,
         GraphCommand::Projects => query::list_projects(client, presentation).await,
         GraphCommand::Imports => query::imports(client, presentation).await,
         GraphCommand::SymbolEdges => query::symbol_edges(client, presentation).await,

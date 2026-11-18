@@ -2,14 +2,22 @@ import type { GraphData } from "../graph";
 
 export interface GraphCategory { key: string; label: string; type: string }
 export function category(node: GraphData["nodes"][number]): GraphCategory;
-export interface SharedConceptFamily { key: string; label: string; members: string[] }
-/** Bound doc concept families with at least two members; largest first, then key. Members are sorted unique IDs. */
+/** `kind` is "doc" for a doc concept family; map regions bind "path" or "terms". */
+export interface SharedConceptFamily { key: string; label: string; kind: "doc" | "path" | "terms"; members: string[] }
+/** Bound families with at least two members; largest first, then key. Members are sorted unique IDs. */
 export function sharedConceptFamilies(nodes: readonly GraphData["nodes"][number][]): SharedConceptFamily[];
 export function exactActivity(node: GraphData["nodes"][number], targets: ReadonlySet<string>, codebaseId: string | null): boolean;
 
 /** Aggregate size for drawing only, never wire data. */
 export function bindDrawingWeight(item: object, weight: number): void;
 export function drawingWeight(item: object): number | undefined;
+/** Marks a folded remainder aggregate. Layouts place it apart and do not let it steer other nodes. */
+export function bindRemainder(item: object): void;
+export function isRemainder(item: object): boolean;
+/** Semantic affinity of a node pair in [0, 1] for one drawing. Placement only: it never adds a relation. */
+export type DrawingAffinity = (a: string, b: string) => number;
+export function bindAffinity(data: object, weight: DrawingAffinity | undefined): void;
+export function affinityOf(data: object): DrawingAffinity | undefined;
 
 export type GraphRelationKind = "containment" | "association" | "import" | "reference" | "generic";
 export interface GraphRelationStyle { readonly label: string; readonly dash: readonly number[]; }

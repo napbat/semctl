@@ -1,9 +1,10 @@
 import type { Component, DescribeContext, NativeNode, NativeUiEvent } from "@oh-my-pi/pi-tui";
 import { conceptRevision, subscribeConcepts } from "./concept-colors";
-import { projectSummary, type GraphGroup, type ProjectSummary } from "./graph-projection";
+import { projectSummary, REMAINDER_GROUP, type GraphGroup, type GraphRegion, type ProjectSummary } from "./graph-projection";
 import { graphPreview, type GraphFeedback, type GraphPreviewSize } from "./graph-preview";
-import { nativeGraphLayout } from "./graph-native-layout";
+import { nativeGraphLayout, type NativeGraphTerritory } from "./graph-native-layout";
 import { exactActivity } from "./graph-data/layout.js";
+import { conceptPalette } from "./graph-data/palette.js";
 import type { GraphActivity } from "./graph-activity";
 import type { Display } from "./inspector";
 import type { GraphRequestState } from "./overview";
@@ -46,7 +47,7 @@ export function livePopupOverlay(size: PopupSize, hidden: boolean) {
 
 interface ButtonOptions { disabled?: boolean; busy?: boolean; role?: string }
 /** A busy button stays disabled and shows a native spinner. Callers set busy only when motion is allowed. */
-function actionButton(cx: DescribeContext, id: string, icon: "expand" | "repeat" | "x" | "settings" | "grip", label: string, title: string,
+function actionButton(cx: DescribeContext, id: string, icon: "expand" | "repeat" | "x" | "settings" | "grip" | undefined, label: string, title: string,
 	{ disabled = false, busy = false, role }: ButtonOptions = {}): NativeNode {
 	const actions = disabled ? undefined : { click: id };
 	const spinning = busy && cx.supports("spinner");
@@ -54,11 +55,11 @@ function actionButton(cx: DescribeContext, id: string, icon: "expand" | "repeat"
 		k: "el", key: id, p: {
 			tag: "button", class: "semctl-icon-action", role, actions, title, aria: title,
 			attrs: { "aria-disabled": disabled, "aria-busy": spinning },
-		}, c: [spinning ? { k: "spinner", p: { style: "orbit", aria: "Refreshing" } } : cx.supports("icon") ? { k: "icon", p: { name: icon } } : text(label)],
+		}, c: [spinning ? { k: "spinner", p: { style: "orbit", aria: "Refreshing" } } : icon && cx.supports("icon") ? { k: "icon", p: { name: icon } } : text(label)],
 	});
 	const props = { role, actions, title, aria: title, tone: "muted" as const, shrink: 0 };
 	return spinning ? { k: "spinner", key: id, p: { ...props, style: "orbit" } }
-		: cx.supports("icon") ? { k: "icon", key: id, p: { ...props, name: icon } }
+		: icon && cx.supports("icon") ? { k: "icon", key: id, p: { ...props, name: icon } }
 			: { ...text(label, props), key: id };
 }
 
@@ -90,35 +91,46 @@ function indexingMeter(cx: DescribeContext, key: string, counts: GraphIndexingCo
 	return labelled ? { k: "row", key: `${key}-row`, p: { role: "semctl.live.indexing-row", gap: "sm", align: "center" }, c: [meter,
 		text(`${Math.floor(counts.ready * 100 / reported)}% ready`, { role: "semctl.live.indexing-label", tone: "muted", shrink: 0, wrap: "none", title })] } : meter;
 }
-/** Tinted areas in the drawing: doc concept families, or shared identifier terms when no family has enough drawn members. */
-type Tint = "family" | "lexical";
+/** Tinted areas in the drawing: doc concept families, folder regions, or shared identifier terms. */
+type Tint = NativeGraphTerritory["kind"];
 const LEGEND = {
 	size: ["files", "Dot size = member nodes, mostly files"],
 	weight: ["links", "Line weight = links between groups"],
 } as const;
-const TINT_LEGEND = {
-	family: ["concepts", "Tint = doc concept family"],
-	lexical: ["shared terms", "Tint = shared identifier terms"],
-} as const;
-/** Styled hosts draw small glyphs that match the graph marks; other hosts read one plain line. The tint item shows only when the drawing has tinted areas. */
-function legend(cx: DescribeContext, tint: Tint | undefined): NativeNode {
+const TINT_LEGEND: { readonly [K in Tint]: readonly [label: string, title: string, spoken: string] } = {
+	family: ["concepts", "Tint = doc concept family", "doc concept families"],
+	module: ["folders", "Tint = groups that share a home folder", "groups that share a home folder"],
+	lexical: ["shared terms", "Tint = shared identifier terms", "shared identifier terms"],
+};
+/** The tint item shows only when the drawing has tinted areas. */
+function legend(tints: readonly Tint[]): NativeNode {
+	const tint = tints.length === 1 ? TINT_LEGEND[tints[0]][0] : tints.length ? "regions" : undefined;
+	const tintTitle = tints.map(kind => TINT_LEGEND[kind][1]).join("\n");
 	const marks: (readonly [key: string, label: string, title: string])[] = [["size", ...LEGEND.size], ["weight", ...LEGEND.weight]];
-	if (tint) marks.push(["tint", ...TINT_LEGEND[tint]]);
-	const props = { role: "semctl.live.legend", title: compactTooltip("Dot size = member nodes · line weight = links between groups", tint && TINT_LEGEND[tint][1]) };
-	if (!supportsElements(cx) || !cx.feature("styles")) return text(`Dot size = files · line weight = links${tint ? ` · tint = ${TINT_LEGEND[tint][0]}` : ""}`, {
-		...props, grow: 1, min: { w: 0 }, tone: "muted", wrap: "none", truncate: "end" });
+	if (tint) marks.push(["tint", tint, tintTitle]);
+	const props = { role: "semctl.live.legend", title: compactTooltip("Dot size = member nodes · line weight = links between groups", tintTitle) };
 	return nativeElement({ k: "el", key: "legend", p: { ...props, tag: "div", class: "semctl-live-legend",
-		aria: `Legend: dot size shows files, line weight shows links${tint ? `, tint shows ${tint === "family" ? "doc concept families" : "shared identifier terms"}` : ""}` },
+		aria: `Legend: dot size shows files, line weight shows links${tints.length ? `, tint shows ${tints.map(kind => TINT_LEGEND[kind][2]).join(" or ")}` : ""}` },
 	c: marks.map(([key, label, title]) => nativeElement({ k: "el", key, p: { tag: "span", class: "semctl-legend-item", title }, c: [
 		nativeElement({ k: "el", key: "glyph", p: { tag: "span", class: `semctl-legend-${key}`, attrs: { "aria-hidden": true } } }),
 		nativeElement({ k: "el", key: "label", p: { tag: "span", class: "semctl-legend-label", text: label } }),
 	] })) });
 }
-/** Identity, catalog state and the naming doc. The row, chip or drawing shows the rest. */
+const termText = (group: GraphGroup) => group.terms.join(" · ");
+/** Identity, key terms, catalog state and the naming doc. The row, chip or drawing shows the rest. */
 function groupTooltip(group: GraphGroup): string {
 	const files = group.members.filter(node => node.category === "file").length;
 	return compactTooltip(`${group.label} · ${files ? plural(files, "file") : plural(group.members.length, "node")}`,
-		indexingSummary(group.indexing), group.source && `From ${group.source}`);
+		[group.terms.length ? `Key terms: ${termText(group)}` : undefined, group.source && `From ${group.source}`, group.region && `Region: ${group.region.label}`].filter(Boolean).join(" · "),
+		indexingSummary(group.indexing));
+}
+/** Region label and size; the kind explains why the groups share the region. */
+function regionTooltip(region: GraphRegion): string {
+	return compactTooltip(`${region.label} · ${plural(region.groups.length, "group")}`,
+		region.kind === "doc" ? "Documentation family: the naming docs share a folder"
+			: region.kind === "path" ? `Most member files are under ${region.label}/`
+				: "Recorded links and shared identifier terms",
+		"A map region, not a dependency boundary");
 }
 function sourceScope(display: Overview): string {
 	return display.loading ? "Relationship layers are loading; observed links only."
@@ -161,6 +173,8 @@ function sameObservations(a: GraphActivity, b: GraphActivity): boolean {
 	});
 }
 
+const lastNeighborPage = (count: number, chips: number) => Math.max(0, Math.ceil(count / chips) - 1);
+
 /** Passive native UI. The renderer owns motion; this component never animates or takes keyboard focus. */
 export class LiveGraphPopup implements Component {
 	private display?: Overview;
@@ -168,29 +182,36 @@ export class LiveGraphPopup implements Component {
 	private links = new Map<string, GroupLinks>();
 	private revision = -1;
 	private detail: GraphAppearance["detail"] | undefined;
-	private groupsOpen = false;
+	private groupsOpen: boolean | undefined;
 	private diagnosticsOpen = false;
 	private selected: string | undefined;
+	private neighborPage = 0;
 	private activityDirty = true;
 	private readonly active = new Set<string>();
 	private readonly feedback = new Map<string, GraphFeedback>();
 	private observationKey = "";
 	private diagramKey: string | undefined;
 	private diagram: NativeNode | undefined;
-	private tint: Tint | undefined;
+	private tints: Tint[] = [];
 	private readonly unsubscribe: () => void;
+	/** Set by a refresh click. Background reads leave the refresh button enabled and static. */
+	private userRefresh = false;
 	private readonly diagramAction = (id: string): string | undefined =>
 		this.summary?.groups.some(group => group.id === id) ? this.groupAction(id) : undefined;
 	private groupAction(id: string): string { return `group:${JSON.stringify([this.display?.identity.codebaseId, id])}`; }
+	private selectGroup(id: string | undefined): void {
+		this.selected = id;
+		this.neighborPage = 0;
+	}
 	private synchronizeSummary(): void {
 		const display = this.state.request.display?.kind === "graph" ? this.state.request.display : undefined;
 		const revision = conceptRevision(), detail = (this.state.appearance ?? DEFAULT_GRAPH_APPEARANCE).detail;
 		if (display === this.display && this.revision === revision && this.detail === detail) return;
-		if (display?.identity.codebaseId !== this.display?.identity.codebaseId) this.selected = undefined;
+		if (display?.identity.codebaseId !== this.display?.identity.codebaseId) this.selectGroup(undefined);
 		this.display = display; this.revision = revision; this.detail = detail;
 		this.summary = display ? projectSummary(display, display.identity.codebaseId, detail) : undefined;
 		this.links = display && this.summary ? groupLinks(display, this.summary) : new Map();
-		if (!this.summary?.groups.some(group => group.id === this.selected)) this.selected = undefined;
+		if (this.selected !== undefined && !this.summary?.groups.some(group => group.id === this.selected)) this.selectGroup(undefined);
 		this.activityDirty = true;
 		this.diagramKey = undefined;
 	}
@@ -208,7 +229,7 @@ export class LiveGraphPopup implements Component {
 		else if (event.type === "toggle" && event.key.endsWith("diagnostics")) { this.diagnosticsOpen = !event.collapsed; this.requestRender(); }
 		else if (event.type === "action") {
 			if (event.act === "close") this.actions.close();
-			else if (event.act === "refresh") this.actions.refresh();
+			else if (event.act === "refresh") { this.userRefresh = true; this.actions.refresh(); }
 			else if (event.act === "expand") this.actions.expand();
 			else if (event.act === "appearance") this.actions.appearance();
 			else if (event.act === "resize" || event.act === "resize:toggle") {
@@ -223,8 +244,20 @@ export class LiveGraphPopup implements Component {
 				try { identity = JSON.parse(event.act.slice(6)); } catch { return; }
 				if (!Array.isArray(identity) || identity.length !== 2 || identity[0] !== this.display?.identity.codebaseId || typeof identity[1] !== "string") return;
 				const id: string = identity[1], group = this.summary?.groups.find(group => group.id === id);
-				if (group) { this.selected = this.selected === group.id ? undefined : group.id; this.requestRender(); }
-			} else if (event.act === "clear-group") { this.selected = undefined; this.requestRender(); }
+				if (group) { this.selectGroup(this.selected === group.id ? undefined : group.id); this.requestRender(); }
+			} else if (event.act === "clear-group") {
+				this.selectGroup(undefined);
+				this.requestRender();
+			} else if (event.act === "previous-neighbors" || event.act === "next-neighbors") {
+				this.synchronizeSummary();
+				const links = this.selected === undefined ? undefined : this.links.get(this.selected);
+				if (!links) return;
+				const chips = popupSizes[(this.state.appearance ?? DEFAULT_GRAPH_APPEARANCE).popup].chips;
+				const last = lastNeighborPage(links.neighbors.length, chips);
+				const current = Math.min(last, this.neighborPage);
+				const page = Math.max(0, Math.min(last, current + (event.act === "next-neighbors" ? 1 : -1)));
+				if (page !== this.neighborPage) { this.neighborPage = page; this.requestRender(); }
+			}
 		}
 	}
 	private groupCue(cx: DescribeContext, group: GraphGroup): NativeNode | undefined {
@@ -246,18 +279,22 @@ export class LiveGraphPopup implements Component {
 			: { k: "row", key, p: props, c: children };
 	}
 	/** `chips` bounds the neighbor and busiest chips; wider popups show more. */
-	private selectionInspector(cx: DescribeContext, display: Overview, tint: Tint | undefined, chips: number): NativeNode {
+	private selectionInspector(cx: DescribeContext, display: Overview, tints: readonly Tint[], chips: number): NativeNode {
 		const selected = this.summary?.groups.find(group => group.id === this.selected);
 		const links = selected && this.links.get(selected.id), cue = selected && this.groupCue(cx, selected);
 		const evidence = links && compactTooltip("Source links counted once, including parallel links and routes not drawn");
 		const evidenceAria = links && spoken(`${links.incoming} incoming links · ${links.outgoing} outgoing links · ${links.internal} internal links`,
 			sourceScope(display), ...display.caveats.slice(0, 2));
-		const neighbors = links?.neighbors.slice(0, chips).map(neighbor => this.groupChip(cx, "neighbor", neighbor.group,
+		const count = links?.neighbors.length ?? 0, last = lastNeighborPage(count, chips);
+		this.neighborPage = Math.min(this.neighborPage, last);
+		const offset = this.neighborPage * chips;
+		const neighbors = links?.neighbors.slice(offset, offset + chips).map(neighbor => this.groupChip(cx, "neighbor", neighbor.group,
 			compactTooltip(neighbor.group.label, `${neighbor.incoming} into selected · ${neighbor.outgoing} from selected`),
 			`Inspect ${clean(neighbor.group.label).slice(0, 160)} · ${neighbor.incoming} incoming links · ${neighbor.outgoing} outgoing links relative to selected group`,
 			neighbor.incoming + neighbor.outgoing)) ?? [];
+		const range = `Neighbors ${offset + 1}–${offset + neighbors.length} of ${count}`;
 		// Without a selection, the groups with the most cross-group links fill the fixed third row.
-		const busiest = selected ? [] : (this.summary?.groups ?? []).filter(group => group.id !== "other-groups").flatMap(group => {
+		const busiest = selected ? [] : (this.summary?.groups ?? []).filter(group => group.id !== REMAINDER_GROUP).flatMap(group => {
 			const { incoming, outgoing } = this.links.get(group.id)!;
 			return incoming + outgoing ? [{ group, incoming, outgoing }] : [];
 		}).sort((a, b) => b.incoming + b.outgoing - a.incoming - a.outgoing || (a.group.id < b.group.id ? -1 : a.group.id > b.group.id ? 1 : 0)).slice(0, chips)
@@ -269,15 +306,20 @@ export class LiveGraphPopup implements Component {
 				...(cue ? [cue] : []),
 				text(selected?.label ?? "Select a group to inspect links", {
 					grow: 1, min: { w: 0 }, tone: selected ? "accent" : "muted", wrap: "none", truncate: "end",
-					title: selected ? groupTooltip(selected) : compactTooltip("Select a dot, chip or group row; select it again to clear"),
+					title: selected ? groupTooltip(selected) : compactTooltip(this.diagram
+						? "Select a dot, chip or group row; select it again to clear"
+						: "Select a group row or chip; select it again to clear"),
 				}),
 				...(selected ? [text(`${selected.members.length} nodes`, { tone: "muted", shrink: 0, aria: `${selected.members.length} member nodes`, title: groupTooltip(selected) }),
 					actionButton(cx, "clear-group", "x", "Clear", "Clear highlighted graph group")] : []),
 			] },
 			{ k: "row", key: "links", p: { gap: "xs", align: "center", min: { h: "1lines" } }, c: [
 				links ? text(`${links.incoming} in · ${links.outgoing} out · ${links.internal} internal`, {
-					role: "semctl.live.links", grow: 1, min: { w: 0 }, tone: "muted", wrap: "none", truncate: "end", title: evidence, aria: evidenceAria,
-				}) : legend(cx, tint),
+					role: "semctl.live.links", shrink: 0, min: { w: 0 }, tone: "muted", wrap: "none", truncate: "end", title: evidence, aria: evidenceAria,
+				}) : this.diagram ? legend(tints) : text("Use the group list to explore connections", { tone: "muted", wrap: "none", truncate: "end" }),
+				// Key terms fill the rest of the row and give way first.
+				...(selected?.terms.length ? [text(termText(selected), { role: "semctl.live.terms", grow: 1, basis: 0, min: { w: 0 }, tone: "muted", wrap: "none",
+					truncate: "end", title: compactTooltip(`Key terms: ${termText(selected)}`, "Distinctive identifier terms of the member files, not a summary") })] : []),
 				...(selected && (display.loading || display.truncated) ? [text(display.loading ? "loading" : "partial", {
 					tone: display.loading ? "muted" : "warning", shrink: 0, title: compactTooltip(sourceScope(display), display.caveats[0]),
 					aria: spoken(sourceScope(display), ...display.caveats.slice(0, 2)),
@@ -289,9 +331,10 @@ export class LiveGraphPopup implements Component {
 					: display.truncated ? "No neighboring groups in this partial map" : "No neighboring groups in this map", {
 						tone: "muted", grow: 1, min: { w: 0 }, wrap: "none", truncate: "end", title: evidence,
 					})] : []),
-				...(links && links.neighbors.length > neighbors.length ? [text(`+${links.neighbors.length - neighbors.length}`, {
-					tone: "muted", shrink: 0, title: compactTooltip(plural(links.neighbors.length, "neighboring group"), "Open Overview for all relationships"),
-				})] : []),
+				...(last > 0 ? [
+					actionButton(cx, "previous-neighbors", undefined, "‹", compactTooltip("Previous neighbors", range), { disabled: this.neighborPage === 0 }),
+					actionButton(cx, "next-neighbors", undefined, "›", compactTooltip("Next neighbors", range), { disabled: this.neighborPage === last }),
+				] : []),
 			] : busiest.length ? [{ ...text("Busiest:", { tone: "muted", shrink: 0,
 				title: compactTooltip("Groups with the most cross-group links, counted once") }), key: "busiest-label" }, ...busiest]
 				: [text(display.loading ? "No cross-group links observed yet"
@@ -300,7 +343,7 @@ export class LiveGraphPopup implements Component {
 					})] },
 		] };
 	}
-	private groupRow(cx: DescribeContext, group: GraphGroup, motion: boolean): NativeNode {
+	private groupRow(cx: DescribeContext, group: GraphGroup, motion: boolean, terms: boolean): NativeNode {
 		const observation = this.active.has(group.id) ? "active" : this.feedback.get(group.id)?.outcome;
 		const indexing = indexingSummary(group.indexing), cue = this.groupCue(cx, group);
 		const meter = indexingMeter(cx, "indexing", group.indexing, { role: "semctl.live.group.indexing", min: { w: "6ch" }, max: { w: "6ch" }, shrink: 0 });
@@ -310,7 +353,10 @@ export class LiveGraphPopup implements Component {
 			title: groupTooltip(group) };
 		const children = [...(cue ? [cue] : []), text(group.label, {
 			grow: 1, min: { w: 0 }, tone: this.selected === group.id ? "accent" : "muted", truncate: "end", wrap: "none",
-		}), ...(meter ? [meter] : status ? [groupBadge(cx, "status", `${group.indexing[status]} ${status}`, status === "failed" ? "error" : "muted",
+		}),
+		// Terms take the remaining width after the label and truncate before it.
+		...(terms && group.terms.length ? [text(termText(group), { role: "semctl.live.group.terms", shrink: 2, min: { w: 0 }, max: { w: "24ch" }, tone: "muted", truncate: "end", wrap: "none" })] : []),
+		...(meter ? [meter] : status ? [groupBadge(cx, "status", `${group.indexing[status]} ${status}`, status === "failed" ? "error" : "muted",
 			compactTooltip(indexing, CATALOG_STATES))] : []),
 		...(observation ? [groupBadge(cx, "observation", observation, observation === "failed" ? "error" : "success",
 			compactTooltip(observation === "active" ? "An active request names a member of this group." : `A recent request naming a group member ${observation}.`))] : []),
@@ -320,10 +366,39 @@ export class LiveGraphPopup implements Component {
 				attrs: { "aria-pressed": this.selected === group.id, "data-motion": motion ? "full" : "reduced" } }, c: children })
 			: { k: "row", key: `group-${group.id}`, p: props, c: children };
 	}
+	/** A non-interactive heading. Its swatch uses the tint of the region's drawn territory. */
+	private regionHeader(cx: DescribeContext, key: string, label: string, count: number, title: string, tint?: string): NativeNode {
+		const props = { role: "semctl.live.region", title, aria: `${clean(label).slice(0, 160)}, ${plural(count, "group")}` };
+		if (!supportsElements(cx) || !cx.feature("styles")) return { k: "row", key, p: { ...props, gap: "xs", align: "center" }, c: [
+			text(label, { tone: "muted", grow: 1, min: { w: 0 }, wrap: "none", truncate: "end" }), text(String(count), { tone: "muted", shrink: 0 })] };
+		return nativeElement({ k: "el", key, p: { ...props, tag: "div", class: "semctl-live-region" }, c: [
+			...(tint ? [nativeElement({ k: "el", key: "swatch", p: { tag: "span", class: `semctl-region-swatch sg-tint-${tint}`, attrs: { "aria-hidden": true } } })] : []),
+			nativeElement({ k: "el", key: "label", p: { tag: "span", class: "semctl-live-region-label", text: clean(label) } }),
+			nativeElement({ k: "el", key: "count", p: { tag: "span", class: "semctl-live-region-count", text: String(count) } }),
+		] });
+	}
+	/** Regions first, in map order, each with its groups by size. Groups outside every region follow; the folded remainder stays last. */
+	private groupList(cx: DescribeContext, motion: boolean, terms: boolean): NativeNode[] {
+		const summary = this.summary!, byId = new Map(summary.groups.map(group => [group.id, group])), rows: NativeNode[] = [], listed = new Set<string>();
+		for (const region of summary.regions) {
+			const tint = conceptPalette(region.key)[cx.dark ? "dark" : "light"].slice(1);
+			rows.push(this.regionHeader(cx, `region-${region.key}`, region.label, region.groups.length, regionTooltip(region), tint));
+			for (const group of region.groups.map(id => byId.get(id)!).sort((a, b) => b.members.length - a.members.length || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))) {
+				rows.push(this.groupRow(cx, group, motion, terms)); listed.add(group.id);
+			}
+		}
+		const rest = summary.groups.filter(group => !listed.has(group.id));
+		if (listed.size && rest.length) rows.push(this.regionHeader(cx, "region-outside", "Outside regions", rest.length,
+			compactTooltip(`${plural(rest.length, "group")} outside every region`, "No shared doc family, home folder, or linked terms with another drawn group")));
+		rows.push(...rest.map(group => this.groupRow(cx, group, motion, terms)));
+		return rows;
+	}
 	describe(cx: DescribeContext): NativeNode {
 		const { request, activity } = this.state;
 		const appearance = this.state.appearance ?? DEFAULT_GRAPH_APPEARANCE, motion = appearance.motion !== "off" && !cx.reduceMotion;
 		const size = popupSizes[appearance.popup];
+		if (!request.loading) this.userRefresh = false;
+		const refreshing = this.userRefresh;
 		this.synchronizeSummary();
 		const display = this.display;
 		if (this.activityDirty) {
@@ -365,14 +440,20 @@ export class LiveGraphPopup implements Component {
 					actionButton(cx, "expand", "expand", "Overview", "Open full project overview"),
 					actionButton(cx, "appearance", "settings", "Appearance",
 						this.state.appearanceError ? compactTooltip("Graph appearance · preferences not saved", this.state.appearanceError) : "Graph appearance"),
-					actionButton(cx, "refresh", "repeat", "Refresh", request.loading ? "Refreshing indexed project map" : "Refresh indexed project map",
-						{ disabled: request.loading, busy: request.loading && motion }),
+					actionButton(cx, "refresh", "repeat", "Refresh", refreshing ? "Refreshing indexed project map" : "Refresh indexed project map",
+						{ disabled: refreshing, busy: refreshing && motion }),
 					actionButton(cx, "close", "x", "Close", "Close live overview"),
 				] },
 			] },
 			...subline,
 		] };
 		const children: NativeNode[] = [];
+		const warnings = request.warnings ?? [];
+		const sections = cx.supports("section");
+		if (warnings.length && sections) children.push({ ...text(`Warning: ${warnings[0]}`, {
+			role: "semctl.live.query-warning", tone: "warning", wrap: "none", truncate: "end",
+			title: compactTooltip(...warnings.slice(0, 2), "Open Diagnostics for all warnings"),
+		}), key: "query-warning" });
 		if (display && this.summary) {
 			const counts = indexingCounts(display.nodes), indexing = indexingSummary(counts);
 			const meter = indexingMeter(cx, "indexing", counts, { role: "semctl.live.indexing", grow: 1, min: { w: 0 } }, true);
@@ -390,16 +471,19 @@ export class LiveGraphPopup implements Component {
 				});
 				// Previews exist only on styled element hosts, so the well needs no fallback.
 				this.diagram = preview && nativeElement({ k: "el", key: "graph-well", p: { tag: "div", class: "semctl-graph-well" }, c: [preview] });
-				// The legend names a tint only when the drawing has tinted areas. The layout is cached, so this reads the drawn geometry.
+				// The legend names the tint kinds that the drawing shows. The layout is cached, so this reads the drawn geometry.
 				const territories = preview ? nativeGraphLayout(this.summary.graph, size.preview, appearance.layout).territories : [];
-				this.tint = territories.some(territory => territory.kind === "family") ? "family" : territories.length ? "lexical" : undefined;
+				this.tints = (["family", "module", "lexical"] as const).filter(kind => territories.some(territory => territory.kind === kind));
 			}
 			if (this.diagram) children.push(this.diagram);
-			children.push(this.selectionInspector(cx, display, this.tint, size.chips));
-			const groups = this.groupsOpen || !cx.supports("section") ? this.summary.groups.map(group => this.groupRow(cx, group, motion)) : [];
-			if (cx.supports("section")) children.push({ k: "section", key: "groups", p: {
-				head: `Explore ${this.summary.groups.length} groups`, collapsible: true, collapsed: !this.groupsOpen,
-			}, c: this.groupsOpen ? groups : [] });
+			children.push(this.selectionInspector(cx, display, this.tints, size.chips));
+			// Small popups keep the row for names, counts and states; wider popups also show key terms.
+			const groupsOpen = this.groupsOpen ?? !this.diagram;
+			const groups = groupsOpen || !sections ? this.groupList(cx, motion, size.chips > 3) : [];
+			const regions = this.summary.regions.length;
+			if (sections) children.push({ k: "section", key: "groups", p: {
+				head: `Explore ${plural(this.summary.groups.length, "group")}${regions ? ` in ${plural(regions, "region")}` : ""}`, collapsible: true, collapsed: !groupsOpen,
+			}, c: groups });
 			else children.push(...groups);
 		} else {
 			const emptyText = request.error ? "The indexed map is unavailable" : request.loading ? "Reading the indexed map" : "No indexed map available";
@@ -415,12 +499,15 @@ export class LiveGraphPopup implements Component {
 				? nativeElement({ k: "el", key: "empty", p: { tag: "div", class: "semctl-live-empty" }, c: empty })
 				: { k: "col", key: "empty", p: { min: { h: "9lines" }, gap: "sm" }, c: empty });
 		}
-		if (request.error) {
-			const diagnostics = text(request.error, { role: "semctl.live.diagnostic-text", wrap: "word", tone: "muted" });
-			children.push(cx.supports("section")
-				? { k: "section", key: "diagnostics", p: { role: "semctl.live.diagnostics", head: "Diagnostics", collapsible: true, collapsed: !this.diagnosticsOpen },
-					c: this.diagnosticsOpen ? [diagnostics] : [] }
-				: diagnostics);
+		if (request.error || warnings.length) {
+			const diagnostics = [
+				...warnings.map(warning => text(`Warning: ${warning}`, { role: "semctl.live.query-warning", wrap: "word", tone: "warning" })),
+				...(request.error ? [text(request.error, { role: "semctl.live.diagnostic-text", wrap: "word", tone: "muted" })] : []),
+			];
+			if (sections) children.push({ k: "section", key: "diagnostics", p: {
+				role: "semctl.live.diagnostics", head: "Diagnostics", collapsible: true, collapsed: !this.diagnosticsOpen,
+			}, c: this.diagnosticsOpen ? diagnostics : [] });
+			else children.push(...diagnostics);
 		}
 		return { k: "col", p: { gap: "sm" }, c: [
 			header, { k: "col", key: "body", p: { role: "semctl.live.body", gap: "sm" }, c: children },
@@ -432,9 +519,10 @@ export class LiveGraphPopup implements Component {
 		const selected = this.summary?.groups.find(group => group.id === this.selected), links = selected && this.links.get(selected.id);
 		return ["semctl · Live project overview",
 			...(this.summary ? [`${this.summary.files} files · ${this.summary.groups.length} groups`,
-				selected ? `${selected.label} · ${selected.members.length} nodes` : "Select a group to inspect links"] : []),
+				selected ? `${selected.label} · ${selected.members.length} nodes${selected.terms.length ? ` · ${termText(selected)}` : ""}` : "Open /semctl graph for keyboard navigation"] : []),
 			...(links && this.display ? [`${links.incoming} in · ${links.outgoing} out · ${links.internal} internal`, sourceScope(this.display),
 				...links.neighbors.slice(0, 3).map(neighbor => `${neighbor.group.label} · ${neighbor.incoming} in · ${neighbor.outgoing} out`)] : []),
+			...(this.state.request.warnings?.flatMap(warning => `Warning: ${warning}`.split(/\r?\n/)) ?? []),
 			this.state.activity.producer?.text ?? "No producer observation", ...this.state.activity.operations.map(operationLabel)]
 			.map(line => clean(line).slice(0, Math.max(0, width)));
 	}

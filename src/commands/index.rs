@@ -152,6 +152,7 @@ async fn wait_for_job(client: &Client, job_id: &str) -> Result<()> {
                 embedded = job.files_embedded,
                 failed = job.files_failed,
                 chunks = ?job.chunk_count,
+                files_per_sec = ?job.operations_per_second,
                 "indexed",
             );
             return Ok(());
@@ -169,11 +170,6 @@ async fn wait_for_job(client: &Client, job_id: &str) -> Result<()> {
         let now = std::time::Instant::now();
         if now >= next_progress {
             // Worker counters are independent reports, not a completion ratio.
-            let phase = if job.started_at.is_some() {
-                "embedding"
-            } else {
-                "queued"
-            };
             info!(
                 %job_id,
                 elapsed_secs = start.elapsed().as_secs(),
@@ -182,7 +178,9 @@ async fn wait_for_job(client: &Client, job_id: &str) -> Result<()> {
                 failed = job.files_failed,
                 planned_embed = ?job.files_to_embed,
                 planned_delete = ?job.files_to_delete,
-                "{phase}: reported file counts (None means unknown)",
+                files_per_sec = ?job.operations_per_second,
+                "{}: reported file counts (None means unknown)",
+                phase(&job),
             );
             next_progress = now + PROGRESS_EVERY;
         }
@@ -193,7 +191,7 @@ async fn wait_for_job(client: &Client, job_id: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{api, poll_interval, terminal_result};
+    use super::{api, phase, poll_interval, terminal_result};
 
     #[test]
     fn polling_is_responsive_for_fast_jobs_then_backs_off() {

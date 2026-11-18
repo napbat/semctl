@@ -3,7 +3,7 @@ import type { GraphData } from "./graph";
 import { DEFAULT_GRAPH_APPEARANCE, type GraphAppearance } from "./graph-appearance";
 import { bindConceptFamily } from "./graph-data/doc-concepts.js";
 import { bindTermVector } from "./graph-data/embedding.js";
-import { bindDrawingWeight, layoutGraph } from "./graph-data/layout.js";
+import { bindDrawingWeight, bindRemainder, layoutGraph } from "./graph-data/layout.js";
 import { conceptPalette } from "./graph-data/palette.js";
 import { nativeGraphLayout, type NativeGraphLayout, type NativeGraphTerritory } from "./graph-native-layout";
 import type { GraphPreviewSize } from "./graph-preview";
@@ -61,6 +61,16 @@ const clockwise = (layout: NativeGraphLayout, center: string) => {
 	const angle = (dot: NativeGraphLayout["dots"][number]) => (Math.atan2(dot.y - hub.y, dot.x - hub.x) + Math.PI * 2.5) % (Math.PI * 2);
 	return layout.dots.filter(dot => dot !== hub).sort((a, b) => angle(a) - angle(b)).map(dot => dot.node.id);
 };
+/** The concepts fixture with folder regions in place of doc families, plus a folded remainder that links to everything. */
+function regions(): GraphData {
+	const data = concepts(), remainder: GraphData["nodes"][number] = { id: "other-groups", label: "9 other groups", category: "group", hit: null, detail: null };
+	for (const node of data.nodes) bindConceptFamily(node, node.id.includes("-")
+		? { key: `region:path:${node.id.split("-")[0]}`, label: node.id.split("-")[0], kind: "path" } : undefined);
+	bindTermVector(remainder, new Map([["boot", .6], ["policy", .6], ["test", .5]]));
+	bindDrawingWeight(remainder, 30);
+	bindRemainder(remainder);
+	return { ...data, nodes: [...data.nodes, remainder] };
+}
 /** Territories never imply membership: member centers inside, every other dot center and territory center outside. */
 function expectStrictTerritories(layout: NativeGraphLayout): void {
 	const reach = (territory: NativeGraphTerritory, x: number, y: number) => ((x - territory.x) / territory.rx) ** 2 + ((y - territory.y) / territory.ry) ** 2;
@@ -333,7 +343,8 @@ test("bound node weights give monotonic dot radii that never overlap in compact"
 		expect(ordered[0].node.id).toBe("n00");
 		expect(ordered[0].radius).toBe(3.5);
 		expect("weight" in ordered[0]).toBe(false);
-		expect(ordered.at(-1)).toMatchObject({ radius: 9.5, weight: 23 });
+		// The compact canvas uses a smaller weighted range: 3.5 to 7.5 px.
+		expect(ordered.at(-1)).toMatchObject({ radius: 7.5, weight: 23 });
 		for (let at = 1; at < ordered.length; at++) expect(ordered[at].radius).toBeGreaterThanOrEqual(ordered[at - 1].radius);
 		expect(ordered[1].radius).toBeLessThan(ordered.at(-1)!.radius);
 		for (const dot of layout.dots) expect(dot.radius * 2 % 1).toBe(0);
@@ -408,6 +419,18 @@ test("concept map keeps doc concept families together and apart from other famil
 	};
 	const architecture = spread(["arch-boot", "arch-dispatch", "arch-memory"]), policy = spread(["policy-compat", "policy-cpu", "policy-threat"]);
 	expect(Math.hypot(architecture.x - policy.x, architecture.y - policy.y)).toBeGreaterThan(architecture.radius + policy.radius);
+});
+
+for (const size of ["inline", "overview"] as const) test(`map/${size} draws folder regions as module territories and keeps the remainder in the lower right`, () => {
+	const data = regions(), layout = nativeGraphLayout(data, size, "map");
+	expect(layout.territories.map(territory => [territory.label, territory.kind]).sort()).toEqual([["arch", "module"], ["policy", "module"]]);
+	expect(layout.territories.find(territory => territory.label === "arch")?.title).toContain("arch/ · folder region");
+	expectStrictTerritories(layout);
+	const remainder = layout.dots.find(dot => dot.node.id === "other-groups")!;
+	expect(remainder.x).toBeGreaterThan(layout.width / 2);
+	expect(remainder.y).toBeGreaterThan(layout.height / 2);
+	const reordered = { ...data, nodes: [...data.nodes].reverse(), edges: [...data.edges].reverse() };
+	expect(geometry(nativeGraphLayout(reordered, size, "map"))).toEqual(geometry(layout));
 });
 
 for (const size of ["inline", "overview"] as const) test(`map/${size} reserves family islands before placing similar ungrouped hubs`, () => {

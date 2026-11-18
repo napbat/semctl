@@ -80,9 +80,5 @@ pub async fn run(args: SearchArgs, cli: &Cli) -> Result<()> {
     .await
     .map_err(query::ToolError::into_cli_error)?
     .text;
-    print!("{out}");
-    if !out.ends_with('\n') {
-        println!();
-    }
-    Ok(())
+    answer::print(&out, &partial)
 }

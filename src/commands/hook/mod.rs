@@ -212,10 +212,7 @@ async fn user_prompt_context(cli: &Cli, input: &HookInput) -> Option<String> {
     if !input.has_semctx_tools() {
         return None;
     }
-    let top_k = env_parse::<usize>("SEMCTX_HOOK_TOP_K").unwrap_or(5);
-    if top_k == 0 {
-        return None;
-    };
+    let top_k = prompt_top_k(env_parse("SEMCTX_HOOK_TOP_K"))?;
     let prompt = input.prompt.trim();
     // A global UserPromptSubmit hook fires on every message. Keep this path
     // high-precision: the skill and MCP metadata route exact operations, while
@@ -266,7 +263,7 @@ async fn user_prompt_context(cli: &Cli, input: &HookInput) -> Option<String> {
         .iter()
         .zip(&sources)
         .filter(|(h, _)| min_score.is_none_or(|m| h.score >= f64::from(m)))
-        .take(top_k)
+        .take(top_k as usize)
         .collect();
     if hits.is_empty() {
         return None;
@@ -288,16 +285,11 @@ async fn user_prompt_context(cli: &Cli, input: &HookInput) -> Option<String> {
         let freshness = source.warning().map_or_else(String::new, |warning| {
             format!("  [source verification: {warning}]")
         });
-        let sym = h
-            .symbol
-            .as_deref()
-            .map(|s| format!("  {s}"))
-            .unwrap_or_default();
+        let sym = h.symbol.as_deref().map_or_default(|s| format!("  {s}"));
         let lang = h
             .language
             .as_deref()
-            .map(|l| format!("  ·  {l}"))
-            .unwrap_or_default();
+            .map_or_default(|l| format!("  ·  {l}"));
         writeln!(out, "- {path}{loc}{sym}{lang}  ({:.3}){freshness}", h.score)
             .expect("writing to a String cannot fail");
     }

@@ -6,6 +6,14 @@ import { graphEmbedding, semanticMap, semanticNeighbours, semanticFamilies, cent
 const drawingWeights = new WeakMap();
 export function bindDrawingWeight(item, weight) { if (Number.isFinite(weight) && weight > 0) drawingWeights.set(item, weight); }
 export function drawingWeight(item) { return drawingWeights.get(item); }
+// A folded remainder aggregates unrelated small groups. Layouts keep it apart from the evidence-based geometry.
+const remainders = new WeakSet();
+export function bindRemainder(item) { remainders.add(item); }
+export function isRemainder(item) { return remainders.has(item); }
+// Semantic affinity between the nodes of one drawing, in [0, 1], from semctx search profiles. Placement only; never a relation.
+const affinities = new WeakMap();
+export function bindAffinity(data, weight) { if (typeof weight === "function") affinities.set(data, weight); else affinities.delete(data); }
+export function affinityOf(data) { return affinities.get(data); }
 
 const compare = (a, b) => a < b ? -1 : a > b ? 1 : 0;
 const hash = text => { let value = 2166136261; for (const char of text) value = Math.imul(value ^ char.charCodeAt(0), 16777619); return value >>> 0; };
@@ -24,13 +32,13 @@ export function category(node) {
 	const kind = node.category ?? node.hit?.kind;
 	return kind ? { key: `kind:${kind}`, label: kind, type: "Kind" } : { key: "structure", label: "Graph structure", type: "" };
 }
-/** Bound doc concept families with at least two members; largest first, then key. */
+/** Bound families (doc concept families or map regions) with at least two members; largest first, then key. */
 export function sharedConceptFamilies(nodes) {
 	const families = new Map();
 	for (const node of [...nodes].sort((a, b) => compare(a.id, b.id))) {
 		const family = conceptFamily(node);
 		if (!family) continue;
-		if (!families.has(family.key)) families.set(family.key, { key: family.key, label: family.label, members: [] });
+		if (!families.has(family.key)) families.set(family.key, { key: family.key, label: family.label, kind: family.kind ?? "doc", members: [] });
 		const members = families.get(family.key).members;
 		if (members.at(-1) !== node.id) members.push(node.id);
 	}

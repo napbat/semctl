@@ -120,15 +120,21 @@ impl PartialAnswers {
         }
     }
 
+    /// Take the recorded answers when the call has finished.
+    pub(crate) fn take(&self) -> Vec<PartialAnswer> {
+        std::mem::take(&mut *self.lock())
+    }
+
     /// The recorded answers, each distinct answer once, in the order in which
     /// they arrived.
+    #[cfg(test)]
     pub(crate) fn answers(&self) -> Vec<PartialAnswer> {
         self.lock().clone()
     }
 
     fn lock(&self) -> MutexGuard<'_, Vec<PartialAnswer>> {
-        // The lock only guards a push or a clone. A panic cannot leave the
-        // list half changed, so a poisoned lock still holds valid data.
+        // A panic cannot leave the list half changed, so a poisoned lock
+        // still holds valid data.
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }

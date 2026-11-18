@@ -6,10 +6,17 @@ export interface SemanticFamily { key: string; label: string; terms: string[]; m
 export function identifierTerms(text: string): string[];
 /** Aggregate nodes (overview groups) carry a precomputed centroid. `graphEmbedding` uses it as-is. */
 export function bindTermVector(node: object, vector: TermVector): void;
+/** Display-only key terms of an aggregate node. An empty list removes the binding. */
+export function bindKeyTerms(node: object, terms: readonly string[]): void;
+export function keyTerms(node: object): readonly string[];
+/** File content terms, such as Markdown headings. Returns true when the binding changed; a change invalidates cached embeddings. */
+export function bindContentTerms(node: object, vector: TermVector | undefined): boolean;
 /** `informative`: at least one term is shared by two nodes and not every non-empty vector is the same. */
 export function graphEmbedding(data: Pick<GraphData, "nodes" | "edges">): { vectors: Map<string, TermVector>; informative: boolean };
 export function cosine(a?: TermVector, b?: TermVector): number;
 export function centroid(vectors: Iterable<TermVector | undefined>): TermVector;
+/** Up to `limit` (default 3) key terms per set ID: frequent in the set, rare in the other sets, and absent from its `exclude` texts. Deterministic. */
+export function distinctiveTerms(sets: readonly { id: string; vectors: Iterable<TermVector | undefined>; exclude?: readonly string[] }[], options?: { limit?: number }): Map<string, string[]>;
 /**
  * Classical MDS on a symmetric similarity, read once per unordered ID pair and once per ID with itself.
  * The squared map distance follows S(a, a) + S(b, b) − 2·S(a, b); the RMS radius is 1.

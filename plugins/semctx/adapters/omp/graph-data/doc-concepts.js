@@ -141,20 +141,22 @@ function proseRegions(text) {
 	return regions;
 }
 // ATX headings: the first level-1 text is the title; level-2 and level-3 texts are headings. A full slot skips the parse.
+// A heading whose letters repeat an earlier heading ("PDF page 71", "PDF page 72") takes no slot.
 function scanHeadings(region, doc) {
 	for (let index = region.indexOf("#"); index >= 0 && (doc.h1 === undefined || doc.headings.length < headingLimit); index = region.indexOf("#", index + 1)) {
 		const start = lineStart(region, index); if (start < 0) continue;
 		let level = 0; while (level < 7 && region.charCodeAt(index + level) === 35) level++;
 		if (level === 1 ? doc.h1 === undefined : level <= 3 && doc.headings.length < headingLimit) {
 			headingLine.lastIndex = start;
-			const value = cleanMarkdown(headingLine.exec(region)?.[2] ?? "");
-			if (value && level === 1) doc.h1 = value; else if (value) doc.headings.push(value);
+			const value = cleanMarkdown(headingLine.exec(region)?.[2] ?? ""), form = value.toLowerCase().replace(/[^\p{L}]+/gu, "");
+			if (value && level === 1) doc.h1 = value;
+			else if (value && !doc.forms.has(form)) { doc.forms.add(form); doc.headings.push(value); }
 		}
 		index = region.indexOf("\n", index); if (index < 0) break;
 	}
 }
 function parseDoc(source) {
-	const doc = { h1: undefined, front: undefined, headings: [], mentions: new Map(), count: 0 };
+	const doc = { h1: undefined, front: undefined, headings: [], forms: new Set(), mentions: new Map(), count: 0 };
 	let text = source.charCodeAt(0) === 0xfeff ? source.slice(1) : source;
 	frontMatter.lastIndex = 0;
 	const front = frontMatter.exec(text);
@@ -307,6 +309,12 @@ function termVector(title, headings, source) {
 	add(title, 1); for (const value of headings) add(value, headingWeight); add(nameOf(parentOf(source)), folderWeight);
 	return centroid([weights]);
 }
+// What a document is about: its headings, with the shared title at half weight. Folders and file names do not take part.
+function contentVector(title, headings) {
+	const weights = new Map(), add = (text, weight) => { for (const term of identifierTerms(text)) weights.set(term, (weights.get(term) ?? 0) + weight); };
+	if (title) add(title, .5); for (const value of headings) add(value, 1);
+	return weights.size ? centroid([weights]) : undefined;
+}
 // Plurality with its count and share. Ties have no winner.
 function plurality(tally) {
 	let best, count = 0, total = 0, tied = false;
@@ -426,7 +434,7 @@ export function docConcepts(data, docs) {
 	const index = catalog(data);
 	const parsed = selectDocs(index, docs).map(({ path, text }) => {
 		const doc = parseDoc(text), { evidence, mentions } = evidenceOf(index, doc, path);
-		return { path, key: `doc:${path}`, title: doc.h1 ?? doc.front ?? fallbackTitle(path), headings: doc.headings, evidence, mentions, reach: evidence.size };
+		return { path, key: `doc:${path}`, title: doc.h1 ?? doc.front ?? fallbackTitle(path), contentTitle: doc.h1 ?? doc.front, headings: doc.headings, evidence, mentions, reach: evidence.size };
 	});
 	const codeCount = index.code.length, hubLimit = Math.max(hubMinimum, hubShare * codeCount);
 	const hubs = parsed.filter(doc => doc.reach > hubLimit), candidates = parsed.filter(doc => doc.reach <= hubLimit && doc.reach >= minimumReach && doc.mentions >= minimumMentions);
@@ -438,5 +446,7 @@ export function docConcepts(data, docs) {
 	const assignments = [...[...assigned].map(([path, item]) => [index.files.get(path), item]), ...directoryAssignments(index, assigned)].sort((a, b) => compare(a[0], b[0]));
 	const members = new Map(concepts.map(doc => [doc.key, []]));
 	for (const [id, { key }] of assignments) members.get(key).push(id);
-	return { concepts: describeConcepts(concepts, members), assignments: new Map(assignments), stats: { docs: parsed.length, hubs: hubs.map(doc => doc.path), files: index.paths.length, assigned: assigned.size } };
+	const contents = new Map(parsed.flatMap(doc => { const vector = contentVector(doc.contentTitle, doc.headings); return vector ? [[doc.path, vector]] : []; }));
+	return { concepts: describeConcepts(concepts, members), assignments: new Map(assignments), contents,
+		stats: { docs: parsed.length, hubs: hubs.map(doc => doc.path), files: index.paths.length, assigned: assigned.size } };
 }

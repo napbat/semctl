@@ -21,9 +21,11 @@ const POPUP_STYLES: NativeStylesheet = { name: "semctl-popups", css: `
 .semctl-sync[data-motion=full][data-state=active] .sf-meter.unknown{animation:semctl-sync-working 2600ms ease-in-out 400ms infinite}
 @keyframes semctl-sync-working{0%,100%{opacity:.65}50%{opacity:1}}
 @media(prefers-reduced-motion:reduce){.semctl-sync,.semctl-sync .sf-meter.unknown{transition:none;animation:none}}
-.sf-overlay[data-role="omp.overlay.semctl-live"]{--semctl-popup-height:min(420px,calc(100vh - 320px));position:absolute;inset:auto 0 calc(100% + 12px) auto;width:min(320px,92vw) !important;max-width:92vw;height:auto;display:block;pointer-events:none;z-index:20}
-.sf-overlay[data-role="omp.overlay.semctl-live"].sz-md{--semctl-popup-height:min(560px,calc(100vh - 320px));width:min(480px,92vw) !important}
-.sf-overlay[data-role="omp.overlay.semctl-live"].sz-lg{--semctl-popup-height:min(720px,calc(100vh - 320px));width:min(680px,92vw) !important}
+.sf-overlay[data-role="omp.overlay.semctl-live"]{--semctl-popup-room:calc(100vh - 320px);--semctl-popup-height:min(420px,var(--semctl-popup-room));position:absolute;inset:auto 0 calc(100% + 12px) auto;width:min(320px,92vw) !important;max-width:92vw;height:auto;display:block;pointer-events:none;z-index:20}
+.sf-overlay[data-role="omp.overlay.semctl-live"].sz-md{--semctl-popup-height:min(560px,var(--semctl-popup-room));width:min(480px,92vw) !important}
+.sf-overlay[data-role="omp.overlay.semctl-live"].sz-lg{--semctl-popup-height:min(720px,var(--semctl-popup-room));width:min(680px,92vw) !important}
+/* A fresh session seats the composer in the middle, not at the foot of the pane. */
+.sf-overlay[data-role="omp.overlay.semctl-live"]:is(.sf-fresh *){--semctl-popup-room:max(120px,calc(50vh - 160px))}
 .sf-overlay[data-role="omp.overlay.semctl-live"]>.sf-ov-card{width:100%;max-width:100%;max-height:var(--semctl-popup-height);margin:0;pointer-events:auto}
 [data-role="omp.overlay.semctl-live"] .sf-ov-body{overflow:hidden}
 [data-role="semctl.live.body"]{min-width:0;overflow-x:hidden;overflow-y:auto;max-height:calc(var(--semctl-popup-height) - 120px)}
@@ -31,6 +33,7 @@ const POPUP_STYLES: NativeStylesheet = { name: "semctl-popups", css: `
 .semctl-live-empty{height:176px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;text-align:center;font-size:12px}
 [data-role="omp.overlay.semctl-live"].sz-md .semctl-live-empty{height:188px}
 [data-role="omp.overlay.semctl-live"].sz-lg .semctl-live-empty{height:288px}
+[data-role="omp.overlay.semctl-live"] .semctl-live-empty{max-height:max(72px,calc(var(--semctl-popup-height) - 160px))}
 [data-role="semctl.live.header"]{gap:2px;min-width:0}
 [data-role="semctl.live.title"]{font-size:13px;font-weight:600;color:var(--t1);cursor:default;user-select:none}
 [data-role="semctl.live.subline"]{font-size:11px;line-height:16px;color:var(--t2);font-variant-numeric:tabular-nums}
@@ -64,6 +67,13 @@ const POPUP_STYLES: NativeStylesheet = { name: "semctl-popups", css: `
 .semctl-live-badge-success{color:var(--sf-p-success,var(--sf-c-success,var(--ok)))}
 .semctl-live-badge-muted{color:var(--t2)}
 [data-role="semctl.live.group.count"]{min-width:18px;text-align:right;font-variant-numeric:tabular-nums}
+[data-role="semctl.live.group.terms"],[data-role="semctl.live.terms"]{font-size:10.5px;color:var(--t3);white-space:nowrap}
+[data-role="semctl.live.terms"]{text-align:right}
+.semctl-live-region{display:flex;align-items:center;gap:6px;min-width:0;padding:6px 6px 2px;font-size:10.5px;font-weight:600;letter-spacing:.02em;color:var(--t3);cursor:default}
+.semctl-live-region:first-child{padding-top:2px}
+.semctl-live-region-label{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.semctl-live-region-count{flex:none;font-weight:400;font-variant-numeric:tabular-nums}
+.semctl-region-swatch{flex:none;width:8px;height:8px;box-sizing:border-box;border-radius:50%;border:1px solid var(--sg-tint,var(--t3));background:rgb(from var(--sg-tint,var(--t3)) r g b / 35%)}
 .semctl-icon-action{display:flex;align-items:center;justify-content:center;width:28px;height:28px;flex-shrink:0;padding:0;border:0;border-radius:var(--r-ctl);background:transparent;color:var(--sf-muted);cursor:pointer;transition:background-color 100ms var(--ease),color 100ms var(--ease)}
 .semctl-icon-action:hover,.semctl-icon-action:focus-visible{background:var(--l1);color:var(--t1)}
 .semctl-icon-action[aria-disabled=true]{opacity:.45;cursor:default;background:transparent}
@@ -77,6 +87,7 @@ const POPUP_STYLES: NativeStylesheet = { name: "semctl-popups", css: `
 [data-role="semctl.graph.body"]{height:min(448px,calc(100vh - 220px));min-width:0;min-height:120px;max-height:calc(100vh - 180px);overflow-x:hidden}
 [data-role="semctl.graph.hint"]{font-size:11px}
 [data-role="semctl.graph.title"]{font-size:13px;font-weight:600}
+[data-role="semctl.graph.group-terms"]{font-size:11px;color:var(--t3)}
 [data-role="semctl.graph.group"]{gap:8px}
 ` };
 const active = new Map<TUI, { references: number; context?: DescribeContext }>();

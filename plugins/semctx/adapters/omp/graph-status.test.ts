@@ -4,6 +4,7 @@ import type { GraphActivity } from "./graph-activity";
 import type { GraphRequestState } from "./overview";
 import { GRAPH_STATUS_STYLES, graphStatus, graphStatusModel } from "./graph-status";
 import { asNativeElement } from "./native-elements";
+import type { Display } from "./inspector";
 
 const idle = (): GraphActivity => ({ operations: [], targets: [], producer: null });
 const settled = (): GraphRequestState => ({ loading: false, text: "" });
@@ -88,6 +89,25 @@ describe("compact live progress", () => {
 			expect(nodes(view).some(node => node.p?.title?.includes("Map refresh disconnected"))).toBe(true);
 			expect(warningSlot(view)?.p?.title).toContain("Map refresh disconnected");
 		}
+	});
+	test("the ring shows the ready share of the map and keeps the job ratio in the tooltip", () => {
+		const states = ["ready", "ready", "pending", "failed", undefined] as const;
+		const display: Extract<Display, { kind: "graph" }> = { version: 1, kind: "graph", title: "Project overview", query: null,
+			identity: { codebaseId: "share", name: null, localRoot: null, copy: "checkout" }, edges: [], roots: [], caveats: [], truncated: false,
+			nodes: states.map((indexing, index) => ({ id: String(index), label: `${index}.ts`, detail: null, hit: null, category: "file" as const,
+				path: `${index}.ts`, ...(indexing ? { indexing } : {}) })) };
+		const activity: GraphActivity = { ...idle(), producer: { text: "embedding 9/10", tone: "accent", symbol: "status.running", progress: 0.9 } };
+		const view = graphStatus(native, { request: { ...settled(), display }, activity, presentation: "icon" });
+		const meter = nodes(view).find(node => node.k === "meter");
+		expect(meter?.p?.value).toBe(0.5);
+		expect(meter?.p?.aria).toBe("Share of reported files that are ready");
+		expect(visibleText(view)).toBe("50%");
+		expect(meter?.p?.title).toContain("Ring: 2 of 4 files ready (50%)");
+		expect(meter?.p?.title).toContain("Reported progress: 90%");
+		const unreported = { ...display, nodes: display.nodes.map(({ indexing: _, ...node }) => node) };
+		const fallback = graphStatus(native, { request: { ...settled(), display: unreported }, activity, presentation: "icon" });
+		expect(nodes(fallback).find(node => node.k === "meter")?.p?.value).toBe(0.9);
+		expect(nodes(fallback).some(node => node.p?.title?.includes("files ready"))).toBe(false);
 	});
 	test("active warnings remain discoverable without dumping producer snapshots into hovers", () => {
 		const diagnostic = `Provider rejected embedding\n${"reason ".repeat(60)}\nFull trace`;

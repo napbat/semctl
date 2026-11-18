@@ -4,10 +4,11 @@ import type { Component, DescribeContext, NativeNode, NativeUiEvent } from "@oh-
 import { nativeConceptCue } from "./native-concepts";
 import type { NativeChild } from "@oh-my-pi/pi-tui/native/node";
 import type { RenderResultContextOptions, ToolRenderer, ToolRenderResult } from "@oh-my-pi/pi-tui/tools";
-import { GraphInspector, readGraph, type GraphData } from "./graph";
+import { GraphInspector, readGraph, type GraphData, type GraphNavigation } from "./graph";
 import { strengths } from "./graph-data/matches.js";
 import { matchScoreIndicator, matchVerificationIcon } from "./match-indicators";
 import { resultGraph } from "./result-graph";
+import { readWarnings } from "./partial-answers";
 import { acceptConceptOverview, conceptRevision, lookupConcept, subscribeConcepts } from "./concept-colors";
 import { nativeElement, supportsElements } from "./native-elements";
 import type { GraphAppearance } from "./graph-appearance";
@@ -37,6 +38,7 @@ const SERVERS = new Set(["semctx", "semctx:semctx"]);
 
 type Obj = Record<string, unknown>;
 interface Identity { codebaseId: string | null; name: string | null; localRoot: string | null; copy: "checkout" | "canonical" }
+
 export interface Hit {
 	path: string | null; symbol: string | null; qualifiedName: string | null; language: string | null; kind: string | null;
 	score: number | null; startLine: number | null; endLine: number | null; startByte: number | null; endByte: number | null;
@@ -44,10 +46,11 @@ export interface Hit {
 	snippetStartByte: number | null; snippetEndByte: number | null; focusLine: number | null; focusByte: number | null;
 	enclosingSymbol?: string | null; isWrite?: boolean | null; referenceNamespace?: string | null;
 	referenceKind?: string | null; externalTarget?: string | null; project?: string | null;
+	expanded?: boolean | null; expansionReason?: string | null;
 	codebaseId: string | null; binding: { state: "bound" | "changed-local" | "range-mismatch" | "unverified" | "not-probed"; reason: string | null };
 }
 const ROW_CAPABILITIES = ["meter", "el", "icon", "kv", "section", "code"] as const;
-interface Search { kind: "search"; query: string; hits: Hit[]; indexWarning: string | null }
+interface Search { kind: "search"; query: string; hits: Hit[]; indexWarning: string | null; budgetNote?: string | null }
 interface Source {
 	kind: "source"; path: string; text: string; language: string | null; sourceOrigin: string;
 	contentHash: string; encoding: string; binary: boolean; truncated: boolean;
@@ -92,8 +95,8 @@ function bounded(value: unknown, localOverview = false): boolean {
 function hit(v: unknown): v is Hit {
 	if (!object(v) || !["path", "symbol", "qualifiedName", "language", "kind", "snippet", "codebaseId"].every(k => nullableString(v[k]))) return false;
 	if (!(v.score === null || (typeof v.score === "number" && Number.isFinite(v.score)))) return false;
-	if (!["enclosingSymbol", "referenceNamespace", "referenceKind", "externalTarget", "project"].every(k => v[k] === undefined || nullableString(v[k])) ||
-		!(v.isWrite === undefined || v.isWrite === null || typeof v.isWrite === "boolean")) return false;
+	if (!["enclosingSymbol", "referenceNamespace", "referenceKind", "externalTarget", "project", "expansionReason"].every(k => v[k] === undefined || nullableString(v[k])) ||
+		![v.isWrite, v.expanded].every(flag => flag === undefined || flag === null || typeof flag === "boolean")) return false;
 	if (!nullableRange(v.startLine, v.endLine, 0) || !nullableRange(v.startByte, v.endByte, 0) ||
 		!nullableRange(v.snippetStartLine, v.snippetEndLine, 0) || !nullableRange(v.snippetStartByte, v.snippetEndByte, 0) ||
 		!coordinate(v.focusLine, 0) || !coordinate(v.focusByte, 0)) return false;
@@ -110,7 +113,10 @@ export function readDisplay(value: unknown, operation: string, localOverview = f
 		if (!object(id) || !["codebaseId", "name", "localRoot"].every(k => nullableString(id[k])) || !["checkout", "canonical"].includes(String(id.copy))) return undefined;
 		if (id.copy === "canonical" && id.localRoot !== null) return undefined;
 		switch (value.kind) {
-			case "search": if (typeof value.query !== "string" || !hits(value.hits) || !nullableString(value.indexWarning)) return undefined; break;
+			case "search":
+				if (typeof value.query !== "string" || !hits(value.hits) || !nullableString(value.indexWarning) ||
+					!(value.budgetNote === undefined || nullableString(value.budgetNote))) return undefined;
+				break;
 			case "graph": if (!readGraph(value, hit, fullOverview)) return undefined; break;
 			case "batch": {
 				if (!Array.isArray(value.symbols)) return undefined;
@@ -215,6 +221,8 @@ export class SemctlInspector implements Component {
 	move(delta: number): void { this.graph?.move(delta); }
 	setActivity(targets: readonly string[]): void { this.graph?.setActivity(targets); }
 	setAppearance(appearance: Readonly<GraphAppearance>): void { this.graph?.setAppearance(appearance); }
+	navigation(): GraphNavigation | undefined { return this.graph?.navigation(); }
+	restoreNavigation(state: GraphNavigation): void { this.graph?.restoreNavigation(state); }
 	handleNativeEvent(event: NativeUiEvent): void {
 		if (event.type === "toggle" && event.key !== "") {
 			const key = event.key.slice(event.key.lastIndexOf("/") + 1);
@@ -242,6 +250,10 @@ export class SemctlInspector implements Component {
 	private preview(h: Hit, cx: DescribeContext): NativeNode[] {
 		const w = snippetWindow(h);
 		const out: NativeNode[] = [];
+		if (typeof h.expanded === "boolean") {
+			const scope = h.expanded ? "Expanded symbol" : `Chunk only${h.expansionReason ? ` · ${label(h.expansionReason)}` : ""}`;
+			out.push(text(scope, { tone: h.expanded ? "muted" : "warning" }));
+		}
 		if (h.snippet) out.push(...this.sourceNodes(h.snippet, { path: h.path ?? undefined, language: h.language ?? undefined,
 			start: w?.start, focus: w?.focus ?? w?.mark?.[0], mark: w?.mark,
 			limit: this.expandedResult() ? Math.max(12, lineCount(h.snippet)) : 12 }, cx));
@@ -347,8 +359,10 @@ export class SemctlInspector implements Component {
 		if (d.kind === "search" || d.kind === "batch") {
 			const rows = this.hits;
 			const rendered = this.hitRows(d, rows, cx);
+			if (d.kind === "search" && d.budgetNote) children.push(text(d.budgetNote, { role: "semctl.search.limit", tone: "warning", wrap: "word" }));
 			if (d.kind === "search" && rows.length === 0) {
-				children.push(text("No matches"), text("Try a symbol name or a shorter description.", { tone: "muted" }));
+				children.push(text(d.budgetNote ? "No matches returned" : "No matches"));
+				if (!d.budgetNote) children.push(text("Try a symbol name or a shorter description.", { tone: "muted" }));
 			}
 			const entries: NativeNode[] = [];
 			if (d.kind === "batch") {
@@ -403,7 +417,13 @@ export class SemctlInspector implements Component {
 			if (typeof c.running === "boolean") out.push(text(`Coordinator: ${c.running ? "running" : "idle"}`));
 			if (typeof c.last_error === "string") out.push(text(`Last indexing error: ${c.last_error}`, { tone: "error" }));
 		}
-		if (d.job) out.push(text(`Job ${d.jobId ?? "unknown"}: ${d.job.filesEmbedded} files embedded · ${d.job.filesFailed} failed${d.job.filesToEmbed !== undefined ? ` · planned ${d.job.filesToEmbed}` : ""}`));
+		if (d.job) {
+			const j = d.job;
+			out.push(text(`Job ${d.jobId ?? "unknown"}: ${j.filesEmbedded} files embedded · ${j.filesFailed} failed${j.filesToEmbed !== undefined ? ` · planned ${j.filesToEmbed}` : ""}`));
+			const stage = typeof j.currentStage === "string" ? label(j.currentStage) : "";
+			const rate = typeof j.operationsPerSecond === "number" && Number.isFinite(j.operationsPerSecond) && j.operationsPerSecond >= 0 ? `${j.operationsPerSecond} files/s` : "";
+			if (stage || rate) out.push(text([stage, rate].filter(Boolean).join(" · "), { tone: "muted" }));
+		}
 		for (const e of [d.catalogError, d.jobError, d.job?.error]) if (typeof e === "string") out.push(text(e, { tone: "error" }));
 		const details: NativeNode = cx.supports("code") ? { k: "code", p: { text: clean(JSON.stringify({ coordinator: d.coordinator, catalog: d.catalog, jobId: d.jobId, job: d.job }, null, 2)), lang: "json", numbers: false, preview: { lines: 12 } } } : text(JSON.stringify(d));
 		if (cx.supports("section")) out.push({ k: "section", key: "snapshot", p: { head: "Snapshot details", collapsible: true, collapsed: !this.expandedSections.has("snapshot") }, c: [details] });
@@ -452,8 +472,9 @@ export function createInspectorRenderer(server: string, operation: string) {
 					details.mcpToolName !== operation || !object(details.mcpMeta) || options.isPartial || options.cancelled) {
 					return fallback.describeResult?.(result, options, args);
 				}
+				const warnings = readWarnings(details.mcpMeta.semctlWarnings);
 				const display = readDisplay(details.mcpMeta.semctlDisplay, operation);
-				if (!display) return fallback.describeResult?.(result, options, args);
+				if (!display || !warnings) return fallback.describeResult?.(result, options, args);
 				let state = states.get(details);
 				if (!state) { state = { result, options, args }; states.set(details, state); }
 				else { state.result = result; state.options = options; state.args = args; }
@@ -477,7 +498,7 @@ export function createInspectorRenderer(server: string, operation: string) {
 							...(display.truncated ? ["partial"] : [])] : count === undefined ? undefined : [
 								`${!options.expanded && count > COMPACT_MATCHES ? `${COMPACT_MATCHES} of ` : ""}${count} ${count === 1 ? "match" : "matches"}`,
 							], badges: headBadges(display) },
-					body: [current.view],
+					body: [...warnings.map(warning => text(warning, { role: "semctl.partial-answer", tone: "warning", wrap: "word" })), current.view],
 					inline: true,
 					preview: "children",
 				};

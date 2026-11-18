@@ -4,11 +4,13 @@ import { normalizeConceptPath } from "./palette.js";
 const compare = (a, b) => a < b ? -1 : a > b ? 1 : 0;
 const capacity = 48, ignored = new Set(["src", "lib", "mod", "index", "main", "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "go", "cs", "cpp", "cc", "h", "hpp", "py", "d", "the", "and", "of", "to", "for"]);
 const splits = new Map(), bound = new WeakMap(), embeddings = new WeakMap();
+// A run of 12 or more hex digits with at least one digit is a content digest or an address, not a word. Its letter runs would be noise terms.
+const digest = /(?<![\p{L}\p{N}])(?:0x)?(?=[\da-f]*\d)[\da-f]{12,}(?![\p{L}\p{N}])/giu;
 function split(text) {
 	let terms = splits.get(text); if (terms) return terms;
 	const unique = new Set();
 	// Letter runs only: digits and punctuation are boundaries, so pure digit tokens never become terms.
-	for (const word of text.replace(/(\p{Ll})(\p{Lu})/gu, "$1 $2").replace(/(\p{Lu}+)(\p{Lu}\p{Ll})/gu, "$1 $2").toLowerCase().split(/[^\p{L}]+/u)) {
+	for (const word of text.replace(digest, " ").replace(/(\p{Ll})(\p{Lu})/gu, "$1 $2").replace(/(\p{Lu}+)(\p{Lu}\p{Ll})/gu, "$1 $2").toLowerCase().split(/[^\p{L}]+/u)) {
 		const term = word.length > 4 && word.endsWith("s") && !word.endsWith("ss") ? word.slice(0, -1) : word;
 		if (term.length > 1 && !ignored.has(term)) unique.add(term);
 	}
@@ -17,6 +19,21 @@ function split(text) {
 }
 export const identifierTerms = text => typeof text === "string" ? [...split(text)] : [];
 export function bindTermVector(node, vector) { if (vector instanceof Map) bound.set(node, vector); }
+// Display-only key terms of an aggregate node, for hover text. They never enter a vector.
+const keyTermsOf = new WeakMap();
+export function bindKeyTerms(node, terms) { if (Array.isArray(terms) && terms.length) keyTermsOf.set(node, Object.freeze([...terms])); else keyTermsOf.delete(node); }
+export function keyTerms(node) { return keyTermsOf.get(node) ?? []; }
+// Content terms of a file, such as the title and headings of a Markdown document. A changed binding invalidates cached embeddings.
+const contents = new WeakMap(); let contentRevision = 0;
+const sameVector = (a, b) => a === b || (a?.size === b?.size && [...a].every(([term, weight]) => b.get(term) === weight));
+export function bindContentTerms(node, vector) {
+	const next = vector instanceof Map && vector.size ? vector : undefined;
+	if (sameVector(contents.get(node), next)) return false;
+	if (next) contents.set(node, next); else contents.delete(node);
+	contentRevision++; return true;
+}
+// Content weighs more than path words: a document named by a hash or a page range says what it is only in its headings.
+const contentWeight = 1.5;
 function normalized(weights) {
 	const entries = [...weights].filter(([, weight]) => weight > 0).sort((a, b) => b[1] - a[1] || compare(a[0], b[0])).slice(0, capacity);
 	const norm = Math.sqrt(entries.reduce((sum, [, weight]) => sum + weight * weight, 0));
@@ -32,6 +49,7 @@ function sources(node) {
 	}
 	add(terms, node.hit?.symbol, 1); add(terms, node.hit?.qualifiedName, .4);
 	if (!path && !node.hit) add(terms, node.label, .8);
+	for (const [term, weight] of contents.get(node) ?? []) terms.set(term, (terms.get(term) ?? 0) + contentWeight * weight);
 	return terms;
 }
 const structural = edge => edge.kind !== "association" && edge.label !== "within project root" && edge.from !== edge.to;
@@ -58,7 +76,7 @@ function discriminates(vectors) {
 	return false;
 }
 export function graphEmbedding(data) {
-	const cached = embeddings.get(data); if (cached) return cached;
+	const cached = embeddings.get(data); if (cached?.revision === contentRevision) return cached.result;
 	const nodes = [...data.nodes].sort((a, b) => compare(a.id, b.id)), terms = new Map(), frequency = new Map();
 	for (const node of nodes) if (!bound.has(node)) terms.set(node.id, sources(node));
 	const edges = [...data.edges].sort((a, b) => compare(a.from, b.from) || compare(a.to, b.to) || compare(a.kind ?? "", b.kind ?? "") || compare(a.symbol ?? "", b.symbol ?? ""));
@@ -68,7 +86,7 @@ export function graphEmbedding(data) {
 	const own = new Map([...terms].map(([id, weights]) => [id, normalized([...weights].map(([term, weight]) => [term, Math.log1p(weight) * idf(term)]))]));
 	const diffused = nodes.length <= 4096 ? diffuse(own, edges) : own, vectors = new Map(nodes.map(node => [node.id, bound.get(node) ?? diffused.get(node.id)]));
 	const result = { vectors, informative: discriminates(vectors.values()) };
-	embeddings.set(data, result); return result;
+	embeddings.set(data, { revision: contentRevision, result }); return result;
 }
 export function cosine(a, b) {
 	if (!a?.size || !b?.size) return 0;
@@ -80,6 +98,24 @@ export function centroid(vectors) {
 	const sum = new Map();
 	for (const vector of vectors) if (vector) for (const [term, weight] of vector) sum.set(term, (sum.get(term) ?? 0) + weight);
 	return normalized(sum);
+}
+/**
+ * Key terms of each set: frequent in that set's centroid and rare in the other sets.
+ * The score is centroid weight · ln((1 + sets) / (1 + sets that carry the term)); terms below 30% of the best score drop.
+ * A term below 0.1 of the centroid weight drops too: a word of one member in a large set does not describe the set.
+ * Terms of each set's `exclude` texts (for example its label) never repeat as key terms.
+ */
+export function distinctiveTerms(sets, { limit = 3 } = {}) {
+	const centroids = sets.map(set => centroid(set.vectors)), frequency = new Map();
+	for (const vector of centroids) for (const [term, weight] of vector) if (weight >= .05) frequency.set(term, (frequency.get(term) ?? 0) + 1);
+	return new Map(sets.map((set, index) => {
+		const skip = new Set((set.exclude ?? []).flatMap(text => identifierTerms(text)));
+		const scored = [...centroids[index]].filter(([term, weight]) => weight >= .1 && !skip.has(term))
+			.map(([term, weight]) => [term, weight * Math.log((1 + sets.length) / (1 + (frequency.get(term) ?? 0)))])
+			.filter(([, score]) => score > 0).sort((a, b) => b[1] - a[1] || compare(a[0], b[0]));
+		const best = scored[0]?.[1] ?? 0;
+		return [set.id, scored.filter(([, score]) => score >= .3 * best).slice(0, Math.max(0, limit)).map(([term]) => term)];
+	}));
 }
 const unique = ids => [...new Set(ids)].sort(compare);
 function similarities(ids, vectors) {

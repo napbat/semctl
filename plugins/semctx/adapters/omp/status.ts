@@ -3,6 +3,8 @@ import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { Component, DescribeContext, NativeNode, NativeScroll, NativeUiEvent } from "@oh-my-pi/pi-tui";
 import { NativeSurface } from "./native-surface";
 import { progressTooltip } from "./status-tooltip";
+import { readyShare, type ReadyShare } from "./graph-status";
+import type { GraphReadiness } from "./overview";
 import { compactTooltip } from "./tooltip-text";
 import { nativeElement, supportsElements } from "./native-elements";
 
@@ -27,6 +29,8 @@ export interface StatusUpdate {
 	unresolvedJob?: string;
 	/** A changed embedding observation can change the catalog's per-file state. */
 	graphRevision?: string;
+	/** The job identity and lifecycle state, without progress counts. A change starts a new phase of the catalog. */
+	graphJob?: string;
 }
 
 function checkoutRoot(value: unknown): string | undefined {
@@ -68,6 +72,7 @@ export function readStatusUpdate(params: unknown, previous?: StatusUpdate): Stat
 			job_id: evidence.job_id, state: String(evidence.state), files_embedded: evidence.files_embedded,
 			files_to_embed: evidence.files_to_embed, files_failed: evidence.files_failed, error: evidence.error,
 		} : undefined;
+	const graphJob = job ? JSON.stringify([status.codebase_id, job.job_id, job.state]) : undefined;
 	const graphRevision = job ? JSON.stringify([status.codebase_id, job.job_id, job.state,
 		job.files_embedded, job.files_to_embed, job.files_failed]) : undefined;
 	const jobFailed = job !== undefined && (job.state === "failed" || (count(job.files_failed) && job.files_failed > 0) ||
@@ -133,7 +138,7 @@ export function readStatusUpdate(params: unknown, previous?: StatusUpdate): Stat
 		].join("\n").replace(/\r\n?/g, "\n").replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, " ");
 		const diagnostic = [...new Set([gateError, snapshot.last_error, object(watcher) ? watcher.unavailable : undefined, job?.error]
 			.filter((value): value is string => typeof value === "string" && value.length > 0))].join("\n") || undefined;
-		return { root, indicator, unresolvedJob, graphRevision, summary, diagnostic, details: `${summary}\n\nProducer snapshot\n${json}` };
+		return { root, indicator, unresolvedJob, graphRevision, graphJob, summary, diagnostic, details: `${summary}\n\nProducer snapshot\n${json}` };
 	};
 	const active = (text: string, progress?: number): StatusUpdate => update({
 		text, progress, tone: failed || jobFailed ? "warning" : "accent", symbol: "status.running",
@@ -188,14 +193,28 @@ export function readStatusUpdate(params: unknown, previous?: StatusUpdate): Stat
 	return update({ text: "status unavailable", tone: "warning", symbol: "status.warning" });
 }
 
+/** Plain terminals and native hosts without meters use the same fixed-width status mark. */
+function statusMark(indicator: Indicator | undefined, progress: number | undefined): string {
+	if (indicator?.tone === "error") return "×";
+	if (indicator?.tone === "warning") return "!";
+	if (progress !== undefined && indicator && indicator.symbol !== "status.info") {
+		return ["○", "◔", "◑", "◕", "●"][progress === 1 ? 4 : Math.floor(progress * 4)];
+	}
+	return { "status.running": "◌", "status.pending": "◌", "status.info": "○",
+		"status.warning": "!", "status.error": "×", "status.success": "●" }[indicator?.symbol ?? "status.info"];
+}
+
 /** Layout status only: native tool cards own every call, result and execution spinner. */
-export function installSyncStatus(pi: ExtensionAPI, openGraph?: (ctx: ExtensionContext, mode: "overview" | "live") => Promise<void>): void {
+export function installSyncStatus(pi: ExtensionAPI, openGraph?: (ctx: ExtensionContext, mode: "overview" | "live") => Promise<void>,
+	readiness?: GraphReadiness): void {
 	const observed = new Map<string, StatusUpdate>();
 	let activationContext: ExtensionContext | undefined;
 	let mounted = false;
 	let requestRender: (() => void) | undefined;
 	let visibleIndicator: Indicator | undefined;
 	let visibleDiagnostic: string | undefined;
+	// The ring shows the ready share of the cached map when one exists, so it agrees with the live popup.
+	let visibleShare: ReadyShare | undefined;
 	let nativeNode: NativeNode | undefined;
 	let nativePresentation: number | undefined;
 	let plainRows: readonly string[] | undefined;
@@ -205,38 +224,42 @@ export function installSyncStatus(pi: ExtensionAPI, openGraph?: (ctx: ExtensionC
 		render(width) {
 			if (!visibleIndicator || width < 1) return [];
 			if (!plainRows) {
-				const indicator = visibleIndicator;
-				const mark = indicator.progress !== undefined && indicator.tone !== "warning" && indicator.tone !== "error"
-					? ["○", "◔", "◑", "◕", "●"][indicator.progress === 1 ? 4 : Math.floor(indicator.progress * 4)]
-					: { "status.running": "◌", "status.pending": "◌", "status.info": "○",
-						"status.warning": "!", "status.error": "×", "status.success": "●" }[indicator.symbol];
-				plainRows = [`${mark} semctl`];
+				const indicator = visibleIndicator, progress = visibleShare?.value ?? indicator.progress;
+				plainRows = [`${statusMark(indicator, progress)} semctl`];
 			}
 			return width >= 8 ? plainRows : [plainRows[0].slice(0, width)];
 		},
 		describe(cx) {
 			nativeSurface?.prepare(cx);
-			if (!cx.supports("meter")) return null;
 			const styled = supportsElements(cx) && cx.feature("styles");
-			const presentation = styled ? cx.reduceMotion ? 2 : 1 : 0;
+			if (!cx.supports("col") || !cx.supports("text") || (!styled && !cx.supports("row"))) return null;
+			const meterSupported = cx.supports("meter");
+			const presentation = (styled ? 1 : 0) | (cx.reduceMotion ? 2 : 0) | (meterSupported ? 4 : 0);
 			if (!nativeNode || nativePresentation !== presentation) {
 				nativePresentation = presentation;
 				const indicator = visibleIndicator;
 				const state = indicator?.tone === "error" ? "error" : indicator?.tone === "warning" ? "warning"
 					: indicator?.symbol === "status.running" ? "active" : indicator?.symbol === "status.pending" ? "pending"
 					: indicator?.symbol === "status.success" ? "ready" : "idle";
+				const progress = visibleShare?.value ?? indicator?.progress;
+				const useMeter = meterSupported && indicator?.symbol !== "status.info" &&
+					indicator?.tone !== "warning" && indicator?.tone !== "error" &&
+					(progress !== undefined || (indicator?.symbol === "status.running" && !cx.reduceMotion));
 				const props = {
 					role: "semctl.sync", hidden: !indicator, shrink: 0,
 					actions: { click: "status", menu: ["status", "details", ...(openGraph ? ["graph", "live"] : [])] },
 					title: progressTooltip(indicator?.text ?? "No status for this checkout", indicator?.progress,
-						visibleDiagnostic, "Open semctl status for the full diagnostic"),
+						visibleDiagnostic, "Open semctl status for the full diagnostic", useMeter ? visibleShare?.text : undefined),
 					aria: `semctl: ${indicator?.text ?? "snapshot unavailable"}`,
 				} as const;
 				// Native keys and fixed slots persist across phases. Unknown is never a fabricated fraction.
 				const children: NativeNode[] = [
-					{ k: "meter", key: "progress", p: {
-						role: "semctl.sync.progress", style: "ring", size: "sm", value: indicator?.progress ?? null,
+					useMeter ? { k: "meter", key: "progress", p: {
+						role: "semctl.sync.progress", style: "ring", size: "sm", value: progress ?? null,
 						tone: indicator?.tone ?? "muted", shrink: 0,
+						...(!styled ? { min: { w: "2ch", h: "1lines" }, max: { w: "2ch", h: "1lines" } } as const : {}),
+					} } : { k: "text", key: "progress", p: {
+						role: "semctl.sync.progress", spans: [{ t: statusMark(indicator, progress), s: indicator?.tone ?? "muted" }], wrap: "none", shrink: 0,
 						...(!styled ? { min: { w: "2ch", h: "1lines" }, max: { w: "2ch", h: "1lines" } } as const : {}),
 					} },
 					{ k: "text", key: "label", p: {
@@ -287,11 +310,14 @@ export function installSyncStatus(pi: ExtensionAPI, openGraph?: (ctx: ExtensionC
 	const show = (ctx: ExtensionContext) => {
 		if (!ctx.hasUI || typeof ctx.ui.setWidget !== "function") return;
 		const selected = selectedStatus(ctx), indicator = selected?.indicator ?? undefined;
+		const share = readiness && selected ? readyShare(readiness.read(selected.root)) : undefined;
 		activationContext = ctx;
 		const changed = indicator?.text !== visibleIndicator?.text || indicator?.tone !== visibleIndicator?.tone ||
-			indicator?.symbol !== visibleIndicator?.symbol || indicator?.progress !== visibleIndicator?.progress || selected?.diagnostic !== visibleDiagnostic;
+			indicator?.symbol !== visibleIndicator?.symbol || indicator?.progress !== visibleIndicator?.progress || selected?.diagnostic !== visibleDiagnostic ||
+			share?.value !== visibleShare?.value || share?.text !== visibleShare?.text;
 		visibleIndicator = indicator;
 		visibleDiagnostic = selected?.diagnostic;
+		visibleShare = share;
 		if (changed) { nativeNode = undefined; plainRows = undefined; }
 		// setWidget replaces and disposes its old component. Mount once, then update
 		// this persistent component in place; notifications never remount it.
@@ -426,11 +452,13 @@ export function installSyncStatus(pi: ExtensionAPI, openGraph?: (ctx: ExtensionC
 		show(ctx);
 	});
 	pi.on("session_start", (_event, ctx) => show(ctx));
+	readiness?.subscribe(() => { if (activationContext) show(activationContext); });
 	pi.on("session_switch", (_event, ctx) => show(ctx));
 	pi.on("session_shutdown", (_event, ctx) => {
 		observed.clear();
 		activationContext = undefined;
 		visibleIndicator = undefined;
+		visibleShare = undefined;
 		nativeNode = undefined;
 		plainRows = undefined;
 		if (mounted && ctx.hasUI && typeof ctx.ui.setWidget === "function") ctx.ui.setWidget(STATUS_KEY, undefined);

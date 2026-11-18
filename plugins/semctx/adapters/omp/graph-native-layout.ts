@@ -1,7 +1,7 @@
 import type { GraphData } from "./graph";
 import { DEFAULT_GRAPH_APPEARANCE, type GraphAppearance } from "./graph-appearance";
 import { bindTermVector, centroid, cosine, graphEmbedding, semanticFamilies, semanticMap, similarityMap } from "./graph-data/embedding.js";
-import { bindDrawingWeight, drawingWeight, edgeGeometry, layoutGraph, relationKind, representativeLinks, sharedConceptFamilies, type GraphPosition, type GraphRelationKind, type SharedConceptFamily } from "./graph-data/layout.js";
+import { affinityOf, bindAffinity, bindDrawingWeight, drawingWeight, edgeGeometry, isRemainder, layoutGraph, relationKind, representativeLinks, sharedConceptFamilies, type GraphPosition, type GraphRelationKind, type SharedConceptFamily } from "./graph-data/layout.js";
 import { conceptPalette } from "./graph-data/palette.js";
 import type { GraphPreviewSize } from "./graph-preview";
 import { compactTooltip } from "./tooltip-text";
@@ -31,16 +31,17 @@ export interface NativeGraphRoute {
 	tier?: 1 | 2 | 3 | 4;
 }
 /**
- * Family around its member dots: a doc concept family, or else a lexical identifier family.
- * It is not the server's embedding and never moves a dot.
+ * Area around its member dots. "family": a doc concept family. "module": map-region groups or drill-down members that share a folder.
+ * "lexical": shared identifier terms, from a map region with recorded links, from term similarity alone, or from a drill-down content subconcept.
+ * A territory never moves a dot.
  */
 export interface NativeGraphTerritory {
 	key: string;
-	kind: "family" | "lexical";
+	kind: "family" | "module" | "lexical";
 	label: string;
 	/** Hover text for the label chip, already compact. */
 	title?: string;
-	/** Shared identifier terms of a lexical family; doc concept families have none. */
+	/** Shared identifier terms of a lexical family; other kinds have none. */
 	terms: string[];
 	members: string[];
 	x: number;
@@ -81,17 +82,19 @@ function orientMap(mapped: ReadonlyMap<string, NativeGraphPoint>, rank: readonly
 
 /**
  * Concept similarity S: shared identifier terms .6, recorded links .3 and one shared doc concept family .1.
+ * With bound semantic affinity (semctx search profiles), terms and affinity take .35 each and links .2.
  * Classical MDS on the distance 1 − S places the nodes; the principal axis is horizontal.
  * The heaviest node, then the first ID, takes the left and top side of each axis.
- * Undefined without term or family evidence, or when all pairs are equally similar.
+ * Undefined without term, family or affinity evidence, or when all pairs are equally similar.
  */
 function conceptMap(data: GraphData): ReadonlyMap<string, NativeGraphPoint> | undefined {
 	const cached = conceptMaps.get(data);
 	if (cached !== undefined) return cached ?? undefined;
 	const ids = [...new Set(data.nodes.map(node => node.id))].sort(compare), n = ids.length, at = new Map(ids.map((id, index) => [id, index]));
-	const { vectors, informative } = graphEmbedding(data), shared = sharedConceptFamilies(data.nodes);
+	const { vectors, informative } = graphEmbedding(data), shared = sharedConceptFamilies(data.nodes), semantic = affinityOf(data);
+	const [termShare, linkShare, semanticShare] = semantic ? [.35, .2, .35] : [.6, .3, 0];
 	let result: Map<string, NativeGraphPoint> | undefined;
-	if (n >= 2 && n <= 512 && (informative || shared.length)) {
+	if (n >= 2 && n <= 512 && (informative || shared.length || semantic)) {
 		const family = new Map(shared.flatMap(item => item.members.map(id => [id, item.key] as const)));
 		// Links count in both directions. Project membership repeats the hierarchy, so it stays out.
 		const pairs = new Map<number, number[]>();
@@ -108,8 +111,8 @@ function conceptMap(data: GraphData): ReadonlyMap<string, NativeGraphPoint> | un
 		for (let i = 0; i < n; i++) {
 			similarity[i * n + i] = 1;
 			for (let j = i + 1; j < n; j++) {
-				const value = .6 * cosine(vectors.get(ids[i]), vectors.get(ids[j])) + (strongest ? .3 * (affinity.get(i * n + j) ?? 0) / strongest : 0) +
-					(family.has(ids[i]) && family.get(ids[i]) === family.get(ids[j]) ? .1 : 0);
+				const value = termShare * cosine(vectors.get(ids[i]), vectors.get(ids[j])) + (strongest ? linkShare * (affinity.get(i * n + j) ?? 0) / strongest : 0) +
+					(semantic ? semanticShare * semantic(ids[i], ids[j]) : 0) + (family.has(ids[i]) && family.get(ids[i]) === family.get(ids[j]) ? .1 : 0);
 				similarity[i * n + j] = similarity[j * n + i] = value;
 				low = Math.min(low, value); high = Math.max(high, value);
 			}
@@ -358,16 +361,54 @@ function memberEllipse(members: readonly { x: number; y: number; radius: number 
 }
 
 /**
- * A family is one outer-map island, not a weak pairwise hint. Its centroid and the ungrouped nodes form the outer MDS.
- * Local MDS keeps the family's terms readable. Packing reserves each family's final territory before any singleton is placed.
+ * Half value, half rank on [0, 1]: one distant outlier cannot squeeze every other position into a corner.
+ * Equal values share their mean rank; a single distinct value maps to .5.
  */
-function familyPositions(data: GraphData, points: GraphPosition[], families: readonly SharedConceptFamily[], left: number, top: number, right: number, bottom: number): boolean {
+function rankBlend(values: readonly number[]): number[] {
+	const low = Math.min(...values), high = Math.max(...values);
+	if (!(high > low)) return values.map(() => .5);
+	const first = new Map<number, number>(), last = new Map<number, number>();
+	[...values].sort((a, b) => a - b).forEach((value, index) => { if (!first.has(value)) first.set(value, index); last.set(value, index); });
+	return values.map(value => ((value - low) / (high - low) + (first.get(value)! + last.get(value)!) / 2 / (values.length - 1)) / 2);
+}
+
+/**
+ * Dot-and-label footprints must not overlap. A preview label sits above and to the right of its dot by default.
+ * Overlapping footprints move apart vertically, so a crowded island reads as a short list.
+ * Positions stay deterministic: pairs resolve in input order for a bounded number of passes.
+ */
+function separateLabels(points: GraphPosition[], width: (point: GraphPosition) => number): void {
+	// The label box spans 14 px and ends 1.5 px below the dot top; see `graphLabels` in graph-preview.ts.
+	const above = (point: GraphPosition) => point.radius + 12.5;
+	for (let pass = 0; pass < 80; pass++) {
+		let moved = false;
+		for (let a = 0; a < points.length; a++) for (let b = a + 1; b < points.length; b++) {
+			const p = points[a], q = points[b];
+			const overlapX = Math.min(p.x + p.radius + 5.5 + width(p), q.x + q.radius + 5.5 + width(q)) - Math.max(p.x - p.radius, q.x - q.radius) + 4;
+			if (overlapX <= 0) continue;
+			const [upper, lower] = q.y > p.y || (q.y === p.y && compare(p.node.id, q.node.id) < 0) ? [p, q] : [q, p];
+			const overlapY = upper.y + upper.radius + above(lower) + 3 - lower.y;
+			if (overlapY <= 0) continue;
+			upper.y -= overlapY / 2; lower.y += overlapY / 2; moved = true;
+		}
+		if (!moved) return;
+	}
+}
+
+/**
+ * A family is one outer-map island, not a weak pairwise hint. Its centroid and the ungrouped nodes form the outer MDS.
+ * Inside an island, the concept map of its members and their own links keeps related members side by side.
+ * Packing reserves each family's final territory before any singleton is placed. A folded remainder takes the free spot nearest the lower right corner.
+ * `labelWidth`, when present, reserves room for each dot's label.
+ */
+function familyPositions(data: GraphData, points: GraphPosition[], families: readonly SharedConceptFamily[], left: number, top: number, right: number, bottom: number,
+	labelWidth?: (point: GraphPosition) => number): boolean {
 	if (!families.length) return false;
 	const { vectors } = graphEmbedding(data), byId = new Map(points.map(point => [point.node.id, point]));
-	const grouped = new Set(families.flatMap(family => family.members));
+	const grouped = new Set(families.flatMap(family => family.members)), remainders = points.filter(point => isRemainder(point.node));
 	const groups = [
 		...families.map(family => ({ key: JSON.stringify(["family", family.key]), members: family.members.map(id => byId.get(id)!) })),
-		...points.filter(point => !grouped.has(point.node.id)).map(point => ({ key: JSON.stringify(["node", point.node.id]), members: [point] })),
+		...points.filter(point => !grouped.has(point.node.id) && !isRemainder(point.node)).map(point => ({ key: JSON.stringify(["node", point.node.id]), members: [point] })),
 	].sort((a, b) => compare(a.key, b.key));
 	const groupOf = new Map(groups.flatMap(group => group.members.map(point => [point.node.id, group.key] as const)));
 	const nodes = groups.map(group => {
@@ -377,80 +418,130 @@ function familyPositions(data: GraphData, points: GraphPosition[], families: rea
 		return node;
 	});
 	const edges = data.edges.flatMap(edge => {
-		const from = groupOf.get(edge.from)!, to = groupOf.get(edge.to)!;
-		if (from === to) return [];
+		const from = groupOf.get(edge.from), to = groupOf.get(edge.to);
+		if (from === undefined || to === undefined || from === to) return [];
 		const link = { ...edge, from, to };
 		bindDrawingWeight(link, drawingWeight(edge) ?? 1);
 		return [link];
 	});
-	const mapped = conceptMap({ ...data, nodes, edges, roots: [] });
-	// The heaviest original node fixes the outer orientation, even when it belongs to a larger family.
-	const rank = [...points].sort((a, b) => (drawingWeight(b.node) ?? 0) - (drawingWeight(a.node) ?? 0) || compare(a.node.id, b.node.id)).map(point => groupOf.get(point.node.id)!);
-	const outer = mapped && orientMap(mapped, rank);
-	const islands = groups.map((group, groupIndex) => {
-		const members = group.members;
-		if (members.length > 1) {
-			const local = semanticMap(members.map(point => point.node.id), vectors), extent = Math.max(24, Math.sqrt(members.length) * 16);
-			const spread = local ? Math.max(...[...local.values()].map(([x, y]) => Math.hypot(x, y))) : 1;
-			members.forEach((point, index) => {
-				const position = local?.get(point.node.id), angle = index * Math.PI * 2 / members.length;
-				// A pair reads down the page, leaving room for both node labels beside its dots.
-				point.x = position ? position[members.length === 2 ? 1 : 0] / spread * extent : Math.cos(angle) * extent;
-				point.y = position ? position[members.length === 2 ? 0 : 1] / spread * extent : Math.sin(angle) * extent;
-			});
-			separate(members, -extent, -extent, extent, extent, false);
-		} else { members[0].x = 0; members[0].y = 0; }
-		const envelope = memberEllipse(members, false);
-		// Keep the territory border and label chip clear of neighbouring islands.
-		const rx = members.length > 1 ? envelope.rx + 10 : members[0].radius + 13, ry = members.length > 1 ? envelope.ry + 10 : members[0].radius + 13;
-		for (const point of members) { point.x -= envelope.x; point.y -= envelope.y; }
-		const seed = outer?.get(group.key);
-		return { ...group, rx, ry, seed: seed ?? [groupIndex, 0], x: 0, y: 0 };
-	});
-	const xs = islands.map(island => island.seed[0]), ys = islands.map(island => island.seed[1]);
-	const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys);
-	// Largest families go first. Every candidate is a nearest free box edge, so small unrelated groups cannot split a family.
-	const placed: typeof islands = [];
-	for (const island of [...islands].sort((a, b) => b.members.length - a.members.length || b.rx * b.ry - a.rx * a.ry || compare(a.key, b.key))) {
-		const x = minX === maxX ? (left + right) / 2 : left + (island.seed[0] - minX) / (maxX - minX) * (right - left);
-		const y = minY === maxY ? (top + bottom) / 2 : top + (island.seed[1] - minY) / (maxY - minY) * (bottom - top);
-		const clampX = (value: number) => Math.max(left + island.rx, Math.min(right - island.rx, value));
-		const clampY = (value: number) => Math.max(top + island.ry, Math.min(bottom - island.ry, value));
-		const candidatesX = [...new Set([clampX(x), left + island.rx, right - island.rx, ...placed.flatMap(other => [other.x - other.rx - island.rx - 8, other.x + other.rx + island.rx + 8])])]
-			.filter(value => value >= left + island.rx && value <= right - island.rx).sort((a, b) => Math.abs(a - x) - Math.abs(b - x) || a - b);
-		const candidatesY = [...new Set([clampY(y), top + island.ry, bottom - island.ry, ...placed.flatMap(other => [other.y - other.ry - island.ry - 8, other.y + other.ry + island.ry + 8])])]
-			.filter(value => value >= top + island.ry && value <= bottom - island.ry).sort((a, b) => Math.abs(a - y) - Math.abs(b - y) || a - b);
-		let best = Infinity;
-		island.x = clampX(x); island.y = clampY(y);
-		for (const cx of candidatesX) {
-			if ((cx - x) ** 2 >= best) break;
-			for (const cy of candidatesY) {
-				const score = (cx - x) ** 2 + (cy - y) ** 2;
-				if (score >= best) break;
-				if (placed.some(other => Math.abs(cx - other.x) < island.rx + other.rx + 7.9 && Math.abs(cy - other.y) < island.ry + other.ry + 7.9)) continue;
-				best = score; island.x = cx; island.y = cy;
-			}
-		}
-		placed.push(island);
-		for (const point of island.members) { point.x += island.x; point.y += island.y; }
+	const outerData = { ...data, nodes, edges, roots: [] }, semantic = affinityOf(data);
+	// Island affinity is the mean affinity of their member pairs.
+	if (semantic) {
+		const members = new Map(groups.map(group => [group.key, group.members.map(point => point.node.id)]));
+		bindAffinity(outerData, (a, b) => {
+			const left = members.get(a) ?? [], right = members.get(b) ?? [];
+			let sum = 0; for (const x of left) for (const y of right) sum += semantic(x, y);
+			return left.length && right.length ? sum / (left.length * right.length) : 0;
+		});
 	}
+	const mapped = conceptMap(outerData);
+	// The heaviest original node fixes the outer orientation, even when it belongs to a larger family.
+	const rank = points.filter(point => groupOf.has(point.node.id)).sort((a, b) => (drawingWeight(b.node) ?? 0) - (drawingWeight(a.node) ?? 0) || compare(a.node.id, b.node.id)).map(point => groupOf.get(point.node.id)!);
+	const outer = mapped && orientMap(mapped, rank);
+	// Islands grow with the canvas, so a large popup spends its room on spacing instead of empty margins.
+	// When the islands do not fit, the next attempt packs them tighter. Then labels keep their spacing inside an island but stop reserving room
+	// beyond it. The last attempt keeps the compact geometry without label room.
+	// A small canvas packs its islands tighter than 16 px per member, so the regions still fit without overlap.
+	const floor = Math.min(16, Math.max(10, Math.sqrt((right - left) * (bottom - top)) / 14));
+	const roomy = Math.max(floor, Math.min(32, Math.sqrt(.3 * (right - left) * (bottom - top) / Math.max(1, points.length)) * .55));
+	const attempts = [{ unit: roomy, labels: labelWidth, reserve: true }, { unit: Math.max(floor, roomy * .75), labels: labelWidth, reserve: true },
+		{ unit: floor, labels: labelWidth, reserve: true }, { unit: floor, labels: labelWidth, reserve: false }, { unit: floor, labels: undefined, reserve: false }];
+	const local = new Map(groups.filter(group => group.members.length > 1).map(group => {
+		const ids = new Set(group.members.map(point => point.node.id));
+		const island = { ...data, nodes: group.members.map(point => point.node), edges: data.edges.filter(edge => ids.has(edge.from) && ids.has(edge.to)), roots: [] };
+		bindAffinity(island, semantic);
+		return [group.key, conceptMap(island) ?? semanticMap([...ids], vectors)];
+	}));
+	const arrange = (unit: number, width: ((point: GraphPosition) => number) | undefined, reserve: boolean, last: boolean): boolean => {
+		const islands = groups.map((group, groupIndex) => {
+			const members = group.members;
+			if (members.length > 1) {
+				const extent = Math.max(24, Math.sqrt(members.length) * unit), coordinates = local.get(group.key);
+				const spread = coordinates ? Math.max(...[...coordinates.values()].map(([x, y]) => Math.hypot(x, y))) : 1;
+				members.forEach((point, index) => {
+					const position = coordinates?.get(point.node.id), angle = index * Math.PI * 2 / members.length;
+					// A pair reads down the page, leaving room for both node labels beside its dots.
+					point.x = position ? position[members.length === 2 ? 1 : 0] / spread * extent : Math.cos(angle) * extent;
+					point.y = position ? position[members.length === 2 ? 0 : 1] / spread * extent : Math.sin(angle) * extent;
+				});
+				separate(members, -extent, -extent, extent, extent, false);
+				if (width) separateLabels(members, width);
+			} else { members[0].x = 0; members[0].y = 0; }
+			const envelope = memberEllipse(members, false);
+			// Keep the territory border and label chip clear of neighbouring islands.
+			const rx = members.length > 1 ? envelope.rx + 10 : members[0].radius + 13, ry = members.length > 1 ? envelope.ry + 10 : members[0].radius + 13;
+			// Labels read to the right of their dots. The packing box also reserves the part of a label that leaves the island.
+			const overhang = width && reserve ? Math.max(0, ...members.map(point => point.x + point.radius + 6 + width(point) - envelope.x - rx)) : 0;
+			for (const point of members) { point.x -= envelope.x + overhang / 2; point.y -= envelope.y; }
+			const seed = outer?.get(group.key);
+			return { ...group, rx: rx + overhang / 2, ry, seed: seed ?? [groupIndex, 0], x: 0, y: 0 };
+		});
+		const xs = rankBlend(islands.map(island => island.seed[0])), ys = rankBlend(islands.map(island => island.seed[1]));
+		islands.forEach((island, index) => { island.x = left + xs[index] * (right - left); island.y = top + ys[index] * (bottom - top); });
+		// The remainder starts in the lower right corner and reserves its own label.
+		const tail = remainders.map(point => {
+			const overhang = width && reserve ? Math.max(0, width(point) + 6 - 13) : 0;
+			return { point, key: JSON.stringify(["remainder", point.node.id]), x: right, y: bottom, rx: point.radius + 13 + overhang / 2, ry: point.radius + 13, shift: overhang / 2 };
+		});
+		if (!packBoxes([...islands, ...tail], left, top, right, bottom) && !last) return false;
+		for (const island of islands) for (const point of island.members) { point.x += island.x; point.y += island.y; }
+		for (const box of tail) { box.point.x = box.x - box.shift; box.point.y = box.y; }
+		return true;
+	};
+	attempts.some(({ unit, labels, reserve }, index) => arrange(unit, labels, reserve, index === attempts.length - 1));
 	return true;
 }
 
-/** Doc concept families, or else lexical identifier families, around settled dots. They never feed back into dot positions. */
+/**
+ * Pushes overlapping boxes apart along their relatively smaller overlap and keeps them inside the canvas.
+ * Boxes keep an 8 px gap. Pairs resolve in input order for a bounded number of passes. True when no overlap remains.
+ */
+function packBoxes(boxes: { key: string; x: number; y: number; rx: number; ry: number }[], left: number, top: number, right: number, bottom: number): boolean {
+	if (boxes.some(box => 2 * box.rx > right - left || 2 * box.ry > bottom - top)) return false;
+	const clamp = (box: typeof boxes[number]) => {
+		box.x = Math.max(left + box.rx, Math.min(right - box.rx, box.x)); box.y = Math.max(top + box.ry, Math.min(bottom - box.ry, box.y));
+	};
+	boxes.forEach(clamp);
+	for (let pass = 0; pass < 240; pass++) {
+		let overlap = 0;
+		for (let a = 0; a < boxes.length; a++) for (let b = a + 1; b < boxes.length; b++) {
+			const p = boxes[a], q = boxes[b], dx = q.x - p.x, dy = q.y - p.y;
+			const ox = p.rx + q.rx + 8 - Math.abs(dx), oy = p.ry + q.ry + 8 - Math.abs(dy);
+			if (ox <= 0 || oy <= 0) continue;
+			overlap = Math.max(overlap, Math.min(ox, oy));
+			const tie = compare(p.key, q.key) <= 0 ? 1 : -1;
+			if (ox / (p.rx + q.rx) < oy / (p.ry + q.ry)) { const sign = Math.sign(dx) || tie; p.x -= sign * ox / 2; q.x += sign * ox / 2; }
+			else { const sign = Math.sign(dy) || tie; p.y -= sign * oy / 2; q.y += sign * oy / 2; }
+			clamp(p); clamp(q);
+		}
+		if (overlap < .5) return true;
+	}
+	return false;
+}
+
+/** Bound families (doc concept families or map regions), or else lexical identifier families, around settled dots. They never feed back into dot positions. */
 function territories(data: GraphData, dots: NativeGraphDot[], width: number, height: number, compact: boolean): NativeGraphTerritory[] {
 	if (dots.length < 4) return [];
 	const { vectors, informative } = graphEmbedding(data), byId = new Map(dots.map(dot => [dot.node.id, dot])), concepts = sharedConceptFamilies(data.nodes);
 	type Family = Pick<NativeGraphTerritory, "key" | "kind" | "label" | "title" | "terms" | "members" | "cohesion">;
-	// A doc concept family names a concept from the docs; lexical families only show shared identifier words.
+	// A doc concept family names a concept from the docs, a module region names a folder, and lexical families only show shared identifier words.
 	const families: Family[] = concepts.length ? concepts.slice(0, 6).map((family): Family => {
 		let total = 0, pairs = 0;
 		for (let a = 0; a < family.members.length; a++) for (let b = a + 1; b < family.members.length; b++) {
 			total += cosine(vectors.get(family.members[a]), vectors.get(family.members[b])); pairs++;
 		}
+		const count = family.members.length, shared = { key: family.key, label: family.label, members: family.members, cohesion: total / pairs };
+		const groups = family.members.every(id => byId.get(id)?.node.category === "group");
+		if (family.kind === "path") return { ...shared, kind: "module", terms: [], title: groups
+			? compactTooltip(`${family.label}/ · folder region`, `${count} groups with most files under ${family.label}/`)
+			: compactTooltip(`${family.label} · folder`, `${count} nodes in this folder`) };
+		if (family.kind === "terms") return { ...shared, kind: "lexical", terms: family.label.split(" · "),
+			title: compactTooltip(`${family.label} · shared terms`, `${count} groups with recorded links and these identifier terms`) };
+		if (family.kind === "content") return { ...shared, kind: "lexical", terms: [],
+			title: compactTooltip(`${family.label} · subconcept`, `${count} ${groups ? "groups" : "nodes"} with related names, headings, links or semctx search results`) };
 		const folder = family.key.startsWith("family:") ? family.key.slice("family:".length) : "";
-		return { key: family.key, kind: "family", label: family.label, terms: [], members: family.members, cohesion: total / pairs,
-			title: compactTooltip(`${family.label} · concept family`, `${family.members.length} concepts from docs in ${folder || "the repository root"}`) };
+		return { ...shared, kind: "family", terms: [],
+			title: compactTooltip(`${family.label} · concept family`, `${count} concepts from docs in ${folder || "the repository root"}`) };
 	}) : informative ? semanticFamilies([...byId.keys()].sort(compare), vectors).map((family): Family => ({ ...family, kind: "lexical",
 		title: compactTooltip(`${family.label} · shared terms`, "Lexical identifier similarity") })) : [];
 	// Cut the overflow of one axis at the canvas margin and center the radius on what remains.
@@ -483,16 +574,18 @@ export function nativeGraphLayout(data: GraphData, size: GraphPreviewSize, choic
 	const key = `${size}:${choice}`, previous = variants?.get(key);
 	if (previous) return previous;
 	// Without term or family evidence the concept map draws the force geometry. Families use their own two-level map.
-	const families = choice === "map" ? sharedConceptFamilies(data.nodes) : [];
-	const mapped = choice === "map" && !families.length ? conceptMap(data) : undefined, mode = choice === "map" && !mapped && !families.length ? "force" : choice;
+	// A folded remainder has no evidence of its own, so it never steers the concept map.
+	const families = choice === "map" ? sharedConceptFamilies(data.nodes) : [], core = data.nodes.filter(node => !isRemainder(node));
+	const mapped = choice === "map" && !families.length ? conceptMap(core.length === data.nodes.length ? data : { ...data, nodes: core, edges: data.edges.filter(edge => core.some(node => node.id === edge.from) && core.some(node => node.id === edge.to)) }) : undefined;
+	const mode = choice === "map" && !mapped && !families.length ? "force" : choice;
 	const links = representativeLinks(data), roots = new Set(data.roots);
 	const weights = new Map(data.nodes.map(node => [node.id, drawingWeight(node)]));
 	const heaviest = Math.max(0, ...[...weights.values()].map(weight => weight ?? 0));
-	// Bound weights size dots by area. Without them, roots and hubs get the larger fixed dot.
+	// Bound weights size dots by area. Without them, roots and hubs get the larger fixed dot. The compact canvas uses a smaller weighted range.
 	const radiusOf = (point: GraphPosition) => {
 		if (!heaviest) return roots.has(point.node.id) || point.degree >= 4 ? 5 : 3.5;
 		const weight = weights.get(point.node.id);
-		return weight ? Math.round((3.5 + 6 * Math.sqrt(weight / heaviest)) * 2) / 2 : 3.5;
+		return weight ? Math.round((3.5 + (size === "compact" ? 4 : 6) * Math.sqrt(weight / heaviest)) * 2) / 2 : 3.5;
 	};
 	const width = size === "compact" ? 280 : size === "overview" ? 760 : 560;
 	const height = size === "compact" ? 176 : size === "overview" ? 320 : data.nodes.length <= 8 ? 156 : data.nodes.length <= 24 ? 216 : 264;
@@ -541,16 +634,20 @@ export function nativeGraphLayout(data: GraphData, size: GraphPreviewSize, choic
 		const fill = (values: number[], from: number, to: number) => {
 			const low = Math.min(...values), high = Math.max(...values);
 			if (high === low) return values.map(() => (from + to) / 2);
-			const first = new Map<number, number>(), last = new Map<number, number>();
-			if (mode === "map") [...values].sort((a, b) => a - b).forEach((value, index) => { if (!first.has(value)) first.set(value, index); last.set(value, index); });
-			return values.map(value => {
-				const linear = (value - low) / (high - low);
-				return from + (mode === "map" ? (linear + (first.get(value)! + last.get(value)!) / 2 / (values.length - 1)) / 2 : linear) * (to - from);
-			});
+			return (mode === "map" ? rankBlend(values) : values.map(value => (value - low) / (high - low))).map(share => from + share * (to - from));
 		};
-		if (mode !== "map" || !familyPositions(data, points, families, left, top, right, bottom)) {
-			const xs = fill(points.map(point => point.x), left, right), ys = fill(points.map(point => point.y), top, bottom);
-			points.forEach((point, index) => { point.x = xs[index]; point.y = ys[index]; });
+		// The estimate follows the preview label: the symbol, else the file name, else the label, at most 30 characters of about 6.8 px.
+		const labelWidth = size === "compact" ? undefined : (point: GraphPosition) => {
+			const path = point.node.hit?.path ?? point.node.path;
+			const name = point.node.hit?.symbol ?? (point.node.category === "file" && path ? path.split("/").at(-1)! : point.node.label);
+			return Math.min(30, Array.from(name).length) * 6.8 + 4;
+		};
+		if (mode !== "map" || !familyPositions(data, points, families, left, top, right, bottom, labelWidth)) {
+			const placed = mode === "map" ? points.filter(point => !isRemainder(point.node)) : points;
+			const xs = fill(placed.map(point => point.x), left, right), ys = fill(placed.map(point => point.y), top, bottom);
+			placed.forEach((point, index) => { point.x = xs[index]; point.y = ys[index]; });
+			// The remainder starts in the lower right corner; separation moves it to free space.
+			if (mode === "map") for (const point of points) if (isRemainder(point.node)) { point.x = right; point.y = bottom; }
 		}
 		separate(points, left, top, right, bottom, mode === "layers");
 		geometries = links.map((_, index) => edgeGeometry(links, index, positions)!);

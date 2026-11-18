@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fmt::Write;
 
 use serde_json::Value;
 
@@ -422,9 +423,9 @@ pub(in crate::query) struct OverviewInput<'a> {
     pub tree: &'a [api::FileTreeNode],
     pub projects: &'a api::ProjectGraph,
     pub imports: &'a [api::ImportEdge],
-    pub imports_total: u32,
+    pub imports_total: Option<usize>,
     pub references: &'a [api::SymbolEdge],
-    pub references_total: u32,
+    pub references_total: Option<usize>,
     pub files: &'a [api::CodebaseFile],
     pub caveats: Vec<String>,
     pub loading: bool,
@@ -447,7 +448,9 @@ pub(in crate::query) fn project_overview(
         caveats,
         loading,
     } = input;
-    if imports.len() > imports_total as usize || references.len() > references_total as usize {
+    if imports_total.is_some_and(|total| imports.len() > total)
+        || references_total.is_some_and(|total| references.len() > total)
+    {
         return Err(invalid(
             "Backend overview relationship counts are inconsistent.",
         ));
@@ -466,8 +469,8 @@ pub(in crate::query) fn project_overview(
     let mut graph = Graph::new("Indexed project overview", None);
     graph.loading = loading.then_some(true);
     graph.truncated = !caveats.is_empty()
-        || imports.len() != imports_total as usize
-        || references.len() != references_total as usize;
+        || Some(imports.len()) != imports_total
+        || Some(references.len()) != references_total;
     graph.caveats = caveats;
     let mut catalog = project_catalog(&mut graph, tree)?;
     project_file_status(&mut graph, &mut catalog, files)?;
@@ -482,7 +485,29 @@ pub(in crate::query) fn project_overview(
     if graph.truncated {
         graph.caveats.push("Partial indexed structure: indexing is incomplete or some structural data is unavailable. The specific caveats and reported relationship counts describe what is available. Only catalog-backed endpoints are connected; no missing links are inferred.".into());
     }
-    graph.caveats.push(format!("Available indexed structure: {} files, {} directories, {} projects, {} groups, {import_count} of {imports_total} resolved file imports, {reference_count} of {references_total} resolved symbol bindings.", catalog.files.len(), catalog.paths.len() - catalog.files.len(), projects.projects.len(), projects.groups.len()));
+    let mut counts = format!(
+        "Available indexed structure: {} files, {} directories, {} projects, {} groups",
+        catalog.files.len(),
+        catalog.paths.len() - catalog.files.len(),
+        projects.projects.len(),
+        projects.groups.len()
+    );
+    for (count, total, kind) in [
+        (import_count, imports_total, "resolved file imports"),
+        (
+            reference_count,
+            references_total,
+            "resolved symbol bindings",
+        ),
+    ] {
+        match total {
+            Some(total) => write!(counts, ", {count} of {total} {kind}"),
+            None => write!(counts, ", {count} {kind} (total unknown)"),
+        }
+        .expect("writing to a String cannot fail");
+    }
+    counts.push('.');
+    graph.caveats.push(counts);
     graph.caveats.push("Containment describes indexed paths. Project association uses nearest reported project roots, not compiler inclusion or verified semantic binding. Reference edges preserve backend-resolved symbol names and monikers; these and file imports provide structural evidence for inferred functional communities, not embedding similarity or every runtime relationship.".into());
     let display = Display {
         version: 1,

@@ -880,10 +880,7 @@ mod tests {
         )
         .expect("the standard envelope must parse");
 
-        let rows = envelope
-            .data
-            .map(TenantsPage::into_rows)
-            .unwrap_or_default();
+        let rows = envelope.data.map_or_default(TenantsPage::into_rows);
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].slug, "napbat");
@@ -900,10 +897,7 @@ mod tests {
         )
         .expect("the older shape must still parse");
 
-        let rows = envelope
-            .data
-            .map(TenantsPage::into_rows)
-            .unwrap_or_default();
+        let rows = envelope.data.map_or_default(TenantsPage::into_rows);
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].slug, "napbat");

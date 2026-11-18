@@ -424,6 +424,37 @@ async fn a_tool_result_notes_the_partial_graph_answers_of_its_own_call_only() {
 }
 
 #[tokio::test]
+async fn graph_warnings_preserve_the_original_model_content_and_native_display() {
+    let graph = r#"{"nodes":[{"domainId":"code","id":"a","score":1.0,"path":"src/lib.rs",
+        "lineStart":1,"lineEnd":1,"kind":"function","symbol":"a","snippet":"fn a() {}"}],"edges":[]}"#;
+    let stub = Stub::serve(vec![
+        Reply::partial("providers-unavailable", "none", graph),
+        Reply::ok(graph),
+    ])
+    .await;
+    let client = Client::for_test_server(&stub.url).with_codebase("codebase".into());
+    let mut host = Host::connect(server_with(client, DEADLINE)).await;
+
+    let partial = host.call_tool("call_graph", json!({"symbol": "a"})).await;
+    let complete = host.call_tool("call_graph", json!({"symbol": "a"})).await;
+    let warning =
+        "the graph answer is partial (providers-unavailable); a retry returns the same result";
+
+    assert_eq!(partial["isError"], false, "{partial}");
+    assert_eq!(complete["isError"], false, "{complete}");
+    assert_eq!(texts_of(&partial).len(), 2);
+    assert_eq!(partial["content"][0], complete["content"][0]);
+    assert_eq!(partial["content"][1]["text"], format!("note: {warning}"));
+    assert_eq!(partial["_meta"]["semctlWarnings"], json!([warning]));
+    assert!(complete["_meta"].get("semctlWarnings").is_none());
+    let display = &complete["_meta"]["semctlDisplay"];
+    assert_eq!(display["kind"], "graph", "{complete}");
+    assert_eq!(&partial["_meta"]["semctlDisplay"], display);
+    assert!(partial.get("structuredContent").is_none());
+    assert_eq!(stub.requests(), 2, "a partial success is not retried");
+}
+
+#[tokio::test]
 async fn a_pending_partial_answer_notes_that_a_later_call_can_return_more() {
     let stub = Stub::serve(vec![Reply::partial("providers-loading", "pending", "[]")]).await;
     let budget = CallBudget::until(Instant::now() + DEADLINE);
@@ -433,8 +464,8 @@ async fn a_pending_partial_answer_notes_that_a_later_call_can_return_more() {
         .await
         .expect("the partial answer is a success");
 
-    let noted = budget.with_partial_notes(CallToolResult::success(vec![Content::text("refs")]));
     let failed = budget.with_partial_notes(CallToolResult::error(vec![Content::text("failed")]));
+    let noted = budget.with_partial_notes(CallToolResult::success(vec![Content::text("refs")]));
 
     let noted = serde_json::to_value(noted).expect("serialize the result");
     assert_eq!(
@@ -451,4 +482,5 @@ async fn a_pending_partial_answer_notes_that_a_later_call_can_return_more() {
         vec!["failed"],
         "an error result has no answer to qualify"
     );
+    assert!(failed.get("_meta").is_none());
 }

@@ -11,8 +11,9 @@ use std::{borrow::Cow, time::Duration};
 
 use rmcp::{
     handler::server::router::tool::ToolRouter,
-    model::{CallToolResult, Content, IntoContents},
+    model::{CallToolResult, Content, IntoContents, Meta},
 };
+use serde_json::Value;
 use tokio::time::{Instant, error::Elapsed};
 
 use super::{DIRECT_EDIT_TOOLS, McpServer};
@@ -58,18 +59,29 @@ impl CallBudget {
             .with_partial_answers(self.partial_answers.clone())
     }
 
-    /// `result` with one note for each partial graph answer of this call, so
-    /// the agent knows that the answer is not complete. An error result gets
-    /// no note: the agent has no answer to qualify.
+    /// Add each partial answer to the model-facing content and to separate
+    /// native metadata. An error result has no answer to qualify.
     pub(crate) fn with_partial_notes(&self, mut result: CallToolResult) -> CallToolResult {
-        if result.is_error != Some(true) {
-            result.content.extend(
-                self.partial_answers
-                    .answers()
-                    .iter()
-                    .map(|answer| Content::text(format!("note: {answer}"))),
-            );
+        if result.is_error == Some(true) {
+            return result;
         }
+        let answers = self.partial_answers.take();
+        if answers.is_empty() {
+            return result;
+        }
+        let mut warnings = Vec::with_capacity(answers.len());
+        result.content.reserve(answers.len());
+        for answer in answers {
+            let warning = answer.to_string();
+            result
+                .content
+                .push(Content::text(format!("note: {warning}")));
+            warnings.push(Value::String(warning));
+        }
+        result
+            .meta
+            .get_or_insert_with(Meta::new)
+            .insert("semctlWarnings".to_string(), Value::Array(warnings));
         result
     }
 

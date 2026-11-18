@@ -115,9 +115,12 @@ export class GraphPage implements Component {
 	private syncInspector(): void {
 		const state = this.options.state();
 		if (state.display !== this.lastDisplay) {
+			// A changed refresh keeps the drill-down group and selected node when they still exist.
+			const navigation = this.inspector && "navigation" in this.inspector && typeof this.inspector.navigation === "function" ? this.inspector.navigation() : undefined;
 			this.inspector?.dispose?.();
 			this.lastDisplay = state.display;
 			this.inspector = state.display ? this.options.createInspector(state.display, this.options.requestRender, state.text, "overview") : undefined;
+			if (navigation && this.inspector && "restoreNavigation" in this.inspector && typeof this.inspector.restoreNavigation === "function") this.inspector.restoreNavigation(navigation);
 		}
 		if (this.inspector && "setAppearance" in this.inspector && typeof this.inspector.setAppearance === "function") this.inspector.setAppearance(this.options.appearance.state.value);
 		if (this.inspector && "setActivity" in this.inspector && typeof this.inspector.setActivity === "function") this.inspector.setActivity(this.options.activity().targets);
@@ -133,7 +136,7 @@ export class GraphPage implements Component {
 		const motion = appearance.state.value.motion !== "off" && !cx.reduceMotion;
 		const out: NativeNode[] = [{ k: "row", key: "toolbar", p: { role: "semctl.graph.toolbar", gap: "sm", align: "center" }, c: [
 			{ k: "col", key: "heading", p: { grow: 1, min: { w: 0 } }, c: [
-				text(operation.label, { role: "semctl.graph.title", truncate: "end", wrap: "none", title: compactTooltip(`Read-only · configured semctl CLI · ${cwd}`) }),
+				text(operation.label, { role: "semctl.graph.title", truncate: "end", wrap: "none", title: compactTooltip("Read-only · configured semctl CLI", cwd) }),
 				...(operation.id === "overview" ? [text(path.basename(cwd), {
 					role: "semctl.graph.hint", tone: "muted", truncate: "end", wrap: "none", title: compactTooltip(cwd),
 				})] : []),
@@ -160,6 +163,8 @@ export class GraphPage implements Component {
 			if (this.inspector) body.push(this.section(cx, "original", "Original CLI result", request.text));
 			if (activity.producer) body.push(this.section(cx, "producer", "Producer observation", [activity.producer.text, activity.producer.details].filter(Boolean).join("\n")));
 		}
+		if (!this.menu && request.warnings?.length) body.unshift({ k: "col", key: "query-warnings", p: { gap: "xs" },
+			c: request.warnings.map(warning => text(`Warning: ${warning}`, { tone: "warning" })) });
 		out.push({ k: "col", key: "body", p: { role: "semctl.graph.body", min: { h: "12lines" }, max: { h: "28lines" } }, scroll: this.scroll, c: body });
 		out.push(graphStatus(cx, { request, activity, motion: appearance.state.value.motion }));
 		out.push(text(this.menu ? "←/→ groups · ↑/↓ analyses · Enter run · Esc return to map"
@@ -172,7 +177,7 @@ export class GraphPage implements Component {
 		const state = this.options.state(), rows = [this.options.operation.label,
 			...(this.menu ? [groups[this.group].label, ...this.groupOperations().map(operation => `${operation.id === this.selectedMenu ? ">" : " "} ${operation.label}`)] : []),
 			...(state.loading ? [state.display ? "Refreshing · last available map retained" : "Reading indexed project map…"] : []),
-			...(state.error ? [state.error] : []), ...clean(state.text).split(/\r?\n/),
+			...(state.error ? [state.error] : []), ...(state.warnings?.map(warning => `Warning: ${warning}`) ?? []), ...clean(state.text).split(/\r?\n/),
 			...(this.diagnostics ? [`Read-only · configured semctl CLI · ${this.options.cwd}`] : []),
 		].flatMap(line => clean(line).split(/\r?\n/)).flatMap(line => line.length ? Array.from({ length: Math.ceil(line.length / Math.max(1, width)) }, (_, index) => line.slice(index * Math.max(1, width), (index + 1) * Math.max(1, width))) : [""]);
 		this.offset = Math.max(0, Math.min(this.offset, rows.length - this.options.height()));

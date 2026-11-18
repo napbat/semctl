@@ -829,6 +829,54 @@ fn symbolic_edits_are_direct_actions_not_plan_transport() {
 }
 
 #[test]
+fn retrieval_skill_has_one_repository_source() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for relative in ["SKILL.md", "agents/openai.yaml"] {
+        assert!(
+            root.join("plugins/semctx/skills/codebase-retrieval")
+                .join(relative)
+                .is_file(),
+            "shared retrieval skill is missing {relative}"
+        );
+        for duplicate in [
+            "skills/codebase-retrieval",
+            "codex-plugin/skills/codebase-retrieval",
+        ] {
+            assert!(
+                !root.join(duplicate).join(relative).exists(),
+                "do not copy shared skill assets into a host adapter"
+            );
+        }
+    }
+}
+
+#[test]
+fn prior_index_permission_is_durable_in_agent_guidance() {
+    for (name, text) in [
+        ("server instructions", server_instructions().to_string()),
+        ("retrieval skill", skill_md()),
+    ] {
+        assert!(
+            text.contains("previously indexed") && text.contains("without asking again"),
+            "{name} must say that an existing index is prior consent"
+        );
+    }
+}
+
+#[test]
+fn first_index_gate_is_explained_in_agent_guidance() {
+    for (name, text) in [
+        ("server instructions", server_instructions().to_string()),
+        ("retrieval skill", skill_md()),
+    ] {
+        assert!(
+            text.contains("first-ever") && text.contains("sync_status"),
+            "{name} must explain the first-index readiness gate and progress path"
+        );
+    }
+}
+
+#[test]
 fn steering_docs_name_no_phantom_tools() {
     let tools = registered_tools();
     let phantoms = phantom_tools(server_instructions(), &tools);

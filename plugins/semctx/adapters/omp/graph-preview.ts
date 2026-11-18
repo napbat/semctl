@@ -2,7 +2,8 @@ import type { DescribeContext, NativeNode } from "@oh-my-pi/pi-tui";
 import { getGraphColorMode, lookupGraphColor, type GraphColor } from "./graph-colors";
 import type { GraphData } from "./graph";
 import type { GraphAppearance } from "./graph-appearance";
-import { drawingWeight, relations } from "./graph-data/layout.js";
+import { drawingWeight, isRemainder, relations } from "./graph-data/layout.js";
+import { keyTerms } from "./graph-data/embedding.js";
 import { conceptClass } from "./native-concepts";
 import { nativeGraphLayout, type NativeGraphLayout, type NativeGraphRoute } from "./graph-native-layout";
 import { positionClasses, routeStrokeClasses, type NativeGraphRouteClasses } from "./graph-native-styles";
@@ -29,8 +30,26 @@ export interface GraphNodeFacts {
 }
 const plain = (value: string) => value.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "");
 const routeGeometry = new WeakMap<NativeGraphRoute, NativeGraphRouteClasses>();
-const layoutIdentities = new WeakMap<NativeGraphLayout, number>();
-let nextLayoutIdentity = 0;
+const layoutSignatures = new WeakMap<NativeGraphLayout, string>();
+
+/**
+ * A key for the settled geometry, not for the layout object. A refresh that yields the same geometry keeps the
+ * route and territory layers mounted, so Tern does not replay their fade-in. Positions round to 0.1 px.
+ */
+function layoutSignature(layout: NativeGraphLayout): string {
+	let signature = layoutSignatures.get(layout);
+	if (signature === undefined) {
+		const round = (value: number) => Math.round(value * 10);
+		const text = JSON.stringify([layout.width, layout.height, layout.dots.map(dot => [dot.node.id, round(dot.x), round(dot.y), dot.radius]),
+			layout.routes.map(route => [route.link.from, route.link.to, route.link.kind, route.tier ?? 0]),
+			layout.territories.map(territory => [territory.key, territory.label, round(territory.x), round(territory.y), round(territory.rx), round(territory.ry)])]);
+		let hash = 2166136261;
+		for (let index = 0; index < text.length; index++) hash = Math.imul(hash ^ text.charCodeAt(index), 16777619);
+		signature = `${(hash >>> 0).toString(36)}${text.length.toString(36)}`;
+		layoutSignatures.set(layout, signature);
+	}
+	return signature;
+}
 
 /** One status phrase for a dot or row; ready nodes need no hover status. */
 function indexingFact(node: GraphData["nodes"][number]): string | undefined {
@@ -47,12 +66,14 @@ function indexingFact(node: GraphData["nodes"][number]): string | undefined {
 
 export function graphNodeTitle(node: GraphData["nodes"][number], color: GraphColor | undefined, facts: GraphNodeFacts = {}): string {
 	const documented = color?.concept?.kind === "doc" ? color.concept : undefined;
-	const group = node.category === "group", weight = group ? drawingWeight(node) : undefined;
-	const second = group && documented?.source ? `From ${documented.source}`
+	const group = node.category === "group", weight = group ? drawingWeight(node) : undefined, terms = group ? keyTerms(node) : [];
+	const origin = group && documented?.source ? `From ${documented.source}`
 		: [node.hit?.path ?? node.path, node.hit?.qualifiedName ?? node.hit?.symbol].find(value => value && value !== node.label);
+	// Key terms describe a group's code better than its first member path.
+	const second = terms.length ? [`Key terms: ${terms.join(" · ")}`, documented ? origin : undefined].filter(Boolean).join(" · ") : origin;
 	const concept = group || color?.source !== "concept" ? undefined
 		: documented ? `Concept: ${documented.title ?? color.label}` : `Inferred concept: ${color.label}`;
-	const status = [weight ? `${weight} nodes` : undefined, indexingFact(node), concept,
+	const status = [weight ? `${weight} nodes` : undefined, group && isRemainder(node) ? "Folded smaller groups" : undefined, indexingFact(node), concept,
 		facts.active ? "Active request target" : facts.recent ? `Recent request: ${facts.recent}` : undefined].filter(Boolean).join(" · ");
 	return compactTooltip(node.label, second, status, facts.hint);
 }
@@ -117,12 +138,14 @@ function territoryLabels(layout: NativeGraphLayout, size: GraphPreviewSize): Map
 
 function graphLabels(layout: NativeGraphLayout, options: Pick<GraphPreviewOptions, "appearance" | "selected" | "size" | "codebaseId">, obstacles: readonly GraphLabelBox[]): Map<string, { text: string; classes: string }> {
 	const mode = options.appearance?.labels;
-	const keyLimit = options.size === "compact" ? 3 : options.size === "overview" ? 10 : layout.dots.length <= 8 ? 8 : 6;
+	// Group maps reserve room for their labels, so they can name more groups than an ordinary result graph.
+	const grouped = layout.dots.every(dot => dot.node.category === "group");
+	const keyLimit = options.size === "compact" ? grouped ? 4 : 3 : options.size === "overview" ? grouped ? 16 : 10 : grouped ? 10 : layout.dots.length <= 8 ? 8 : 6;
 	const limit = mode === "hover" ? Number(options.selected !== undefined) : mode === "more" ? keyLimit * 2 : keyLimit;
-	// Documented concepts explain the map better than incidental structural hubs. Selection still wins.
+	// Documented concepts explain the map better than incidental structural hubs. Selection still wins. A folded remainder names nothing, so it comes last.
 	const documented = new Set(layout.dots.filter(dot => lookupGraphColor(options.codebaseId, dot.node, "concepts")?.concept?.kind === "doc").map(dot => dot.node.id));
 	const priority = [...layout.dots].sort((a, b) => Number(b.node.id === options.selected) - Number(a.node.id === options.selected) ||
-		Number(documented.has(b.node.id)) - Number(documented.has(a.node.id)) ||
+		Number(isRemainder(a.node)) - Number(isRemainder(b.node)) || Number(documented.has(b.node.id)) - Number(documented.has(a.node.id)) ||
 		Number(b.root) - Number(a.root) || (drawingWeight(b.node) ?? 0) - (drawingWeight(a.node) ?? 0) ||
 		b.degree - a.degree || (a.node.id < b.node.id ? -1 : a.node.id > b.node.id ? 1 : 0));
 	const boxes: GraphLabelBox[] = [];
@@ -161,8 +184,7 @@ function graphLabels(layout: NativeGraphLayout, options: Pick<GraphPreviewOption
 export function graphPreview(data: GraphData, cx: DescribeContext, options: GraphPreviewOptions = {}): NativeElement | undefined {
 	if (!supportsElements(cx) || !cx.feature("styles") || data.nodes.length < 1 || data.nodes.length > 64 || data.edges.length > 128) return undefined;
 	const size = options.size ?? "inline", appearance = options.appearance, layout = nativeGraphLayout(data, size, appearance?.layout);
-	const layoutId = layoutIdentities.get(layout) ?? ++nextLayoutIdentity;
-	layoutIdentities.set(layout, layoutId);
+	const layoutId = layoutSignature(layout);
 	const colorMode = appearance?.color ?? getGraphColorMode();
 	const selected = layout.dots.some(dot => dot.node.id === options.selected) ? options.selected : undefined;
 	const names = new Map(data.nodes.map(node => [node.id, node.label]));
@@ -206,7 +228,7 @@ export function graphPreview(data: GraphData, cx: DescribeContext, options: Grap
 			hint: action ? dot.node.category === "group" ? "Select to explore group" : "Select for details" : undefined });
 		return nativeElement({ k: "el", key: `node:${id}`, p: { tag: "div", class: "sg-node" }, c: [
 			nativeElement({ k: "el", key: "target", p: {
-				tag: "button", class: `sg-target ${positionClasses(dot.x, dot.y, layout.width, layout.height)} sg-s${Math.round(dot.radius * 2)} sg-d${arrival.get(id)}${color ? ` ${conceptClass(color, cx.dark)}` : ""}${dot.root ? " sg-root" : ""}${active ? " sg-active" : ""}${affected ? ` sg-indexing-${indexing}` : ""}${pip ? ` ${pip}` : ""}${id === selected ? " sg-selected" : ""}${selected && !connected.has(id) ? " sg-muted" : ""}${action ? " sg-action" : ""}`,
+				tag: "button", class: `sg-target ${positionClasses(dot.x, dot.y, layout.width, layout.height)} sg-s${Math.round(dot.radius * 2)} sg-d${arrival.get(id)}${color ? ` ${conceptClass(color, cx.dark)}` : ""}${dot.root ? " sg-root" : ""}${isRemainder(dot.node) ? " sg-remainder" : ""}${active ? " sg-active" : ""}${affected ? ` sg-indexing-${indexing}` : ""}${pip ? ` ${pip}` : ""}${id === selected ? " sg-selected" : ""}${selected && !connected.has(id) ? " sg-muted" : ""}${action ? " sg-action" : ""}`,
 				title, aria: `${plain(dot.node.label)}${dot.root ? ", graph root" : ""}${active ? ", active request target" : ""}${feedback ? `, recently ${feedback.outcome}` : ""}${stateText ? `, ${plain(stateText)}` : ""}${dot.node.category === "group" && dot.node.detail ? `, ${plain(dot.node.detail)}` : ""}${id === selected ? ", selected" : ""}`,
 				attrs: { "data-node": id, "aria-pressed": id === selected, ...(indexing ? { "data-indexing": indexing } : {}) }, actions: action ? { click: action } : undefined,
 			}, c: [

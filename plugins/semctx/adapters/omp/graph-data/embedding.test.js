@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { bindTermVector, centroid, cosine, graphEmbedding, identifierTerms, semanticFamilies, semanticMap, semanticNeighbours, similarityMap } from "./embedding.js";
+import { bindTermVector, centroid, cosine, distinctiveTerms, graphEmbedding, identifierTerms, semanticFamilies, semanticMap, semanticNeighbours, similarityMap } from "./embedding.js";
 const file = (id, path, symbol = null) => ({ id, label: id, detail: null, path, category: "file", project: "", hit: symbol ? { path, symbol, qualifiedName: null } : null });
 const planted = () => ({ nodes: [file("a1", "graph/query_parser.rs", "QueryParser"), file("a2", "graph/query_planner.rs", "QueryPlanner"), file("a3", "graph/query_cache.rs", "QueryCache"),
 	file("b1", "store/vector_writer.rs", "VectorWriter"), file("b2", "store/vector_reader.rs", "VectorReader"), file("b3", "store/vector_loader.rs", "VectorLoader")], edges: [], roots: [] });
@@ -24,6 +24,9 @@ describe("lexical identifier vectors", () => {
 		expect(identifierTerms("utf8Decoder2024 v2")).toEqual(["utf", "decoder"]); expect(identifierTerms("src/lib/mod.rs index.tsx main.go the_x_of_y")).toEqual([]);
 		expect(identifierTerms("GraphNodes class tests")).toEqual(["graph", "node", "class", "test"]); expect(identifierTerms("graph_graph Graph")).toEqual(["graph"]);
 		const terms = identifierTerms("GraphQuery"); terms.push("mutated"); expect(identifierTerms("GraphQuery")).toEqual(["graph", "query"]);
+		// Content digests and addresses are not words, but a short hex-like word and a version suffix stay.
+		expect(identifierTerms("volume-3c-system-guide-6ba0bd5db5665334fc97b15e836cf55382d73d9b51b09536f37dacdfacf9e804-part-01.md")).toEqual(["volume", "system", "guide", "part", "md"]);
+		expect(identifierTerms("deadbeef_cache 0x7ffe12ab34cd fabric1")).toEqual(["deadbeef", "cache", "fabric"]);
 	});
 	test("files in one directory with related symbols are nearer than unrelated files", () => {
 		const data = { nodes: [file("parser", "query/parser.rs", "QueryParser"), file("reader", "query/reader.rs", "QueryReader"), file("lexer", "query/lexer.rs", "TokenLexer"), file("vector", "storage/vector.rs", "VectorCodec")], edges: [], roots: [] };
@@ -136,5 +139,21 @@ describe("semantic placement", () => {
 		expect(pairs(semanticNeighbours(ids, vectors, { k: 1 }))).toEqual([["a1", "a2"], ["a1", "a3"], ["b1", "b2"], ["b1", "b3"]]);
 		expect(semanticNeighbours(ids, vectors, { minimum: .5 })).toEqual([]);
 		for (const { similarity } of semanticNeighbours(ids, vectors)) expect(similarity).toBeCloseTo(cosine(vectors.get("a1"), vectors.get("a2")), 12);
+	});
+	test("key terms are frequent in their set, rare elsewhere, and never repeat the set label", () => {
+		const weights = (...entries) => new Map(entries);
+		const sets = [
+			{ id: "vtx", vectors: [weights(["vmcs", .8], ["exit", .5], ["include", .3]), weights(["vmcs", .6], ["nested", .7], ["include", .4])], exclude: ["include/vtx"] },
+			{ id: "svm", vectors: [weights(["vmcb", .9], ["include", .4]), weights(["vmcb", .5], ["exit", .5], ["include", .3])], exclude: ["include/svm"] },
+			{ id: "tools", vectors: [weights(["crate", 1])], exclude: ["tools"] },
+		];
+		const terms = distinctiveTerms(sets);
+		// "exit" occurs in two sets, so it scores below 30% of the best term and drops.
+		expect(terms.get("vtx")).toEqual(["vmcs", "nested"]);
+		expect(terms.get("svm")).toEqual(["vmcb"]);
+		expect(terms.get("tools")).toEqual(["crate"]);
+		expect(distinctiveTerms(sets, { limit: 1 }).get("vtx")).toEqual(["vmcs"]);
+		// One set alone has no contrast, so no term is distinctive.
+		expect(distinctiveTerms([sets[0]]).get("vtx")).toEqual([]);
 	});
 });

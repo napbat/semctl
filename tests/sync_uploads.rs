@@ -186,9 +186,7 @@ fn respond(stream: &mut TcpStream, request: &Request, reply: &Reply) {
             retry_after,
         } => {
             let body = "Client Closed Request";
-            let retry = retry_after
-                .map(|seconds| format!("Retry-After: {seconds}\r\n"))
-                .unwrap_or_default();
+            let retry = retry_after.map_or_default(|seconds| format!("Retry-After: {seconds}\r\n"));
             write!(
                 stream,
                 "HTTP/1.1 {status} Fixture\r\nContent-Type: text/plain\r\n{retry}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",

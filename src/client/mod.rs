@@ -96,6 +96,9 @@ pub struct Client {
     /// owner keeps, such as a coordinator, never does: see
     /// [`Self::with_deadline`].
     deadline: Option<Instant>,
+    /// The per-call record of partial graph answers, if the caller presents
+    /// them to a user. Like the deadline, it only lives on a per-call clone.
+    partial_answers: Option<PartialAnswers>,
     /// Snapshot views use available layers without waiting for graph restores.
     wait_for_loading: bool,
 }
@@ -132,6 +135,13 @@ impl Client {
         )
     }
 
+    /// The same client with `root` as its checkout, without a source identity.
+    #[cfg(test)]
+    pub(crate) fn with_test_local_root(mut self, root: PathBuf) -> Self {
+        self.local_root = Some(root);
+        self
+    }
+
     fn new(
         transport: &HttpTransport,
         credentials: CredentialSource,
@@ -154,6 +164,7 @@ impl Client {
             capabilities: Arc::new(tokio::sync::OnceCell::new()),
             remote_permits,
             deadline: None,
+            partial_answers: None,
             wait_for_loading: true,
         }
     }
@@ -428,8 +439,7 @@ impl Client {
             .get_or_init(|| async {
                 self.get::<api::Whoami>("/v1/whoami")
                     .await
-                    .map(|whoami| whoami.capabilities)
-                    .unwrap_or_default()
+                    .map_or_default(|whoami| whoami.capabilities)
             })
             .await;
 
@@ -443,6 +453,18 @@ impl Client {
             .send(reqwest::Method::GET, path, None, Idempotency::Idempotent)
             .await?;
         unwrap_envelope(resp, "GET", &url).await
+    }
+
+    /// Like [`Self::get`], also returning the truncation reported by the server
+    /// for a result shortened by its content budget.
+    pub async fn get_budgeted<T: DeserializeOwned>(
+        &self,
+        path: &str,
+    ) -> Result<(T, Option<ResultTruncation>)> {
+        let (resp, url) = self
+            .send(reqwest::Method::GET, path, None, Idempotency::Idempotent)
+            .await?;
+        unwrap_budgeted(resp, "GET", &url).await
     }
 
     /// Like [`Self::get`], but returns `Ok(None)` on an API 404 instead of erroring —

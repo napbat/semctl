@@ -7,6 +7,8 @@ import { graphColorRevision, graphGroupColor, lookupGraphColor } from "./graph-c
 import { strengths } from "./graph-data/matches.js";
 import { matchScoreIndicator, matchVerificationIcon } from "./match-indicators";
 import { graphWindow, projectSummary, type GraphGroup, type ProjectSummary } from "./graph-projection";
+import { scopeView, type ScopeView } from "./graph-scope";
+import { AFFINITY_MAX_FILES, subscribeAffinity } from "./graph-affinity";
 import { nativeElement, supportsElements } from "./native-elements";
 import { indexingParts, indexingSummary, indexingText, type GraphIndexing, type GraphIndexingCounts } from "./graph-indexing";
 import type { GraphAppearance } from "./graph-appearance";
@@ -91,6 +93,10 @@ function relationIndex(data: GraphData, nodes: Map<string, GraphData["nodes"][nu
 	return relations;
 }
 
+/** Group IDs from the top-level group down, and node content identity. All stay valid when a refresh renumbers transport IDs. */
+export interface GraphNavigation { scope?: string; trail?: string[]; selected?: string }
+const nodeIdentity = (node: GraphData["nodes"][number]) => JSON.stringify([node.category ?? null, node.path ?? null, node.hit?.path ?? null, node.hit?.symbol ?? null, node.label]);
+
 /** A rooted relationship navigator, not a unique-parent reinterpretation of the graph. */
 export class GraphInspector implements Component {
 	private selected: string | undefined;
@@ -118,20 +124,35 @@ export class GraphInspector implements Component {
 	private projection?: ProjectSummary;
 	private appearance?: Readonly<GraphAppearance>;
 	private projectionDetail?: GraphAppearance["detail"];
-	private scope?: GraphGroup;
-	private scopeDrawing?: GraphData;
+	/** The open groups: a top-level group, then the subconcepts opened inside it. */
+	private trail: GraphGroup[] = [];
+	/** The organized view of the innermost open group; recomputed after a trail, evidence or affinity change. */
+	private view?: ScopeView;
 	private focusDrawing?: GraphData;
 	private shownGroups = 6;
 	private shownRelations = 8;
 	private readonly groupCues = new Map<string, NativeNode>();
+	private pendingNavigation?: GraphNavigation;
 	private readonly diagramAction = (id: string): string | undefined => {
-		if (this.projection && !this.scopeDrawing && !this.focusDrawing) {
+		if (this.focusDrawing === undefined && this.projection && !this.scope) {
 			const index = this.projection.groups.findIndex(group => group.id === id);
 			return index < 0 ? undefined : `summary-group:${index}`;
+		}
+		const view = this.currentView();
+		if (this.focusDrawing === undefined && view?.summary) {
+			const index = view.children.findIndex(child => child.id === id);
+			return index < 0 ? undefined : `subconcept:${index}`;
 		}
 		const index = this.nodeOrder.get(id);
 		return index === undefined ? undefined : `node:${index}`;
 	};
+	private get scope(): GraphGroup | undefined { return this.trail.at(-1); }
+	/** The organized view of the open group. Its affinity request starts on first use. */
+	private currentView(): ScopeView | undefined {
+		const scope = this.scope;
+		if (!scope) return undefined;
+		return this.view ??= scopeView(this.data, scope, this.codebaseId, this.appearance?.detail ?? "balanced");
+	}
 	constructor(readonly data: GraphData, private readonly requestRender: () => void, private readonly preview: (hit: Hit) => Component,
 		private readonly codebaseId: string | null = null, comparisonHits?: readonly Hit[], private readonly summary: "header" | "body" = "body",
 		private readonly presentation: "inline" | "overview" = "inline") {
@@ -145,10 +166,14 @@ export class GraphInspector implements Component {
 		const hits = comparisonHits ?? data.nodes.flatMap(node => node.hit ? [node.hit] : []), scales = strengths(hits);
 		this.ranks = new Map(hits.map((hit, index) => [hit, { index, strength: scales[index] }]));
 		subscribeConcepts(this, owner => owner.requestRender());
+		// Settled semantic affinity reorganizes the open group without another overview request.
+		subscribeAffinity(this, owner => { if (owner.scope) { owner.view = undefined; owner.requestRender(); } });
 	}
 	invalidate(): void { this.quickCache = undefined; this.rowCache = undefined; this.previewComponent?.invalidate?.(); }
 	setAppearance(appearance: Readonly<GraphAppearance>): void {
 		if (this.appearance === appearance) return;
+		// The detail budget also bounds the number of subconcepts.
+		if (this.appearance?.detail !== appearance.detail) this.view = undefined;
 		this.appearance = appearance;
 		this.conceptCues.clear(); this.groupCues.clear(); this.treeCache.clear();
 		this.quickCache = undefined; this.rowCache = undefined;
@@ -162,6 +187,37 @@ export class GraphInspector implements Component {
 		this.treeCache.clear();
 		this.quickCache = undefined; this.rowCache = undefined;
 		this.requestRender();
+	}
+	/** Drill-down trail and selection, by identities that survive a refresh. Local overview transport IDs are ordinal, so they do not. */
+	navigation(): GraphNavigation {
+		const selected = this.selected === undefined ? undefined : this.nodeById.get(this.selected);
+		return { ...(this.trail.length ? { scope: this.trail[0].id } : {}), ...(this.trail.length > 1 ? { trail: this.trail.slice(1).map(group => group.id) } : {}),
+			...(selected ? { selected: nodeIdentity(selected) } : {}) };
+	}
+	/** Applies on the next describe, after the overview projection exists. Missing groups or nodes are ignored. */
+	restoreNavigation(state: GraphNavigation): void {
+		this.pendingNavigation = state.scope !== undefined || state.selected !== undefined ? state : undefined;
+	}
+	private applyNavigation(state: GraphNavigation): void {
+		const group = state.scope === undefined ? undefined : this.projection?.allGroups.find(candidate => candidate.id === state.scope);
+		if (group) this.setTrail(this.resolveTrail([group.id, ...state.trail ?? []]));
+		const node = state.selected === undefined ? undefined : this.data.nodes.find(candidate => nodeIdentity(candidate) === state.selected);
+		if (node) this.select(node.id);
+	}
+	/** The longest prefix of `ids` that still names a top-level group and then its subconcepts. */
+	private resolveTrail(ids: readonly string[]): GraphGroup[] {
+		const trail: GraphGroup[] = [];
+		for (const [depth, id] of ids.entries()) {
+			const candidates = depth === 0 ? [...this.projection?.allGroups ?? [], ...this.projection?.groups ?? []]
+				: scopeView(this.data, trail[depth - 1], this.codebaseId, this.appearance?.detail ?? "balanced").children;
+			const group = candidates.find(candidate => candidate.id === id);
+			if (!group) break;
+			trail.push(group);
+		}
+		return trail;
+	}
+	private setTrail(trail: GraphGroup[]): void {
+		this.trail = trail; this.view = undefined; this.shownNodes = 32; this.treeCache.clear();
 	}
 	private active(node: GraphData["nodes"][number]): boolean {
 		if (node.hit?.codebaseId && node.hit.codebaseId !== this.codebaseId) return false;
@@ -182,15 +238,23 @@ export class GraphInspector implements Component {
 		this.enterGroup(group);
 	}
 	private enterGroup(group?: GraphGroup): void {
-		this.scope = group; this.scopeDrawing = group ? graphWindow(this.data, group.members) : undefined;
-		this.clearSelection(); this.shownNodes = 32; this.treeCache.clear(); this.requestRender();
+		this.setTrail(group ? [group] : []);
+		this.clearSelection(); this.requestRender();
+	}
+	/** Opens one subconcept of the open group as the next level. */
+	private enterSubconcept(index: number): void {
+		const child = this.currentView()?.children[index];
+		if (!child) return;
+		this.setTrail([...this.trail, child]);
+		this.clearSelection(); this.requestRender();
 	}
 	private diagram(cx: DescribeContext): NativeNode | undefined {
-		const drawing = this.focusDrawing ?? this.scopeDrawing ?? this.projection?.graph ?? this.data;
+		const view = this.currentView(), drawing = this.focusDrawing ?? view?.drawing ?? this.projection?.graph ?? this.data;
 		let active = this.activeIds;
-		if (drawing === this.projection?.graph) {
+		const groupOf = drawing === this.projection?.graph ? this.projection.groupOf : drawing === view?.summary?.graph ? view.summary.groupOf : undefined;
+		if (groupOf) {
 			active = new Set<string>();
-			for (const id of this.activeIds) { const group = this.projection.groupOf.get(id); if (group) active.add(group); }
+			for (const id of this.activeIds) { const group = groupOf.get(id); if (group) active.add(group); }
 		}
 		return graphPreview(drawing, cx, { codebaseId: this.codebaseId, activeIds: active,
 			selected: this.selected, size: this.presentation === "overview" ? "overview" : "inline", nodeAction: this.diagramAction, appearance: this.appearance });
@@ -205,16 +269,24 @@ export class GraphInspector implements Component {
 				parts, title: summary && compactTooltip(summary), aria: summary, min: { w: "10ch" }, max: { w: "10ch" }, shrink: 0 } };
 		};
 		if (this.scope) {
-			const status = meter(this.scope.indexing);
-			return [{ k: "row", key: "graph-scope", p: { gap: "sm", align: "center" }, c: [
-				text("Overview", { tone: "accent", actions: { click: "overview" }, aria: "Return to project overview" }),
-				text("›", { tone: "muted" }), text(this.scope.label, { grow: 1, truncate: "end", wrap: "none",
-					title: compactTooltip(this.scope.label, this.scope.source && `From ${this.scope.source}`) }),
-				...(this.scope.source ? [text(this.scope.source, { role: "semctl.graph.group-source", tone: "muted", wrap: "none", truncate: "start",
+			const scope = this.scope, status = meter(scope.indexing), view = this.currentView()!;
+			const crumbs: NativeNode[] = [{ ...text("Overview", { tone: "accent", actions: { click: "overview" }, aria: "Return to project overview", shrink: 0, wrap: "none" }), key: "crumb-overview" }];
+			for (const [depth, group] of this.trail.entries()) {
+				const last = depth === this.trail.length - 1;
+				crumbs.push({ ...text("›", { tone: "muted", shrink: 0 }), key: `crumb-separator-${depth}` }, { ...text(group.label, {
+					role: "semctl.graph.crumb", wrap: "none", truncate: "end", min: { w: 0 }, grow: last ? 1 : 0, shrink: last ? 1 : 2,
+					...(last ? {} : { tone: "accent" as const, actions: { click: `trail:${depth}` }, aria: `Return to ${clean(group.label)}` }),
+					title: compactTooltip(group.label, group.terms.length ? `Key terms: ${group.terms.join(" · ")}` : undefined, group.source && `From ${group.source}`),
+				}), key: `crumb-${depth}` });
+			}
+			return [{ k: "row", key: "graph-scope", p: { gap: "sm", align: "center" }, c: [...crumbs,
+				...(scope.terms.length ? [text(scope.terms.join(" · "), { role: "semctl.graph.group-terms", tone: "muted", wrap: "none", truncate: "end",
+					shrink: 2, min: { w: 0 }, max: { w: "28ch" } })] : []),
+				...(scope.source ? [text(scope.source, { role: "semctl.graph.group-source", tone: "muted", wrap: "none", truncate: "start",
 					shrink: 1, min: { w: 0 }, max: { w: "32ch" } })] : []),
-				text(`${this.scope.members.length} nodes`, { tone: "muted" }),
-				...(status ? [status] : indexingSummary(this.scope.indexing) ? [text(indexingSummary(this.scope.indexing)!, { tone: "muted" })] : []),
-			] }];
+				text(`${scope.members.length} nodes`, { tone: "muted", shrink: 0 }),
+				...(status ? [status] : indexingSummary(scope.indexing) ? [text(indexingSummary(scope.indexing)!, { tone: "muted" })] : []),
+			] }, this.semanticStatus(view)];
 		}
 		const rows: NativeNode[] = this.projection.allGroups.slice(0, this.shownGroups).map((group, index) => {
 			const active = this.activeIds.size > 0 && group.members.some(node => this.activeIds.has(node.id));
@@ -222,16 +294,20 @@ export class GraphInspector implements Component {
 			const status = meter(group.indexing);
 			let cue = this.groupCues.get(group.id);
 			if (!cue && supportsElements(cx) && cx.feature("styles")) {
-				const color = graphGroupColor(this.codebaseId, group.members, this.appearance?.color);
+				const color = graphGroupColor(this.codebaseId, group.members, this.appearance?.color, group.folder);
 				if (color) cue = nativeGraphColorCue(color, cx, undefined, `group-cue-${index}`);
 				if (cue) this.groupCues.set(group.id, cue);
 			}
 			return { k: "row", key: `group-${index}`, p: { role: "semctl.graph.group", gap: "sm", align: "center", actions: { click: action },
-				title: compactTooltip(group.label, group.source && `From ${group.source}`,
+				title: compactTooltip(group.label, [group.terms.length ? `Key terms: ${group.terms.join(" · ")}` : undefined, group.source && `From ${group.source}`,
+					group.region && `Region: ${group.region.label}`].filter(Boolean).join(" · "),
 					`${group.members.length} nodes · ${group.internal} internal links${active ? " · active request target" : ""}`, indexingSummary(group.indexing)),
 				aria: `Explore ${clean(group.label)}${active ? ", active request target" : ""}${indexingSummary(group.indexing) ? `, ${indexingSummary(group.indexing)}` : ""}` }, c: [...(cue ? [cue] : []),
 				{ k: "text", p: { grow: 1, wrap: "none", truncate: "end", spans: [{ t: clean(group.label), s: active ? "success" : "",
 					fx: active && !cx.reduceMotion ? "pulse" : undefined }] } },
+				// Key terms say what the group's code is about; they shrink before the label.
+				...(group.terms.length ? [text(group.terms.join(" · "), { role: "semctl.graph.group-terms", tone: "muted", wrap: "none", truncate: "end",
+					shrink: 2, min: { w: 0 }, max: { w: "28ch" } })] : []),
 				...(group.source ? [text(group.source, { role: "semctl.graph.group-source", tone: "muted", wrap: "none", truncate: "start",
 					shrink: 1, min: { w: 0 }, max: { w: "32ch" } })] : []),
 				status ? { k: "row", p: { justify: "end", min: { w: "4ch" }, shrink: 0 }, c: [text(`${group.members.length}`, { tone: "muted" })] }
@@ -243,6 +319,44 @@ export class GraphInspector implements Component {
 			tone: "muted", actions: { click: "more-groups" }, aria: "Show more project groups",
 		}));
 		return [{ k: "col", key: "project-groups", p: { gap: "sm", max: { w: "100ch" } }, c: rows }];
+	}
+	/** What placed the open group: semctx search profiles, or terms and links while they are unavailable. */
+	private semanticStatus(view: ScopeView): NativeNode {
+		const { status, files, indexed, pairs, error } = view.semantic;
+		const how = "Each file is described by one semctx search of its headings, outline or name. Files that retrieve each other or share results sit together.";
+		const label = status === "ready" ? `Semantic placement · ${pairs} related pair${pairs === 1 ? "" : "s"} · ${indexed} of ${files} files indexed`
+			: status === "loading" ? "Semantic placement loading · terms and links for now"
+			: status === "failed" ? "Semantic placement unavailable · terms and links"
+			: files > AFFINITY_MAX_FILES ? `Terms and links · open a subconcept of at most ${AFFINITY_MAX_FILES} files for semantic placement`
+			: "Terms and links";
+		return { ...text(label, { role: "semctl.graph.semantic", tone: status === "failed" ? "warning" : "muted", wrap: "none", truncate: "end",
+			title: compactTooltip(status === "failed" && error ? error : how, "Retrieval evidence for placement, not a dependency or a confidence score") }), key: "semantic" };
+	}
+	/** The subconcepts of the open group, largest first. Selecting one opens it as the next level. */
+	private subconceptRows(cx: DescribeContext): NativeNode[] {
+		const view = this.currentView();
+		if (!view || view.children.length < 2) return [];
+		const nodes = new Map(view.summary?.graph.nodes.map(node => [node.id, node]));
+		const rows = view.children.slice(0, 12).map((child, index): NativeNode => {
+			let cue: NativeNode | undefined;
+			if (supportsElements(cx) && cx.feature("styles")) {
+				const node = nodes.get(child.id), color = node ? lookupGraphColor(this.codebaseId, node, this.appearance?.color)
+					: graphGroupColor(this.codebaseId, child.members, this.appearance?.color, child.folder, child.folder === undefined ? { key: child.id, label: child.label } : undefined);
+				cue = color && nativeGraphColorCue(color, cx, undefined, `subconcept-cue-${index}`);
+			}
+			return { k: "row", key: `subconcept-${index}`, p: { role: "semctl.graph.group", gap: "sm", align: "center", actions: { click: `subconcept:${index}` },
+				title: compactTooltip(child.label, child.terms.length ? `Key terms: ${child.terms.join(" · ")}` : undefined, `${child.members.length} nodes · select to open`),
+				aria: `Open ${clean(child.label)}, ${child.members.length} nodes` }, c: [...(cue ? [cue] : []),
+				text(child.label, { grow: 1, wrap: "none", truncate: "end" }),
+				...(child.terms.length ? [text(child.terms.join(" · "), { role: "semctl.graph.group-terms", tone: "muted", wrap: "none", truncate: "end",
+					shrink: 2, min: { w: 0 }, max: { w: "28ch" } })] : []),
+				text(`${child.members.length}`, { tone: "muted", shrink: 0 }),
+			] };
+		});
+		return [{ k: "col", key: "subconcepts", p: { gap: "xs", max: { w: "100ch" } }, c: [
+			text(`${view.children.length} subconcepts`, { role: "semctl.graph.hint", tone: "muted", title: compactTooltip("Child folders first, then content clusters", "Select a subconcept to open it") }),
+			...rows,
+		] }];
 	}
 	private conceptCue(node: GraphData["nodes"][number], cx: DescribeContext): NativeNode | undefined {
 		if (!supportsElements(cx) || !cx.feature("styles")) return undefined;
@@ -303,9 +417,11 @@ export class GraphInspector implements Component {
 		this.quickCache = undefined; this.rowCache = undefined;
 		if (!this.nodeById.has(id)) return;
 		if (this.scope && !this.scope.members.some(node => node.id === id)) {
-			this.scope = this.projection?.allGroups.find(group => group.members.some(node => node.id === id));
-			this.scopeDrawing = this.scope ? graphWindow(this.data, this.scope.members) : undefined;
-			this.shownNodes = 32; this.treeCache.clear();
+			// Keep the deepest open level that holds the node; otherwise open its top-level group.
+			let depth = this.trail.length - 1;
+			while (depth >= 0 && !this.trail[depth].members.some(node => node.id === id)) depth--;
+			const top = this.projection?.allGroups.find(group => group.members.some(node => node.id === id));
+			this.setTrail(depth >= 0 ? this.trail.slice(0, depth + 1) : top ? [top] : []);
 		}
 		this.selected = id;
 		this.relation = relation;
@@ -362,6 +478,11 @@ export class GraphInspector implements Component {
 				const group = this.projection?.groups[Number(event.act.slice(14))];
 				if (group) this.enterGroup(group);
 			}
+			else if (event.act.startsWith("subconcept:")) this.enterSubconcept(Number(event.act.slice(11)));
+			else if (event.act.startsWith("trail:")) {
+				const depth = Number(event.act.slice(6));
+				if (Number.isSafeInteger(depth) && depth >= 0 && depth < this.trail.length - 1) { this.setTrail(this.trail.slice(0, depth + 1)); this.clearSelection(); this.requestRender(); }
+			}
 			else if (event.act === "more-groups") { this.shownGroups += 12; this.requestRender(); }
 			else if (event.act === "more-related") { this.shownRelations += 16; this.requestRender(); }
 			else if (event.act === "more-nodes") { this.shownNodes = Math.min(this.visibleNodes().length, this.shownNodes + 32); this.requestRender(); }
@@ -383,11 +504,10 @@ export class GraphInspector implements Component {
 		if (this.aggregate && (this.conceptCacheRevision !== revision || this.projectionDetail !== this.appearance?.detail)) {
 			this.projection = projectSummary(d, this.codebaseId, this.appearance?.detail);
 			this.projectionDetail = this.appearance?.detail;
-			// A display-only budget change must not replace the user's drilled-down membership.
-			this.scope = this.projection.allGroups.find(group => group.id === this.scope?.id) ??
-				this.projection.groups.find(group => group.id === this.scope?.id) ?? this.scope;
-			this.scopeDrawing = this.scope ? graphWindow(d, this.scope.members) : undefined;
+			// New evidence or a display-only budget change keeps the user's drilled-down trail where its groups still exist.
+			if (this.trail.length) this.setTrail(this.resolveTrail(this.trail.map(group => group.id)));
 		}
+		if (this.pendingNavigation) { const state = this.pendingNavigation; this.pendingNavigation = undefined; this.applyNavigation(state); }
 		if (this.conceptCacheRevision !== revision || this.colorCacheRevision !== colorRevision || this.conceptCacheDark !== cx.dark || this.indicatorMask !== mask) {
 			this.conceptCacheRevision = revision; this.colorCacheRevision = colorRevision; this.conceptCacheDark = cx.dark; this.indicatorMask = mask;
 			this.conceptCues.clear(); this.groupCues.clear(); this.treeCache.clear(); this.quickCache = undefined; this.rowCache = undefined;
@@ -428,16 +548,18 @@ export class GraphInspector implements Component {
 		else if (d.nodes.length) out.push(text("Native graph drawing unavailable · use node navigation below.", {
 			tone: "muted", title: compactTooltip("Graph drawing requires Tern native elements and surface styles."),
 		}));
-		const drawing = this.focusDrawing ?? this.scopeDrawing ?? this.projection?.graph;
+		const view = this.currentView(), drawing = this.focusDrawing ?? view?.drawing ?? this.projection?.graph;
+		const unit = drawing === this.projection?.graph ? "group summaries" : drawing === view?.summary?.graph ? "subconcepts" : "nodes";
 		if (diagram && drawing) out.push({ k: "row", key: "graph-drawing-summary", p: { gap: "sm", align: "center" }, c: [
-			text(`${drawing.nodes.length} ${drawing === this.projection?.graph ? "group summaries" : "nodes"} · ${drawing.edges.length} routes drawn`, {
+			text(`${drawing.nodes.length} ${unit} · ${drawing.edges.length} routes drawn`, {
 				role: "semctl.graph.hint", tone: "muted", grow: 1, title: caveatTitle(drawing.caveats) ?? compactTooltip("Exact relationships remain in native node details."),
 			}),
-			...(drawing.nodes.some(node => this.diagramAction(node.id) !== undefined) ? [text("Select a dot for details", {
+			...(drawing.nodes.some(node => this.diagramAction(node.id) !== undefined) ? [text(unit === "subconcepts" ? "Select a dot to open it" : "Select a dot for details", {
 				role: "semctl.graph.hint", tone: "muted", shrink: 0, wrap: "none",
 			})] : []),
 		] });
 		if (this.projection && !this.scope && !this.selected) out.push(...this.groupControls(cx));
+		if (this.scope && !this.selected) out.push(...this.subconceptRows(cx));
 		const quick = this.quickCache ??= members.slice(0, 3).map((node): NativeNode => {
 			const index = this.nodeOrder.get(node.id)!;
 			return { k: "row", key: `quick-${index}`, p: {

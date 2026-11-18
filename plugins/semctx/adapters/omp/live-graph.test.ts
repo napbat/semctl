@@ -258,10 +258,10 @@ describe("live group inspection", () => {
 			expect(legend[0].p?.title?.split("\n")).toEqual(["Dot size = member nodes · line weight = links between groups", "Tint = shared identifier terms"]);
 			expect(legend[0].p?.title).not.toMatch(/embedding/i);
 			expect(content(inspection(initial))).toContain("Select a group to inspect links");
-			// A host without styles draws no map, so its plain legend names no tint.
-			const plain = legendOf(view.describe({ ...native, feature: () => false }));
-			expect(plain.map(node => [node.k, node.p?.text, node.p?.tone])).toEqual([["text", "Dot size = files · line weight = links", "muted"]]);
-			expect(plain[0].p?.title?.split("\n")).toHaveLength(1);
+			// Without a drawing the native fallback shows the actual way to navigate instead of a legend.
+			const plain = view.describe({ ...native, feature: () => false });
+			expect(legendOf(plain)).toEqual([]);
+			expect(content(inspection(plain))).toContain("Use the group list to explore connections");
 			view.update({ ...popupState(data), appearance: { ...DEFAULT_GRAPH_APPEARANCE, layout: "force" } });
 			expect(tree(legendOf(view.describe(native))[0]).flatMap(node => asNativeElement(node)?.p.text ?? [])).toEqual(["files", "links", "shared terms"]);
 			view.update({ ...popupState(data), appearance: { ...DEFAULT_GRAPH_APPEARANCE, layout: "radial" } });
@@ -339,6 +339,30 @@ describe("live group inspection", () => {
 			expect(selectedGroup(reordered)).toBe(id);
 			expectLinks(reordered, 11, 13, 0);
 			expect(neighbors(reordered).map(node => node.p?.actions?.click)).toEqual(controls);
+			const well = tree(reordered).find(node => node.key === "graph-well");
+			const visited = new Set(controls);
+			let page = reordered;
+			let next = tree(page).find(node => node.key === "next-neighbors");
+			while (next?.p?.actions?.click) {
+				action(view, next.p.actions.click);
+				page = view.describe(native);
+				expect(selectedGroup(page)).toBe(id);
+				expect(tree(page).find(node => node.key === "graph-well")).toBe(well);
+				for (const neighbor of neighbors(page)) {
+					expect(visited.has(neighbor.p?.actions?.click)).toBe(false);
+					visited.add(neighbor.p?.actions?.click);
+				}
+				next = tree(page).find(node => node.key === "next-neighbors");
+			}
+			expect(visited.size).toBe(11);
+			expect(next?.p?.title).toContain("Neighbors 10–11 of 11");
+			action(view, tree(page).find(node => node.key === "previous-neighbors")!.p!.actions!.click!);
+			const previous = view.describe(native);
+			expect(tree(previous).find(node => node.key === "next-neighbors")?.p?.title).toContain("Neighbors 7–9 of 11");
+			action(view, neighbors(previous)[0].p!.actions!.click!);
+			const moved = view.describe(native);
+			expect(selectedGroup(moved)).not.toBe(id);
+			expect(tree(moved).find(node => node.key === "next-neighbors")?.p?.title).toContain("Neighbors 1–3 of 11");
 		} finally { view.dispose(); }
 	});
 	test("counts links within and across folded groups using original edge endpoints", () => {
@@ -414,26 +438,66 @@ describe("live group inspection", () => {
 		}
 	});
 	test("preserves directed inspection and neighboring navigation in unstyled and plain terminal fallbacks", () => {
-		const data = overview(["src/api/a.ts", "src/db/b.ts"]);
-		data.edges = [{ from: "0", to: "1", label: "imports" }, { from: "0", to: "1", label: "imports" }];
+		const data = overview(["src/api/a.ts", ...Array.from({ length: 5 }, (_, index) => `src/module-${index}/b.ts`)]);
+		data.edges = data.nodes.slice(1).map(node => ({ from: "0", to: node.id, label: "imports" }));
 		for (const supports of [native.supports, () => false]) {
 			const view = popup(popupState(data)), fallback = { ...native, supports, feature: () => false };
 			try {
 				const initial = view.describe(fallback);
-				const groups = tree(initial).filter(node => node.p?.role === "semctl.live.group");
-				if (!groups.length) view.handleNativeEvent({ type: "toggle", key: "groups", collapsed: false });
-				const rows = tree(view.describe(fallback)).filter(node => node.p?.role === "semctl.live.group");
+				const rows = tree(initial).filter(node => node.p?.role === "semctl.live.group");
+				expect(rows).toHaveLength(6);
+				if (supports("section")) {
+					expect(tree(initial).find(node => node.key === "groups")?.p?.collapsed).toBe(false);
+					view.handleNativeEvent({ type: "toggle", key: "groups", collapsed: true });
+					expect(tree(view.describe(fallback)).find(node => node.key === "groups")?.p?.collapsed).toBe(true);
+					view.handleNativeEvent({ type: "toggle", key: "groups", collapsed: false });
+				}
+				expect(view.render(120).join("\n")).toContain("/semctl graph");
 				const api = projectSummary(data, data.identity.codebaseId).groups.find(group => group.members.some(node => node.id === "0"))!;
 				action(view, rows.find(node => node.p?.title?.startsWith(api.label))!.p!.actions!.click!);
 				const selected = view.describe(fallback);
-				expectLinks(selected, 0, 2, 0);
-				expect(neighbors(selected)).toHaveLength(1);
+				expectLinks(selected, 0, 5, 0);
+				expect(neighbors(selected)).toHaveLength(3);
 				expect(view.render(120).join("\n")).toContain(api.label);
-				expect(view.render(120).join("\n")).toContain("2 out");
-				action(view, neighbors(selected)[0].p!.actions!.click!);
-				expectLinks(view.describe(fallback), 2, 0, 0);
+				expect(view.render(120).join("\n")).toContain("5 out");
+				const next = tree(selected).find(node => node.key === "next-neighbors");
+				expect(next?.k).toBe("text");
+				action(view, next!.p!.actions!.click!);
+				const lastPage = view.describe(fallback), remaining = neighbors(lastPage);
+				expect(remaining).toHaveLength(2);
+				expect(remaining[0].key).not.toBe(neighbors(selected)[0].key);
+				action(view, remaining[0].p!.actions!.click!);
+				expectLinks(view.describe(fallback), 1, 0, 0);
 				action(view, "clear-group");
 				expect(neighbors(view.describe(fallback))).toHaveLength(0);
+			} finally { view.dispose(); }
+		}
+	});
+	test("lists groups under their regions with key terms in wider popups and names the region tint in the legend", () => {
+		const data = overview(["hv/src/vtx/vmcs_fields.cpp", "hv/src/vtx/exit_handler.cpp", "hv/src/svm/vmcb_layout.cpp", "hv/src/svm/npt_walker.cpp",
+			"tools/lib/lab_runner.py", "tools/rust/crate_loader.rs", "cmake/test/contract.cmake"]);
+		const regionLabels = (root: NativeNode) => tree(root).filter(node => node.p?.role === "semctl.live.region").map(node => asNativeElement(node)?.c?.map(child => asNativeElement(child as NativeNode)?.p.text).filter(Boolean));
+		const rows = (root: NativeNode) => tree(root).filter(node => node.p?.role === "semctl.live.region" || node.p?.role === "semctl.live.group").map(node => node.key);
+		const terms = (root: NativeNode) => tree(root).filter(node => node.p?.role === "semctl.live.group.terms").map(node => node.p?.text);
+		for (const popupSize of ["small", "medium"] as const) {
+			const view = popup({ ...popupState(data), appearance: { ...DEFAULT_GRAPH_APPEARANCE, popup: popupSize } });
+			try {
+				view.handleNativeEvent({ type: "toggle", key: "groups", collapsed: false });
+				const card = view.describe(native), summary = projectSummary(data, data.identity.codebaseId);
+				// Without project roots, files group by their first two folders: hv/src, tools/lib, tools/rust and cmake/test.
+				expect(summary.regions.map(region => region.label)).toEqual(["tools"]);
+				expect(regionLabels(card)).toEqual([["tools", "2"], ["Outside regions", "2"]]);
+				// The region heading comes first, then its groups; the outside heading precedes the rest.
+				const order = rows(card), tools = summary.regions[0].groups.map(id => `group-${id}`);
+				expect(order[0]).toBe("region-region:path:tools");
+				expect(order.slice(1, 3).sort()).toEqual([...tools].sort());
+				expect(order[3]).toBe("region-outside");
+				expect(tree(card).find(node => node.k === "section" && node.key === "groups")?.p?.head).toBe("Explore 4 groups in 1 region");
+				const legend = asNativeElement(tree(card).find(node => node.p?.role === "semctl.live.legend")!);
+				expect(legend?.p.title).toContain("Tint = groups that share a home folder");
+				if (popupSize === "small") expect(terms(card)).toEqual([]);
+				else expect(terms(card)).toEqual(["lab · runner", "crate · loader", "exit · field · handler", "contract"]);
+				expectCompactTitles(card);
 			} finally { view.dispose(); }
 		}
 	});
@@ -524,7 +588,8 @@ describe("compact live popup observations", () => {
 			expect(indexing).toMatchObject({ k: "meter", p: { value: 0.5 } });
 			expect(tree(rendered).find(node => node.p?.role === "semctl.live.indexing-label")?.p?.text).toBe("50% ready");
 			expect(indexing?.p?.title).toContain("1 ready · 1 unknown · 1 unreported");
-			expect(tree(rendered).find(node => node.key === "progress")?.p?.value).toBe(0);
+			// The footer ring shows the same ready share as the header, not the failed job ratio.
+			expect(tree(rendered).find(node => node.key === "progress")?.p?.value).toBe(0.5);
 		} finally { view.dispose(); }
 	});
 	test("reads as a titled card with a subline, a ready-share meter and a cached graph well", () => {
@@ -683,7 +748,14 @@ describe("compact live popup observations", () => {
 			expect(tree(empty(animated)).find(node => node.k === "shimmer")?.p).toMatchObject({ text: "Reading the indexed map" });
 			expect(tree(animated).find(node => node.p?.role === "semctl.live.title")?.p?.text).toBe("Project map");
 			expect(tree(animated).some(node => node.p?.role === "semctl.live.subline")).toBe(false);
-			const refresh = asNativeElement(tree(animated).find(node => node.key === "refresh")!)!;
+			// A background read leaves the refresh button enabled and static.
+			const background = asNativeElement(tree(animated).find(node => node.key === "refresh")!)!;
+			expect(background.p.actions).toEqual({ click: "refresh" });
+			expect(background.p.attrs?.["aria-disabled"]).toBe(false);
+			expect(background.c?.[0]).toMatchObject({ k: "icon", p: { name: "repeat" } });
+			// A refresh that the user starts shows the spinner until a describe observes the completed read.
+			action(view, "refresh");
+			const refresh = asNativeElement(tree(view.describe(live)).find(node => node.key === "refresh")!)!;
 			expect(refresh.p.actions).toBeUndefined();
 			expect(refresh.p.attrs?.["aria-disabled"]).toBe(true);
 			expect(refresh.c?.[0]).toMatchObject({ k: "spinner", p: { style: "orbit", aria: "Refreshing" } });

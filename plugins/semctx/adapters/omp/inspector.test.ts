@@ -173,6 +173,25 @@ describe("returned match graph", () => {
 });
 
 describe("per-card native renderer", () => {
+	test("native results keep partial-answer warnings visible and fall back when warning metadata is invalid", () => {
+		const r = renderer(), payload = search(), warning = "Partial graph: providers unavailable";
+		const withWarnings = (semctlWarnings: unknown) => result(payload, { mcpMeta: { semctlDisplay: payload, semctlWarnings } });
+		const rendered = r.describeResult!(withWarnings([warning]), compact);
+		const note = rendered?.body?.[0];
+		expect(note && "k" in note && textContent(note)).toBe(warning);
+		expect(rendered?.body?.[1]).toBeInstanceOf(SemctlInspector);
+		expect(r.describeResult!(withWarnings([42]), compact)).toBe(nativeFallback);
+	});
+	test("a budget cut stays visible before folded hits and an open chunk is not labeled as a whole symbol", () => {
+		const budgetNote = "The server shortened this result. Narrow the query.";
+		const display = { ...search([match({ expanded: false, expansionReason: "ContentBudget" })]), budgetNote };
+		const view = new SemctlInspector(readDisplay(display, "search_codebase")!, () => {});
+		expect(nodes(view.describe(native)).filter(n => n.k === "text").map(textContent)).toContain(budgetNote);
+		activate(view, "hit-0");
+		expect(nodes(view.describe(native)).filter(n => n.k === "text").map(textContent)).toContain("Chunk only · ContentBudget");
+		const empty = new SemctlInspector({ ...display, hits: [] }, () => {});
+		expect(nodes(empty.describe(native)).filter(n => n.k === "text").map(textContent)).toContain("No matches returned");
+	});
 	test("matches start folded and expand independently without fetching or replacing another preview", () => {
 		const payload = search([match(), match({ path: "other.ts" })]);
 		const before = JSON.stringify(payload), view = new SemctlInspector(payload, () => {});

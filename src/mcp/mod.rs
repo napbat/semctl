@@ -347,7 +347,7 @@ impl McpServer {
     /// The bound client, without a first-index wait.
     ///
     /// The binding that this server keeps, and that it hands to a watcher, has
-    /// no deadline. Only the returned copy is bounded by `budget`.
+    /// no deadline or partial-answer record. Only the returned copy has them.
     async fn bound_unchecked(
         &self,
         op: &'static str,

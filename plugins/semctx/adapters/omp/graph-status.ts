@@ -2,6 +2,7 @@ import type { DescribeContext, NativeNode } from "@oh-my-pi/pi-tui";
 import type { GraphActivity } from "./graph-activity";
 import type { GraphAppearance } from "./graph-appearance";
 import type { GraphRequestState } from "./overview";
+import { indexingCounts, type GraphIndexingCounts } from "./graph-indexing";
 import { nativeElement, supportsElements } from "./native-elements";
 import { progressTooltip } from "./status-tooltip";
 import { boundedTooltip, compactTooltip } from "./tooltip-text";
@@ -15,6 +16,15 @@ interface GraphStatusInput {
 const clean = (value: string) => value.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "");
 const text = (value: string, props: Record<string, unknown> = {}): NativeNode => ({ k: "text", p: { text: clean(value), ...props } });
 const operationLabel = (value: string) => clean(value).replace(/^mcp__semctx_/, "").replace(/[_-]+/g, " ");
+
+/** The ready share of reported nodes and the tooltip line that names it. */
+export interface ReadyShare { value: number; text: string }
+/** The ready share that the popup header shows. Unreported nodes do not count, so a map without reported states has no share. */
+export function readyShare(counts: GraphIndexingCounts | undefined): ReadyShare | undefined {
+	const reported = counts ? counts.ready + counts.processing + counts.pending + counts.failed + counts.unknown : 0;
+	if (!counts || !reported) return undefined;
+	return { value: counts.ready / reported, text: `Ring: ${counts.ready} of ${reported} files ready (${Math.floor(counts.ready * 100 / reported)}%)` };
+}
 
 /** Current evidence wins over a previous receipt. A queued observation never implies active work. */
 export function graphStatusModel({ request, activity }: GraphStatusInput) {
@@ -43,13 +53,15 @@ export function graphStatusModel({ request, activity }: GraphStatusInput) {
 export function graphStatus(cx: DescribeContext, input: GraphStatusInput): NativeNode {
 	const model = graphStatusModel(input), { mode, tone, requests } = model;
 	const compact = input.presentation === "icon";
-	// Map refresh errors do not invalidate separately reported producer progress.
-	const progress = compact ? input.activity.producer?.progress : model.progress;
+	// The compact ring shows the same ready share as the popup header. Map refresh errors do not invalidate
+	// separately reported producer progress, which stays in the tooltip.
+	const share = compact && input.request.display?.kind === "graph" ? readyShare(indexingCounts(input.request.display.nodes)) : undefined;
+	const progress = compact ? share?.value ?? input.activity.producer?.progress : model.progress;
 	const warning = mode === "failed" || mode === "warning" || input.activity.producer?.tone === "warning";
 	const { producer, operations } = input.activity;
 	const loadingNotes = input.request.display?.kind === "graph" && input.request.display.loading ? input.request.display.caveats.join("\n") : undefined;
-	const detail = progressTooltip(model.label, progress, input.request.error ?? producer?.diagnostic ?? (warning ? producer?.details : loadingNotes),
-		"Overview → Diagnostics for the full error");
+	const detail = progressTooltip(model.label, share ? input.activity.producer?.progress : progress,
+		input.request.error ?? producer?.diagnostic ?? (warning ? producer?.details : loadingNotes), "Overview → Diagnostics for the full error", share?.text);
 	const traffic = requests ? `${requests.sent} sent · ${requests.received} returned · ${requests.failed} failed` : "";
 	const activityTitle = compactTooltip(traffic, operations.length ? `Active: ${[...new Set(operations)].join(", ")}` : undefined);
 	const styled = supportsElements(cx) && cx.feature("styles");
@@ -57,7 +69,7 @@ export function graphStatus(cx: DescribeContext, input: GraphStatusInput): Nativ
 	const mark: NativeNode = (compact || progress !== undefined) && cx.supports("meter")
 		? { k: "meter", key: "progress", p: { value: progress ?? null, style: "ring", size: "sm",
 			tone: compact ? progress === undefined ? "muted" : progress === 1 ? "success" : "accent" : tone,
-			title: detail, aria: "Producer-reported embedding and sync progress" } }
+			title: detail, aria: share ? "Share of reported files that are ready" : "Producer-reported embedding and sync progress" } }
 		: !compact && cx.supports("icon") && (mode === "failed" || mode === "warning")
 			? { k: "icon", key: "warning", p: { name: "warn", tone, title: detail, aria: detail } }
 			: !compact && motion && (mode === "loading" || mode === "working") && cx.supports("spinner")

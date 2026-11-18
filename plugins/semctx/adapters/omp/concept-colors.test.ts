@@ -92,6 +92,26 @@ describe("shared evidence-backed concept colors", () => {
 		for (const stop of stops) stop(); resetConcepts();
 		expect(owners.every(owner => owner.paints === 1)).toBe(true);
 	});
+	test("an equal snapshot of the same display keeps the assignments and revision; changed evidence replaces them", () => {
+		const value = docOverview("equal-local", { truncated: false });
+		setConceptSnapshot(validated(value), DOCS);
+		const doc = lookupConcept("equal-local", "docs/dispatch.md"), peer = lookupConcept("equal-local", "lib/peer.ts"), revision = conceptRevision();
+		expect(doc?.kind).toBe("doc"); expect(peer).toBeDefined();
+		// An unchanged CLI result keeps its display object, so the document content terms are already bound.
+		setConceptSnapshot(validated(value), DOCS);
+		expect(conceptRevision()).toBe(revision);
+		expect(lookupConcept("equal-local", "docs/dispatch.md")).toBe(doc!);
+		expect(lookupConcept("equal-local", "lib/peer.ts")).toBe(peer!);
+		// A new display object needs its own content terms, so its vectors and observers update.
+		setConceptSnapshot(validated(docOverview("equal-local", { truncated: false })), DOCS);
+		expect(conceptRevision()).toBeGreaterThan(revision);
+		expect(lookupConcept("equal-local", "docs/dispatch.md")).toMatchObject({ key: doc!.key, title: doc!.title });
+		const settled = conceptRevision();
+		const renamed = [{ ...DOCS[0], text: DOCS[0].text.replace("# Dispatch", "# Renamed dispatch") }];
+		setConceptSnapshot(validated(docOverview("equal-local", { truncated: false })), renamed);
+		expect(conceptRevision()).toBeGreaterThan(settled);
+		expect(lookupConcept("equal-local", "docs/dispatch.md")).toMatchObject({ title: "Renamed dispatch" });
+	});
 	test("doc concepts color truncated displays, including directories, but never loading displays", () => {
 		const value = docOverview("doc-local"), result = docConcepts(value, DOCS), concept = result.concepts.find(entry => entry.key === "doc:docs/dispatch.md");
 		expect(concept).toBeDefined();
