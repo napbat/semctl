@@ -6,12 +6,19 @@ const capacity = 48, ignored = new Set(["src", "lib", "mod", "index", "main", "r
 const splits = new Map(), bound = new WeakMap(), embeddings = new WeakMap();
 // A run of 12 or more hex digits with at least one digit is a content digest or an address, not a word. Its letter runs would be noise terms.
 const digest = /(?<![\p{L}\p{N}])(?:0x)?(?=[\da-f]*\d)[\da-f]{12,}(?![\p{L}\p{N}])/giu;
+// Plural folding for display terms. A bare trailing-s rule shows `matche` and `statu`; these rules keep real words.
+function singular(word) {
+	if (word.length <= 4 || /(?:ss|us|is)$/.test(word)) return word;
+	if (word.endsWith("ies")) return `${word.slice(0, -3)}y`;
+	if (/(?:sses|shes|xes|zzes|[^a]ches)$/.test(word)) return word.slice(0, -2);
+	return word.endsWith("s") ? word.slice(0, -1) : word;
+}
 function split(text) {
 	let terms = splits.get(text); if (terms) return terms;
 	const unique = new Set();
 	// Letter runs only: digits and punctuation are boundaries, so pure digit tokens never become terms.
 	for (const word of text.replace(digest, " ").replace(/(\p{Ll})(\p{Lu})/gu, "$1 $2").replace(/(\p{Lu}+)(\p{Lu}\p{Ll})/gu, "$1 $2").toLowerCase().split(/[^\p{L}]+/u)) {
-		const term = word.length > 4 && word.endsWith("s") && !word.endsWith("ss") ? word.slice(0, -1) : word;
+		const term = singular(word);
 		if (term.length > 1 && !ignored.has(term)) unique.add(term);
 	}
 	if (splits.size >= 4096) splits.delete(splits.keys().next().value);

@@ -9,7 +9,7 @@ import type { GraphActivity } from "./graph-activity";
 import type { Display } from "./inspector";
 import type { GraphRequestState } from "./overview";
 import { nativeElement, supportsElements } from "./native-elements";
-import { indexingCounts, indexingParts, indexingSummary, type GraphIndexingCounts } from "./graph-indexing";
+import { indexingCounts, indexingParts, indexingSummary, indexingUnsettled, type GraphIndexingCounts } from "./graph-indexing";
 import { DEFAULT_GRAPH_APPEARANCE, type GraphAppearance } from "./graph-appearance";
 import { graphColorRevision, lookupGraphColor } from "./graph-colors";
 import { nativeGraphColorCue } from "./native-concepts";
@@ -93,8 +93,9 @@ function indexingMeter(cx: DescribeContext, key: string, counts: GraphIndexingCo
 }
 /** Tinted areas in the drawing: doc concept families, folder regions, or shared identifier terms. */
 type Tint = NativeGraphTerritory["kind"];
+// Each dot is one selectable group; its size counts member files.
 const LEGEND = {
-	size: ["files", "Dot size = member nodes, mostly files"],
+	size: ["group", "Dot = one group · size = member nodes, mostly files"],
 	weight: ["links", "Line weight = links between groups"],
 } as const;
 const TINT_LEGEND: { readonly [K in Tint]: readonly [label: string, title: string, spoken: string] } = {
@@ -108,9 +109,9 @@ function legend(tints: readonly Tint[]): NativeNode {
 	const tintTitle = tints.map(kind => TINT_LEGEND[kind][1]).join("\n");
 	const marks: (readonly [key: string, label: string, title: string])[] = [["size", ...LEGEND.size], ["weight", ...LEGEND.weight]];
 	if (tint) marks.push(["tint", tint, tintTitle]);
-	const props = { role: "semctl.live.legend", title: compactTooltip("Dot size = member nodes · line weight = links between groups", tintTitle) };
+	const props = { role: "semctl.live.legend", title: compactTooltip("Dot = one group, sized by member nodes · line weight = links between groups", tintTitle) };
 	return nativeElement({ k: "el", key: "legend", p: { ...props, tag: "div", class: "semctl-live-legend",
-		aria: `Legend: dot size shows files, line weight shows links${tints.length ? `, tint shows ${tints.map(kind => TINT_LEGEND[kind][2]).join(" or ")}` : ""}` },
+		aria: `Legend: each dot is a group sized by its files, line weight shows links${tints.length ? `, tint shows ${tints.map(kind => TINT_LEGEND[kind][2]).join(" or ")}` : ""}` },
 	c: marks.map(([key, label, title]) => nativeElement({ k: "el", key, p: { tag: "span", class: "semctl-legend-item", title }, c: [
 		nativeElement({ k: "el", key: "glyph", p: { tag: "span", class: `semctl-legend-${key}`, attrs: { "aria-hidden": true } } }),
 		nativeElement({ k: "el", key: "label", p: { tag: "span", class: "semctl-legend-label", text: label } }),
@@ -282,8 +283,8 @@ export class LiveGraphPopup implements Component {
 			? nativeElement({ k: "el", key, p: { ...props, tag: "button", class: "semctl-live-neighbor" }, c: children })
 			: { k: "row", key, p: props, c: children };
 	}
-	/** `chips` bounds the neighbor and busiest chips; wider popups show more. */
-	private selectionInspector(cx: DescribeContext, display: Overview, tints: readonly Tint[], chips: number): NativeNode {
+	/** `chips` bounds the neighbor chips; wider popups show more. `linked` bounds the most-linked chips; 0 hides them. `mapShown` says whether the drawing is visible. */
+	private selectionInspector(cx: DescribeContext, display: Overview, tints: readonly Tint[], chips: number, linked: number, mapShown: boolean): NativeNode {
 		const selected = this.summary?.groups.find(group => group.id === this.selected);
 		const links = selected && this.links.get(selected.id), cue = selected && this.groupCue(cx, selected);
 		const evidence = links && compactTooltip("Source links counted once, including parallel links and routes not drawn");
@@ -298,10 +299,10 @@ export class LiveGraphPopup implements Component {
 			neighbor.incoming + neighbor.outgoing)) ?? [];
 		const range = `Neighbors ${offset + 1}–${offset + neighbors.length} of ${count}`;
 		// Without a selection, the groups with the most cross-group links fill the fixed third row.
-		const busiest = selected ? [] : (this.summary?.groups ?? []).filter(group => group.id !== REMAINDER_GROUP).flatMap(group => {
+		const busiest = selected || !linked ? [] : (this.summary?.groups ?? []).filter(group => group.id !== REMAINDER_GROUP).flatMap(group => {
 			const { incoming, outgoing } = this.links.get(group.id)!;
 			return incoming + outgoing ? [{ group, incoming, outgoing }] : [];
-		}).sort((a, b) => b.incoming + b.outgoing - a.incoming - a.outgoing || (a.group.id < b.group.id ? -1 : a.group.id > b.group.id ? 1 : 0)).slice(0, chips)
+		}).sort((a, b) => b.incoming + b.outgoing - a.incoming - a.outgoing || (a.group.id < b.group.id ? -1 : a.group.id > b.group.id ? 1 : 0)).slice(0, linked)
 			.map(({ group, incoming, outgoing }) => this.groupChip(cx, "busiest", group,
 				compactTooltip(group.label, `${incoming + outgoing} cross-group links · ${incoming} incoming · ${outgoing} outgoing`),
 				`Inspect ${clean(group.label).slice(0, 160)} · ${incoming + outgoing} cross-group links · ${incoming} incoming links · ${outgoing} outgoing links`));
@@ -311,7 +312,7 @@ export class LiveGraphPopup implements Component {
 				...(cue ? [cue] : []),
 				text(selected?.label ?? "Select a group to inspect links", {
 					grow: 1, min: { w: 0 }, tone: selected ? "accent" : "muted", wrap: "none", truncate: "end",
-					title: selected ? groupTooltip(selected) : compactTooltip(this.diagram
+					title: selected ? groupTooltip(selected) : compactTooltip(mapShown
 						? "Select a dot, chip or group row; select it again to clear"
 						: "Select a group row or chip; select it again to clear"),
 				}),
@@ -321,16 +322,19 @@ export class LiveGraphPopup implements Component {
 			{ k: "row", key: "links", p: { gap: "xs", align: "center", min: { h: "1lines" } }, c: [
 				links ? text(`${links.incoming} in · ${links.outgoing} out · ${links.internal} internal`, {
 					role: "semctl.live.links", shrink: 0, min: { w: 0 }, tone: "muted", wrap: "none", truncate: "end", title: evidence, aria: evidenceAria,
-				}) : this.diagram ? legend(tints) : text("Use the group list to explore connections", { tone: "muted", wrap: "none", truncate: "end" }),
+				}) : mapShown ? legend(tints) : text("Use the group list to explore connections", { tone: "muted", wrap: "none", truncate: "end" }),
 				// Key terms fill the rest of the row and give way first.
 				...(selected?.terms.length ? [text(termText(selected), { role: "semctl.live.terms", grow: 1, basis: 0, min: { w: 0 }, tone: "muted", wrap: "none",
 					truncate: "end", title: compactTooltip(`Key terms: ${termText(selected)}`, "Distinctive identifier terms of the member files, not a summary") })] : []),
-				...(selected && (display.loading || display.truncated) ? [text(display.loading ? "loading" : "partial", {
-					tone: display.loading ? "muted" : "warning", shrink: 0, title: compactTooltip(sourceScope(display), display.caveats[0]),
+				// The footer already reports loading layers; only a partial map needs a mark beside the counts.
+				...(selected && display.truncated && !display.loading ? [text("partial", {
+					tone: "warning", shrink: 0, title: compactTooltip(sourceScope(display), display.caveats[0]),
 					aria: spoken(sourceScope(display), ...display.caveats.slice(0, 2)),
 				})] : []),
 			] },
 			{ k: "row", key: "neighbors", p: { gap: "xs", align: "center", wrap: true, min: { h: "1.25lines" } }, c: selected ? [
+				// The label names the chip counts: links in both directions between that group and the selected one.
+				...(neighbors.length ? [{ ...text("Linked:", { tone: "muted", shrink: 0, title: compactTooltip("Neighboring groups, with links in both directions") }), key: "neighbor-label" }] : []),
 				...neighbors,
 				...(!neighbors.length ? [text(display.loading ? "No neighboring groups observed yet"
 					: display.truncated ? "No neighboring groups in this partial map" : "No neighboring groups in this map", {
@@ -340,24 +344,24 @@ export class LiveGraphPopup implements Component {
 					actionButton(cx, "previous-neighbors", undefined, "‹", compactTooltip("Previous neighbors", range), { disabled: this.neighborPage === 0 }),
 					actionButton(cx, "next-neighbors", undefined, "›", compactTooltip("Next neighbors", range), { disabled: this.neighborPage === last }),
 				] : []),
-			] : busiest.length ? [{ ...text("Busiest:", { tone: "muted", shrink: 0,
+			] : busiest.length ? [{ ...text("Most links:", { tone: "muted", shrink: 0,
 				title: compactTooltip("Groups with the most cross-group links, counted once") }), key: "busiest-label" }, ...busiest]
-				: [text(display.loading ? "No cross-group links observed yet"
+				: linked ? [text(display.loading ? "No cross-group links observed yet"
 					: display.truncated ? "No cross-group links in this partial map" : "No cross-group links in this map", {
 						tone: "muted", grow: 1, min: { w: 0 }, wrap: "none", truncate: "end", title: compactTooltip(display.caveats[0]) || undefined,
-					})] },
+					})] : [] },
 		] };
 	}
 	private groupRow(cx: DescribeContext, group: GraphGroup, motion: boolean, terms: boolean): NativeNode {
 		const observation = this.active.has(group.id) ? "active" : this.feedback.get(group.id)?.outcome;
 		const indexing = indexingSummary(group.indexing), cue = this.groupCue(cx, group);
-		const meter = indexingMeter(cx, "indexing", group.indexing, { role: "semctl.live.group.indexing", min: { w: "6ch" }, max: { w: "6ch" }, shrink: 0 });
-		const status = (["failed", "processing", "pending", "unknown", "ready"] as const).find(state => group.indexing[state] > 0);
+		const meter = indexingUnsettled(group.indexing) ? indexingMeter(cx, "indexing", group.indexing, { role: "semctl.live.group.indexing", min: { w: "6ch" }, max: { w: "6ch" }, shrink: 0 }) : undefined;
+		const status = (["failed", "processing", "pending", "unknown"] as const).find(state => group.indexing[state] > 0);
 		const props = { role: "semctl.live.group", gap: "xs" as const, align: "center" as const, actions: { click: this.groupAction(group.id) },
 			aria: `${this.selected === group.id ? "Selected: " : "Inspect "}${clean(group.label).slice(0, 160)}, ${group.members.length} nodes${indexing ? `, ${indexing}` : ""}${observation ? `, ${observation}` : ""}`,
 			title: groupTooltip(group) };
 		const children = [...(cue ? [cue] : []), text(group.label, {
-			grow: 1, min: { w: 0 }, tone: this.selected === group.id ? "accent" : "muted", truncate: "end", wrap: "none",
+			grow: 1, min: { w: "12ch" }, tone: this.selected === group.id ? "accent" : "muted", truncate: "end", wrap: "none",
 		}),
 		// Terms take the remaining width after the label and truncate before it.
 		...(terms && group.terms.length ? [text(termText(group), { role: "semctl.live.group.terms", shrink: 2, min: { w: 0 }, max: { w: "24ch" }, tone: "muted", truncate: "end", wrap: "none" })] : []),
@@ -427,8 +431,8 @@ export class LiveGraphPopup implements Component {
 		const partial = display?.truncated && !display.loading ? { tone: "warning" as const, shrink: 0,
 			title: compactTooltip("Partial indexed map", caveats[0]), aria: spoken("Partial indexed map", ...caveats) } : undefined;
 		const counts = this.counts;
-		const meter = counts && indexingMeter(cx, "indexing", counts, { role: "semctl.live.indexing", grow: 1, min: { w: 0 } }, true);
-		const indexing = counts && !meter ? indexingSummary(counts) : undefined;
+		const meter = counts && indexingUnsettled(counts) ? indexingMeter(cx, "indexing", counts, { role: "semctl.live.indexing", grow: 1, min: { w: 0 } }, true) : undefined;
+		const indexing = counts && !meter && indexingUnsettled(counts) ? indexingSummary(counts) : undefined;
 		const subline: NativeNode[] = display && this.summary ? [{ k: "row", key: "subline", p: { gap: "xs", align: "center" }, c: [
 			text(`${plural(this.summary.files, "file")} · ${plural(this.summary.groups.length, "group")}`, {
 				role: "semctl.live.subline", tone: "muted", min: { w: 0 }, wrap: "none", truncate: "end",
@@ -480,16 +484,20 @@ export class LiveGraphPopup implements Component {
 				const territories = preview ? nativeGraphLayout(this.summary.graph, size.preview, appearance.layout).territories : [];
 				this.tints = (["family", "module", "lexical"] as const).filter(kind => territories.some(territory => territory.kind === kind));
 			}
-			const details = [this.selectionInspector(cx, display, this.tints, size.chips)];
+			// Small and medium popups stack the list below the drawing, so an open list replaces the drawing: Map and Groups are two views.
+			const groupsOpen = this.groupsOpen ?? !this.diagram, listView = groupsOpen && sections && !!this.diagram && appearance.popup !== "large";
+			// An open list already names every group, and narrow chips truncate to fragments, so fewer chips show.
+			const linked = groupsOpen ? 0 : Math.min(size.chips, appearance.popup === "small" ? 2 : 3);
+			const details = [this.selectionInspector(cx, display, this.tints, size.chips, linked, !!this.diagram && !listView)];
 			// Small popups keep the row for names, counts and states; wider popups also show key terms.
-			const groupsOpen = this.groupsOpen ?? !this.diagram;
 			const groups = groupsOpen || !sections ? this.groupList(cx, motion, size.chips > 3) : [];
 			const regions = this.summary.regions.length;
 			if (sections) details.push({ k: "section", key: "groups", p: {
-				head: `Explore ${plural(this.summary.groups.length, "group")}${regions ? ` in ${plural(regions, "region")}` : ""}`, collapsible: true, collapsed: !groupsOpen,
+				head: listView ? `Back to map · ${plural(this.summary.groups.length, "group")}` : `Explore ${plural(this.summary.groups.length, "group")}${regions ? ` in ${plural(regions, "region")}` : ""}`,
+				collapsible: true, collapsed: !groupsOpen,
 			}, c: groups });
 			else details.push(...groups);
-			if (this.diagram) children.push({ k: "col", key: "workspace", p: { role: "semctl.live.workspace", gap: "sm" }, c: [
+			if (this.diagram && !listView) children.push({ k: "col", key: "workspace", p: { role: "semctl.live.workspace", gap: "sm" }, c: [
 				this.diagram, { k: "col", key: "details", p: { role: "semctl.live.details", gap: "xs" }, c: details },
 			] });
 			else children.push(...details);

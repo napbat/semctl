@@ -57,7 +57,7 @@ const POPUP_STYLES: NativeStylesheet = { name: "semctl-popups", css: `
 .semctl-legend-weight{width:12px;height:2px;border-radius:1px;background:var(--sf-muted)}
 .semctl-legend-tint{width:8px;height:8px;border-radius:50%;background:color-mix(in oklab, var(--sf-accent, var(--accent)) 25%, transparent)}
 .semctl-live-group,.semctl-live-neighbor{display:flex;align-items:center;gap:4px;min-width:0;box-sizing:border-box;border:0;border-radius:var(--r-ctl);background:transparent;color:var(--t2);font:inherit;text-align:left;cursor:pointer}
-.semctl-live-group{width:100%;gap:6px;padding:4px 6px;border-radius:6px;font-size:12px}
+.semctl-live-group{width:100%;gap:6px;padding:4px 6px;border-radius:6px;box-shadow:none;font-size:12px}
 .semctl-live-neighbor{height:22px;padding:1px 4px;background:var(--l1);font-size:11px}
 .semctl-live-group:hover,.semctl-live-group:focus-visible{background:var(--l1);color:var(--t1)}
 .semctl-live-group[aria-pressed=true],.semctl-live-neighbor:hover,.semctl-live-neighbor:focus-visible{background:var(--l2);color:var(--t1)}
@@ -82,7 +82,7 @@ const POPUP_STYLES: NativeStylesheet = { name: "semctl-popups", css: `
 .semctl-icon-action[aria-pressed=true]{color:var(--t1);background:var(--l1)}
 .semctl-icon-action[data-role="semctl.live.resize"]{width:20px;color:var(--t3);cursor:nwse-resize}
 .semctl-icon-action[data-role="semctl.live.resize"]:hover,.semctl-icon-action[data-role="semctl.live.resize"]:focus-visible{color:var(--t1)}
-@media (prefers-reduced-motion:reduce){.semctl-icon-action,.semctl-live-group[data-motion]{transition:none}}
+@media (prefers-reduced-motion:reduce){.semctl-icon-action,.semctl-live-group[data-motion],[data-role="semctl.graph.chooser-run"],[data-role="semctl.graph.chooser-back"]{transition:none}}
 /* Flex bases use the card width, not the window width. Narrow panes stack the controls below the drawing. */
 [data-role="semctl.live.workspace"]{flex-direction:row;flex-wrap:wrap;align-items:flex-start}
 [data-role="semctl.live.workspace"]>.semctl-graph-well{flex:3 1 278px;align-self:flex-start}
@@ -90,13 +90,39 @@ const POPUP_STYLES: NativeStylesheet = { name: "semctl-popups", css: `
 [data-role="semctl.live.details"] [data-role="semctl.live.selection"]{height:auto;max-height:none;min-height:0;padding:0;border:0}
 [data-role="semctl.live.details"] [data-role="semctl.live.selection"]>:last-child{flex:0 0 auto;height:auto;flex-wrap:wrap;min-width:0}
 [data-role="semctl.live.details"] .semctl-live-neighbor{flex:1 1 62px;max-width:100%}
+/* Beside the drawing, the group list scrolls under a pinned section head and keeps room for three rows. */
+[data-role="semctl.live.details"]>.sf-section>.sf-section-body{max-height:max(96px,calc(var(--semctl-body-room) - 104px));overflow-x:hidden;overflow-y:auto}
 [data-role="semctl.status.snapshot"],[data-role="semctl.graph.body"]{overflow:auto}
-.sf-overlay[data-role="omp.overlay.semctl-graph"]>.sf-ov-card{width:min(800px,calc(100vw - 40px))}
+.sf-overlay[data-role="omp.overlay.semctl-graph"]>.sf-ov-card{width:min(1040px,calc(100vw - 40px))}
 [data-role="semctl.graph.body"]{height:min(448px,calc(100vh - 220px));min-width:0;min-height:120px;max-height:calc(100vh - 180px);overflow-x:hidden}
 [data-role="semctl.graph.hint"]{font-size:11px}
+[data-role="semctl.graph.chooser"]{max-width:64ch}
+[data-role="semctl.graph.chooser-actions"]{padding-top:8px}
+[data-role="semctl.graph.chooser-run"],[data-role="semctl.graph.chooser-back"]{padding:3px 10px;border-radius:var(--r-ctl);cursor:pointer;transition:background-color 100ms var(--ease)}
+[data-role="semctl.graph.chooser-run"]{border:1px solid color-mix(in oklab,var(--sf-accent,var(--accent)) 45%,transparent);background:color-mix(in oklab,var(--sf-accent,var(--accent)) 10%,transparent)}
+[data-role="semctl.graph.chooser-back"]{border:1px solid var(--l2)}
+[data-role="semctl.graph.chooser-run"]:hover,[data-role="semctl.graph.chooser-back"]:hover{background:var(--l1)}
+[data-role="semctl.graph.group-source"]{font-size:11px;color:var(--t3)}
 [data-role="semctl.graph.title"]{font-size:13px;font-weight:600}
 [data-role="semctl.graph.group-terms"]{font-size:11px;color:var(--t3)}
-[data-role="semctl.graph.group"]{gap:8px}
+/* Wide pages put navigation beside the drawing; narrow pages wrap it below. On a wide page the list adds no height of
+   its own: the row takes the drawing's height, and the absolutely placed inner list scrolls within it. */
+[data-role="semctl.graph.workspace"]{flex-direction:row;flex-wrap:wrap;align-items:flex-start}
+[data-role="semctl.graph.canvas"]{flex:3 1 480px;min-width:0}
+[data-role="semctl.graph.side"]{flex:2 1 240px;min-width:0}
+/* Tern supports no width media queries. The row takes the drawing's height or the stable body height less the rows
+   above it, whichever is taller, and the absolutely placed list scrolls within it. A narrow card wraps the list below
+   the drawing with the same minimum. The .sf prefix outranks the host's own .sf-col positioning. */
+.sf[data-role="semctl.graph.workspace"]{align-items:stretch}
+.sf[data-role="semctl.graph.side"]{position:relative;min-height:max(200px,calc(min(448px,calc(100vh - 220px)) - 88px))}
+.sf[data-role="semctl.graph.side-list"]{position:absolute;top:0;right:0;bottom:0;left:0;overflow-x:hidden;overflow-y:auto}
+[data-role="semctl.graph.group"]{gap:0;padding:3px 6px;border-radius:6px;cursor:pointer}
+[data-role="semctl.graph.group"]:hover,[data-role="semctl.graph.group"]:focus-visible{background:var(--l1)}
+[data-role="semctl.graph.group"]:focus-visible{outline:1.5px dashed var(--sf-accent,var(--accent));outline-offset:1px}
+[data-role="semctl.graph.group-detail"]{padding-left:14px;font-size:11px}
+[data-role="semctl.graph.group-count"]{text-align:right;font-variant-numeric:tabular-nums}
+[data-role="semctl.graph.back"]{padding:1px 6px;border-radius:var(--r-ctl);background:var(--l1);cursor:pointer}
+[data-role="semctl.graph.back"]:hover,[data-role="semctl.graph.back"]:focus-visible{background:var(--l2)}
 ` };
 const active = new Map<TUI, { references: number; context?: DescribeContext }>();
 let encodedStyles: readonly string[] = [];

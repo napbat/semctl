@@ -14,6 +14,14 @@ import { nativeElement, supportsElements } from "./native-elements";
 import type { GraphAppearance } from "./graph-appearance";
 import { boundedTooltip, compactTooltip } from "./tooltip-text";
 
+/** Catalog sizes in binary units, matching the CLI status text. */
+function byteSize(bytes: number): string {
+	const units = ["bytes", "KiB", "MiB", "GiB", "TiB"];
+	let value = bytes, unit = 0;
+	while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; }
+	return unit === 0 ? `${bytes} ${bytes === 1 ? "byte" : "bytes"}` : `${value.toFixed(1)} ${units[unit]}`;
+}
+
 const MAX_BYTES = 32 * 1024;
 const MAX_HITS = 32;
 const COMPACT_MATCHES = 6;
@@ -353,7 +361,7 @@ export class SemctlInspector implements Component {
 			k: "code", key: "source", p: { text: clean(shown), path: info.path, lang: info.language, start,
 				numbers: start !== undefined, wrap: this.standalone, marks: marks.length ? marks : undefined },
 		} : { k: "text", p: { text: clean(shown), wrap: this.standalone ? "word" : "none" } }];
-		if (count < total) result.push(text(`${count} of ${total} lines · expand tool for full result`, { tone: "muted" }));
+		if (count < total) result.push(text(`Showing ${count} of ${total} lines · expand this result to read all`, { tone: "muted" }));
 		return result;
 	}
 	private hitRows(d: Display, rows: Hit[], cx: DescribeContext): NativeNode[] {
@@ -426,13 +434,16 @@ export class SemctlInspector implements Component {
 			}
 			if (this.standalone && d.kind === "batch" && d.symbols.length === 0) children.push(text("No symbols returned."));
 			const entries: NativeNode[] = [];
+			// When no name matched, one summary line replaces a repeated status on every name. The names keep their rows for paging.
+			const missed = d.kind === "batch" && d.symbols.length > 1 && d.symbols.every(s => s.hits.length === 0);
+			if (missed) children.push(text(`No indexed matches for ${d.symbols.length} names`, { role: "semctl.batch.summary" }));
 			if (d.kind === "batch") {
 				let offset = 0, slot = 0;
 				for (const [index, s] of d.symbols.entries()) {
 					if (this.standalone || d.symbols.length > 1 || s.hits.length === 0) {
 						const first = this.standalone ? slot : s.hits.length ? offset : index;
-						const matches = s.hits.length === 0 ? "no match" : s.hits.length === 1 ? "1 match" : `${s.hits.length} matches`;
-						entries.push({ ...text(`${s.symbol} · ${matches}`, {
+						const matches = missed ? "" : ` · ${s.hits.length === 0 ? "no match" : s.hits.length === 1 ? "1 match" : `${s.hits.length} matches`}`;
+						entries.push({ ...text(`${s.symbol}${matches}`, {
 							role: "semctl.batch.heading", basis: "100%", tone: "muted", wrap: "none", truncate: "end",
 							hidden: !this.allRows && first >= COMPACT_MATCHES,
 						}), key: `${s.hits.length ? "batch-group" : "batch-miss"}-${index}` });
@@ -483,19 +494,21 @@ export class SemctlInspector implements Component {
 	}
 	private status(d: Status, cx: DescribeContext): NativeNode[] {
 		const out: NativeNode[] = [text("Index snapshot · not live progress", { tone: "muted" })];
-		if (d.catalog) out.push(text(`Catalog: ${d.catalog.files} files · ${d.catalog.bytes} bytes`));
-		if (d.coordinator) {
-			const c = d.coordinator;
-			if (typeof c.running === "boolean") out.push(text(`Coordinator: ${c.running ? "running" : "idle"}`));
-			if (typeof c.last_error === "string") out.push(text(`Last indexing error: ${c.last_error}`, { tone: "error" }));
-		}
+		// Coordinator state and the job identity are plumbing; they stay in the snapshot details below.
+		const count = (n: number, noun: string) => `${n} ${noun}${n === 1 ? "" : "s"}`;
+		const facts: { k: string; v: string }[] = [];
+		if (d.catalog) facts.push({ k: "Catalog", v: `${count(d.catalog.files, "file")} · ${byteSize(d.catalog.bytes)}` });
 		if (d.job) {
 			const j = d.job;
-			out.push(text(`Job ${d.jobId ?? "unknown"}: ${j.filesEmbedded} files embedded · ${j.filesFailed} failed${j.filesToEmbed !== undefined ? ` · planned ${j.filesToEmbed}` : ""}`));
+			const planned = typeof j.filesToEmbed === "number" ? ` · ${j.filesToEmbed} planned` : "";
+			facts.push({ k: "Last job", v: `${count(j.filesEmbedded, "file")} embedded · ${j.filesFailed} failed${planned}` });
 			const stage = typeof j.currentStage === "string" ? label(j.currentStage) : "";
 			const rate = typeof j.operationsPerSecond === "number" && Number.isFinite(j.operationsPerSecond) && j.operationsPerSecond >= 0 ? `${j.operationsPerSecond} files/s` : "";
-			if (stage || rate) out.push(text([stage, rate].filter(Boolean).join(" · "), { tone: "muted" }));
+			if (stage || rate) facts.push({ k: "Stage", v: [stage, rate].filter(Boolean).join(" · ") });
 		}
+		if (facts.length) out.push(...(cx.supports("kv") ? [{ k: "kv" as const, key: "facts", p: { items: facts.map(fact => ({ k: fact.k, v: clean(fact.v) })) } }]
+			: facts.map(fact => text(`${fact.k}: ${fact.v}`))));
+		if (d.coordinator && typeof d.coordinator.last_error === "string") out.push(text(`Last indexing error: ${d.coordinator.last_error}`, { tone: "error" }));
 		for (const e of [d.catalogError, d.jobError, d.job?.error]) if (typeof e === "string") out.push(text(e, { tone: "error" }));
 		const details: NativeNode = cx.supports("code") ? { k: "code", p: { text: clean(JSON.stringify({ coordinator: d.coordinator, catalog: d.catalog, jobId: d.jobId, job: d.job }, null, 2)), lang: "json", numbers: false, preview: { lines: 12 } } } : text(JSON.stringify(d));
 		if (cx.supports("section")) out.push({ k: "section", key: "snapshot", p: { head: "Snapshot details", collapsible: true, collapsed: !this.expandedSections.has("snapshot") }, c: [details] });
@@ -574,8 +587,9 @@ export function createInspectorRenderer(server: string, operation: string) {
 							display.kind === "batch" && display.symbols.length === 1 ? clean(display.symbols[0].symbol) : undefined,
 						targetKind: display.kind === "source" || operation === "expand_chunk" ? "path" :
 							display.kind === "search" || operation === "search_symbols" ? "query" : "text",
-						meta: display.kind === "graph" ? [`${display.nodes.length} nodes`, `${display.edges.length} links`,
-							...(display.truncated ? ["partial"] : [])] : count === undefined ? undefined : [
+						// The body badge already marks a partial graph; the header says when relationships are missing rather than zero.
+						meta: display.kind === "graph" ? [`${display.nodes.length} nodes`, display.edges.length ? `${display.edges.length} links`
+							: display.truncated || display.loading ? "relationships unavailable" : "0 links"] : count === undefined ? undefined : [
 								`${!options.expanded && count > COMPACT_MATCHES ? `${COMPACT_MATCHES} of ` : ""}${count} ${count === 1 ? "match" : "matches"}`,
 							], badges: headBadges(display) },
 					body: [...warnings.map(warning => text(warning, { role: "semctl.partial-answer", tone: "warning", wrap: "word" })), current.view],

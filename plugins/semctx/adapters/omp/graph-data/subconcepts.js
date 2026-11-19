@@ -127,7 +127,8 @@ export function partitionSubconcepts(items, { affinity = [], links = [], limit =
 		for (const [child, members] of kept) {
 			const folder = child ? [common, child].filter(Boolean).join("/") : common;
 			const label = child || `${segments(common).at(-1) ?? "root"} · files`;
-			if (members.length >= dominantMinimum && members.length >= dominantShare * sorted.length) result.push(...content(members, label, Math.max(2, limit - kept.length + 1)));
+			// The breadcrumb already names the open folder, so clusters of its direct files repeat only `files`, not the folder name.
+			if (members.length >= dominantMinimum && members.length >= dominantShare * sorted.length) result.push(...content(members, child || "files", Math.max(2, limit - kept.length + 1)));
 			else result.push({ key: `folder:${folder}${child ? "" : "/"}`, label, kind: "folder", folder, members: members.map(item => item.id) });
 		}
 		if (folded.length) rest = { key: `folder:${common}/*`, label: `${ordered.length - kept.length} other folders`, kind: "folder", members: folded.map(item => item.id) };

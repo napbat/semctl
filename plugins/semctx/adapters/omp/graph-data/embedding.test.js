@@ -23,6 +23,7 @@ describe("lexical identifier vectors", () => {
 		expect(identifierTerms("vector_store-cache.loader/path::Codec")).toEqual(["vector", "store", "cache", "loader", "path", "codec"]);
 		expect(identifierTerms("utf8Decoder2024 v2")).toEqual(["utf", "decoder"]); expect(identifierTerms("src/lib/mod.rs index.tsx main.go the_x_of_y")).toEqual([]);
 		expect(identifierTerms("GraphNodes class tests")).toEqual(["graph", "node", "class", "test"]); expect(identifierTerms("graph_graph Graph")).toEqual(["graph"]);
+		expect(identifierTerms("matches status analysis entries classes caches boxes processes")).toEqual(["match", "status", "analysis", "entry", "class", "cache", "box", "process"]);
 		const terms = identifierTerms("GraphQuery"); terms.push("mutated"); expect(identifierTerms("GraphQuery")).toEqual(["graph", "query"]);
 		// Content digests and addresses are not words, but a short hex-like word and a version suffix stay.
 		expect(identifierTerms("volume-3c-system-guide-6ba0bd5db5665334fc97b15e836cf55382d73d9b51b09536f37dacdfacf9e804-part-01.md")).toEqual(["volume", "system", "guide", "part", "md"]);

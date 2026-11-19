@@ -27,6 +27,11 @@ describe("inferred concepts from actual bindings", () => {
 		expect(result.groups.map(group => group.symbols[0].symbol)).toEqual(["GraphQuery", "VectorStore"]);
 		expect(result.unassigned).toEqual(["unsupported"]); expect(result.assignments.has("workspace")).toBe(false);
 	});
+	test("labels concepts in title case and keeps acronyms upper case", () => {
+		const nodes = ["a0", "a1", "b0", "b1"].map(id => file(id)), edges = [];
+		for (const [prefix, symbol] of [["a", "McpServer"], ["b", "conceptPalette"]]) edges.push(reference(`${prefix}0`, `${prefix}1`, symbol), reference(`${prefix}1`, `${prefix}0`, symbol));
+		expect(inferConcepts({ nodes, edges, roots: [] }).groups.map(group => group.label).sort()).toEqual(["Concept Palette", "MCP Server"]);
+	});
 	test("retains verifiable original edge indices, symbol identities and complete member files", () => {
 		const data = modules(), result = inferConcepts(data);
 		for (const group of result.groups) {

@@ -61,12 +61,9 @@ export interface NativeGraphLayout {
 	/** Force and concept map only; the other layouts return none. */
 	territories: NativeGraphTerritory[];
 }
-interface NativeCurve {
-	from: readonly number[];
-	to: readonly number[];
-	control: number[];
-	self: boolean;
-}
+interface LayoutBounds { left: number; top: number; right: number; bottom: number }
+interface PackingBox { key: string; x: number; y: number; rx: number; ry: number; shift?: number }
+const maxStretch = 1.6, gapFactor = 1.6, boxGap = 8;
 const layouts = new WeakMap<GraphData, Map<string, NativeGraphLayout>>();
 const conceptMaps = new WeakMap<GraphData, ReadonlyMap<string, NativeGraphPoint> | null>();
 const compare = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
@@ -293,12 +290,33 @@ function layeredPositions(data: GraphData): Map<string, NativeGraphPoint> {
 	return result;
 }
 
+/** Fit settled positions without changing their order. An empty axis does not limit the scale. */
+function canvasFit(bounds: LayoutBounds, frame: LayoutBounds, stretch = maxStretch, corner = false) {
+	const width = bounds.right - bounds.left, height = bounds.bottom - bounds.top;
+	let sx = width ? (frame.right - frame.left) / width : Infinity;
+	let sy = height ? (frame.bottom - frame.top) / height : Infinity;
+	if (sx === Infinity && sy === Infinity) sx = sy = 1;
+	else { sx = Math.min(sx, sy * stretch); sy = Math.min(sy, sx * stretch); }
+	const dx = frame.left - bounds.left * sx + (frame.right - frame.left - width * sx) * (corner ? 1 : .5);
+	const dy = frame.top - bounds.top * sy + (frame.bottom - frame.top - height * sy) * (corner ? 1 : .5);
+	return { sx, sy, dx, dy };
+}
+
+function fitPoints(points: GraphPosition[], frame: LayoutBounds, stretch = maxStretch): void {
+	if (!points.length) return;
+	const xs = points.map(point => point.x), ys = points.map(point => point.y);
+	const { sx, sy, dx, dy } = canvasFit({ left: Math.min(...xs), top: Math.min(...ys), right: Math.max(...xs), bottom: Math.max(...ys) }, frame, stretch);
+	for (const point of points) { point.x = point.x * sx + dx; point.y = point.y * sy + dy; }
+}
+
+const dotGap = (p: GraphPosition, q: GraphPosition) => 2.2 * Math.max(p.radius, q.radius);
+
 /** Resolve visual collisions without feeding transient state back into the force simulation. */
 function separate(points: GraphPosition[], left: number, top: number, right: number, bottom: number, layered: boolean): void {
 	const width = right - left, height = bottom - top;
 	const base = Math.min(26, Math.sqrt(width * height / Math.max(1, points.length) / 1.5));
 	// The gap grows with both radii so that large weighted dots never touch.
-	const gap = (p: GraphPosition, q: GraphPosition) => Math.max(base, p.radius + q.radius + 10);
+	const gap = (p: GraphPosition, q: GraphPosition) => Math.max(base, p.radius + q.radius + 10, dotGap(p, q));
 	const ordered = layered ? [...points].sort((a, b) => a.x - b.x || a.y - b.y || compare(a.node.id, b.node.id)) : undefined;
 	const clamp = (point: GraphPosition) => { point.x = Math.max(left, Math.min(right, point.x)); point.y = Math.max(top, Math.min(bottom, point.y)); };
 	for (let pass = 0; pass < 160; pass++) {
@@ -329,7 +347,16 @@ function separate(points: GraphPosition[], left: number, top: number, right: num
 	}
 	if (!jammed) return;
 	const pitch = Math.max(base, 2 * Math.max(...points.map(point => point.radius)) + 10);
-	const columns = Math.max(1, Math.floor(width / pitch) + 1), rows = Math.max(1, Math.ceil(points.length / columns));
+	let columns = Math.max(1, Math.floor(width / pitch) + 1), rows = Math.max(1, Math.ceil(points.length / columns));
+	if (rows > 1 && height / (rows - 1) < pitch) {
+		// Use the grid with the largest minimum spacing when neither axis can keep the preferred pitch.
+		let best = height / (rows - 1);
+		for (let count = 1; count <= points.length; count++) {
+			const rowCount = Math.ceil(points.length / count);
+			const spacing = Math.min(count > 1 ? width / (count - 1) : Infinity, rowCount > 1 ? height / (rowCount - 1) : Infinity);
+			if (spacing > best) { columns = count; rows = rowCount; best = spacing; }
+		}
+	}
 	const slots: NativeGraphPoint[] = [];
 	for (let y = 0; y < rows; y++) for (let x = 0; x < columns; x++) slots.push([
 		columns === 1 ? (left + right) / 2 : left + x * width / (columns - 1),
@@ -363,14 +390,22 @@ function memberEllipse(members: readonly { x: number; y: number; radius: number 
 
 /**
  * Half value, half rank on [0, 1]: one distant outlier cannot squeeze every other position into a corner.
- * Equal values share their mean rank; a single distinct value maps to .5.
+ * Values equal within projection precision share their mean rank.
  */
 function rankBlend(values: readonly number[]): number[] {
-	const low = Math.min(...values), high = Math.max(...values);
-	if (!(high > low)) return values.map(() => .5);
-	const first = new Map<number, number>(), last = new Map<number, number>();
-	[...values].sort((a, b) => a - b).forEach((value, index) => { if (!first.has(value)) first.set(value, index); last.set(value, index); });
-	return values.map(value => ((value - low) / (high - low) + (first.get(value)! + last.get(value)!) / 2 / (values.length - 1)) / 2);
+	const ordered = values.map((_, index) => index).sort((a, b) => values[a] - values[b]);
+	const low = values[ordered[0]], range = values[ordered.at(-1)!] - low;
+	if (!(range >= 1e-6)) return values.map(() => .5);
+	const shares = values.map(() => 0);
+	for (let start = 0; start < ordered.length;) {
+		let end = start;
+		while (end + 1 < ordered.length && values[ordered[end + 1]] - values[ordered[start]] <= range * 1e-6) end++;
+		const fraction = ((values[ordered[start]] + values[ordered[end]]) / 2 - low) / range;
+		const share = (fraction + (start + end) / 2 / (ordered.length - 1)) / 2;
+		for (let at = start; at <= end; at++) shares[ordered[at]] = share;
+		start = end + 1;
+	}
+	return shares;
 }
 
 /**
@@ -380,15 +415,15 @@ function rankBlend(values: readonly number[]): number[] {
  */
 function separateLabels(points: GraphPosition[], width: (point: GraphPosition) => number): void {
 	// The label box spans 14 px and ends 1.5 px below the dot top; see `graphLabels` in graph-preview.ts.
-	const above = (point: GraphPosition) => point.radius + 12.5;
+	const ends = points.map(point => point.x + point.radius + 5.5 + width(point));
 	for (let pass = 0; pass < 80; pass++) {
 		let moved = false;
 		for (let a = 0; a < points.length; a++) for (let b = a + 1; b < points.length; b++) {
 			const p = points[a], q = points[b];
-			const overlapX = Math.min(p.x + p.radius + 5.5 + width(p), q.x + q.radius + 5.5 + width(q)) - Math.max(p.x - p.radius, q.x - q.radius) + 4;
+			const overlapX = Math.min(ends[a], ends[b]) - Math.max(p.x - p.radius, q.x - q.radius) + 4;
 			if (overlapX <= 0) continue;
 			const [upper, lower] = q.y > p.y || (q.y === p.y && compare(p.node.id, q.node.id) < 0) ? [p, q] : [q, p];
-			const overlapY = upper.y + upper.radius + above(lower) + 3 - lower.y;
+			const overlapY = upper.y + upper.radius + lower.radius + 15.5 - lower.y;
 			if (overlapY <= 0) continue;
 			upper.y -= overlapY / 2; lower.y += overlapY / 2; moved = true;
 		}
@@ -402,9 +437,10 @@ function separateLabels(points: GraphPosition[], width: (point: GraphPosition) =
  * Packing reserves each family's final territory before any singleton is placed. A folded remainder takes the free spot nearest the lower right corner.
  * `labelWidth`, when present, reserves room for each dot's label.
  */
-function familyPositions(data: GraphData, points: GraphPosition[], families: readonly SharedConceptFamily[], left: number, top: number, right: number, bottom: number,
+function familyPositions(data: GraphData, points: GraphPosition[], families: readonly SharedConceptFamily[], frame: LayoutBounds,
 	labelWidth?: (point: GraphPosition) => number): boolean {
 	if (!families.length) return false;
+	const { left, top, right, bottom } = frame;
 	const { vectors } = graphEmbedding(data), byId = new Map(points.map(point => [point.node.id, point]));
 	const grouped = new Set(families.flatMap(family => family.members)), remainders = points.filter(point => isRemainder(point.node));
 	const groups = [
@@ -440,42 +476,52 @@ function familyPositions(data: GraphData, points: GraphPosition[], families: rea
 	const rank = points.filter(point => groupOf.has(point.node.id)).sort((a, b) => (drawingWeight(b.node) ?? 0) - (drawingWeight(a.node) ?? 0) || compare(a.node.id, b.node.id)).map(point => groupOf.get(point.node.id)!);
 	const outer = mapped && orientMap(mapped, rank);
 	// Islands grow with the canvas, so a large popup spends its room on spacing instead of empty margins.
-	// When the islands do not fit, the next attempt packs them tighter. Then labels keep their spacing inside an island but stop reserving room
-	// beyond it. The last attempt keeps the compact geometry without label room.
-	// A small canvas packs its islands tighter than 16 px per member, so the regions still fit without overlap.
+	// If labels make the islands too large, keep the wide member spacing without reserving labels.
+	// The smallest canvas can trade space around territories for room between their dots.
 	const floor = Math.min(16, Math.max(10, Math.sqrt((right - left) * (bottom - top)) / 14));
 	const roomy = Math.max(floor, Math.min(32, Math.sqrt(.3 * (right - left) * (bottom - top) / Math.max(1, points.length)) * .55));
-	const attempts = [{ unit: roomy, labels: labelWidth, reserve: true }, { unit: Math.max(floor, roomy * .75), labels: labelWidth, reserve: true },
-		{ unit: floor, labels: labelWidth, reserve: true }, { unit: floor, labels: labelWidth, reserve: false }, { unit: floor, labels: undefined, reserve: false }];
+	const attempts = [
+		...(labelWidth ? [
+			{ unit: roomy, labels: labelWidth, reserve: true, padding: 10 },
+			{ unit: Math.max(floor, roomy * .75), labels: labelWidth, reserve: true, padding: 10 },
+			{ unit: floor, labels: labelWidth, reserve: false, padding: 10 },
+		] : []),
+		{ unit: roomy, labels: undefined, reserve: false, padding: 10 },
+		{ unit: floor, labels: undefined, reserve: false, padding: 10 },
+		{ unit: floor * .7, labels: undefined, reserve: false, padding: 4 },
+	];
 	const local = new Map(groups.filter(group => group.members.length > 1).map(group => {
 		const ids = new Set(group.members.map(point => point.node.id));
 		const island = { ...data, nodes: group.members.map(point => point.node), edges: data.edges.filter(edge => ids.has(edge.from) && ids.has(edge.to)), roots: [] };
 		bindAffinity(island, semantic);
 		return [group.key, conceptMap(island) ?? semanticMap([...ids], vectors)];
 	}));
-	const arrange = (unit: number, width: ((point: GraphPosition) => number) | undefined, reserve: boolean, last: boolean): boolean => {
+	const arrange = (unit: number, width: ((point: GraphPosition) => number) | undefined, reserve: boolean, padding: number): boolean => {
 		const islands = groups.map((group, groupIndex) => {
 			const members = group.members;
 			if (members.length > 1) {
 				const extent = Math.max(24, Math.sqrt(members.length) * unit), coordinates = local.get(group.key);
-				const spread = coordinates ? Math.max(...[...coordinates.values()].map(([x, y]) => Math.hypot(x, y))) : 1;
+				const spread = coordinates ? Math.max(1e-6, ...[...coordinates.values()].map(([x, y]) => Math.hypot(x, y))) : 1;
 				members.forEach((point, index) => {
 					const position = coordinates?.get(point.node.id), angle = index * Math.PI * 2 / members.length;
 					// A pair reads down the page, leaving room for both node labels beside its dots.
 					point.x = position ? position[members.length === 2 ? 1 : 0] / spread * extent : Math.cos(angle) * extent;
 					point.y = position ? position[members.length === 2 ? 0 : 1] / spread * extent : Math.sin(angle) * extent;
 				});
-				separate(members, -extent, -extent, extent, extent, false);
+				const localWidth = members.length > 2 ? extent * 1.25 : extent;
+				for (const point of members) point.x *= localWidth / extent;
+				separate(members, -localWidth, -extent, localWidth, extent, false);
 				if (width) separateLabels(members, width);
 			} else { members[0].x = 0; members[0].y = 0; }
 			const envelope = memberEllipse(members, false);
 			// Keep the territory border and label chip clear of neighbouring islands.
-			const rx = members.length > 1 ? envelope.rx + 10 : members[0].radius + 13, ry = members.length > 1 ? envelope.ry + 10 : members[0].radius + 13;
+			const rx = members.length > 1 ? envelope.rx + padding : members[0].radius + padding + 3;
+			const ry = members.length > 1 ? envelope.ry + padding : rx;
 			// Labels read to the right of their dots. The packing box also reserves the part of a label that leaves the island.
 			const overhang = width && reserve ? Math.max(0, ...members.map(point => point.x + point.radius + 6 + width(point) - envelope.x - rx)) : 0;
 			for (const point of members) { point.x -= envelope.x + overhang / 2; point.y -= envelope.y; }
 			const seed = outer?.get(group.key);
-			return { ...group, rx: rx + overhang / 2, ry, seed: seed ?? [groupIndex, 0], x: 0, y: 0 };
+			return { ...group, rx: rx + overhang / 2, ry, shift: overhang / 2, seed: seed ?? [groupIndex, 0], x: 0, y: 0 };
 		});
 		const xs = rankBlend(islands.map(island => island.seed[0])), ys = rankBlend(islands.map(island => island.seed[1]));
 		islands.forEach((island, index) => { island.x = left + xs[index] * (right - left); island.y = top + ys[index] * (bottom - top); });
@@ -484,20 +530,34 @@ function familyPositions(data: GraphData, points: GraphPosition[], families: rea
 			const overhang = width && reserve ? Math.max(0, width(point) + 6 - 13) : 0;
 			return { point, key: JSON.stringify(["remainder", point.node.id]), x: right, y: bottom, rx: point.radius + 13 + overhang / 2, ry: point.radius + 13, shift: overhang / 2 };
 		});
-		if (!packBoxes([...islands, ...tail], left, top, right, bottom) && !last) return false;
-		for (const island of islands) for (const point of island.members) { point.x += island.x; point.y += island.y; }
-		for (const box of tail) { box.point.x = box.x - box.shift; box.point.y = box.y; }
+		const boxes = [...islands, ...tail];
+		if (!packBoxes(boxes, frame)) return false;
+		compactIslands(islands, boxes, frame, Math.sqrt((right - left) * (bottom - top) / points.length));
+		// A uniform final fit preserves the capped distance ratios when there are more than two islands.
+		const fit = fitBoxes(boxes, frame, islands.length > 2, tail.length > 0);
+		for (const island of islands) for (const point of island.members) {
+			point.x = (point.x + island.x) * fit.sx + fit.dx;
+			point.y = (point.y + island.y) * fit.sy + fit.dy;
+		}
+		for (const box of tail) {
+			box.point.x = (box.x - box.shift) * fit.sx + fit.dx;
+			box.point.y = box.y * fit.sy + fit.dy;
+		}
 		return true;
 	};
-	attempts.some(({ unit, labels, reserve }, index) => arrange(unit, labels, reserve, index === attempts.length - 1));
-	return true;
+	if (attempts.some(({ unit, labels, reserve, padding }) => arrange(unit, labels, reserve, padding))) return true;
+	// If the footprints cannot fit, use the outer map as the seed for dot packing.
+	for (const [index, group] of groups.entries()) for (const point of group.members) {
+		[point.x, point.y] = outer?.get(group.key) ?? [index, 0];
+	}
+	return false;
 }
 
 /**
  * Pushes overlapping boxes apart along their relatively smaller overlap and keeps them inside the canvas.
  * Boxes keep an 8 px gap. Pairs resolve in input order for a bounded number of passes. True when no overlap remains.
  */
-function packBoxes(boxes: { key: string; x: number; y: number; rx: number; ry: number }[], left: number, top: number, right: number, bottom: number): boolean {
+function packBoxes(boxes: PackingBox[], { left, top, right, bottom }: LayoutBounds): boolean {
 	if (boxes.some(box => 2 * box.rx > right - left || 2 * box.ry > bottom - top)) return false;
 	const clamp = (box: typeof boxes[number]) => {
 		box.x = Math.max(left + box.rx, Math.min(right - box.rx, box.x)); box.y = Math.max(top + box.ry, Math.min(bottom - box.ry, box.y));
@@ -507,17 +567,98 @@ function packBoxes(boxes: { key: string; x: number; y: number; rx: number; ry: n
 		let overlap = 0;
 		for (let a = 0; a < boxes.length; a++) for (let b = a + 1; b < boxes.length; b++) {
 			const p = boxes[a], q = boxes[b], dx = q.x - p.x, dy = q.y - p.y;
-			const ox = p.rx + q.rx + 8 - Math.abs(dx), oy = p.ry + q.ry + 8 - Math.abs(dy);
+			const ox = p.rx + q.rx + boxGap - Math.abs(dx), oy = p.ry + q.ry + boxGap - Math.abs(dy);
 			if (ox <= 0 || oy <= 0) continue;
 			overlap = Math.max(overlap, Math.min(ox, oy));
 			const tie = compare(p.key, q.key) <= 0 ? 1 : -1;
-			if (ox / (p.rx + q.rx) < oy / (p.ry + q.ry)) { const sign = Math.sign(dx) || tie; p.x -= sign * ox / 2; q.x += sign * ox / 2; }
-			else { const sign = Math.sign(dy) || tie; p.y -= sign * oy / 2; q.y += sign * oy / 2; }
+			const canSeparateX = 2 * (p.rx + q.rx) + boxGap <= right - left;
+			const canSeparateY = 2 * (p.ry + q.ry) + boxGap <= bottom - top;
+			if (!canSeparateX && !canSeparateY) return false;
+			if (canSeparateX && (!canSeparateY || ox / (p.rx + q.rx) < oy / (p.ry + q.ry))) {
+				const sign = Math.sign(dx) || tie; p.x -= sign * ox / 2; q.x += sign * ox / 2;
+			} else {
+				const sign = Math.sign(dy) || tie; p.y -= sign * oy / 2; q.y += sign * oy / 2;
+			}
 			clamp(p); clamp(q);
 		}
 		if (overlap < .5) return true;
 	}
 	return false;
+}
+
+function fitBoxes(boxes: PackingBox[], frame: LayoutBounds, uniform: boolean, corner = false) {
+	return canvasFit({
+		left: Math.min(...boxes.map(box => box.x - box.rx)), right: Math.max(...boxes.map(box => box.x + box.rx)),
+		top: Math.min(...boxes.map(box => box.y - box.ry)), bottom: Math.max(...boxes.map(box => box.y + box.ry)),
+	}, frame, uniform ? 1 : maxStretch, corner);
+}
+
+/**
+ * Move outlying island centers toward their nearest neighbors. Keep label space and retries for overlap recovery.
+ * The folded remainder takes part in packing, but not in the neighbor distances.
+ */
+function compactIslands(islands: PackingBox[], boxes: PackingBox[], frame: LayoutBounds, pairGap: number): boolean {
+	if (islands.length < 2) return false;
+	const x = (box: PackingBox) => box.x - (box.shift ?? 0);
+	const distance = (a: PackingBox, b: PackingBox) => Math.hypot(x(a) - x(b), a.y - b.y);
+	let compacted = false;
+	for (let pass = 0; pass < 4; pass++) {
+		const nearest = islands.map(p => {
+			let pair = p, gap = Infinity;
+			for (const q of islands) if (q !== p) {
+				const candidate = distance(p, q);
+				if (candidate < gap) { pair = q; gap = candidate; }
+			}
+			return { pair, gap };
+		});
+		const gaps = nearest.map(item => item.gap).sort((a, b) => a - b), mid = gaps.length >> 1;
+		const cap = gapFactor * (gaps[mid] + gaps[(gaps.length - 1) >> 1]) / 2;
+		let before: NativeGraphPoint[] | undefined;
+		for (const [index, p] of islands.entries()) {
+			const q = nearest[index].pair, dx = x(p) - x(q), dy = p.y - q.y, d = Math.hypot(dx, dy);
+			if (!d) continue;
+			const boxDx = p.x - q.x;
+			// Leave room for both boxes on at least one axis.
+			const contact = Math.min(
+				Math.abs(dx) < 1e-6 || boxDx * dx <= 0 ? Infinity : Math.max(0, d + (p.rx + q.rx + boxGap - Math.abs(boxDx)) * d / Math.abs(dx)),
+				Math.abs(dy) < 1e-6 ? Infinity : (p.ry + q.ry + boxGap) * d / Math.abs(dy),
+			);
+			// The available room also limits gaps when there are only two islands and the ratio is always one.
+			const limit = Math.max(contact, Math.min(cap, contact + pairGap));
+			if (d - limit < .5) continue;
+			before ??= boxes.map((box): NativeGraphPoint => [box.x, box.y]);
+			p.x -= dx * (1 - limit / d); p.y -= dy * (1 - limit / d);
+		}
+		if (!before) break;
+		if (!packBoxes(boxes, frame)) {
+			boxes.forEach((box, index) => { [box.x, box.y] = before![index]; });
+			break;
+		}
+		compacted = true;
+	}
+	return compacted;
+}
+
+/** Translate settled force groups or lexical islands without changing their membership. */
+function compactSettledGroups(points: GraphPosition[], frame: LayoutBounds, groupOf: (point: GraphPosition) => string, limitPairGap: boolean): void {
+	const groups = new Map<string, GraphPosition[]>();
+	for (const point of points) {
+		const key = groupOf(point), members = groups.get(key);
+		if (members) members.push(point); else groups.set(key, [point]);
+	}
+	if (groups.size < 2) return;
+	const islands = [...groups].map(([key, members]) => ({ key, members, ...(members.length > 1 ? memberEllipse(members, false) : {
+		x: members[0].x, y: members[0].y, rx: members[0].radius + 5, ry: members[0].radius + 5,
+	}) }));
+	const origins = islands.map(box => [box.x, box.y]);
+	const { left, top, right, bottom } = frame;
+	const pairGap = limitPairGap ? Math.sqrt((right - left) * (bottom - top) / points.length) : Infinity;
+	if (!compactIslands(islands, islands, frame, pairGap)) return;
+	const { sx, sy, dx, dy } = fitBoxes(islands, frame, true);
+	for (const [index, box] of islands.entries()) for (const point of box.members) {
+		point.x = (point.x + box.x - origins[index][0]) * sx + dx;
+		point.y = (point.y + box.y - origins[index][1]) * sy + dy;
+	}
 }
 
 /** Bound families (doc concept families or map regions), or else lexical identifier families, around settled dots. They never feed back into dot positions. */
@@ -589,91 +730,80 @@ export function nativeGraphLayout(data: GraphData, size: GraphPreviewSize, choic
 		return weight ? Math.round((3.5 + (size === "compact" ? 4 : 6) * Math.sqrt(weight / heaviest)) * 2) / 2 : 3.5;
 	};
 	const { width, height } = GRAPH_CANVAS[size !== "inline" ? size : data.nodes.length <= 8 ? "small" : data.nodes.length <= 24 ? "medium" : "inline"];
-	let positions: Map<string, GraphPosition>, project: (x: number, y: number) => NativeGraphPoint;
-	let geometries: NativeCurve[];
-	if (mode === "force" && size !== "compact") {
-		// Preserve established inline/tool-response geometry when no new mode is requested.
-		const layout = layoutGraph(data);
-		positions = layout.positions;
-		geometries = links.map((_, index) => edgeGeometry(links, index, positions)!);
-		let left = layout.bounds.x, top = layout.bounds.y, right = left + layout.width, bottom = top + layout.height;
-		for (const edge of geometries) for (let at = 0; at < edge.control.length; at += 2) {
-			left = Math.min(left, edge.control[at]); right = Math.max(right, edge.control[at]);
-			top = Math.min(top, edge.control[at + 1]); bottom = Math.max(bottom, edge.control[at + 1]);
-		}
-		// Fit each axis to the wide canvas, but limit the stretch so that the topology reads the same.
-		let sx = Math.min(2.4, (width - 64) / Math.max(1, right - left)), sy = Math.min(2.4, (height - 48) / Math.max(1, bottom - top));
-		sx = Math.min(sx, sy * 1.45); sy = Math.min(sy, sx * 1.45);
-		project = (x, y) => [(x - (left + right) / 2) * sx + width / 2, (y - (top + bottom) / 2) * sy + height / 2];
-	} else {
-		if (mode === "force") positions = new Map([...layoutGraph(data).positions].map(([id, point]) => [id, { ...point }]));
-		else {
-			const coordinates = mapped ?? (mode === "map" ? undefined : mode === "radial" ? radialPositions(data) : mode === "components" ? componentPositions(data) : layeredPositions(data));
-			positions = new Map([...data.nodes].sort((a, b) => compare(a.id, b.id)).map(node => [node.id, {
-				node, x: coordinates?.get(node.id)?.[0] ?? 0, y: coordinates?.get(node.id)?.[1] ?? 0, radius: 0, degree: 0, category: "",
-			}]));
-			for (const edge of data.edges) { positions.get(edge.from)!.degree++; positions.get(edge.to)!.degree++; }
-		}
-		const points = [...positions.values()];
-		for (const point of points) point.radius = radiusOf(point);
-		const pairs = new Map<string, number>();
-		for (const link of links) { const pair = JSON.stringify([link.from, link.to]); pairs.set(pair, (pairs.get(pair) ?? 0) + 1); }
-		let inset = 20, headroom = 20;
-		for (const link of links) {
-			const count = pairs.get(JSON.stringify([link.from, link.to]))!;
-			if (link.from === link.to) {
-				const size = positions.get(link.from)!.radius + 13 + (count - 1) * 5;
-				inset = Math.max(inset, size + 4); headroom = Math.max(headroom, size * 2 + 4);
-			} else {
-				const reverse = pairs.has(JSON.stringify([link.to, link.from]));
-				inset = Math.max(inset, (count - 1) * 5 + (reverse ? 15 : 0) + 4);
-			}
-		}
-		const left = inset, right = width - inset, top = Math.max(inset, headroom), bottom = height - inset;
-		// Each axis fills the canvas. The concept map places half by value and half by rank, so one distant cluster cannot squeeze the rest.
-		const fill = (values: number[], from: number, to: number) => {
-			const low = Math.min(...values), high = Math.max(...values);
-			if (high === low) return values.map(() => (from + to) / 2);
-			return (mode === "map" ? rankBlend(values) : values.map(value => (value - low) / (high - low))).map(share => from + share * (to - from));
-		};
-		// The estimate follows the preview label: the symbol, else the file name, else the label, at most 30 characters of about 6.8 px.
-		const labelWidth = size === "compact" ? undefined : (point: GraphPosition) => {
-			const path = point.node.hit?.path ?? point.node.path;
-			const name = point.node.hit?.symbol ?? (point.node.category === "file" && path ? path.split("/").at(-1)! : point.node.label);
-			return Math.min(30, Array.from(name).length) * 6.8 + 4;
-		};
-		if (mode !== "map" || !familyPositions(data, points, families, left, top, right, bottom, labelWidth)) {
-			const placed = mode === "map" ? points.filter(point => !isRemainder(point.node)) : points;
-			const xs = fill(placed.map(point => point.x), left, right), ys = fill(placed.map(point => point.y), top, bottom);
-			placed.forEach((point, index) => { point.x = xs[index]; point.y = ys[index]; });
-			// The remainder starts in the lower right corner; separation moves it to free space.
-			if (mode === "map") for (const point of points) if (isRemainder(point.node)) { point.x = right; point.y = bottom; }
-		}
-		separate(points, left, top, right, bottom, mode === "layers");
-		geometries = links.map((_, index) => edgeGeometry(links, index, positions)!);
-		project = (x, y) => [x, y];
+	let positions: Map<string, GraphPosition>;
+	if (mode === "force") positions = layoutGraph(data).positions;
+	else {
+		const coordinates = mapped ?? (mode === "map" ? undefined : mode === "radial" ? radialPositions(data) : mode === "components" ? componentPositions(data) : layeredPositions(data));
+		positions = new Map([...data.nodes].sort((a, b) => compare(a.id, b.id)).map(node => [node.id, {
+			node, x: coordinates?.get(node.id)?.[0] ?? 0, y: coordinates?.get(node.id)?.[1] ?? 0, radius: 0, degree: 0, category: "",
+		}]));
+		for (const edge of data.edges) { positions.get(edge.from)!.degree++; positions.get(edge.to)!.degree++; }
 	}
-	const dots = [...positions.values()].map((point): NativeGraphDot => {
-		const [x, y] = project(point.x, point.y), weight = weights.get(point.node.id);
-		return { node: point.node, x, y, radius: radiusOf(point), degree: point.degree, root: roots.has(point.node.id), ...(weight === undefined ? {} : { weight }) };
+	const points = [...positions.values()];
+	for (const point of points) point.radius = radiusOf(point);
+	const pairs = new Map<string, number>();
+	for (const link of links) { const pair = JSON.stringify([link.from, link.to]); pairs.set(pair, (pairs.get(pair) ?? 0) + 1); }
+	// Leave a wider gutter above and to the right, where labels start. Large curves need more room.
+	let inset = 20, headroom = 24;
+	for (const link of links) {
+		const count = pairs.get(JSON.stringify([link.from, link.to]))!;
+		if (link.from === link.to) {
+			const size = positions.get(link.from)!.radius + 13 + (count - 1) * 5;
+			inset = Math.max(inset, size + 4); headroom = Math.max(headroom, size * 2 + 4);
+		} else {
+			const reverse = pairs.has(JSON.stringify([link.to, link.from]));
+			inset = Math.max(inset, (count - 1) * 5 + (reverse ? 15 : 0) + 4);
+		}
+	}
+	const frame = { left: inset, top: Math.max(inset, headroom), right: width - Math.max(inset, 24), bottom: height - inset };
+	const { left, top, right, bottom } = frame;
+	// Estimate the preview label: the symbol, else the file name, else the label, at most 30 characters of about 6.8 px.
+	const labelWidth = size === "compact" ? undefined : (point: GraphPosition) => {
+		const path = point.node.hit?.path ?? point.node.path;
+		const name = point.node.hit?.symbol ?? (point.node.category === "file" && path ? path.split("/").at(-1)! : point.node.label);
+		return Math.min(30, Array.from(name).length) * 6.8 + 4;
+	};
+	if (mode !== "map" || !familyPositions(data, points, families, frame, labelWidth)) {
+		if (mode === "map") {
+			const placed = points.filter(point => !isRemainder(point.node));
+			const xs = placed.map(point => point.x), ys = placed.map(point => point.y);
+			const rankX = rankBlend(xs), rankY = rankBlend(ys);
+			const extentX = Math.max(...xs) - Math.min(...xs), extentY = Math.max(...ys) - Math.min(...ys);
+			placed.forEach((point, index) => { point.x = rankX[index] * extentX; point.y = rankY[index] * extentY; });
+			fitPoints(placed, frame);
+			if (!families.length) {
+				const { vectors } = graphEmbedding(data);
+				const lexical = semanticFamilies(placed.map(point => point.node.id), vectors);
+				const groupOf = new Map(lexical.flatMap(family => family.members.map(id => [id, family.members[0]] as const)));
+				compactSettledGroups(placed, frame, point => groupOf.get(point.node.id) ?? point.node.id, false);
+			}
+			// The remainder starts in the lower right corner; separation moves it to free space.
+			for (const point of points) if (isRemainder(point.node)) { point.x = right; point.y = bottom; }
+		} else {
+			fitPoints(points, frame);
+			if (mode === "force") compactSettledGroups(points, frame, point => point.category, true);
+		}
+		// Keep the force positions when displayed dots already have enough space.
+		if (mode !== "force" || size === "compact" ||
+			points.some((p, a) => points.some((q, b) => b > a && Math.hypot(p.x - q.x, p.y - q.y) < dotGap(p, q)))) {
+			separate(points, left, top, right, bottom, mode === "layers");
+			if (!points.some(point => isRemainder(point.node))) fitPoints(points, frame, 1);
+		}
+	}
+	const dots = points.map((point): NativeGraphDot => {
+		const { x, y, radius } = point, weight = weights.get(point.node.id);
+		return { node: point.node, x, y, radius, degree: point.degree, root: roots.has(point.node.id), ...(weight === undefined ? {} : { weight }) };
 	});
-	const byId = new Map(dots.map(dot => [dot.node.id, dot]));
 	// Route tiers exist only when edge drawing weights are bound. An unweighted original edge counts once.
 	const routeWeights = data.edges.some(edge => drawingWeight(edge) !== undefined)
 		? links.map(link => link.indices.reduce((sum, index) => sum + (drawingWeight(data.edges[index]) ?? 1), 0)) : undefined;
 	const heaviestRoute = Math.max(0, ...routeWeights ?? []);
-	const routes = geometries.map((edge, index): NativeGraphRoute => {
-		const controls: NativeGraphPoint[] = [project(edge.from[0], edge.from[1])];
-		for (let at = 0; at < edge.control.length; at += 2) controls.push(project(edge.control[at], edge.control[at + 1]));
-		controls.push(project(edge.to[0], edge.to[1]));
-		if (!edge.self) {
-			// Clip to the rendered dots, not the simulation's differently scaled radii.
-			for (const [at, id, adjacent] of [[0, links[index].from, 1], [controls.length - 1, links[index].to, controls.length - 2]] as const) {
-				const dot = byId.get(id)!, tangent = controls[adjacent], dx = tangent[0] - dot.x, dy = tangent[1] - dot.y;
-				const distance = Math.hypot(dx, dy) || 1;
-				controls[at] = [dot.x + dx / distance * (dot.radius + 1), dot.y + dy / distance * (dot.radius + 1)];
-			}
-		}
+	const routes = links.map((link, index): NativeGraphRoute => {
+		// Route geometry uses final dot positions and rendered radii.
+		const edge = edgeGeometry(links, index, positions)!;
+		const controls: NativeGraphPoint[] = [edge.from];
+		for (let at = 0; at < edge.control.length; at += 2) controls.push([edge.control[at], edge.control[at + 1]]);
+		controls.push(edge.to);
 		const points: NativeGraphPoint[] = [controls[0]];
 		// De Casteljau subdivision: <=.12px curve error and <=48px chords.
 		// Native CSS residual classes keep positional rounding below .13px per axis at 760px.
@@ -692,9 +822,9 @@ export function nativeGraphLayout(data: GraphData, size: GraphPreviewSize, choic
 			subdivide(first, depth + 1); subdivide(last, depth + 1);
 		}
 		subdivide(controls, 0);
-		if (!routeWeights) return { link: links[index], points };
+		if (!routeWeights) return { link, points };
 		const ratio = routeWeights[index] / heaviestRoute;
-		return { link: links[index], points, tier: ratio >= .6 ? 4 : ratio >= .3 ? 3 : ratio >= .12 ? 2 : 1 };
+		return { link, points, tier: ratio >= .6 ? 4 : ratio >= .3 ? 3 : ratio >= .12 ? 2 : 1 };
 	});
 	const prepared = { width, height, dots, routes, territories: mode === "force" || mode === "map" ? territories(data, dots, width, height, size === "compact") : [] };
 	if (!variants) { variants = new Map(); layouts.set(data, variants); }

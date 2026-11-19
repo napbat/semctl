@@ -192,6 +192,9 @@ function expectLinks(root: NativeNode, incoming: number, outgoing: number, inter
 	expect(evidence).toContain(`${outgoing} outgoing links`);
 	expect(evidence).toContain(`${internal} internal links`);
 }
+function listSelection(root: NativeNode): boolean {
+	return tree(root).some(node => node.p?.role === "semctl.live.group" && node.p.aria?.startsWith("Selected: "));
+}
 
 describe("live group inspection", () => {
 	test("counts directed source links and navigates neighboring groups without opening another surface", () => {
@@ -227,13 +230,21 @@ describe("live group inspection", () => {
 			expect(selectedGroup(cleared)).toBeUndefined();
 			expect(content(inspection(cleared))).toBe(hint);
 			expect(neighbors(cleared)).toHaveLength(0);
+			const graphAction = dots(cleared).find(node => node.p.attrs?.["data-node"] === api)!.p.actions!.click!;
 			view.handleNativeEvent({ type: "toggle", key: "groups", collapsed: false });
-			const explorer = view.describe(native), graphAction = dots(explorer).find(node => node.p.attrs?.["data-node"] === api)!.p.actions!.click!;
+			// The small popup shows the open list instead of the drawing; the section head returns to the map.
+			const explorer = view.describe(native);
+			expect(dots(explorer)).toHaveLength(0);
+			expect(tree(explorer).find(node => node.k === "section" && node.key === "groups")?.p?.head).toBe("Back to map · 3 groups");
 			const group = tree(explorer).find(node => node.p?.role === "semctl.live.group" && node.p.actions?.click === graphAction)!;
 			expect(group.p?.aria).toContain("2 nodes");
 			action(view, group.p!.actions!.click!);
+			const listed = view.describe(native);
+			expect(tree(listed).find(node => node.p?.role === "semctl.live.group" && node.p.actions?.click === graphAction)?.p?.aria).toStartWith("Selected: ");
+			expectLinks(listed, 1, 3, 2);
+			// Closing the list returns to the drawing with the same selection.
+			view.handleNativeEvent({ type: "toggle", key: "groups", collapsed: true });
 			expect(selectedGroup(view.describe(native))).toBe(api);
-			expectLinks(view.describe(native), 1, 3, 2);
 			expect(opened).toBe(0);
 		} finally { view.dispose(); }
 	});
@@ -250,12 +261,13 @@ describe("live group inspection", () => {
 			const initial = view.describe(native), legend = legendOf(initial);
 			expect(legend).toHaveLength(1);
 			expect((legend[0].c ?? []).map(child => "k" in child ? [child.key, asNativeElement(child)?.p.title] : [])).toEqual([
-				["size", "Dot size = member nodes, mostly files"], ["weight", "Line weight = links between groups"], ["tint", "Tint = shared identifier terms"]]);
+				["size", "Dot = one group · size = member nodes, mostly files"], ["weight", "Line weight = links between groups"], ["tint", "Tint = shared identifier terms"]]);
 			const parts = tree(legend[0]).map(asNativeElement).filter((node): node is NativeElement => !!node);
 			const glyphs = parts.filter(node => /^semctl-legend-(size|weight|tint)$/.test(node.p.class ?? ""));
 			expect(glyphs.map(node => [node.p.class, node.p.attrs?.["aria-hidden"]])).toEqual([["semctl-legend-size", true], ["semctl-legend-weight", true], ["semctl-legend-tint", true]]);
-			expect(parts.flatMap(node => node.p.text ?? [])).toEqual(["files", "links", "shared terms"]);
-			expect(legend[0].p?.title?.split("\n")).toEqual(["Dot size = member nodes · line weight = links between groups", "Tint = shared identifier terms"]);
+			// Each dot is a selectable group, so the key names groups, not files.
+			expect(parts.flatMap(node => node.p.text ?? [])).toEqual(["group", "links", "shared terms"]);
+			expect(legend[0].p?.title?.split("\n")).toEqual(["Dot = one group, sized by member nodes · line weight = links between groups", "Tint = shared identifier terms"]);
 			expect(legend[0].p?.title).not.toMatch(/embedding/i);
 			expect(content(inspection(initial))).toContain("Select a group to inspect links");
 			// Without a drawing the native fallback shows the actual way to navigate instead of a legend.
@@ -263,12 +275,12 @@ describe("live group inspection", () => {
 			expect(legendOf(plain)).toEqual([]);
 			expect(content(inspection(plain))).toContain("Use the group list to explore connections");
 			view.update({ ...popupState(data), appearance: { ...DEFAULT_GRAPH_APPEARANCE, layout: "force" } });
-			expect(tree(legendOf(view.describe(native))[0]).flatMap(node => asNativeElement(node)?.p.text ?? [])).toEqual(["files", "links", "shared terms"]);
+			expect(tree(legendOf(view.describe(native))[0]).flatMap(node => asNativeElement(node)?.p.text ?? [])).toEqual(["group", "links", "shared terms"]);
 			view.update({ ...popupState(data), appearance: { ...DEFAULT_GRAPH_APPEARANCE, layout: "radial" } });
 			const radial = legendOf(view.describe(native))[0];
-			expect(tree(radial).flatMap(node => asNativeElement(node)?.p.text ?? [])).toEqual(["files", "links"]);
+			expect(tree(radial).flatMap(node => asNativeElement(node)?.p.text ?? [])).toEqual(["group", "links"]);
 			expect(radial.p?.title).not.toContain("Tint");
-			expect(tree(legendOf(quiet.describe(native))[0]).flatMap(node => asNativeElement(node)?.p.text ?? [])).toEqual(["files", "links"]);
+			expect(tree(legendOf(quiet.describe(native))[0]).flatMap(node => asNativeElement(node)?.p.text ?? [])).toEqual(["group", "links"]);
 			view.update(popupState(data));
 			action(view, dots(view.describe(native)).find(node => node.p.attrs?.["data-node"] === id)!.p.actions!.click!);
 			const selected = view.describe(native);
@@ -276,18 +288,18 @@ describe("live group inspection", () => {
 			expect(tree(inspection(selected)).some(node => node.p?.role === "semctl.live.links")).toBe(true);
 		} finally { view.dispose(); quiet.dispose(); }
 	});
-	test("fills the idle third inspector row with the busiest groups as short selectable chips", () => {
+	test("fills the idle third inspector row with the most-linked groups as short selectable chips", () => {
 		const data = overview(["src/api/a.ts", "src/db/b.ts", "src/cache/c.ts", "src/web/d.ts", "src/cli/e.ts"]);
 		data.edges = [["0", "1"], ["0", "2"], ["0", "3"], ["1", "2"], ["3", "4"], ["4", "4"]].map(([from, to]) => ({ from, to, label: "imports" }));
 		const groupOf = projectSummary(data, data.identity.codebaseId).groupOf;
 		const names = new Map([[groupOf.get("0")!, "api"], [groupOf.get("1")!, "db"], [groupOf.get("2")!, "cache"], [groupOf.get("3")!, "web"]]);
-		// api has 3 cross-group links; db, cache and web tie at 2 and order by id; cli has 1.
-		const expected = [groupOf.get("0")!, ...[groupOf.get("1")!, groupOf.get("2")!, groupOf.get("3")!].sort()].slice(0, 3);
+		// api has 3 cross-group links; db, cache and web tie at 2 and order by id; cli has 1. The small popup shows two chips.
+		const expected = [groupOf.get("0")!, ...[groupOf.get("1")!, groupOf.get("2")!, groupOf.get("3")!].sort()].slice(0, 2);
 		const view = popup(popupState(data)), quiet = popup(popupState(overview(["src/api/a.ts", "src/db/b.ts"])));
 		try {
 			const row = inspection(view.describe(native)).c?.[2] as NativeNode;
 			expect(row.key).toBe("neighbors");
-			expect(row.c?.[0]).toMatchObject({ k: "text", key: "busiest-label", p: { text: "Busiest:", tone: "muted" } });
+			expect(row.c?.[0]).toMatchObject({ k: "text", key: "busiest-label", p: { text: "Most links:", tone: "muted" } });
 			const chips = tree(row).filter(node => node.p?.role === "semctl.live.busiest");
 			expect(chips.map(node => [node.key, asNativeElement(node)?.p.class])).toEqual(expected.map(id => [`busiest-${id}`, "semctl-live-neighbor"]));
 			expect(chips.map(chip => tree(chip).filter(node => node.k === "text").map(node => node.p?.text))).toEqual(expected.map(id => [names.get(id)]));
@@ -301,18 +313,19 @@ describe("live group inspection", () => {
 			const api = neighbors(selected).find(node => node.p?.actions?.click === chips[0].p?.actions?.click)!;
 			expect(tree(api).filter(node => node.k === "text").map(node => node.p?.text)).toEqual(["src/api", "1"]);
 			action(view, "clear-group");
+			// Without a drawing the group list is open and already names every group, so no chips repeat it.
 			const fallback = tree(inspection(view.describe({ ...native, feature: () => false }))).filter(node => node.p?.role === "semctl.live.busiest");
-			expect(fallback.map(node => [node.k, node.key])).toEqual(expected.map(id => ["row", `busiest-${id}`]));
+			expect(fallback).toEqual([]);
 			expect(content(inspection(quiet.describe(native)).c?.[2] as NativeNode)).toContain("No cross-group links in this map");
-			// Wider popups show more busiest chips; the ranking stays the same.
+			// Wider popups show at most three chips so each name stays readable; the ranking stays the same.
 			const ranked = [groupOf.get("0")!, ...[groupOf.get("1")!, groupOf.get("2")!, groupOf.get("3")!].sort(), groupOf.get("4")!];
 			const busiestAt = (size: GraphAppearance["popup"]) => {
 				view.update({ ...popupState(data), appearance: { ...DEFAULT_GRAPH_APPEARANCE, popup: size } });
 				return tree(inspection(view.describe(native))).filter(node => node.p?.role === "semctl.live.busiest").map(node => node.key);
 			};
-			expect(busiestAt("medium")).toEqual(ranked.slice(0, 4).map(id => `busiest-${id}`));
-			expect(busiestAt("large")).toEqual(ranked.map(id => `busiest-${id}`));
-			expect(busiestAt("small")).toEqual(ranked.slice(0, 3).map(id => `busiest-${id}`));
+			expect(busiestAt("medium")).toEqual(ranked.slice(0, 3).map(id => `busiest-${id}`));
+			expect(busiestAt("large")).toEqual(ranked.slice(0, 3).map(id => `busiest-${id}`));
+			expect(busiestAt("small")).toEqual(ranked.slice(0, 2).map(id => `busiest-${id}`));
 		} finally { view.dispose(); quiet.dispose(); }
 	});
 	test("inspects omitted source routes while bounding and deterministically ordering neighboring controls", () => {
@@ -481,6 +494,9 @@ describe("live group inspection", () => {
 		for (const popupSize of ["small", "medium"] as const) {
 			const view = popup({ ...popupState(data), appearance: { ...DEFAULT_GRAPH_APPEARANCE, popup: popupSize } });
 			try {
+				const map = view.describe(native);
+				const legend = asNativeElement(tree(map).find(node => node.p?.role === "semctl.live.legend")!);
+				expect(legend?.p.title).toContain("Tint = groups that share a home folder");
 				view.handleNativeEvent({ type: "toggle", key: "groups", collapsed: false });
 				const card = view.describe(native), summary = projectSummary(data, data.identity.codebaseId);
 				// Without project roots, files group by their first two folders: hv/src, tools/lib, tools/rust and cmake/test.
@@ -491,9 +507,9 @@ describe("live group inspection", () => {
 				expect(order[0]).toBe("region-region:path:tools");
 				expect(order.slice(1, 3).sort()).toEqual([...tools].sort());
 				expect(order[3]).toBe("region-outside");
-				expect(tree(card).find(node => node.k === "section" && node.key === "groups")?.p?.head).toBe("Explore 4 groups in 1 region");
-				const legend = asNativeElement(tree(card).find(node => node.p?.role === "semctl.live.legend")!);
-				expect(legend?.p.title).toContain("Tint = groups that share a home folder");
+				expect(tree(card).find(node => node.k === "section" && node.key === "groups")?.p?.head).toBe("Back to map · 4 groups");
+				// The list view hides the drawing, so the inspector names the list instead of the drawing's glyphs.
+				expect(tree(card).some(node => node.p?.role === "semctl.live.legend")).toBe(false);
 				if (popupSize === "small") expect(terms(card)).toEqual([]);
 				else expect(terms(card)).toEqual(["lab · runner", "crate · loader", "exit · field · handler", "contract"]);
 				expectCompactTitles(card);
@@ -641,8 +657,9 @@ describe("compact live popup observations", () => {
 		try {
 			const rendered = view.describe(native);
 			expect(dots(rendered)).toHaveLength(2);
-			expect(content(rendered)).toContain("100% ready");
-			expect(tree(rendered).find(node => node.p?.role === "semctl.live.map-state")?.p?.text).toBe("Relationship layers loading");
+			// Every reported file is ready, so the header needs no indexing meter; the loading layers still show.
+			expect(tree(rendered).some(node => node.p?.role === "semctl.live.indexing")).toBe(false);
+			expect(tree(rendered).find(node => node.p?.role === "semctl.live.map-state")?.p?.text).toBe("Loading graph relationships…");
 			expect(tree(rendered).some(node => node.p?.title?.includes(data.caveats[0]))).toBe(true);
 			expect(dots(rendered).some(node => node.p.class?.includes("sg-active") || node.p.class?.includes("sg-indexing-"))).toBe(false);
 			action(view, dots(rendered)[0].p.actions!.click!);
@@ -685,17 +702,18 @@ describe("compact live popup observations", () => {
 			view.handleNativeEvent({ type: "toggle", key: "groups", collapsed: false });
 			view.update(popupState({ ...data, nodes: [...data.nodes] }, { requests: { sent: 3, received: 2, failed: 0 } }));
 			const retained = view.describe(native);
-			expect(dots(retained).find(node => node.p?.attrs?.["data-node"] === group)?.p?.attrs?.["aria-pressed"]).toBe(true);
+			// The small popup shows the open list instead of the drawing, so the list row carries the selection.
+			expect(tree(retained).find(node => node.p?.role === "semctl.live.group" && node.p.aria?.startsWith("Selected: "))?.p?.actions?.click).toBe(first.p!.actions!.click);
 			expect(tree(retained).find(node => node.k === "section")?.p).toMatchObject({ collapsed: false });
 			const chosen = projectSummary(data, data.identity.codebaseId).groups.find(candidate => candidate.id === group)!;
 			const remaining = { ...data, nodes: data.nodes.filter(node => !chosen.members.some(member => member.id === node.id)), roots: [] };
 			view.update(popupState(remaining));
-			expect(dots(view.describe(native)).some(node => node.p?.attrs?.["aria-pressed"] === true)).toBe(false);
-			const replacement = dots(view.describe(native))[0];
+			expect(listSelection(view.describe(native))).toBe(false);
+			const replacement = tree(view.describe(native)).find(node => node.p?.role === "semctl.live.group")!;
 			action(view, replacement.p!.actions!.click!);
-			expect(dots(view.describe(native)).some(node => node.p?.attrs?.["aria-pressed"] === true)).toBe(true);
+			expect(listSelection(view.describe(native))).toBe(true);
 			view.update(popupState({ ...remaining, identity: { ...data.identity, codebaseId: "other-checkout" } }));
-			expect(dots(view.describe(native)).some(node => node.p?.attrs?.["aria-pressed"] === true)).toBe(false);
+			expect(listSelection(view.describe(native))).toBe(false);
 			expect(tree(view.describe(native)).find(node => node.k === "section")?.p).toMatchObject({ collapsed: false });
 		} finally { view.dispose(); }
 	});

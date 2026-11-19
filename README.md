@@ -266,23 +266,30 @@ Tern owns transitions. The graph does not use SVG images or a web viewer.
 compact project map, observed request counts, and producer-backed progress.
 The popup title is `Project map`. A subline shows `N files · M groups`.
 A warning icon after the subline marks a partial map.
-A slim stacked indexing bar shows `N% ready`.
-This value is the ready share of the files that report a catalog state.
-The bar tooltip shows the exact counts.
+While some files are pending, processing, failed, or unreported, a slim stacked
+indexing bar shows `N% ready`. This value is the ready share of the files that
+report a catalog state. The bar tooltip shows the exact counts. The bar is
+hidden when every reported file is ready.
 The drawing fits the popup without stretching routes. The group inspector sits
 beside the map when it fits, and below the map in narrow panes.
-With no selection, a one-line legend explains dot size (files) and line weight
-(links). It names the drawn territory kinds only when territories are drawn.
-The `Busiest` chips select individual groups with many cross-group
+With no selection, a one-line legend explains that each dot is a group sized by
+its files and that line weight shows links. It names the drawn territory kinds
+only when territories are drawn. The popup hides while the full graph page is
+open and returns unchanged when the page closes.
+The `Most links:` chips select the individual groups with the most cross-group
 links. The folded remainder does not compete with individual groups.
+The small popup shows two chips; medium and large popups show three.
+The chips are hidden while the group list is open.
 The group list follows the map regions, with a heading per region.
-Small, medium, and large popups show up to three, four, and five chips.
+In small and medium popups, the open group list replaces the drawing. Select
+`Back to map` to return. In the large popup, the list scrolls beside the map
+below its heading.
 Select the grip at the upper left to enlarge the popup.
 Shift+click makes it smaller. Both controls wrap through the three sizes.
 Double-click the title to switch between small and large.
 Tern does not expose continuous drag-resize events.
 The popup size is saved per OMP profile.
-Group rows use small stacked indexing bars.
+Group rows show small stacked indexing bars only while some files are not ready.
 The popup footer uses one row for a fixed progress ring, a percentage, a separate
 warning badge, and request counters.
 The counters show `↑` for sent requests and `↓` for returned requests.

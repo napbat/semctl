@@ -357,7 +357,7 @@ function harness(extra: Partial<GraphOverviewDependencies> = {}) {
 	} } as unknown as ExtensionContext;
 	const pi = { exec: host.exec } as ExtensionAPI;
 	const overview = createGraphOverview(pi, { ...deps, ...extra });
-	return { ...host, overview, ctx, views, answers, prompts, notifications, get renders() { return renders; } };
+	return { ...host, overview, ctx, views, answers, prompts, notifications, get renders() { return renders; }, get widget() { return widget; } };
 }
 async function settle(): Promise<void> { await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); }
 function action(view: View, act: string): void { view.handleNativeEvent({ type: "action", key: "", act, mods: [] }); }
@@ -468,7 +468,7 @@ describe("native overview popup", () => {
 			expect(visible()).toHaveLength(6);
 			const heading = described().find(n => n.key === "batch-group-0");
 			expect(heading?.p).toMatchObject({ spans: [{ t: "main · 8 matches", s: "muted" }] });
-			expect(content(view.describe(native))).toContain("↑/↓ matches · Enter source");
+			expect(content(view.describe(native))).toContain("↑/↓ select match · Enter source");
 			expect(described().find(n => n.key === "result-rows")?.p?.aria).toBe("Show 2 more results (E)");
 			view.handleInput("e");
 			expect(visible()).toHaveLength(8);
@@ -793,6 +793,21 @@ describe("native live graph popup", () => {
 		action(h.views[0], "close");
 		await h.overview.togglePopup(h.ctx);
 		expect(h.pending).toHaveLength(1);
+		h.overview.reset();
+	});
+	test("hides the popup while the full page is open and restores it unchanged on close", async () => {
+		const h = harness({ readDisplay });
+		await h.overview.togglePopup(h.ctx);
+		h.pending[0].response.resolve(result(JSON.stringify({ text: "map", display: indexedOverview(2) }))); await settle();
+		const hidden = () => (h.widget?.describe?.(native) as NativeNode | undefined)?.p?.hidden;
+		h.views[0].handleNativeEvent({ type: "toggle", key: "groups", collapsed: false });
+		expect(hidden()).toBe(false);
+		action(h.views[0], "expand"); await settle();
+		// One dialog owns focus while the page is open; the popup stays mounted with its state.
+		expect(hidden()).toBe(true);
+		h.views.at(-1)!.handleInput("tui.select.cancel"); await settle();
+		expect(hidden()).toBe(false);
+		expect(nodes(h.views[0].describe(native)).find(node => node.k === "section" && node.key === "groups")?.p?.collapsed).toBe(false);
 		h.overview.reset();
 	});
 	test("reopening retries a failed startup read instead of caching the failure forever", async () => {

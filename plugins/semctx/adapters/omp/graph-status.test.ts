@@ -101,7 +101,7 @@ describe("compact live progress", () => {
 		const meter = nodes(view).find(node => node.k === "meter");
 		expect(meter?.p?.value).toBe(0.5);
 		expect(meter?.p?.aria).toBe("Share of reported files that are ready");
-		expect(visibleText(view)).toBe("50%");
+		expect(visibleText(view)).toBe("50% ready");
 		expect(meter?.p?.title).toContain("Ring: 2 of 4 files ready (50%)");
 		expect(meter?.p?.title).toContain("Reported progress: 90%");
 		const unreported = { ...display, nodes: display.nodes.map(({ indexing: _, ...node }) => node) };

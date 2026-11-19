@@ -14,6 +14,8 @@ interface GraphStatusInput {
 	presentation?: "label" | "icon";
 	counts?: GraphIndexingCounts;
 	subject?: "Map" | "Analysis";
+	/** The caller already marks loading relationship layers beside the drawing, so the footer does not repeat it. */
+	layersInline?: boolean;
 }
 const clean = (value: string) => value.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "");
 const text = (value: string, props: Record<string, unknown> = {}): NativeNode => ({ k: "text", p: { text: clean(value), ...props } });
@@ -29,12 +31,12 @@ export function readyShare(counts: GraphIndexingCounts | undefined): ReadyShare 
 }
 
 /** Current evidence wins over a previous receipt. A queued observation never implies active work. */
-export function graphStatusModel({ request, activity, subject = "Map" }: GraphStatusInput) {
+export function graphStatusModel({ request, activity, subject = "Map", layersInline = false }: GraphStatusInput) {
 	const { producer, requests } = activity;
 	const active = activity.operations.length;
 	const latest = (activity.recent ?? []).reduce<NonNullable<GraphActivity["recent"]>[number] | undefined>(
 		(previous, receipt) => !previous || receipt.id > previous.id ? receipt : previous, undefined);
-	const layersLoading = request.display?.kind === "graph" && request.display.loading;
+	const layersLoading = !layersInline && request.display?.kind === "graph" && request.display.loading;
 	const mode = request.error ? "failed" : producer?.symbol === "status.error" || producer?.tone === "error" ? "failed"
 		: producer?.symbol === "status.running" ? "working" : producer?.symbol === "status.pending" ? "pending"
 		: producer?.symbol === "status.success" ? "ready" : request.loading || layersLoading ? "loading"
@@ -89,13 +91,14 @@ export function graphStatus(cx: DescribeContext, input: GraphStatusInput): Nativ
 			role: "semctl.graph.status-slot", min: { w: "2.5ch" }, max: { w: "2.5ch" }, grow: 0, shrink: 0, align: "center",
 		}, c: [mark] };
 	const children: NativeNode[] = [slot,
-		text(compact ? progress === undefined ? "—" : `${Math.floor(progress * 100)}%` : model.label, {
+		// A ready share says what it measures, so it does not read as progress of the loading relationships beside it.
+		text(compact ? progress === undefined ? "—" : `${Math.floor(progress * 100)}%${share ? " ready" : ""}` : model.label, {
 			role: compact ? "semctl.live.progress-value" : "semctl.graph.status-label",
 			...compact ? { shrink: 0, min: { w: "4ch" } } : { grow: 1, basis: 0, min: { w: 0 } }, tone: compact ? "muted" : tone,
 			wrap: "none", truncate: "end", title: boundedTooltip([detail, progress === undefined ? "Progress unknown" : undefined], 4),
 		}),
 		...(compact ? [{ k: "row" as const, key: "spacer", p: { grow: 1, basis: 0, min: { w: 0 } },
-			c: display?.kind === "graph" && (input.request.error || display.loading) ? [text(input.request.error ? input.request.retainedAfterError ? "Showing last map" : "Map diagnostic" : "Relationship layers loading", {
+			c: display?.kind === "graph" && (input.request.error || display.loading) ? [text(input.request.error ? input.request.retainedAfterError ? "Showing last map" : "Map diagnostic" : "Loading graph relationships…", {
 				role: "semctl.live.map-state", min: { w: 0 }, tone: input.request.error ? "warning" : "muted", wrap: "none", truncate: "end",
 				title: compactTooltip(input.request.error ?? display.caveats[0]),
 			})] : [] }, ...alert] : []),

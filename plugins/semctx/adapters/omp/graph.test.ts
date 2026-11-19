@@ -109,11 +109,16 @@ describe("bounded graph carrier", () => {
 });
 
 describe("native graph navigation", () => {
-	test("wraps inline and overview diagrams in the shared well only on styled hosts", () => {
+	test("wraps inline and overview diagrams in the shared well only on styled hosts and puts page navigation beside the drawing", () => {
 		const styled: DescribeContext = { ...native, feature: name => name === "styles" };
 		for (const presentation of ["inline", "overview"] as const) {
 			const view = new GraphInspector(graph(), () => {}, () => ({} as Component), null, undefined, "body", presentation);
-			const root = view.describe(styled), well = root.c?.find(child => "k" in child && child.key === "graph-well");
+			const root = view.describe(styled), workspace = root.c?.find(child => "k" in child && child.key === "graph-workspace");
+			// The page splits the drawing from its navigation so the list keeps its own room; inline results keep one column.
+			expect(workspace && "k" in workspace ? workspace.c?.map(child => "k" in child ? child.key : undefined) : undefined)
+				.toEqual(presentation === "overview" ? ["graph-canvas", "graph-side"] : undefined);
+			const column = workspace && "k" in workspace ? workspace.c?.[0] : root;
+			const well = column && "k" in column ? column.c?.find(child => "k" in child && child.key === "graph-well") : undefined;
 			if (!well || !("k" in well)) throw new Error("Missing graph well");
 			expect(asNativeElement(well)?.p.class).toBe("semctl-graph-well");
 			expect(well.c).toHaveLength(1);
@@ -136,13 +141,15 @@ describe("native graph navigation", () => {
 			expect(nodes(root).some(node => node.key === "graph-well")).toBe(false);
 		} finally { preview.mockRestore(); }
 	});
-	test("uses native state badges with the original titles and retains plain text fallbacks", () => {
+	test("uses one native state badge with the original title and retains plain text fallbacks", () => {
 		const view = new GraphInspector({ ...graph(), loading: true }, () => {}, () => ({} as Component));
 		const root = view.describe(native), badges = nodes(root).filter(node => node.k === "badge");
+		// Loading layers already explain the missing relationships, so the truncation badge waits until they settle.
 		expect(badges.map(node => node.p)).toEqual([
-			{ text: "Partial graph", tone: "warning", title: "The graph is truncated. The original result retains all returned data." },
 			{ text: "Relationship layers loading", tone: "muted", title: "Available nodes remain usable." },
 		]);
+		expect(nodes(new GraphInspector(graph(), () => {}, () => ({} as Component)).describe(native)).filter(node => node.k === "badge").map(node => node.p?.text))
+			.toEqual(graph().truncated ? ["Partial graph"] : []);
 		const counts = nodes(root).find(node => node.k === "text" && node.p?.text === "5 nodes · 7 relationships");
 		expect(counts?.p?.tone).toBe("muted");
 		expect(counts?.p?.role).toBe("semctl.graph.hint");
@@ -163,7 +170,7 @@ describe("native graph navigation", () => {
 		const row = nodes(view.describe({ ...native, feature: name => name === "styles" })).find(node => node.key === "graph-drawing-summary");
 		if (!row) throw new Error("Missing drawing summary");
 		expect(row.k).toBe("row");
-		expect(content(row)).toContain("group summaries · 0 routes drawn");
+		expect(content(row)).toContain("groups · no relationships drawn");
 		expect(content(row)).toContain("Select a dot for details");
 		const labels = nodes(row).filter(node => node.k === "text");
 		expect(labels.map(node => [node.p?.role, node.p?.tone])).toEqual([
@@ -346,12 +353,13 @@ describe("native graph navigation", () => {
 			expect(content(row)).not.toContain("Indexing:");
 			if (!scoped) {
 				expect(row.p?.role).toBe("semctl.graph.group");
-				expect(row.c?.find(node => "k" in node && node.k === "text" && node.p?.spans)?.p?.grow).toBe(1);
+				const line = row.c?.find(node => "k" in node && node.key === "line");
+				expect(line && "k" in line ? line.c?.find(node => "k" in node && node.k === "text" && node.p?.spans)?.p?.grow : undefined).toBe(1);
 				expect(row.p?.title).toContain(meter.p?.title!);
 				expect(row.p?.aria).toContain(meter.p?.title!);
-				const count = row.c?.find(node => "k" in node && node.k === "row" && node.p?.min?.w === "4ch");
-				expect(count && "k" in count ? count.p?.justify : undefined).toBe("end");
-				expect(count && "k" in count ? nodes(count).find(node => node.k === "text")?.p?.text : undefined).toBe("30");
+				const count = nodes(row).find(node => node.p?.role === "semctl.graph.group-count");
+				expect(count?.p?.text).toBe("30");
+				expect(count?.p?.shrink).toBe(0);
 			}
 			const fallback = nodes(view.describe(withoutMeter)).find(node => node.key === key)!;
 			expect(nodes(fallback).some(node => node.k === "meter")).toBe(false);
@@ -511,8 +519,10 @@ describe("native graph navigation", () => {
 		const rows = subconcepts(level);
 		expect(rows.map(label)).toEqual(["intel", "amd", "uefi"]);
 		expect(content(level.find(node => node.key === "graph-drawing-summary")!)).toContain("3 subconcepts");
-		// 90 files exceed the affinity bound, so this level places by terms and links only.
-		expect(content(level.find(node => node.key === "semantic")!)).toContain("open a subconcept of at most 64 files");
+		// 90 files exceed the affinity bound, so this level places by terms and links only; the hover names the bound.
+		const semantic = level.find(node => node.key === "semantic")!;
+		expect(content(semantic)).toBe("Placed by shared terms and links");
+		expect(semantic.p?.title).toContain("at most 64 files");
 		action(view, rows[0].p!.actions!.click!);
 		const intel = nodes(view.describe(cx));
 		expect(intel.find(node => node.key === "crumb-0")?.p?.actions?.click).toBe("trail:0");
@@ -520,7 +530,7 @@ describe("native graph navigation", () => {
 		expect(subconcepts(intel).map(label).sort()).toEqual(["field · vmcs", "paging · table"]);
 		expect(runs).toHaveLength(1);
 		expect(runs[0]).toHaveLength(60);
-		expect(content(intel.find(node => node.key === "semantic")!)).toContain("loading");
+		expect(content(intel.find(node => node.key === "semantic")!)).toContain("while semantic placement loads");
 		const [a, b] = runs[0];
 		settle.resolve({ display: { version: 1, kind: "affinity", files: runs[0].map(path => ({ path, query: "content", indexed: false, results: 4 })),
 			pairs: [{ a, b, direct: 0, shared: .6 }], caveats: [] } });
@@ -556,7 +566,7 @@ describe("native graph navigation", () => {
 		const view = new GraphInspector(data, () => {}, () => { throw new Error("No source supplied"); }, "hv", undefined, "body", "overview");
 		view.describe(native);
 		action(view, "group:0");
-		expect(content(nodes(view.describe(native)).find(node => node.key === "semantic")!)).toBe("Semantic placement loading · terms and links for now");
+		expect(content(nodes(view.describe(native)).find(node => node.key === "semantic")!)).toBe("Placing by shared terms while semantic placement loads");
 		await Promise.resolve();
 		expect(content(nodes(view.describe(native)).find(node => node.key === "semantic")!)).toBe(expected);
 	});

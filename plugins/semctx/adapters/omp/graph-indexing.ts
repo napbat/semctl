@@ -34,6 +34,10 @@ export function indexingParts(counts: GraphIndexingCounts): { value: number; tok
 	return ([["ready", "success"], ["processing", "accent"], ["pending", "muted"], ["failed", "error"], ["unknown", "dim"]] as const)
 		.filter(([state]) => counts[state] > 0).map(([state, token]) => ({ value: counts[state] / total, token, label: `${counts[state]} ${state}` }));
 }
+/** True when a reported state still needs attention. A fully ready group needs no meter; its tooltip keeps the counts. */
+export function indexingUnsettled(counts: GraphIndexingCounts): boolean {
+	return counts.pending + counts.processing + counts.failed + counts.unknown > 0;
+}
 export function groupIndexing(counts: GraphIndexingCounts): GraphIndexing | undefined {
 	for (const state of ["failed", "processing", "pending"] as const) if (counts[state]) return state;
 	if (counts.unknown) return "unknown";

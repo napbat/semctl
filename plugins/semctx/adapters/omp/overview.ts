@@ -496,7 +496,8 @@ export function createGraphOverview(pi: ExtensionAPI, dependencies: GraphOvervie
 						render: width => closed ? [] : view!.render(width),
 						describe(cx) {
 							surface?.prepare(cx);
-							return { k: "overlay", key: "semctl-live", p: livePopupOverlay(appearance.state.value.popup, closed), c: view ? [view] : [] };
+							// One dialog owns focus: the popup stays mounted but hidden while the full page is open, so its state returns unchanged.
+							return { k: "overlay", key: "semctl-live", p: livePopupOverlay(appearance.state.value.popup, closed || live !== undefined), c: view ? [view] : [] };
 						},
 						dispose,
 					};
@@ -570,6 +571,7 @@ export function createGraphOverview(pi: ExtensionAPI, dependencies: GraphOvervie
 				currentRequest?.cancel();
 				if (owner !== generation) return;
 				live = undefined;
+				popup?.render();
 				if (!choice) return;
 				const selected = GRAPH_OPERATIONS.find(op => op.id === choice);
 				if (!selected) return;

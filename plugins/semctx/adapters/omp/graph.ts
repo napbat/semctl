@@ -10,7 +10,7 @@ import { graphWindow, projectSummary, type GraphGroup, type ProjectSummary } fro
 import { scopeView, type ScopeView } from "./graph-scope";
 import { AFFINITY_MAX_FILES, subscribeAffinity } from "./graph-affinity";
 import { nativeElement, supportsElements } from "./native-elements";
-import { indexingParts, indexingSummary, indexingText, type GraphIndexing, type GraphIndexingCounts } from "./graph-indexing";
+import { indexingParts, indexingSummary, indexingText, indexingUnsettled, type GraphIndexing, type GraphIndexingCounts } from "./graph-indexing";
 import type { GraphAppearance } from "./graph-appearance";
 import { compactTooltip } from "./tooltip-text";
 
@@ -129,7 +129,8 @@ export class GraphInspector implements Component {
 	/** The organized view of the innermost open group; recomputed after a trail, evidence or affinity change. */
 	private view?: ScopeView;
 	private focusDrawing?: GraphData;
-	private shownGroups = 6;
+	/** The page list sits beside the drawing and fills its height; inline results keep a short list. */
+	private shownGroups: number;
 	private shownRelations = 8;
 	private readonly groupCues = new Map<string, NativeNode>();
 	private pendingNavigation?: GraphNavigation;
@@ -156,6 +157,7 @@ export class GraphInspector implements Component {
 	constructor(readonly data: GraphData, private readonly requestRender: () => void, private readonly preview: (hit: Hit) => Component,
 		private readonly codebaseId: string | null = null, comparisonHits?: readonly Hit[], private readonly summary: "header" | "body" = "body",
 		private readonly presentation: "inline" | "overview" = "inline") {
+		this.shownGroups = presentation === "overview" ? 12 : 6;
 		this.nodeById = new Map(data.nodes.map(n => [n.id, n]));
 		this.relations = relationIndex(data, this.nodeById);
 		const roots = new Set(data.roots);
@@ -262,7 +264,7 @@ export class GraphInspector implements Component {
 	private groupControls(cx: DescribeContext): NativeNode[] {
 		if (!this.projection) return [];
 		const meter = (counts: GraphIndexingCounts): NativeNode | undefined => {
-			const parts = cx.supports("meter") ? indexingParts(counts) : undefined;
+			const parts = cx.supports("meter") && indexingUnsettled(counts) ? indexingParts(counts) : undefined;
 			if (!parts) return undefined;
 			const summary = indexingSummary(counts);
 			return { k: "meter", p: { value: parts.find(part => part.token === "success")?.value ?? 0, style: "bar", size: "sm",
@@ -270,7 +272,7 @@ export class GraphInspector implements Component {
 		};
 		if (this.scope) {
 			const scope = this.scope, status = meter(scope.indexing), view = this.currentView()!;
-			const crumbs: NativeNode[] = [{ ...text("Overview", { tone: "accent", actions: { click: "overview" }, aria: "Return to project overview", shrink: 0, wrap: "none" }), key: "crumb-overview" }];
+			const crumbs: NativeNode[] = [{ ...text("← Overview", { role: "semctl.graph.back", tone: "accent", actions: { click: "overview" }, aria: "Return to project overview", shrink: 0, wrap: "none" }), key: "crumb-overview" }];
 			for (const [depth, group] of this.trail.entries()) {
 				const last = depth === this.trail.length - 1;
 				crumbs.push({ ...text("›", { tone: "muted", shrink: 0 }), key: `crumb-separator-${depth}` }, { ...text(group.label, {
@@ -285,7 +287,7 @@ export class GraphInspector implements Component {
 				...(scope.source ? [text(scope.source, { role: "semctl.graph.group-source", tone: "muted", wrap: "none", truncate: "start",
 					shrink: 1, min: { w: 0 }, max: { w: "32ch" } })] : []),
 				text(`${scope.members.length} nodes`, { tone: "muted", shrink: 0 }),
-				...(status ? [status] : indexingSummary(scope.indexing) ? [text(indexingSummary(scope.indexing)!, { tone: "muted" })] : []),
+				...(status ? [status] : indexingUnsettled(scope.indexing) && indexingSummary(scope.indexing) ? [text(indexingSummary(scope.indexing)!, { tone: "muted" })] : []),
 			] }, this.semanticStatus(view)];
 		}
 		const rows: NativeNode[] = this.projection.allGroups.slice(0, this.shownGroups).map((group, index) => {
@@ -298,27 +300,30 @@ export class GraphInspector implements Component {
 				if (color) cue = nativeGraphColorCue(color, cx, undefined, `group-cue-${index}`);
 				if (cue) this.groupCues.set(group.id, cue);
 			}
-			return { k: "row", key: `group-${index}`, p: { role: "semctl.graph.group", gap: "sm", align: "center", actions: { click: action },
+			// Name and count lead; key terms and the naming document follow on a quieter second line.
+			const detail: NativeNode[] = [
+				...(group.terms.length ? [text(group.terms.join(" · "), { role: "semctl.graph.group-terms", tone: "muted", wrap: "none", truncate: "end", shrink: 2, min: { w: 0 } })] : []),
+				...(group.source ? [text(group.source, { role: "semctl.graph.group-source", tone: "muted", wrap: "none", truncate: "start", shrink: 1, min: { w: 0 }, max: { w: "32ch" } })] : []),
+			];
+			return { k: "col", key: `group-${index}`, p: { role: "semctl.graph.group", gap: "none", actions: { click: action },
 				title: compactTooltip(group.label, [group.terms.length ? `Key terms: ${group.terms.join(" · ")}` : undefined, group.source && `From ${group.source}`,
 					group.region && `Region: ${group.region.label}`].filter(Boolean).join(" · "),
 					`${group.members.length} nodes · ${group.internal} internal links${active ? " · active request target" : ""}`, indexingSummary(group.indexing)),
-				aria: `Explore ${clean(group.label)}${active ? ", active request target" : ""}${indexingSummary(group.indexing) ? `, ${indexingSummary(group.indexing)}` : ""}` }, c: [...(cue ? [cue] : []),
-				{ k: "text", p: { grow: 1, wrap: "none", truncate: "end", spans: [{ t: clean(group.label), s: active ? "success" : "",
-					fx: active && !cx.reduceMotion ? "pulse" : undefined }] } },
-				// Key terms say what the group's code is about; they shrink before the label.
-				...(group.terms.length ? [text(group.terms.join(" · "), { role: "semctl.graph.group-terms", tone: "muted", wrap: "none", truncate: "end",
-					shrink: 2, min: { w: 0 }, max: { w: "28ch" } })] : []),
-				...(group.source ? [text(group.source, { role: "semctl.graph.group-source", tone: "muted", wrap: "none", truncate: "start",
-					shrink: 1, min: { w: 0 }, max: { w: "32ch" } })] : []),
-				status ? { k: "row", p: { justify: "end", min: { w: "4ch" }, shrink: 0 }, c: [text(`${group.members.length}`, { tone: "muted" })] }
-					: text(`${group.members.length}`, { tone: "muted" }),
-				...(status ? [status] : indexingSummary(group.indexing) ? [text(indexingSummary(group.indexing)!, { tone: group.indexing.failed ? "error" : "muted", wrap: "none", truncate: "end" })] : []),
+				aria: `Explore ${clean(group.label)}${active ? ", active request target" : ""}${indexingSummary(group.indexing) ? `, ${indexingSummary(group.indexing)}` : ""}` }, c: [
+				{ k: "row", key: "line", p: { gap: "sm", align: "center" }, c: [...(cue ? [cue] : []),
+					{ k: "text", p: { grow: 1, min: { w: 0 }, wrap: "none", truncate: "end", spans: [{ t: clean(group.label), s: active ? "success" : "",
+						fx: active && !cx.reduceMotion ? "pulse" : undefined }] } },
+					...(status ? [status] : indexingUnsettled(group.indexing) && indexingSummary(group.indexing) ? [text(indexingSummary(group.indexing)!, { tone: group.indexing.failed ? "error" : "muted", wrap: "none", truncate: "end" })] : []),
+					text(`${group.members.length}`, { role: "semctl.graph.group-count", tone: "muted", shrink: 0, min: { w: "4ch" } }),
+				] },
+				...(detail.length ? [{ k: "row" as const, key: "detail", p: { role: "semctl.graph.group-detail", gap: "sm" as const, align: "center" as const, min: { w: 0 } }, c: detail }] : []),
 			] };
 		});
-		if (this.shownGroups < this.projection.allGroups.length) rows.push(text(`${this.projection.allGroups.length - this.shownGroups} more groups`, {
-			tone: "muted", actions: { click: "more-groups" }, aria: "Show more project groups",
-		}));
-		return [{ k: "col", key: "project-groups", p: { gap: "sm", max: { w: "100ch" } }, c: rows }];
+		const hidden = this.projection.allGroups.length - this.shownGroups;
+		if (hidden > 0) rows.push({ ...text(`Show ${Math.min(12, hidden)} more of ${hidden} groups`, {
+			tone: "accent", actions: { click: "more-groups" }, aria: "Show more project groups",
+		}), key: "more-groups" });
+		return [{ k: "col", key: "project-groups", p: { gap: "xs" }, c: rows }];
 	}
 	/** What placed the open group: semctx search profiles, or terms and links while they are unavailable. */
 	private semanticStatus(view: ScopeView): NativeNode {
@@ -330,12 +335,13 @@ export class GraphInspector implements Component {
 			: status === "empty" ? "Affinity searches returned no result files · terms and links"
 			: status === "partial" ? pairs > 0 ? `Partial semantic placement · ${related}` : "Incomplete affinity search evidence · terms and links"
 			: status === "backend-loading" ? "Affinity searches unavailable while the backend loads · terms and links"
-			: status === "loading" ? "Semantic placement loading · terms and links for now"
+			: status === "loading" ? "Placing by shared terms while semantic placement loads"
 			: status === "failed" ? "Semantic placement unavailable · terms and links"
-			: files > AFFINITY_MAX_FILES ? `Terms and links · open a subconcept of at most ${AFFINITY_MAX_FILES} files for semantic placement`
-			: "Terms and links";
+			: "Placed by shared terms and links";
+		// The size bound explains why a large level has no semantic placement; it belongs in the hover, not in the visible line.
+		const bound = files > AFFINITY_MAX_FILES ? `Semantic placement runs for levels of at most ${AFFINITY_MAX_FILES} files. Open a subconcept to use it.` : undefined;
 		return { ...text(label, { role: "semctl.graph.semantic", tone: status === "failed" || status === "partial" ? "warning" : "muted", wrap: "none", truncate: "end",
-			title: compactTooltip(status === "failed" && error ? error : how, "Search results do not measure index coverage or show dependencies") }), key: "semantic" };
+			title: compactTooltip(status === "failed" && error ? error : bound ?? how, "Search results do not measure index coverage or show dependencies") }), key: "semantic" };
 	}
 	/** The subconcepts of the open group, largest first. Selecting one opens it as the next level. */
 	private subconceptRows(cx: DescribeContext): NativeNode[] {
@@ -349,16 +355,18 @@ export class GraphInspector implements Component {
 					: graphGroupColor(this.codebaseId, child.members, this.appearance?.color, child.folder, child.folder === undefined ? { key: child.id, label: child.label } : undefined);
 				cue = color && nativeGraphColorCue(color, cx, undefined, `subconcept-cue-${index}`);
 			}
-			return { k: "row", key: `subconcept-${index}`, p: { role: "semctl.graph.group", gap: "sm", align: "center", actions: { click: `subconcept:${index}` },
+			return { k: "col", key: `subconcept-${index}`, p: { role: "semctl.graph.group", gap: "none", actions: { click: `subconcept:${index}` },
 				title: compactTooltip(child.label, child.terms.length ? `Key terms: ${child.terms.join(" · ")}` : undefined, `${child.members.length} nodes · select to open`),
-				aria: `Open ${clean(child.label)}, ${child.members.length} nodes` }, c: [...(cue ? [cue] : []),
-				text(child.label, { grow: 1, wrap: "none", truncate: "end" }),
-				...(child.terms.length ? [text(child.terms.join(" · "), { role: "semctl.graph.group-terms", tone: "muted", wrap: "none", truncate: "end",
-					shrink: 2, min: { w: 0 }, max: { w: "28ch" } })] : []),
-				text(`${child.members.length}`, { tone: "muted", shrink: 0 }),
+				aria: `Open ${clean(child.label)}, ${child.members.length} nodes` }, c: [
+				{ k: "row", key: "line", p: { gap: "sm", align: "center" }, c: [...(cue ? [cue] : []),
+					text(child.label, { grow: 1, min: { w: 0 }, wrap: "none", truncate: "end" }),
+					text(`${child.members.length}`, { role: "semctl.graph.group-count", tone: "muted", shrink: 0, min: { w: "4ch" } }),
+				] },
+				...(child.terms.length ? [{ k: "row" as const, key: "detail", p: { role: "semctl.graph.group-detail", min: { w: 0 } }, c: [
+					text(child.terms.join(" · "), { role: "semctl.graph.group-terms", tone: "muted", wrap: "none", truncate: "end", min: { w: 0 } })] }] : []),
 			] };
 		});
-		return [{ k: "col", key: "subconcepts", p: { gap: "xs", max: { w: "100ch" } }, c: [
+		return [{ k: "col", key: "subconcepts", p: { gap: "xs" }, c: [
 			text(`${view.children.length} subconcepts`, { role: "semctl.graph.hint", tone: "muted", title: compactTooltip("Child folders first, then content clusters", "Select a subconcept to open it") }),
 			...rows,
 		] }];
@@ -530,7 +538,8 @@ export class GraphInspector implements Component {
 		if (this.summary === "body") summary.push(text(`${d.nodes.length} nodes · ${d.edges.length} relationships`, {
 			role: "semctl.graph.hint", tone: "muted", title: compactTooltip("Arrows show edge direction. Shared nodes and cycles remain links."),
 		}));
-		if (d.truncated) {
+		// Loading layers explain the missing relationships, so one badge says so instead of two.
+		if (d.truncated && !d.loading) {
 			const title = compactTooltip("The graph is truncated. The original result retains all returned data.");
 			summary.push(cx.supports("badge") ? { k: "badge", p: { text: "Partial graph", tone: "warning", title } } : text("Partial graph", { tone: "warning", title }));
 		}
@@ -546,7 +555,7 @@ export class GraphInspector implements Component {
 		if (summary.length) out.push({ k: "row", p: { gap: "sm", align: "center" }, c: summary });
 		if (!rows.length) out.push(text("No graph nodes in this result.", { tone: "muted" }));
 		if (this.scope) out.push(...this.groupControls(cx));
-		const diagram = this.diagram(cx);
+		const diagram = this.diagram(cx), canvasStart = out.length;
 		if (diagram) out.push(drawingSupported ? nativeElement({ k: "el", key: "graph-well", p: {
 			tag: "div", class: "semctl-graph-well",
 		}, c: [diagram] }) : diagram);
@@ -554,15 +563,17 @@ export class GraphInspector implements Component {
 			tone: "muted", title: compactTooltip("Graph drawing requires Tern native elements and surface styles."),
 		}));
 		const view = this.currentView(), drawing = this.focusDrawing ?? view?.drawing ?? this.projection?.graph;
-		const unit = drawing === this.projection?.graph ? "group summaries" : drawing === view?.summary?.graph ? "subconcepts" : "nodes";
+		const unit = drawing === this.projection?.graph ? "group" : drawing === view?.summary?.graph ? "subconcept" : "node";
+		const relations = drawing?.edges.length ? `${drawing.edges.length} relationship${drawing.edges.length === 1 ? "" : "s"} shown` : d.loading ? "relationships loading" : "no relationships drawn";
 		if (diagram && drawing) out.push({ k: "row", key: "graph-drawing-summary", p: { gap: "sm", align: "center" }, c: [
-			text(`${drawing.nodes.length} ${unit} · ${drawing.edges.length} routes drawn`, {
+			text(`${drawing.nodes.length} ${unit}${drawing.nodes.length === 1 ? "" : "s"} · ${relations}`, {
 				role: "semctl.graph.hint", tone: "muted", grow: 1, title: caveatTitle(drawing.caveats) ?? compactTooltip("Exact relationships remain in native node details."),
 			}),
-			...(drawing.nodes.some(node => this.diagramAction(node.id) !== undefined) ? [text(unit === "subconcepts" ? "Select a dot to open it" : "Select a dot for details", {
+			...(drawing.nodes.some(node => this.diagramAction(node.id) !== undefined) ? [text(unit === "subconcept" ? "Select a dot to open it" : "Select a dot for details", {
 				role: "semctl.graph.hint", tone: "muted", shrink: 0, wrap: "none",
 			})] : []),
 		] });
+		const sideStart = out.length;
 		if (this.projection && !this.scope && !this.selected) out.push(...this.groupControls(cx));
 		if (this.scope && !this.selected) out.push(...this.subconceptRows(cx));
 		const quick = this.quickCache ??= members.slice(0, 3).map((node): NativeNode => {
@@ -575,12 +586,16 @@ export class GraphInspector implements Component {
 					fx: this.active(node) && !cx.reduceMotion ? "pulse" : undefined }], truncate: "end", wrap: "none" },
 			}] };
 		});
-		if (quick.length && (!this.projection || this.scope)) out.push({ k: "row", key: "quick-nodes", p: { gap: "md", wrap: true }, c: quick });
+		// Project maps navigate through group and subconcept rows, so only plain result graphs get direct node shortcuts.
+		if (quick.length && !this.projection) out.push({ k: "row", key: "quick-nodes", p: { gap: "md", wrap: true }, c: quick });
 		const details = [...rows];
 		if (this.shownNodes < members.length) details.push({ ...text(`Show ${Math.min(32, members.length - this.shownNodes)} more`, {
 			tone: "accent", actions: { click: "more-nodes" }, aria: "Show more graph nodes",
 		}), key: "more-nodes" });
-		if (details.length) out.push(...this.section("graph-nodes", this.scope ? "Group nodes" : this.projection ? "All nodes" : d.edges.length ? "Relationships" : "Nodes", details, cx));
+		// The disclosure says what opening it shows and how much.
+		const browse = (count: number, noun: string) => `Browse ${count} ${noun}${count === 1 ? "" : "s"}`;
+		if (details.length) out.push(...this.section("graph-nodes", this.scope ? browse(members.length, "group node") : this.projection ? browse(d.nodes.length, "node")
+			: d.edges.length ? browse(d.edges.length, "relationship") : browse(d.nodes.length, "node"), details, cx));
 		if (this.selected !== undefined) {
 			const selected = this.nodeById.get(this.selected)!;
 			out.push({ k: "row", key: "selection", reveal: { at: "nearest", n: this.selectionRevision }, p: { gap: "sm", wrap: true }, c: [text(selected.label, { grow: 1, tone: "accent" }),
@@ -602,6 +617,17 @@ export class GraphInspector implements Component {
 			}));
 			if (!relations.length) out.push(text("No relationships for this node in this bounded result.", { tone: "muted" }));
 			if (this.previewComponent) out.push({ k: "col", key: `preview-${this.nodeOrder.get(selected.id)}`, c: [this.previewComponent] });
+		}
+		// The page puts the drawing beside its navigation; a narrow card wraps the list below the drawing.
+		// The inner list lets a wide page bound the list by the drawing's height and scroll it on its own.
+		if (this.presentation === "overview" && drawingSupported && diagram) {
+			const canvas = out.splice(canvasStart, sideStart - canvasStart), side = out.splice(canvasStart);
+			out.push({ k: "col", key: "graph-workspace", p: { role: "semctl.graph.workspace", gap: "md" }, c: [
+				{ k: "col", key: "graph-canvas", p: { role: "semctl.graph.canvas", gap: "xs" }, c: canvas },
+				...(side.length ? [{ k: "col" as const, key: "graph-side", p: { role: "semctl.graph.side" }, c: [
+					{ k: "col" as const, key: "graph-side-list", p: { role: "semctl.graph.side-list", gap: "xs" as const }, c: side },
+				] }] : []),
+			] });
 		}
 		return { k: "col", p: { gap: "xs" }, c: out };
 	}

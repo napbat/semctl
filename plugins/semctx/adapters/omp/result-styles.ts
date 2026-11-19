@@ -1,13 +1,16 @@
 /** Native file chips keep the host's spacing, colors and link treatment. Motion runs only under data-motion=full. */
 export const RESULT_STYLES: readonly { name: string; css: string }[] = [{ name: "semctl-results", css: `
-.sf[data-role="semctl.matches"]{display:flex;flex-wrap:wrap;align-items:flex-start;gap:2px;min-width:0}
-[data-role="semctl.match"]{flex:0 1 auto;min-width:0;max-width:100%}
-[data-role="semctl.match.expanded"]{flex:0 0 100%;width:100%;min-width:0;max-width:100%}
-[data-role="semctl.match"]>[data-role="omp.tool.chip"],[data-role="semctl.match.expanded"]>[data-role="omp.tool.chip"]{align-self:flex-start;width:max-content;max-width:100%;min-width:0;border-radius:var(--r-card);padding-left:8px;padding-right:8px;cursor:pointer}
-[data-role="semctl.match.path"]{flex:0 1 auto;min-width:0}
+/* One ordered column keeps rank order readable. The column takes the widest chip, so scores and checks align at the right.
+   The graph icon takes a narrow second column on the first row, under the header's match count, so it adds no row. */
+.sf[data-role="semctl.matches"]{display:grid;grid-template-columns:fit-content(calc(100% - 32px)) 24px;justify-content:space-between;align-items:start;column-gap:8px;row-gap:2px;min-width:0}
+.sf[data-role="semctl.matches"]>*{grid-column:1}
+[data-role="semctl.match"]{min-width:0;max-width:100%}
+[data-role="semctl.match.expanded"]{width:100%;min-width:0;max-width:100%}
+[data-role="semctl.match"]>[data-role="omp.tool.chip"],[data-role="semctl.match.expanded"]>[data-role="omp.tool.chip"]{align-self:flex-start;width:100%;max-width:100%;min-width:0;box-sizing:border-box;border-radius:var(--r-card);padding-left:8px;padding-right:8px;cursor:pointer}
+[data-role="semctl.match.path"]{flex:1 1 auto;min-width:0}
 [data-role="semctl.match.preview"]{min-width:0;padding:4px 0 6px 0}
-[data-role="semctl.batch.heading"]{flex:0 0 100%;min-width:0}
-[data-role="semctl.matches"]>[data-role="semctl.match.graph"]{flex:0 0 24px;width:24px;height:24px;min-width:24px;margin-left:auto;align-self:center}
+[data-role="semctl.batch.heading"]{min-width:0;padding-top:4px}
+[data-role="semctl.matches"]>[data-role="semctl.match.graph"]{grid-column:2;grid-row:1;align-self:center;width:24px;height:24px;min-width:24px}
 [data-role="semctl.score"][data-style="bar"]{width:40px;min-width:40px;max-width:40px;flex:0 0 40px;display:flex;align-items:center;align-self:center;margin-left:6px}
 [data-role="semctl.score"] .sf-mt-track{height:4px;border-radius:2px;background:var(--l2);overflow:hidden}
 [data-role="semctl.score"] .sf-mt-fill{border-radius:2px;background:var(--sf-accent,var(--accent))}

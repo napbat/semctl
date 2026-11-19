@@ -122,8 +122,9 @@ reports the expansion state.
 
 The exact query appears in the native `Code search` header. Each match uses a
 native file chip with a file icon, linked filename, line range, and verification
-state. Rounded chips wrap across rows, with the same native small gap as Read
-results. Chip labels retain the complete returned path, including directories.
+state. Rounded chips form one column in rank order. All chips take the width of
+the widest chip, so relevance bars and verification marks align at the right
+edge. Chip labels retain the complete returned path, including directories.
 Only the available row width can truncate a path. Hover or open Details to read
 the full location. Filenames use native link styling when a safe checkout link is available.
 Hover and expanded previews retain the symbol and
@@ -267,13 +268,23 @@ Select a group to open it. The open group splits into subconcepts:
    that holds at least 70% of the members, and at least 12 members, also splits
    into clusters. A cluster joins files with related names, Markdown headings,
    recorded links, and semantic affinity. Words that every member shares, such
-   as a common manual title, do not separate clusters.
+   as a common manual title, do not separate clusters. A cluster label starts
+   with its child folder name, or with `files` for the direct files of the open
+   folder, followed by its distinctive terms.
 
 Calm shows at most 6 subconcepts, Balanced 8, and Detailed 12. A group with more
 than 24 nodes draws one dot per subconcept. Select a subconcept dot or row to
 open the next level. A group with 24 nodes or fewer draws its members inside
-tinted subconcept territories. The breadcrumb returns to each open level.
-A refresh keeps the open levels when they still exist.
+tinted subconcept territories. The `← Overview` control and the breadcrumb return
+to each open level. A refresh keeps the open levels when they still exist.
+
+On a wide window, the full graph page puts the group or subconcept list beside
+the drawing. The list scrolls on its own and keeps the drawing in view. A
+narrow window puts the list below the drawing. Each row shows the name and the
+member count on its first line, and the key terms and naming document on a
+quieter second line. The summary below the drawing counts the drawn groups and
+relationships. While relationship layers load, one badge says so above the
+drawing, and the page footer does not repeat it.
 
 Semantic affinity comes from semctx search profiles. The server gives no
 embedding vectors, so the adapter uses its hybrid search ranking. For an open
@@ -290,6 +301,8 @@ and searches that could not run while the backend loaded. Partial results keep
 their usable pairs. A later request for the same level can retry a loading
 result after ten seconds. No timer starts another search. A failed request
 shows a warning. The level can still use terms and recorded links.
+A level with more than 64 files shows `Placed by shared terms and links`. Its
+hover names the size bound and tells you to open a subconcept.
 
 Concept map and Force can draw soft tinted territories behind their members.
 A documentation family has a solid border. A home-folder region has a dashed
@@ -360,10 +373,12 @@ PgDn to scroll the original result and its returned source.
 
 The compact toolbar opens analyses, appearance, refresh, diagnostics, and close.
 Analyses use native tabs for Project, Symbols, Calls, Flow & types, Quality,
-and Source. The map, chooser, and diagnostics share a stable viewing area.
+and Source. The chooser is titled `Choose an analysis`. Each analysis shows the
+input that it needs, and the result status footer is hidden while the chooser
+is open. The map, chooser, and diagnostics share a stable viewing area.
 Switching views keeps the selected node and source preview.
 A refresh that changes the map keeps the open group, its open subconcepts, and
-the selected file when they still exist. Group rows show key terms beside the
+the selected file when they still exist. Group rows show key terms below the
 group name.
 Use A for analyses, S for appearance, I for diagnostics, and R to refresh.
 Escape returns from the chooser or diagnostics to the result. Escape on the
@@ -378,9 +393,11 @@ The graph page footer uses a native spinner while loading or working.
 Reduced-motion mode and Motion Off use static icons and labels instead.
 
 Graph-based feed results show a compact native dot graph directly.
-Node and link counts remain in the tool header. Disconnected and single-node
-results retain their native node controls. `Relationships` exposes the complete
-supplied link list. Hover graph notes for explanatory limits. Partial graphs
+Node and link counts remain in the tool header. A partial or loading graph with
+no links says `relationships unavailable` instead of `0 links`. Disconnected and
+single-node results retain their native node controls. `Browse N relationships`
+exposes the complete supplied link list, and `Browse N nodes` lists the nodes of
+a graph without links. Hover graph notes for explanatory limits. Partial graphs
 remain visibly marked. Ordinary links are solid, imports are dashed, and
 project associations are dotted. Curved links share one continuous pattern.
 Import dashes stay at least 8 pixels long. Association marks stay at least
@@ -391,7 +408,7 @@ Search and lookup results keep their compact match chips. A separate graph icon
 appears when at least two distinct supplied locations can be shown.
 This includes references, callers, definitions, implementations, declaration
 search, batch lookups, and expanded source context.
-The icon trails the match chips on their last row. The graph groups returned
+The icon sits at the right of the first match row, below the match count. The graph groups returned
 matches by file and codebase. These links show locations, not inferred calls,
 dependencies, or embedding similarity. Graph selection and open match chips
 survive collapse and reopen. Opening a source preview does not fetch more data.
@@ -534,28 +551,32 @@ Select a dot or group row to inspect it. The inspector shows member counts
 and incoming, outgoing, and internal link counts from the full supplied map, including parallel
 links and routes omitted from the drawing. Partial or loading maps stay qualified.
 With a selection, the second row also shows the key terms of the group.
-With no selection, the inspector shows a one-line legend. It explains dot size
-(files) and line weight (links). A tint entry appears only when territories are
+With no selection, the inspector shows a one-line legend. It explains that each
+dot is a group sized by its files (`group`) and line weight (`links`). A tint entry appears only when territories are
 drawn. Its label names the drawn kind: `concepts` for documentation families,
 `folders` for home-folder regions, and `shared terms` for lexical families.
 Several kinds show `regions`. Hover a legend item for its meaning.
-The row below the legend shows `Busiest` chips for individual groups.
+The row below the legend shows `Most links:` chips for individual groups.
 The folded remainder is excluded from this ranking.
-Small, Medium, and Large show up to three, four, and five chips.
+The small popup shows up to two chips. Medium and Large show up to three.
+The chips are hidden while the group list is open, because the list names every group.
 Select a chip to select its group.
-With a selection, the chips show neighboring groups with the most observed links.
+With a selection, a `Linked:` label precedes chips for the neighboring groups with the most observed links.
 Use the previous and next controls to see the other neighboring groups
 without changing the selected group.
 The neighbor count includes both directions. Hover shows each direction separately.
 The group list follows the map: each region has a heading with its territory
 tint and group count, and its groups follow by size. An `Outside regions`
 heading precedes the other groups. The folded remainder stays last.
+In Small and Medium popups, the open group list replaces the drawing.
+Its heading changes to `Back to map · N groups`; select it to return to the drawing.
+In the Large popup, the list scrolls beside the drawing below its heading.
 The group list separates names, member counts, indexing states, and request activity.
 Medium and Large popups also show the key terms of each group.
-Each group row shows its catalog indexing states as a small stacked bar.
-Hosts without meters show a badge with the count of the most urgent state.
+A group row shows its catalog indexing states as a small stacked bar while some
+files are not ready. Hosts without meters show a badge with the count of the most urgent state.
 Hover a group for counts, key terms, region, and its source document.
-Use the expand icon for the full map.
+Use the expand icon for the full map. The popup hides while the full map is open.
 Selection follows group identity across refreshes. A delayed action cannot select
 a different group because the list order changed.
 When a map request fails, the `Diagnostics` disclosure retains the full error.
@@ -564,14 +585,14 @@ The hover summary stays short.
 The popup footer uses one row below the group list.
 The row contains a fixed progress ring, a percentage, a separate warning badge,
 and request counters. Percentage digits animate when motion is allowed.
-When the map reports indexing states, the ring and the percentage show the
+When the map reports indexing states, the ring and the `N% ready` label show the
 ready share. This is the same share as the header bar. Nodes without a
 reported state do not count. The hover names this measure and also shows the
 producer-reported job progress.
 Without reported states, the ring shows the producer-reported progress.
 A dash means that the producer has not reported a current percentage.
 Producer phases appear in the tooltip. If relationship layers are loading, the
-footer says so even when all reported files are ready. A failed refresh says
+footer says `Loading graph relationships…` even when all reported files are ready. A failed refresh says
 `Showing last map` while the retained map is visible. The warning badge marks
 a current problem.
 The badge sits beside the ring in its own space.
@@ -582,6 +603,8 @@ Hover the circle or warning badge for the current state and
 diagnostic. Long producer errors use a bounded preview; the full error remains
 in the status or overview diagnostics view.
 Map refresh errors do not erase separately reported producer progress.
+The full graph page shows its status footer only while a request runs, a
+problem exists, or observed requests exist. An idle footer is omitted.
 Current requests take precedence over older request receipts, including their
 halos and hover descriptions. Exact, codebase-matched request targets use the
 native positive green cue. Their halos use a slow, subtle opacity change after

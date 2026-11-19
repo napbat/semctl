@@ -3,7 +3,11 @@
 import { normalizeConceptPath } from "./palette.js";
 const compare = (a, b) => a < b ? -1 : a > b ? 1 : 0;
 const file = node => node.category === "file";
-const displayName = symbol => symbol.replace(/([a-z\d])([A-Z])/g, "$1 $2").replace(/[_-]+/g, " ").trim();
+// Readable words in one consistent case: `conceptPalette` and `ConceptPalette` both read `Concept Palette`; `HTTPTransport` reads `HTTP Transport`.
+// Well-known acronyms keep their case even when the identifier spells them as a word: `McpServer` reads `MCP Server`.
+const ACRONYMS = new Set(["api", "cli", "css", "dom", "html", "http", "https", "id", "io", "ipc", "json", "lsp", "mcp", "sql", "tcp", "ui", "uri", "url", "uuid", "xml"]);
+const displayName = symbol => symbol.replace(/([a-z\d])([A-Z])/g, "$1 $2").replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2").replace(/[_-]+/g, " ").trim()
+	.split(/\s+/).filter(Boolean).map(word => ACRONYMS.has(word.toLowerCase()) ? word.toUpperCase() : word[0].toUpperCase() + word.slice(1)).join(" ") || symbol;
 export function inferConcepts(data) {
 	const files = data.nodes.filter(file), nodesById = new Map(files.map(node => [node.id, node])), paths = new Map();
 	for (const node of files) {

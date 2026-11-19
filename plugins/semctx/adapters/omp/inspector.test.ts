@@ -542,7 +542,9 @@ describe("standalone analysis results", () => {
 		expect(visible()).toHaveLength(6);
 		expect(nodes(view.describe(native)).find(n => n.key === "result-rows")?.p?.aria).toBe("Show 1 more result (E)");
 		view.handlePageKey("expand");
-		expect(visible().at(-1)).toBe("missing-6 · no match");
+		// Every name missed, so one summary states it and each row names one symbol.
+		expect(visible().at(-1)).toBe("missing-6");
+		expect(nodes(view.describe(native)).find(n => n.p?.role === "semctl.batch.summary")?.p?.text).toBe("No indexed matches for 7 names");
 	});
 
 	test("renders full selected source in native code and plain native text without changing the feed preview", () => {
@@ -555,12 +557,12 @@ describe("standalone analysis results", () => {
 		expect(body.find(n => n.k === "code")?.p).toMatchObject({
 			text: snippet, start: 100, numbers: true, wrap: true, marks: [{ line: 120, tone: "accent" }],
 		});
-		expect(body.map(textContent).join("\n")).not.toContain("expand tool");
+		expect(body.map(textContent).join("\n")).not.toContain("expand this result");
 		const plain = { ...native, supports: (kind: string) => kind === "col" || kind === "row" || kind === "text" };
 		expect(nodes(view.describe(plain)).find(n => textContent(n) === snippet)?.p).toMatchObject({ wrap: "word" });
 		const feed = renderer(), value = result(payload), card = component(feed, value);
 		activate(card, "hit-0");
-		expect(nodes(card.describe(native)).map(textContent)).toContain("12 of 30 lines · expand tool for full result");
+		expect(nodes(card.describe(native)).map(textContent)).toContain("Showing 12 of 30 lines · expand this result to read all");
 		expect(nodes(card.describe(native)).some(n => n.key === "result-rows")).toBe(false);
 		expect(component(feed, value, { ...compact, expanded: true })).toBe(card);
 		expect(nodes(card.describe(native)).find(n => n.k === "code")?.p).toMatchObject({ text: snippet, wrap: false });

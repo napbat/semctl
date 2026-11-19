@@ -332,7 +332,7 @@ test("inline force uses the wide canvas with a bounded stretch", () => {
 	const sx = extent(layout.dots.map(dot => dot.x)) / extent(simulation.map(point => point.x));
 	const sy = extent(layout.dots.map(dot => dot.y)) / extent(simulation.map(point => point.y));
 	expect(sx).toBeGreaterThan(sy);
-	expect(sx / sy).toBeLessThanOrEqual(1.45 + 1e-9);
+	expect(sx / sy).toBeLessThanOrEqual(1.6 + 1e-9);
 });
 
 test("bound node weights give monotonic dot radii that never overlap in compact", () => {
@@ -452,6 +452,63 @@ for (const size of ["inline", "overview"] as const) test(`map/${size} reserves f
 	const reordered = { ...data, nodes: [...data.nodes].reverse(), edges: [...data.edges].reverse() };
 	expect(geometry(nativeGraphLayout(reordered, size, "map"))).toEqual(geometry(layout));
 	expect(nativeGraphLayout(reordered, size, "map").territories).toEqual(layout.territories);
+});
+
+/** Two matching regions and an optional outlier that shares no terms with either region. */
+function mapIslands(regionSize: number, outlierSize: number): GraphData {
+	const data = fixture(0); data.roots = [];
+	for (const [label, count, term] of [["a", regionSize, "shared"], ["b", regionSize, "shared"], ["z", outlierSize, "other"]] as const) {
+		for (let index = 0; index < count; index++) {
+			const id = `${label}${index}`, node: GraphData["nodes"][number] = { id, label: id, category: "group", hit: null, detail: null };
+			if (count > 1) bindConceptFamily(node, { key: label, label, kind: "path" });
+			bindTermVector(node, new Map([[term, 1]]));
+			bindDrawingWeight(node, index ? 1 : 9);
+			data.nodes.push(node);
+		}
+	}
+	if (outlierSize) data.edges.push({ from: "a0", to: "z0", kind: "association", label: "within project root" });
+	return data;
+}
+
+for (const outlierSize of [1, 2]) test(`map pulls a distant ${outlierSize === 1 ? "dot" : "region"} within the neighbor gap cap`, () => {
+	const data = mapIslands(2, outlierSize), layout = nativeGraphLayout(data, "overview", "map");
+	expect(layout.territories).toHaveLength(outlierSize === 1 ? 2 : 3);
+	const centers = ["a", "b", "z"].map(prefix => {
+		const members = layout.dots.filter(dot => dot.node.id.startsWith(prefix));
+		return {
+			x: members.reduce((sum, dot) => sum + dot.x, 0) / members.length,
+			y: members.reduce((sum, dot) => sum + dot.y, 0) / members.length,
+		};
+	});
+	const nearest = centers.map(p => Math.min(...centers.filter(q => q !== p).map(q => Math.hypot(p.x - q.x, p.y - q.y)))).sort((a, b) => a - b);
+	expect(nearest[2]).toBeLessThanOrEqual(nearest[1] * 1.6 + .5);
+	expect(centers[2].x).toBeGreaterThan(Math.max(centers[0].x, centers[1].x));
+	expectStrictTerritories(layout);
+	const reordered = { ...data, nodes: [...data.nodes].reverse(), edges: [...data.edges].reverse() };
+	expect(geometry(nativeGraphLayout(reordered, "overview", "map"))).toEqual(geometry(layout));
+});
+
+for (const size of ["inline", "overview"] as const) test(`map/${size} fits two spread regions inside the label gutters`, () => {
+	const layout = nativeGraphLayout(mapIslands(12, 0), size, "map");
+	expect(layout.territories).toHaveLength(2);
+	expectStrictTerritories(layout);
+	const xs = layout.dots.map(dot => dot.x), ys = layout.dots.map(dot => dot.y);
+	expect(Math.max(...xs) - Math.min(...xs)).toBeGreaterThanOrEqual(.7 * layout.width);
+	expect(Math.min(...xs)).toBeGreaterThanOrEqual(20);
+	expect(Math.max(...xs)).toBeLessThanOrEqual(layout.width - 24);
+	expect(Math.min(...ys)).toBeGreaterThanOrEqual(24);
+	expect(Math.max(...ys)).toBeLessThanOrEqual(layout.height - 20);
+	for (const territory of layout.territories) {
+		expect(territory.x - territory.rx).toBeGreaterThanOrEqual(16);
+		expect(territory.x + territory.rx).toBeLessThanOrEqual(layout.width - 16);
+		expect(territory.y - territory.ry).toBeGreaterThanOrEqual(16);
+		expect(territory.y + territory.ry).toBeLessThanOrEqual(layout.height - 16);
+		const members = layout.dots.filter(dot => territory.members.includes(dot.node.id));
+		for (let a = 0; a < members.length; a++) for (let b = a + 1; b < members.length; b++) {
+			const p = members[a], q = members[b];
+			expect(Math.hypot(p.x - q.x, p.y - q.y)).toBeGreaterThanOrEqual(2.2 * Math.max(p.radius, q.radius));
+		}
+	}
 });
 
 test("Radial orders each ring by the concept map angle so that related nodes sit side by side", () => {

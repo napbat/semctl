@@ -103,11 +103,11 @@ ${Object.entries(GRAPH_CANVAS).map(([name, { width, height }]) => `.semctl-graph
 .semctl-graph .sg-arrow{position:absolute;left:calc(var(--sg-span) - 3px);top:1.5px;width:3px;height:3px;border-top:1px solid currentColor;border-right:1px solid currentColor;transform:rotate(45deg);pointer-events:none}
 .semctl-graph.sg-compact .sg-arrow{visibility:hidden}
 .semctl-graph .sg-route.sg-related .sg-arrow{visibility:visible}
-.semctl-graph .sg-target{--sg-d:7px;position:absolute;width:max(24px,calc(var(--sg-d) + 8px));height:max(24px,calc(var(--sg-d) + 8px));transform:translate(-50%,-50%);padding:0;border:0;border-radius:50%;background:transparent;pointer-events:auto;z-index:2}
+.semctl-graph .sg-target{--sg-d:7px;position:absolute;width:max(24px,calc(var(--sg-d) + 8px));height:max(24px,calc(var(--sg-d) + 8px));transform:translate(-50%,-50%);padding:0;border:0;border-radius:50%;background:transparent;box-shadow:none;pointer-events:auto;z-index:2}
 .semctl-graph .sg-target.sg-action{cursor:pointer}
 .semctl-graph.sg-neutral .sg-target{color:var(--sg-node)}
 .semctl-graph .sg-dot{position:absolute;left:50%;top:50%;width:var(--sg-d);height:var(--sg-d);transform:translate(-50%,-50%) scale(var(--sg-dot-scale,1));border-radius:50%;background:currentColor;box-shadow:0 0 0 1.5px var(--sg-bg);pointer-events:none}
-.semctl-graph .sg-root .sg-dot{outline:1px solid var(--sg-accent);outline-offset:1px}
+.semctl-graph .sg-root .sg-dot{box-shadow:0 0 0 1.5px var(--sg-bg),0 0 0 2.5px color-mix(in oklab,currentColor 45%,transparent)}
 .semctl-graph .sg-remainder .sg-dot{background:transparent;border:1.5px dashed var(--sg-node);box-sizing:border-box;box-shadow:none}
 .semctl-graph .sg-remainder .sg-label{color:var(--t3);font-style:italic}
 .semctl-graph .sg-halo{position:absolute;left:50%;top:50%;width:calc(var(--sg-d) + 10px);height:calc(var(--sg-d) + 10px);transform:translate(-50%,-50%);border:1px solid currentColor;border-radius:50%;opacity:0;pointer-events:none}
@@ -124,10 +124,11 @@ ${Object.entries(GRAPH_CANVAS).map(([name, { width, height }]) => `.semctl-graph
 .semctl-graph .sg-pip-strong .sg-indexing-state{--sg-pip-opacity:1;opacity:1;width:6px;height:6px}
 .semctl-graph .sg-selected .sg-dot{outline:2px solid var(--sg-accent);outline-offset:2px}
 .semctl-graph .sg-target:hover .sg-dot,.semctl-graph .sg-target:focus-visible .sg-dot{--sg-dot-scale:1.18}
+.semctl-graph .sg-target:focus-visible:not(.sg-selected) .sg-dot{outline:1.5px dashed var(--sg-accent);outline-offset:3px}
 .semctl-graph .sg-muted .sg-dot{--sg-dot-opacity:.28;opacity:.28}
-.semctl-graph .sg-label{position:absolute;left:calc(50% + var(--sg-d) / 2 + 5px);bottom:calc(50% + var(--sg-d) / 2 - 1px);max-width:180px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font:500 11px/14px var(--sans,system-ui,sans-serif);color:var(--t2);filter:drop-shadow(1px 0 1px var(--sg-bg)) drop-shadow(-1px 0 1px var(--sg-bg));pointer-events:none;text-align:left}
+.semctl-graph .sg-label{position:absolute;left:calc(50% + var(--sg-d) / 2 + 2px);bottom:calc(50% + var(--sg-d) / 2 - 1px);max-width:180px;padding:0 3px;border-radius:3px;background:color-mix(in oklab,var(--sg-bg) 80%,transparent);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font:500 11px/14px var(--sans,system-ui,sans-serif);color:var(--t2);pointer-events:none;text-align:left}
 .semctl-graph.sg-compact .sg-label{font-size:10.5px}
-.semctl-graph .sg-label.sg-label-left{left:auto;right:calc(50% + var(--sg-d) / 2 + 5px);text-align:right}
+.semctl-graph .sg-label.sg-label-left{left:auto;right:calc(50% + var(--sg-d) / 2 + 2px);text-align:right}
 .semctl-graph .sg-label.sg-label-below{bottom:auto;top:calc(50% + var(--sg-d) / 2 + 3px)}
 .semctl-graph .sg-selected .sg-label,.semctl-graph .sg-target:hover .sg-label,.semctl-graph .sg-target:focus-visible .sg-label{color:var(--t1);font-weight:600}
 .semctl-graph .sg-label.sg-label-transient{visibility:hidden}

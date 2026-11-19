@@ -24,10 +24,10 @@ export function category(node) {
 		const relative = project && (path === project || path.startsWith(project + "/")) ? path.slice(project.length).replace(/^\//, "") : path;
 		const directory = node.category === "directory" ? relative : relative.slice(0, Math.max(0, relative.lastIndexOf("/")));
 		const parts = directory.split("/").filter(Boolean), depth = parts[0] === "plugins" ? 3 : 2, branch = parts.slice(0, depth).join("/");
-		return { key: `module:${JSON.stringify([project, branch])}`, label: branch || project || ".", type: "Directory" };
+		return { key: `module:${JSON.stringify([project, branch])}`, label: branch || project || "Root files", type: "Directory" };
 	}
 	const project = node.project ?? node.hit?.project, path = node.path ?? node.hit?.path;
-	if (project !== undefined && project !== null) return { key: `project:${project}`, label: project || ".", type: "Project" };
+	if (project !== undefined && project !== null) return { key: `project:${project}`, label: project || "Root project", type: "Project" };
 	if (path) { const normalized = path.replace(/\\/g, "/"), cut = normalized.lastIndexOf("/"), directory = cut < 0 ? "." : normalized.slice(0, cut) || "/"; return { key: `path:${directory}`, label: directory, type: "Directory" }; }
 	const kind = node.category ?? node.hit?.kind;
 	return kind ? { key: `kind:${kind}`, label: kind, type: "Kind" } : { key: "structure", label: "Graph structure", type: "" };

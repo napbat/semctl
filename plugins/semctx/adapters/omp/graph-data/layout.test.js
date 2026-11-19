@@ -23,7 +23,7 @@ describe("deterministic force layout", () => {
 	});
 	test("only real metadata determines category anchors; query scores do not imply similarity", () => {
 		expect(category({ id: "file", category: "file", path: "lib\\part\\file.ts", project: "engine", hit: hit({ project: "wrong" }) }).key).toBe('module:["engine","lib/part"]');
-		expect(category({ id: "root", category: "project", path: "", project: "", hit: null })).toEqual({ key: "project:", label: ".", type: "Project" });
+		expect(category({ id: "root", category: "project", path: "", project: "", hit: null })).toEqual({ key: "project:", label: "Root project", type: "Project" });
 		expect(category({ category: "file", path: "lib\\part\\file.ts", hit: null }).key).toBe('module:["","lib/part"]');
 		expect(category(node("kind", { path: null, kind: "trait" })).key).toBe("kind:trait"); expect(category({ hit: null }).key).toBe("structure");
 		const data = fixture(), changed = { ...data, nodes: data.nodes.map(item => ({ ...item, hit: item.hit ? { ...item.hit, score: 999 } : null })) };

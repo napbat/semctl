@@ -259,7 +259,8 @@ test("neutral dots have canvas separation and centered hover scales while labels
 	const label = css.match(/\.semctl-graph \.sg-label\{([^}]+)\}/)?.[1];
 	expect(label).toContain("font:500 11px/14px");
 	expect(label).toContain("color:var(--t2)");
-	expect(label).toContain("drop-shadow(1px 0 1px var(--sg-bg))");
+	// An opaque canvas-colored backing keeps text readable where routes pass under it.
+	expect(label).toContain("background:color-mix(in oklab,var(--sg-bg) 80%,transparent)");
 	expect(css).toContain(".semctl-graph.sg-compact .sg-label{font-size:10.5px}");
 	expect(css).toContain(".sg-target:focus-visible .sg-label{color:var(--t1);font-weight:600}");
 });

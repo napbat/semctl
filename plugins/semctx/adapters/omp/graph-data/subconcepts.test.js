@@ -62,6 +62,15 @@ describe("subconcepts", () => {
 			["notes", "folder", 2],
 		]);
 	});
+	test("clusters of the open folder's direct files name only `files`, not the folder again", () => {
+		const direct = Array.from({ length: 14 }, (_, n) => item(`omp/${String(n).padStart(2, "0")}.ts`, n < 7 ? "paging" : "interrupt", n < 7 ? "table" : "vector"));
+		const parts = partitionSubconcepts([...direct, item("omp/notes/a.md", "notes"), item("omp/notes/b.md", "notes")], { limit: 4 });
+		expect(parts.map(part => [part.label, part.kind, part.members.length])).toEqual([
+			["files · paging · table", "content", 7],
+			["files · interrupt · vector", "content", 7],
+			["notes", "folder", 2],
+		]);
+	});
 	test("the partition does not depend on the input order", () => {
 		const items = ["a", "b", "c", "d", "e", "f"].map((name, index) => item(`x/${name}.md`, index % 2 ? "odd" : "even", name));
 		const forward = partitionSubconcepts(items, { limit: 3 }), backward = partitionSubconcepts([...items].reverse(), { limit: 3 });

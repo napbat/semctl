@@ -6,7 +6,7 @@ import type { GraphAppearanceStore } from "./graph-appearance";
 import type { GraphAppearanceKeyMatcher } from "./graph-appearance-panel";
 import type { GRAPH_OPERATIONS, GraphOverviewDependencies, GraphRequestState } from "./overview";
 import { nativeElement, supportsElements } from "./native-elements";
-import { graphStatus } from "./graph-status";
+import { graphStatus, graphStatusModel } from "./graph-status";
 import { compactTooltip } from "./tooltip-text";
 
 type Operation = (typeof GRAPH_OPERATIONS)[number];
@@ -100,7 +100,7 @@ export class GraphPage implements Component {
 	}
 	private chooser(cx: DescribeContext): NativeNode {
 		const operations = this.groupOperations();
-		return { k: "col", key: "chooser", p: { gap: "xs", aria: "Choose read-only graph analysis" }, c: [
+		return { k: "col", key: "chooser", p: { role: "semctl.graph.chooser", gap: "xs", aria: "Choose read-only graph analysis" }, c: [
 			cx.supports("tabs") ? { k: "tabs", key: "analysis-groups", p: {
 				active: groups[this.group].id, items: groups.map(group => ({ id: group.id, label: group.label })), aria: "Analysis groups",
 			} } : { k: "row", key: "analysis-groups", p: { gap: "sm", wrap: true, aria: "Analysis groups" }, c: groups.map((group, index) =>
@@ -108,10 +108,17 @@ export class GraphPage implements Component {
 					mark: this.group === index ? "pick" : undefined, aria: `${group.label} analyses${this.group === index ? ", selected" : ""}` }), key: group.id })) },
 			cx.supports("list") ? { k: "list", key: "analyses", p: { selected: this.selectedMenu }, c: operations.map(operation => ({
 				k: "item", key: operation.id, reveal: operation.id === this.selectedMenu ? { at: "nearest", n: this.menuRevision } : undefined,
-				p: { label: operation.label, title: compactTooltip(operation.fields.length ? `Arguments: ${operation.fields.join(", ")}` : "No arguments") },
+				// Only analyses that ask for input say so; the rest run at once.
+				p: { label: operation.label, ...(operation.fields.length ? { detail: `Needs ${operation.fields.join(", ").toLowerCase()}` } : {}),
+					title: compactTooltip(operation.fields.length ? `Arguments: ${operation.fields.join(", ")}` : "No arguments") },
 			})) } : { k: "col", c: operations.map(operation => ({ ...text(operation.label, {
 				tone: this.selectedMenu === operation.id ? "accent" : "muted", actions: { click: `choose:${operation.id}` }, aria: `Run ${operation.label}`,
 			}), key: operation.id })) },
+			{ k: "row", key: "chooser-actions", p: { role: "semctl.graph.chooser-actions", gap: "sm", align: "center" }, c: [
+				{ ...text("Run analysis", { role: "semctl.graph.chooser-run", tone: "accent", wrap: "none", actions: { click: `choose:${this.selectedMenu}` },
+					aria: `Run ${this.options.operations.find(operation => operation.id === this.selectedMenu)?.label ?? "the selected analysis"}` }), key: "run" },
+				{ ...text("Back to result", { role: "semctl.graph.chooser-back", tone: "muted", wrap: "none", actions: { click: "analyses" }, aria: "Return to the result" }), key: "back" },
+			] },
 		] };
 	}
 	private syncInspector(): void {
@@ -138,7 +145,7 @@ export class GraphPage implements Component {
 		const motion = appearance.state.value.motion !== "off" && !cx.reduceMotion;
 		const out: NativeNode[] = [{ k: "row", key: "toolbar", p: { role: "semctl.graph.toolbar", gap: "sm", align: "center" }, c: [
 			{ k: "col", key: "heading", p: { grow: 1, min: { w: 0 } }, c: [
-				text(operation.label, { role: "semctl.graph.title", truncate: "end", wrap: "none", title: compactTooltip("Read-only · configured semctl CLI", cwd) }),
+				text(this.menu ? "Choose an analysis" : operation.label, { role: "semctl.graph.title", truncate: "end", wrap: "none", title: compactTooltip("Read-only · configured semctl CLI", cwd) }),
 				...(operation.id === "overview" ? [text(path.basename(cwd), {
 					role: "semctl.graph.hint", tone: "muted", truncate: "end", wrap: "none", title: compactTooltip(cwd),
 				})] : []),
@@ -169,12 +176,16 @@ export class GraphPage implements Component {
 		if (!this.menu && request.warnings?.length) body.unshift({ k: "col", key: "query-warnings", p: { gap: "xs" },
 			c: request.warnings.map(warning => text(`Warning: ${warning}`, { tone: "warning" })) });
 		out.push({ k: "col", key: "body", p: { role: "semctl.graph.body", min: { h: "12lines" }, max: { h: "28lines" } }, scroll: this.scroll, c: body });
-		out.push(graphStatus(cx, { request, activity, motion: appearance.state.value.motion, subject: operation.id === "overview" ? "Map" : "Analysis" }));
+		// The chooser shows no result, so the result status would describe something off screen. An idle footer with no
+		// observed requests says nothing, and beside a loading badge it reads as a contradiction.
+		const status = { request, activity, motion: appearance.state.value.motion, subject: operation.id === "overview" ? "Map" as const : "Analysis" as const,
+			layersInline: !this.diagnostics && request.display?.kind === "graph" };
+		if (!this.menu && (graphStatusModel(status).mode !== "idle" || activity.requests?.sent)) out.push(graphStatus(cx, status));
 		const display = request.display;
 		const hasMatches = display?.kind === "search" ? display.hits.length > 0
 			: display?.kind === "batch" && display.symbols.some(symbol => symbol.hits.length > 0);
-		const navigation = hasMatches ? "↑/↓ matches · Enter source" : display?.kind === "graph" ? "↑/↓ nodes" : "↑/↓ scroll";
-		out.push(text(this.menu ? "←/→ groups · ↑/↓ analyses · Enter run · Esc return to result"
+		const navigation = hasMatches ? "↑/↓ select match · Enter source" : display?.kind === "graph" ? "↑/↓ select node" : "↑/↓ scroll";
+		out.push(text(this.menu ? "←/→ category · ↑/↓ analysis · Enter run · Esc back to result"
 			: this.diagnostics ? "PgUp/PgDn scroll · I or Esc return to result"
 				: `${navigation} · PgUp/PgDn scroll · A analyses · S appearance · I details · R refresh · Esc close`,
 		{ role: "semctl.graph.hint", tone: "muted" }));
@@ -185,7 +196,7 @@ export class GraphPage implements Component {
 		this.syncInspector();
 		const source = !this.diagnostics && !this.menu && this.inspector instanceof SemctlInspector ? this.inspector.returnedSource() : undefined;
 		const body = this.menu ? [
-			"←/→ groups · ↑/↓ analyses · Enter run · Esc return to result",
+			"←/→ category · ↑/↓ analysis · Enter run · Esc back to result",
 			groups.map((group, index) => this.group === index ? `[${group.label}]` : group.label).join(" · "),
 			...this.groupOperations().map(operation => `${operation.id === this.selectedMenu ? ">" : " "} ${operation.label}`),
 		] : [
