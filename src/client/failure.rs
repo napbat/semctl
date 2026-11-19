@@ -8,11 +8,17 @@ use std::{fmt, time::Duration};
 
 use reqwest::StatusCode;
 
-use super::bounded_loading_delay;
+const LOADING_RETRY_MIN_DELAY: Duration = Duration::from_secs(1);
+const LOADING_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
+const LOADING_WINDOW_MIN: Duration = Duration::from_secs(15);
+const LOADING_WINDOW_MAX: Duration = Duration::from_secs(60);
 
-/// The typed API error codes of a temporary, request-safe loading state. The
-/// server answers them with `409` and a `Retry-After` header.
-const LOADING_CODES: [&str; 2] = ["GraphLoading", "FileLoading"];
+/// The projection that is not ready for the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoadingKind {
+    Graph,
+    File,
+}
 
 /// Whether the response follows the API error contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,21 +95,33 @@ impl ApiFailure {
         self.retry_after
     }
 
-    /// Whether the server asks the caller to repeat the request after a delay.
-    pub(crate) fn is_loading(&self) -> bool {
-        self.status == StatusCode::CONFLICT
-            && self.code.as_deref().is_some_and(|code| {
-                LOADING_CODES
-                    .iter()
-                    .any(|loading| loading.eq_ignore_ascii_case(code))
-            })
+    /// Which projection the server reports as still loading.
+    pub(crate) fn loading_kind(&self) -> Option<LoadingKind> {
+        if self.status != StatusCode::CONFLICT {
+            return None;
+        }
+        match self.code.as_deref()? {
+            code if code.eq_ignore_ascii_case("GraphLoading") => Some(LoadingKind::Graph),
+            code if code.eq_ignore_ascii_case("FileLoading") => Some(LoadingKind::File),
+            _ => None,
+        }
     }
 
-    /// The delay before a repeat call of a loading failure: the advertised
-    /// delay within the client's retry bounds. A response without a delay gets
-    /// the lower bound.
-    pub(crate) fn loading_delay(&self) -> Duration {
-        bounded_loading_delay(self.retry_after.unwrap_or_default())
+    pub(crate) fn is_loading(&self) -> bool {
+        self.loading_kind().is_some()
+    }
+
+    /// The delay between attempts of one call. Without a header, do not retry.
+    pub(super) fn loading_delay(&self) -> Option<Duration> {
+        self.retry_after()
+            .map(|delay| delay.clamp(LOADING_RETRY_MIN_DELAY, LOADING_RETRY_MAX_DELAY))
+    }
+
+    /// How long later calls should avoid waiting for the same codebase again.
+    pub(crate) fn loading_window(&self) -> Duration {
+        self.retry_after()
+            .unwrap_or_default()
+            .clamp(LOADING_WINDOW_MIN, LOADING_WINDOW_MAX)
     }
 }
 

@@ -5,7 +5,9 @@ use reqwest::StatusCode;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::{ApiFailure, first_error_code, gateway_error, response_body_error, retry_after};
+use super::{
+    ApiFailure, LoadingKind, first_error_code, gateway_error, response_body_error, retry_after,
+};
 use crate::client::stub::{Reply, Stub};
 use crate::client::{Client, unwrap_envelope, unwrap_page};
 use crate::query::ToolError;
@@ -67,7 +69,7 @@ async fn a_loading_conflict_carries_its_code_and_delay() {
     assert_eq!(failure.status, StatusCode::CONFLICT);
     assert_eq!(failure.code.as_deref(), Some("GraphLoading"));
     assert_eq!(failure.retry_after, Some(Duration::from_secs(2)));
-    assert!(failure.is_loading());
+    assert_eq!(failure.loading_kind(), Some(LoadingKind::Graph));
     assert_eq!(
         error.to_string(),
         format!("GET {url} -> 409 Conflict: {{\"code\":\"GraphLoading\",\"message\":\"loading\"}}"),
@@ -92,7 +94,7 @@ async fn a_conflict_without_a_typed_code_is_not_a_loading_state() {
     assert_eq!(failure.status, StatusCode::CONFLICT);
     assert_eq!(failure.code, None);
     assert_eq!(failure.retry_after, None);
-    assert!(!failure.is_loading());
+    assert_eq!(failure.loading_kind(), None);
 }
 
 #[tokio::test]
@@ -111,7 +113,7 @@ async fn a_paged_failure_is_typed_like_an_enveloped_failure() {
         Some(Duration::from_secs(3600)),
         "the failure keeps the delay as the response sent it"
     );
-    assert!(failure.is_loading());
+    assert_eq!(failure.loading_kind(), Some(LoadingKind::File));
 }
 
 #[tokio::test]
@@ -126,7 +128,7 @@ async fn paged_loading_failures_do_not_require_success_page_fields() {
     assert_eq!(failure.code.as_deref(), Some("GraphLoading"));
     assert_eq!(failure.retry_after(), Some(Duration::from_secs(2)));
     assert!(failure.is_api_response());
-    assert!(failure.is_loading());
+    assert_eq!(failure.loading_kind(), Some(LoadingKind::Graph));
     assert!(
         error
             .to_string()
@@ -146,7 +148,7 @@ async fn failure_flags_on_http_success_keep_typed_errors_without_page_metadata()
     assert_eq!(failure.code.as_deref(), Some("Forbidden"));
     assert_eq!(failure.retry_after(), Some(Duration::from_secs(3)));
     assert!(failure.is_api_response());
-    assert!(!failure.is_loading());
+    assert_eq!(failure.loading_kind(), None);
 }
 
 #[tokio::test]
@@ -176,7 +178,7 @@ async fn a_failure_of_any_status_keeps_its_retry_after_delay() {
     let failure = typed(&error);
     assert_eq!(failure.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(failure.retry_after(), Some(Duration::from_secs(30)));
-    assert!(!failure.is_loading());
+    assert_eq!(failure.loading_kind(), None);
 }
 
 #[tokio::test]
@@ -209,10 +211,10 @@ fn a_loading_delay_stays_within_the_client_retry_bounds() {
         .loading_delay()
     };
 
-    assert_eq!(delayed(None), Duration::from_secs(1));
-    assert_eq!(delayed(Some(0)), Duration::from_secs(1));
-    assert_eq!(delayed(Some(3)), Duration::from_secs(3));
-    assert_eq!(delayed(Some(3600)), Duration::from_secs(5));
+    assert_eq!(delayed(None), None);
+    assert_eq!(delayed(Some(0)), Some(Duration::from_secs(1)));
+    assert_eq!(delayed(Some(3)), Some(Duration::from_secs(3)));
+    assert_eq!(delayed(Some(3600)), Some(Duration::from_secs(5)));
 }
 
 #[test]
@@ -408,9 +410,16 @@ fn the_first_error_code_skips_entries_without_a_string_code() {
 
 #[test]
 fn only_a_conflict_with_a_loading_code_is_a_loading_state() {
-    assert!(failure(StatusCode::CONFLICT, Some("GraphLoading")).is_loading());
-    assert!(failure(StatusCode::CONFLICT, Some("fileloading")).is_loading());
-    assert!(!failure(StatusCode::CONFLICT, Some("Other")).is_loading());
-    assert!(!failure(StatusCode::CONFLICT, None).is_loading());
-    assert!(!failure(StatusCode::BAD_GATEWAY, Some("GraphLoading")).is_loading());
+    let kind = |status, code| failure(status, code).loading_kind();
+    assert_eq!(
+        kind(StatusCode::CONFLICT, Some("GraphLoading")),
+        Some(LoadingKind::Graph)
+    );
+    assert_eq!(
+        kind(StatusCode::CONFLICT, Some("fileloading")),
+        Some(LoadingKind::File)
+    );
+    assert_eq!(kind(StatusCode::CONFLICT, Some("Other")), None);
+    assert_eq!(kind(StatusCode::CONFLICT, None), None);
+    assert_eq!(kind(StatusCode::BAD_GATEWAY, Some("GraphLoading")), None);
 }

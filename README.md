@@ -89,6 +89,18 @@ When the repair state is `none` (for example `providers-unavailable` or
 repair state is `pending` (for example `providers-loading`), the text says that
 a later call can return more.
 
+While the server restores the code graph or a file, it answers `409` with the
+typed code `GraphLoading` or `FileLoading` and a `Retry-After` delay. One call
+waits for that delay, bounded to 1–5 s, within a 60 s budget and the call
+deadline. When a call stops waiting, the client records the loading state for
+that codebase for 15–60 s. During that window, later graph or file calls in the
+same MCP session or CLI process make one attempt and fail at once. The error
+names the loading state. Its `next:` line tells the agent to use
+`search_codebase` or `grep`, which do not need the graph, and when to try the
+graph tool again. Only a successful request of the same kind ends the window
+early. Metadata, catalog, and selector requests do not end it.
+`current_context` does not wait for a graph restore.
+
 ## Grammar-native editing
 
 The server's edit operations are planners: they resolve one qualified or

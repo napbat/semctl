@@ -267,29 +267,100 @@ impl Host {
 }
 
 #[tokio::test]
-async fn a_read_tool_that_meets_a_server_still_loading_fails_with_a_retry_before_the_deadline() {
+async fn a_later_graph_tool_in_one_session_sends_once_and_gives_text_search_guidance() {
     let stub = Stub::serve(vec![Reply::loading("1")]).await;
-    let server = server_with(Client::for_test_server(&stub.url), Duration::from_secs(3));
+    let client = Client::for_test_server(&stub.url).with_codebase("codebase".into());
+    let server = server_with(client, Duration::from_secs(3));
     let mut host = Host::connect(server).await;
     let started = Instant::now();
 
-    let result = host.call_tool("list_domains", json!({})).await;
+    let first = host
+        .call_tool("find_definition", json!({"symbol": "a"}))
+        .await;
 
     assert!(
         started.elapsed() < Duration::from_secs(3),
         "the failure must arrive before the deadline: {:?}",
         started.elapsed()
     );
-    assert_eq!(result["isError"], true);
-    let text = text_of(&result);
-    assert!(text.starts_with("list_domains failed: "), "{text}");
+    assert_eq!(first["isError"], true);
+    let first_attempts = stub.requests();
+    assert!(first_attempts >= 2, "the first tool call waits and retries");
+
+    let second = host
+        .call_tool("find_definition", json!({"symbol": "b"}))
+        .await;
+    assert_eq!(stub.requests(), first_attempts + 1);
+    assert_eq!(second["isError"], true);
+    let text = text_of(&second);
+    assert_eq!(
+        text.lines().next(),
+        Some(
+            "find_definition: the server is still loading the code graph for this codebase \
+             (GraphLoading)."
+        )
+    );
     assert!(
         text.ends_with(
-            "next: retry this call once after 1 s. If it fails again, use local Read/Grep for \
-             this request."
+            "next: use search_codebase or grep now; they do not need the graph. \
+             Try graph tools again in about 15 s. sync_status reports index state."
         ),
         "{text}"
     );
+}
+
+#[tokio::test]
+async fn validating_an_explicit_selector_does_not_clear_its_loading_entry() {
+    let stub = Stub::serve(vec![
+        Reply::loading("5"),
+        Reply::ok(r#"{"id":"remote","slug":"remote"}"#),
+        Reply::loading("5"),
+    ])
+    .await;
+    let client = Client::for_test_server(&stub.url).with_codebase("codebase".into());
+    client
+        .available_snapshot()
+        .get::<Value>("/v1/codebases/remote/graph/definitions")
+        .await
+        .expect_err("the selected codebase is loading");
+    let mut host = Host::connect(server_with(client, DEADLINE)).await;
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        host.call_tool(
+            "find_definition",
+            json!({"symbol": "x", "codebase": "remote"}),
+        ),
+    )
+    .await
+    .expect("the graph request does not wait after successful selector validation");
+    assert_eq!(result["isError"], true);
+    assert!(text_of(&result).contains("(GraphLoading)."), "{result}");
+    assert_eq!(
+        stub.request_lines(),
+        [
+            "GET /v1/codebases/remote/graph/definitions HTTP/1.1",
+            "GET /v1/codebases/remote HTTP/1.1",
+            "GET /v1/codebases/remote/graph/definitions?symbol=x HTTP/1.1",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn current_context_does_not_wait_when_its_explicit_selector_is_loading() {
+    let stub = Stub::serve(vec![Reply::loading("5")]).await;
+    let client = Client::for_test_server(&stub.url).with_codebase("codebase".into());
+    let mut host = Host::connect(server_with(client, DEADLINE)).await;
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        host.call_tool("current_context", json!({"codebase": "remote"})),
+    )
+    .await
+    .expect("selector validation does not wait for a restore");
+    assert_eq!(result["isError"], true);
+    assert!(text_of(&result).contains("(GraphLoading)."), "{result}");
+    assert_eq!(stub.request_lines(), ["GET /v1/codebases/remote HTTP/1.1"]);
 }
 
 /// A call that waits on state of its own, with no request in flight, has only

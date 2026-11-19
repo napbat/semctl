@@ -123,6 +123,8 @@ pub async fn current_context(
     watcher_active: bool,
     last_job_id: Option<&str>,
 ) -> String {
+    // Status probes report what is available now, without waiting for a restore.
+    let client = client.available_snapshot();
     let tenant = client.tenant().await.unwrap_or_else(|| "(unset)".into());
     let root = client
         .local_root()
@@ -177,7 +179,7 @@ pub async fn current_context(
     }
     if codebase != "(unbound)" {
         out.push('\n');
-        out.push_str(&describe_copies(client, &codebase, source.as_deref()).await);
+        out.push_str(&describe_copies(&client, &codebase, source.as_deref()).await);
     }
     out
 }
@@ -942,20 +944,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn context_reports_copies_even_when_the_codebase_summary_is_unavailable() {
-        let stub = Stub::serve(vec![
-            Reply::Answer {
-                status: "400 Bad Request",
-                headers: Vec::new(),
-                body: r#"{"success":false,"errors":[{"code":"SummaryUnavailable","message":"summary unavailable"}]}"#.into(),
-            },
-            Reply::ok(COPIES),
-        ])
-        .await;
+    async fn context_reports_copies_without_waiting_for_a_loading_summary() {
+        let stub = Stub::serve(vec![Reply::loading("5"), Reply::ok(COPIES)]).await;
         let client = Client::for_test_server(&stub.url).with_codebase("A".into());
-        let text = current_context(&client, false, None).await;
+        let text = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            current_context(&client, false, None),
+        )
+        .await
+        .expect("this status probe does not wait for the restore");
 
-        assert!(text.contains("SummaryUnavailable"), "{text}");
+        assert!(text.contains("GraphLoading"), "{text}");
         for id in ["canonical", "selected", "older", "case-distinct"] {
             assert!(text.contains(&markdown_cell(id)), "{text}");
         }

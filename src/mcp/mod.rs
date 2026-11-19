@@ -223,6 +223,15 @@ impl McpServer {
         budget.for_call(self.shared.base.clone())
     }
 
+    fn resolution_for(&self, op: &'static str, budget: &CallBudget) -> Client {
+        if op == "current_context" {
+            // Selector validation is part of the status probe, not a graph query.
+            budget.for_call(self.shared.base.available_snapshot())
+        } else {
+            self.base_for(budget)
+        }
+    }
+
     /// The bound client when this session has one, else the base client, for
     /// this call only. Tools that list or search without a codebase use it.
     async fn bound_or_base(&self, budget: &CallBudget) -> Client {
@@ -396,7 +405,7 @@ impl McpServer {
 
         // Authenticated: resolve against the server without registering on a
         // clean miss. Registration is reserved for the explicit index tool.
-        let id = match crate::codebase::resolve(&self.base_for(budget), &dir).await {
+        let id = match crate::codebase::resolve(&self.resolution_for(op, budget), &dir).await {
             Ok(Some(r)) => {
                 info!(codebase = %r.id, matched_by = r.how, dir = %dir.display(), "resolved codebase");
                 r.id
@@ -503,7 +512,7 @@ impl McpServer {
         let candidate = PathBuf::from(raw);
         if selector_is_path_like(&self.shared.context.cwd, raw) {
             let dir = canonical_directory(op, &self.shared.context.cwd, &candidate)?;
-            let resolved = crate::codebase::resolve(&self.base_for(budget), &dir)
+            let resolved = crate::codebase::resolve(&self.resolution_for(op, budget), &dir)
                 .await
                 .map_err(|e| {
                     ToolError::from_client(
@@ -540,7 +549,7 @@ impl McpServer {
         }
 
         match self
-            .base_for(budget)
+            .resolution_for(op, budget)
             .get_opt::<client::api::CodebaseSummary>(&format!("/v1/codebases/{raw}"))
             .await
         {

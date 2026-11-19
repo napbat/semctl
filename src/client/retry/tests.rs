@@ -10,10 +10,11 @@ use serde::Deserialize;
 use tokio::time::Instant;
 
 use super::{
-    DEADLINE_MARGIN, GATEWAY_RETRY_DELAY, Idempotency, allows_wait, is_gateway_status, usable_until,
+    DEADLINE_MARGIN, GATEWAY_RETRY_DELAY, Idempotency, LOADING_RETRY_BUDGET, LoadingRetry,
+    allows_wait, is_gateway_status, usable_until,
 };
 use crate::client::stub::{Reply, Stub};
-use crate::client::{ApiFailure, Client, PartialAnswers};
+use crate::client::{ApiFailure, Client, LoadingKind, PartialAnswers};
 use crate::query::ToolError;
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -36,6 +37,30 @@ fn failure(error: &anyhow::Error) -> &ApiFailure {
     error
         .downcast_ref::<ApiFailure>()
         .expect("the error must carry the typed failure")
+}
+
+#[tokio::test(start_paused = true)]
+async fn exhausting_the_loading_retry_budget_memoizes_the_typed_failure() {
+    let client = Client::for_test_server("http://127.0.0.1:1");
+    let mut loading = LoadingRetry::new(&client.loading_memo, GRAPH_A);
+    tokio::time::advance(LOADING_RETRY_BUDGET).await;
+    let error = ApiFailure::new(
+        reqwest::StatusCode::CONFLICT,
+        Some("GraphLoading".into()),
+        Some(Duration::from_secs(1)),
+        "loading".into(),
+    )
+    .into();
+
+    let error = loading
+        .retry_after(&client, error)
+        .expect_err("the loading retry budget is exhausted");
+    assert_eq!(failure(&error).loading_kind(), Some(LoadingKind::Graph));
+    assert!(
+        client
+            .loading_memo
+            .contains("a", LoadingKind::Graph, Instant::now())
+    );
 }
 
 #[test]
@@ -97,7 +122,7 @@ async fn available_snapshot_returns_typed_loading_without_changing_the_original_
         .await
         .expect("snapshot reads do not wait for loading retries")
         .unwrap_err();
-    assert!(failure(&error).is_loading());
+    assert_eq!(failure(&error).loading_kind(), Some(LoadingKind::Graph));
     assert_eq!(stub.requests(), 1);
 }
 
@@ -125,7 +150,7 @@ async fn available_snapshot_keeps_a_partial_answer_and_its_call_record() {
 }
 
 #[tokio::test]
-async fn a_loading_answer_that_outlasts_the_deadline_returns_retryable_before_it() {
+async fn a_loading_answer_that_outlasts_the_deadline_returns_before_it() {
     let stub = Stub::serve(vec![Reply::loading("1")]).await;
     let client = within(client(&stub), 3.0);
     let started = Instant::now();
@@ -140,7 +165,7 @@ async fn a_loading_answer_that_outlasts_the_deadline_returns_retryable_before_it
         "the failure must arrive before the deadline: {:?}",
         started.elapsed()
     );
-    assert!(failure(&error).is_loading());
+    assert_eq!(failure(&error).loading_kind(), Some(LoadingKind::Graph));
     assert_eq!(failure(&error).retry_after(), Some(Duration::from_secs(1)));
     assert!(
         stub.requests() >= 2,
@@ -149,8 +174,8 @@ async fn a_loading_answer_that_outlasts_the_deadline_returns_retryable_before_it
     );
     let text = ToolError::from_client("trace", &error).to_string();
     assert!(
-        text.contains("retry this call once after 1 s"),
-        "the typed failure must give the retry instruction: {text}"
+        text.contains("Try graph tools again in about 15 s."),
+        "the typed failure must give the loading window: {text}"
     );
 }
 
@@ -165,6 +190,185 @@ async fn a_loading_answer_is_retried_until_the_server_is_ready_without_a_deadlin
 
     assert_eq!(probe, Probe { ok: true });
     assert_eq!(stub.requests(), 2);
+}
+
+const GRAPH_A: &str = "/v1/codebases/a/graph/definitions";
+const GRAPH_B: &str = "/v1/codebases/b/graph/definitions";
+const FILE_A: &str = "/v1/codebases/a/files/content?path=x";
+
+#[tokio::test]
+async fn a_later_call_for_the_same_codebase_skips_the_loading_wait() {
+    let stub = Stub::serve(vec![
+        Reply::loading("5"),
+        Reply::loading("5"),
+        Reply::ok(PROBE),
+    ])
+    .await;
+    let client = client(&stub).with_codebase("different-from-request".into());
+
+    let first = within(client.clone(), 3.0)
+        .get::<Probe>(GRAPH_A)
+        .await
+        .expect_err("the first call cannot wait for the advertised retry");
+    assert_eq!(failure(&first).loading_kind(), Some(LoadingKind::Graph));
+    assert_eq!(stub.requests(), 1);
+
+    let second = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.get::<Probe>("/v1/codebases/a/graph/references?symbol=x"),
+    )
+    .await
+    .expect("the second call must not wait for a retry")
+    .expect_err("the graph is still loading");
+    assert_eq!(failure(&second).loading_kind(), Some(LoadingKind::Graph));
+    assert_eq!(stub.requests(), 2);
+}
+
+#[tokio::test]
+async fn a_success_clears_a_loading_entry_set_by_a_snapshot() {
+    let stub = Stub::serve(vec![
+        Reply::loading("5"),
+        Reply::loading("5"),
+        Reply::ok(PROBE),
+        Reply::loading("1"),
+        Reply::ok(PROBE),
+    ])
+    .await;
+    let client = client(&stub);
+    let error = client
+        .available_snapshot()
+        .get::<Probe>(GRAPH_A)
+        .await
+        .expect_err("the snapshot does not wait");
+    assert_eq!(failure(&error).loading_kind(), Some(LoadingKind::Graph));
+    assert_eq!(stub.requests(), 1);
+
+    let second = tokio::time::timeout(Duration::from_secs(3), client.get::<Probe>(GRAPH_A))
+        .await
+        .expect("a later call uses the snapshot's loading entry")
+        .expect_err("the graph is still loading");
+    assert_eq!(failure(&second).loading_kind(), Some(LoadingKind::Graph));
+    assert_eq!(stub.requests(), 2);
+
+    client
+        .get::<Probe>("/v1/codebases/a/graph/trace")
+        .await
+        .expect("a successful answer clears the memo");
+    within(client, 4.0)
+        .get::<Probe>(GRAPH_A)
+        .await
+        .expect("the next loading answer can wait and retry");
+    assert_eq!(stub.requests(), 5);
+}
+
+#[tokio::test]
+async fn a_loading_entry_does_not_change_retries_for_other_paths() {
+    let stub = Stub::serve(vec![
+        Reply::loading("5"),
+        Reply::loading("1"),
+        Reply::ok(PROBE),
+        Reply::loading("1"),
+        Reply::ok(PROBE),
+    ])
+    .await;
+    let client = client(&stub).with_codebase("a".into());
+    client
+        .available_snapshot()
+        .get::<Probe>(GRAPH_A)
+        .await
+        .expect_err("the snapshot does not wait");
+    assert_eq!(stub.requests(), 1);
+
+    for (path, requests) in [(GRAPH_B, 3), ("/v1/probe", 5)] {
+        within(client.clone(), 4.0)
+            .get::<Probe>(path)
+            .await
+            .expect("this path has no loading entry");
+        assert_eq!(stub.requests(), requests);
+    }
+}
+
+#[tokio::test]
+async fn a_graph_success_leaves_the_file_loading_entry_in_place() {
+    let stub = Stub::serve(vec![
+        Reply::Answer {
+            status: "409 Conflict",
+            headers: Vec::new(),
+            body: r#"{"success":false,"errors":[{"code":"FileLoading"}]}"#.into(),
+        },
+        Reply::loading("1"),
+        Reply::ok(PROBE),
+        Reply::Answer {
+            status: "409 Conflict",
+            headers: vec![("Retry-After", "5")],
+            body: r#"{"success":false,"errors":[{"code":"FileLoading"}]}"#.into(),
+        },
+    ])
+    .await;
+    let client = client(&stub);
+    let file = client
+        .get::<Probe>(FILE_A)
+        .await
+        .expect_err("a loading answer without Retry-After is not retried");
+    assert_eq!(failure(&file).loading_kind(), Some(LoadingKind::File));
+
+    within(client.clone(), 4.0)
+        .get::<Probe>(GRAPH_A)
+        .await
+        .expect("the graph can still wait and retry");
+    assert_eq!(stub.requests(), 3);
+
+    let file = tokio::time::timeout(Duration::from_secs(3), client.get::<Probe>(FILE_A))
+        .await
+        .expect("the file call does not wait")
+        .expect_err("the file is still loading");
+    assert_eq!(failure(&file).loading_kind(), Some(LoadingKind::File));
+    assert_eq!(stub.requests(), 4);
+}
+
+#[tokio::test]
+async fn a_silent_retry_keeps_the_loading_answer_when_the_deadline_expires() {
+    let stub = Stub::serve(vec![
+        Reply::loading("1"),
+        Reply::Silent,
+        Reply::loading("5"),
+    ])
+    .await;
+    let client = client(&stub);
+
+    let first = within(client.clone(), 3.0)
+        .get::<Probe>(GRAPH_A)
+        .await
+        .expect_err("the retry runs out of time");
+    assert_eq!(failure(&first).loading_kind(), Some(LoadingKind::Graph));
+    assert_eq!(stub.requests(), 2);
+
+    let later = tokio::time::timeout(Duration::from_secs(3), client.get::<Probe>(GRAPH_A))
+        .await
+        .expect("the later call does not wait")
+        .expect_err("the graph is still loading");
+    assert_eq!(failure(&later).loading_kind(), Some(LoadingKind::Graph));
+    assert_eq!(stub.requests(), 3);
+}
+
+#[tokio::test]
+async fn a_non_loading_conflict_with_retry_after_is_not_retried() {
+    let stub = Stub::serve(vec![
+        Reply::Answer {
+            status: "409 Conflict",
+            headers: vec![("Retry-After", "1")],
+            body: r#"{"success":false,"errors":[{"code":"StaleRevision"}]}"#.into(),
+        },
+        Reply::ok(PROBE),
+    ])
+    .await;
+
+    let error = client(&stub)
+        .get::<Probe>(GRAPH_A)
+        .await
+        .expect_err("only loading conflicts can be retried");
+    assert_eq!(failure(&error).loading_kind(), None);
+    assert_eq!(stub.requests(), 1);
 }
 
 /// The log text that the client writes on this thread while a capture runs.

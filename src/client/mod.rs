@@ -25,6 +25,7 @@ use crate::session::{CredentialScope, CredentialSource, SessionContext};
 
 mod failure;
 mod graph_state;
+mod loading_memo;
 mod retry;
 #[cfg(test)]
 pub(crate) mod stub;
@@ -34,7 +35,7 @@ mod truncation;
 use failure::gateway_error;
 use retry::Idempotency;
 
-pub(crate) use failure::ApiFailure;
+pub(crate) use failure::{ApiFailure, LoadingKind};
 pub(crate) use graph_state::{PartialAnswer, PartialAnswers};
 pub(crate) use retry::DEADLINE_MARGIN;
 pub(crate) use transport::HttpTransport;
@@ -45,8 +46,6 @@ const TENANT_HEADER: &str = "X-Tenant-Id";
 /// codebase for any read that is about one, so an agent working in a checkout
 /// is answered about the tree it is looking at.
 const CHECKOUT_HEADER: &str = "X-Semctx-Source-Id";
-const LOADING_RETRY_MIN_DELAY: Duration = Duration::from_secs(1);
-const LOADING_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
 
 /// Cheap to clone — `reqwest::Client` is internally `Arc`'d and the
 /// other fields are small strings. The MCP server handler holds a
@@ -101,6 +100,8 @@ pub struct Client {
     partial_answers: Option<PartialAnswers>,
     /// Snapshot views use available layers without waiting for graph restores.
     wait_for_loading: bool,
+    /// Shared across calls; a recent loading failure skips the retry wait.
+    loading_memo: loading_memo::LoadingMemo,
 }
 
 impl Client {
@@ -166,6 +167,7 @@ impl Client {
             deadline: None,
             partial_answers: None,
             wait_for_loading: true,
+            loading_memo: loading_memo::LoadingMemo::default(),
         }
     }
 
@@ -584,26 +586,6 @@ impl Client {
     }
 }
 
-/// The server uses `409 + Retry-After` only for typed, request-safe loading
-/// states (`GraphLoading` / `FileLoading`). Bound each advertised delay so a
-/// malformed or hostile response cannot park the CLI for an arbitrary period;
-/// the overall retry loop has its own deadline as well.
-fn loading_retry_delay(
-    status: reqwest::StatusCode,
-    headers: &reqwest::header::HeaderMap,
-) -> Option<Duration> {
-    if status != reqwest::StatusCode::CONFLICT {
-        return None;
-    }
-    failure::retry_after(headers).map(bounded_loading_delay)
-}
-
-/// The one bound for a delay that a loading response advertises. The retry
-/// loop and the typed failure classification both use it.
-fn bounded_loading_delay(delay: Duration) -> Duration {
-    delay.clamp(LOADING_RETRY_MIN_DELAY, LOADING_RETRY_MAX_DELAY)
-}
-
 fn tenant_binding_denied(body: &str) -> bool {
     fn contains_code(value: &serde_json::Value) -> bool {
         match value {
@@ -842,12 +824,10 @@ pub async fn for_cwd(cli: &crate::cli::Cli) -> Result<Client> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use serde::Deserialize;
 
     use super::{
-        Client, CredentialSource, HttpTransport, PageEnvelope, gateway_error, loading_retry_delay,
+        Client, CredentialSource, HttpTransport, PageEnvelope, gateway_error,
         tenant_binding_denied, tenant_selection,
     };
 
@@ -952,33 +932,6 @@ mod tests {
         assert_eq!(tenant_selection(None, None), (None, false));
     }
 
-    #[test]
-    fn only_typed_loading_responses_receive_a_bounded_retry_delay() {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(reqwest::header::RETRY_AFTER, "1".parse().unwrap());
-        assert_eq!(
-            loading_retry_delay(reqwest::StatusCode::CONFLICT, &headers),
-            Some(Duration::from_secs(1))
-        );
-        assert_eq!(
-            loading_retry_delay(reqwest::StatusCode::OK, &headers),
-            None,
-            "a successful response must never be replayed"
-        );
-
-        headers.insert(reqwest::header::RETRY_AFTER, "3600".parse().unwrap());
-        assert_eq!(
-            loading_retry_delay(reqwest::StatusCode::CONFLICT, &headers),
-            Some(Duration::from_secs(5)),
-            "one server response cannot stall the client beyond the delay cap"
-        );
-        headers.insert(reqwest::header::RETRY_AFTER, "invalid".parse().unwrap());
-        assert_eq!(
-            loading_retry_delay(reqwest::StatusCode::CONFLICT, &headers),
-            None,
-            "malformed retry instructions are surfaced normally"
-        );
-    }
     /// A checkout answers about itself; asking for canonical drops the claim
     /// that the caller is standing anywhere, which is how the server hears
     /// "tell me what the project publishes".

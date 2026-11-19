@@ -19,7 +19,11 @@ use tokio::{sync::OwnedSemaphorePermit, time::Instant};
 use tracing::debug;
 
 use super::{
-    Client, failure::response_body_error, graph_state, loading_retry_delay, tenant_binding_denied,
+    ApiFailure, Client, LoadingKind, envelope_failure,
+    failure::{response_body_error, retry_after},
+    graph_state,
+    loading_memo::{CodebaseRequest, LoadingMemo},
+    tenant_binding_denied,
 };
 
 /// How long loading retries may run when no call deadline applies.
@@ -70,6 +74,75 @@ fn deadline_passed() -> anyhow::Error {
     anyhow!(DEADLINE_PASSED)
 }
 
+/// One call's loading policy and the last loading answer before a retry.
+struct LoadingRetry<'a> {
+    memo: &'a LoadingMemo,
+    request: Option<CodebaseRequest<'a>>,
+    started: Instant,
+    previous: Option<anyhow::Error>,
+}
+
+impl<'a> LoadingRetry<'a> {
+    fn new(memo: &'a LoadingMemo, path: &'a str) -> Self {
+        Self {
+            memo,
+            request: CodebaseRequest::from_path(path),
+            started: Instant::now(),
+            previous: None,
+        }
+    }
+
+    fn retry_after(&mut self, client: &Client, error: anyhow::Error) -> Result<Duration> {
+        let Some(failure) = error.downcast_ref::<ApiFailure>() else {
+            return Err(error);
+        };
+        let Some(kind) = failure.loading_kind() else {
+            return Err(error);
+        };
+        if let Some(delay) = failure.loading_delay()
+            && client.wait_for_loading
+            && !self
+                .request
+                .as_ref()
+                .is_some_and(|request| self.memo.contains(request.id, kind, self.started))
+            && delay < LOADING_RETRY_BUDGET.saturating_sub(self.started.elapsed())
+            && allows_wait(usable_until(client.deadline, Instant::now()), delay)
+        {
+            self.previous = self.request.as_ref().map(|_| error);
+            return Ok(delay);
+        }
+        self.record(failure, kind);
+        Err(error)
+    }
+
+    fn on_deadline(&mut self, error: anyhow::Error) -> anyhow::Error {
+        let Some(previous) = self.previous.take() else {
+            return error;
+        };
+        if let Some(failure) = previous.downcast_ref::<ApiFailure>()
+            && let Some(kind) = failure.loading_kind()
+        {
+            self.record(failure, kind);
+        }
+        previous.context(format!("{error:#}"))
+    }
+
+    fn record(&self, failure: &ApiFailure, kind: LoadingKind) {
+        if let Some(request) = &self.request {
+            self.memo
+                .record(request.id, kind, Instant::now(), failure.loading_window());
+        }
+    }
+
+    fn clear(&self) {
+        if let Some(request) = &self.request
+            && let Some(kind) = request.kind
+        {
+            self.memo.clear(request.id, kind);
+        }
+    }
+}
+
 impl Client {
     /// Send one request, repairing a stale persisted tenant once, honoring the
     /// server's bounded `Retry-After` contract for transient graph/file
@@ -86,7 +159,7 @@ impl Client {
         body: Option<serde_json::Value>,
         idempotency: Idempotency,
     ) -> Result<(Response, String)> {
-        let started = Instant::now();
+        let mut loading = LoadingRetry::new(&self.loading_memo, path);
         let mut tenant_retried = false;
         let mut gateway_retried = false;
         loop {
@@ -95,12 +168,16 @@ impl Client {
             // would make the bound self-blocking.
             let (req, url, rejected_tenant) = self
                 .before_deadline(self.authed(method.clone(), path))
-                .await??;
+                .await
+                .map_err(|error| loading.on_deadline(error))??;
             let req = match &body {
                 Some(json) => req.json(json),
                 None => req,
             };
-            let (req, permit) = self.admit(req).await?;
+            let (req, permit) = self
+                .admit(req)
+                .await
+                .map_err(|error| loading.on_deadline(error))?;
             let resp = match req.send().await {
                 Ok(resp) => resp,
                 Err(error) => {
@@ -112,27 +189,30 @@ impl Client {
                         tokio::time::sleep(GATEWAY_RETRY_DELAY).await;
                         continue;
                     }
-                    return Err(self.transport_error(error, &method, &url));
+                    let cut_off = self.cut_off_by_deadline(&error);
+                    let error = transport_error(error, &method, &url, cut_off);
+                    return Err(if cut_off {
+                        loading.on_deadline(error)
+                    } else {
+                        error
+                    });
                 }
             };
 
             let status = resp.status();
-            if let Some(delay) = loading_retry_delay(status, resp.headers()) {
-                if !self.wait_for_loading {
-                    return Ok((resp, url));
-                }
-                let usable = usable_until(self.deadline, Instant::now());
-                if delay > LOADING_RETRY_BUDGET.saturating_sub(started.elapsed())
-                    || !allows_wait(usable, delay)
-                {
-                    return Ok((resp, url));
-                }
+            if status == StatusCode::CONFLICT {
+                // Only retry an HTTP conflict when its body confirms loading.
+                // Like the envelope readers, do not hold a permit for the body.
+                drop(permit);
+                let error = self
+                    .read_conflict(resp, &method, &url, &mut loading)
+                    .await?;
+                let delay = loading.retry_after(self, error)?;
                 debug!(
                     %status,
                     retry_after_ms = delay.as_millis(),
                     "server projection is restoring; retrying request"
                 );
-                drop(permit);
                 tokio::time::sleep(delay).await;
                 continue;
             }
@@ -147,6 +227,7 @@ impl Client {
             }
 
             if status.is_success() {
+                loading.clear();
                 // A partial graph answer is the best result the server has.
                 // A retry cannot improve it at once, so the client keeps it.
                 graph_state::observe(
@@ -183,6 +264,33 @@ impl Client {
                 &response_body,
             ));
         }
+    }
+
+    async fn read_conflict(
+        &self,
+        resp: Response,
+        method: &Method,
+        url: &str,
+        loading: &mut LoadingRetry<'_>,
+    ) -> Result<anyhow::Error> {
+        let retry_after = retry_after(resp.headers());
+        let status = resp.status();
+        let body = resp.text().await.map_err(|error| {
+            let cut_off = self.cut_off_by_deadline(&error);
+            let error = anyhow::Error::new(error).context(format!("{method} {url}: read body"));
+            if cut_off {
+                loading.on_deadline(error)
+            } else {
+                error
+            }
+        })?;
+        Ok(envelope_failure(
+            method.as_str(),
+            url,
+            status,
+            retry_after,
+            &body,
+        ))
     }
 
     /// Run one step that is not an HTTP attempt, such as a token refresh or the
@@ -226,19 +334,26 @@ impl Client {
         allowed
     }
 
-    /// The error of an attempt that got no response. An attempt cut off by the
-    /// call deadline says so; a connect timeout does not, because the
-    /// transport's own limit ended it.
-    fn transport_error(&self, error: reqwest::Error, method: &Method, url: &str) -> anyhow::Error {
-        let cut_off = self.deadline.is_some() && error.is_timeout() && !error.is_connect();
-        let error = anyhow::Error::new(error);
-        let error = if cut_off {
-            error.context(DEADLINE_PASSED)
-        } else {
-            error
-        };
-        error.context(format!("{method} {url}"))
+    fn cut_off_by_deadline(&self, error: &reqwest::Error) -> bool {
+        self.deadline.is_some() && error.is_timeout() && !error.is_connect()
     }
+}
+
+/// An attempt cut off by the call deadline says so. The transport's own
+/// connect timeout is separate.
+fn transport_error(
+    error: reqwest::Error,
+    method: &Method,
+    url: &str,
+    cut_off: bool,
+) -> anyhow::Error {
+    let error = anyhow::Error::new(error);
+    let error = if cut_off {
+        error.context(DEADLINE_PASSED)
+    } else {
+        error
+    };
+    error.context(format!("{method} {url}"))
 }
 
 #[cfg(test)]

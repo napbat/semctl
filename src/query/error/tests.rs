@@ -28,46 +28,46 @@ fn classified(
 }
 
 #[test]
-fn a_graph_loading_conflict_is_retryable_after_the_server_delay() {
+fn a_graph_loading_conflict_uses_the_advertised_window() {
     assert_eq!(
         classified(
             StatusCode::CONFLICT,
             Some("GraphLoading"),
-            Some(Duration::from_secs(2))
+            Some(Duration::from_secs(25))
         ),
-        FailureKind::Retryable {
-            after: Duration::from_secs(2)
+        FailureKind::GraphLoading {
+            after: Duration::from_secs(25)
         }
     );
 }
 
 #[test]
-fn a_loading_conflict_is_retryable_within_the_client_delay_bounds() {
+fn a_loading_window_stays_within_the_client_bounds() {
     let after = |seconds| match classified(
         StatusCode::CONFLICT,
         Some("GraphLoading"),
         Some(Duration::from_secs(seconds)),
     ) {
-        FailureKind::Retryable { after } => after,
-        other => panic!("a loading conflict must be retryable: {other:?}"),
+        FailureKind::GraphLoading { after } => after,
+        other => panic!("a graph loading conflict must give a window: {other:?}"),
     };
 
-    assert_eq!(after(0), Duration::from_secs(1));
-    assert_eq!(after(3600), Duration::from_secs(5));
+    assert_eq!(after(0), Duration::from_secs(15));
+    assert_eq!(after(3600), Duration::from_secs(60));
 }
 
 #[test]
-fn a_file_loading_conflict_without_a_delay_is_retryable_after_one_second() {
+fn a_file_loading_conflict_without_retry_after_uses_the_minimum_window() {
     assert_eq!(
         classified(StatusCode::CONFLICT, Some("FileLoading"), None),
-        FailureKind::Retryable {
-            after: Duration::from_secs(1)
+        FailureKind::FileLoading {
+            after: Duration::from_secs(15)
         }
     );
 }
 
 #[test]
-fn a_conflict_without_a_loading_code_is_not_retryable() {
+fn a_conflict_without_a_loading_code_has_no_loading_window() {
     let delay = Some(Duration::from_secs(2));
     assert_eq!(
         classified(StatusCode::CONFLICT, None, delay),
@@ -80,7 +80,7 @@ fn a_conflict_without_a_loading_code_is_not_retryable() {
 }
 
 #[test]
-fn a_loading_code_on_another_status_is_not_retryable() {
+fn a_loading_code_on_another_status_has_no_loading_window() {
     assert_eq!(
         classified(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -161,15 +161,8 @@ fn an_error_without_a_typed_cause_is_unavailable() {
 }
 
 #[test]
-fn every_kind_renders_a_failure_line_and_one_next_step() {
+fn other_failures_render_a_failure_line_and_one_next_step() {
     let cases = [
-        (
-            FailureKind::Retryable {
-                after: Duration::from_secs(3),
-            },
-            "retry this call once after 3 s. If it fails again, use local Read/Grep for this \
-             request.",
-        ),
         (
             FailureKind::Unavailable,
             "use local Read/Grep for this request.",
@@ -202,20 +195,53 @@ fn every_kind_renders_a_failure_line_and_one_next_step() {
 }
 
 #[test]
-fn a_retry_delay_below_one_second_rounds_up() {
-    let error = ToolError::new(
-        "trace",
-        FailureKind::Retryable {
-            after: Duration::from_millis(1),
-        },
-        "loading",
+fn graph_loading_guidance_puts_text_search_before_a_later_graph_call() {
+    let error = api_failure(
+        StatusCode::CONFLICT,
+        Some("GraphLoading"),
+        Some(Duration::from_secs(20)),
     );
+    let failed: Result<String, ToolError> = Err(ToolError::from_client("find_definition", &error));
+    let result = failed.into_call_tool_result().unwrap();
+    let text = &result.content[0].as_text().unwrap().text;
 
-    assert!(error.to_string().contains("after 1 s."));
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(
+        text,
+        "find_definition: the server is still loading the code graph for this codebase \
+         (GraphLoading).\ndetail: GET https://example/v1/x -> 409 Conflict: failed\n\
+         next: use search_codebase or grep now; they do not need the graph. \
+         Try graph tools again in about 20 s. sync_status reports index state."
+    );
 }
 
 #[test]
-fn the_cli_error_is_the_summary_line_without_the_next_step() {
+fn file_loading_guidance_refers_to_the_requested_file_and_revision() {
+    let error = api_failure(StatusCode::CONFLICT, Some("FileLoading"), None);
+    let tool_error = ToolError::from_client("read_source", &error);
+
+    assert_eq!(
+        tool_error.to_string(),
+        "read_source: the server is still loading the requested file (FileLoading).\n\
+         detail: GET https://example/v1/x -> 409 Conflict: failed\n\
+         next: use local Read if the requested revision is available. \
+         Try the file request again in about 15 s."
+    );
+    let cli_error = tool_error.into_cli_error();
+    assert_eq!(
+        cli_error.to_string(),
+        "read_source: the server is still loading the requested file (FileLoading).\n\
+         next: read the local file if the requested revision is available. \
+         Try the file request again in about 15 s."
+    );
+    assert_eq!(
+        cli_error.root_cause().to_string(),
+        "GET https://example/v1/x -> 409 Conflict: failed"
+    );
+}
+
+#[test]
+fn the_cli_error_for_an_unavailable_server_has_no_next_step() {
     let error = ToolError::new("grep", FailureKind::Unavailable, "the server is down");
 
     assert_eq!(error.summary(), "grep failed: the server is down");

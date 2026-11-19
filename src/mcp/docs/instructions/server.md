@@ -82,5 +82,6 @@ Prefer the symbol-graph tools over search whenever you have an exact name — th
 ## When a tool fails
 
 A tool failure arrives as an error result with a `next:` line. Follow that line.
-Retry once only when it says the call is retryable. Otherwise use local
-Read/Grep for that request. Do not repeat the same failing call in a loop.
+If the graph is loading, use `search_codebase` or `grep` before trying a graph
+tool again. For other failures, use local Read/Grep for that request. Do not
+repeat the same failing call in a loop.

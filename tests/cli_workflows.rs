@@ -42,6 +42,13 @@ struct Server {
 
 impl Server {
     fn start(response: impl Fn(&Request) -> Value + Send + 'static) -> Self {
+        Self::start_with_status("200 OK", response)
+    }
+
+    fn start_with_status(
+        status: &'static str,
+        response: impl Fn(&Request) -> Value + Send + 'static,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind isolated HTTP server");
         let address = listener.local_addr().unwrap();
         let stopped = Arc::new(AtomicBool::new(false));
@@ -65,7 +72,7 @@ impl Server {
                 recorded.lock().unwrap().push(request);
                 write!(
                     stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 )
                 .unwrap();
@@ -411,9 +418,10 @@ async fn unrelated_pinned_codebase_cannot_apply_to_the_working_directory() {
 }
 
 #[tokio::test]
-async fn a_failed_server_answer_exits_non_zero_with_one_failure_line() {
+async fn a_loading_graph_exits_nonzero_with_guidance_before_http_details() {
     let checkout = Checkout::new();
-    let server = Server::start(
+    let server = Server::start_with_status(
+        "409 Conflict",
         |_| json!({"success": false, "errors": [{"code": "GraphLoading", "message": "loading"}]}),
     );
     let output = checkout
@@ -426,12 +434,21 @@ async fn a_failed_server_answer_exits_non_zero_with_one_failure_line() {
     assert!(!output.status.success());
     assert_eq!(String::from_utf8_lossy(&output.stdout), "");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("who_calls failed: GET "), "{stderr}");
-    assert!(stderr.contains("GraphLoading"), "{stderr}");
-    assert!(
-        !stderr.contains("next:"),
-        "the next step is guidance for a model, not for the CLI: {stderr}"
+    assert_eq!(
+        stderr.lines().next(),
+        Some(
+            "Error: who_calls: the server is still loading the code graph for this codebase \
+             (GraphLoading)."
+        )
     );
+    assert!(
+        stderr.contains(
+            "next: run `semctl search` or search the local checkout now. \
+                         Try graph commands again in about 15 s."
+        ),
+        "{stderr}"
+    );
+    assert!(stderr.contains("Caused by:\n    GET "), "{stderr}");
 }
 
 fn readiness_server(
