@@ -86,6 +86,55 @@ the last complete index.
   leads when additional repository evidence is needed, and pull focused detail
   with `expand_chunk` / `file_outline` rather than issuing a fresh broad search.
 
+## Use it in proportion to the task
+
+- Decide what is still unknown before calling anything. Map only what you will
+  change or rely on: `trace` or `call_graph` for entry points whose behavior
+  changes, `who_calls` for each function whose contract changes, and
+  `implementations_of` / `type_hierarchy` for interfaces you touch. Skip mapping
+  that your task brief or earlier results already supply.
+- Moves, renames and deletes need `find_references` on every affected symbol;
+  cleanup of a whole area adds `unused` and `duplicates`. Ordinary feature work
+  does not need area-wide scans.
+- Batch: one `batch_lookup` instead of many `find_definition` calls, one
+  `call_graph` instead of chained `who_calls`. When docs or specifications would
+  crowd out code in `search_codebase`, pass `kinds` (for example function) or
+  `prefer` code.
+- Run `sync_status` once at the start of a task that relies on graph results,
+  and note the snapshot it reports.
+
+## Which source wins
+
+- Current bytes, compiler or language-server diagnostics and tests outrank the
+  index. When they disagree with a semctx answer, trust them and say so.
+- C++: the graph can miss members, calls through macros and code behind
+  preprocessor conditions the index was not configured with. For an exhaustive
+  reference list, a rename or a delete, use `grep` or a language server on the
+  matching compile database as the authority; use semctx for reach, concept
+  search and links across languages, build files and docs.
+- Rust, TypeScript/JS, Go and C#: graph answers for in-repo symbols are reliable;
+  macros, string literals and docs still need `grep`.
+- Build membership (which target compiles a file, which test registers it) and
+  build-configuration switches are not graph edges: search the build files.
+
+## Stale views while you edit
+
+- Answers describe the last synced snapshot of an indexed checkout. A scratch or
+  isolated checkout that was never indexed has no index of its own: query the
+  indexed source checkout read-only and treat the answers as pre-edit state.
+  After you move or rename a symbol, re-check with local Grep in your checkout.
+- After edits in an indexed checkout, the watcher catches up; check
+  `sync_status` before trusting graph results about code you just changed.
+
+## Report on the tool
+
+semctl is experimental, and your notes are its test data. When a task used
+semctx, end the final report with a short "semctl notes" block, or append to the
+shared notes file the task names. Give one line per notable query: tool,
+query or symbol, result, what Grep, Read or the compiler showed, and a verdict
+(saved work, stale, wrong, empty, slow). Name any capability you reached for
+that did not exist. Leave the block out if you did not use semctx; do not pad it.
+
 ## Degraded states — read the signals, don't guess
 
 - Empty results right after attach → `sync_status`: a first-index phase of
