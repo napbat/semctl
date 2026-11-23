@@ -757,6 +757,40 @@ fn every_tool_has_a_doc() {
     }
 }
 
+/// Session history showed agents that sent `\(` in a JSON `pattern`, which is
+/// invalid JSON, and agents that sent a path or `code` as `scope`. The tool
+/// description and the argument schema both state the rule.
+#[test]
+fn argument_docs_state_json_escaping_and_the_meaning_of_scope() {
+    let tools = super::tools::router().list_all();
+    let property = |tool: &str, field: &str| -> String {
+        let tool = tools
+            .iter()
+            .find(|candidate| candidate.name == tool)
+            .unwrap_or_else(|| panic!("{tool} is registered"));
+        tool.input_schema["properties"][field]["description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{field} of {} has a description", tool.name))
+            .to_owned()
+    };
+    let grep = McpServer::tool_doc("grep").expect("grep has a doc");
+    let search = McpServer::tool_doc("search_codebase").expect("search_codebase has a doc");
+
+    for text in [grep, &property("grep", "pattern")] {
+        assert!(
+            text.contains("backslash twice") && text.contains(r#""fn \\w+\\(""#),
+            "{text}"
+        );
+    }
+    for text in [search, &property("search_codebase", "scope")] {
+        assert!(
+            text.contains("Not a path") || text.contains("not a path"),
+            "{text}"
+        );
+        assert!(text.contains("`prefer`"), "{text}");
+    }
+}
+
 #[test]
 fn server_instructions_cover_every_tool() {
     let missing = missing_from(server_instructions(), &registered_tools());

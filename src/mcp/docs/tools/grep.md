@@ -4,7 +4,7 @@ Use this for exact strings and patterns: an error message, a config key, a TODO,
 
 ## Parameters
 
-- `pattern` (required) — the pattern to find. A **regular expression** by default (Rust `regex`-crate syntax, matched per line), so `fn \w+\(` finds function definitions and metacharacters are active. Set `literal: true` to match it as an exact substring instead.
+- `pattern` (required) — the pattern to find. A **regular expression** by default (Rust `regex`-crate syntax, matched per line), so `fn \w+\(` finds function definitions and metacharacters are active. Set `literal: true` to match it as an exact substring instead. The pattern is a JSON string: write each regex backslash twice, as in `"fn \\w+\\("`. A single backslash before `(`, `.`, `[` or `s` is invalid JSON, and the call fails before it reaches the server.
 - `literal` — match `pattern` as an exact substring: every character (including `. * ( ) [ ] \`) is taken verbatim, so nothing needs escaping and there are no accidental regex matches. Default false. Use it for exact code like `.unwrap()`, `foo(bar)`, or `Vec<T>`.
 - `ignore_case` — case-insensitive matching. Default false.
 - `path` — optional path substring to narrow which files are scanned (e.g. `server/`).

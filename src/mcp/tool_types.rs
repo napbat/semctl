@@ -40,8 +40,9 @@ pub struct SearchArgs {
     /// when its snippet is only a chunk. Do not reread files whose bodies were
     /// returned.
     pub expand: Option<bool>,
-    /// Server scope lens: `local`, `personal`, `organization`, or `global`.
-    /// Mutually exclusive with `codebase_ids`.
+    /// Server visibility lens: `local`, `personal`, `organization`, or
+    /// `global`. Not a path, a folder, or a content kind; use `prefer` to rank
+    /// code or docs first. Mutually exclusive with `codebase_ids`.
     pub scope: Option<String>,
     /// Explicit visible codebase ids to search. Mutually exclusive with `scope`.
     pub codebase_ids: Option<Vec<String>>,
@@ -141,8 +142,9 @@ pub struct GrepArgs {
     pub copy: Option<String>,
     /// The pattern to search for — a **regular expression** by default (Rust
     /// `regex`-crate syntax, matched per line; no look-around or backreferences),
-    /// so `fn \w+\(` finds function definitions. Set `literal: true` to match it
-    /// as an exact substring instead, e.g. to search `.unwrap()` without escaping.
+    /// so `fn \w+\(` finds function definitions. In the JSON arguments, write
+    /// each regex backslash twice (`"fn \\w+\\("`). Set `literal: true` to match
+    /// it as an exact substring instead, e.g. to search `.unwrap()` without escaping.
     pub pattern: String,
     /// Match `pattern` as a literal substring instead of a regex — every
     /// character, including `. * ( ) [ ] \`, is matched verbatim (no escaping).

@@ -20,6 +20,7 @@ Hybrid (dense + lexical) retrieval over the indexed codebase. Returns ranked hit
 - `prefer` — ranking bias: `"code"` demotes documentation (markdown) so the implementation leads; `"docs"` does the reverse. Omit for the unbiased hybrid ranking. Use `"code"` for "how is X implemented", leave off for "explain X conceptually".
 - `kinds` — restrict to chunk kinds: `function`, `container` (type/class/module), or `block` (free text, incl. prose). Omit for every kind.
 - `expand` — return the **full enclosing-symbol body** per hit instead of a 4-line snippet. Block hits snap to their enclosing function/type. Default false. Expand a small `top_k`, and do not reread files whose bodies were returned.
+- `scope` — the visibility lens of the server: `local`, `personal`, `organization`, or `global`. It is not a path, a folder, or a content kind. Use `prefer` to rank code or docs first. Mutually exclusive with `codebase_ids`.
 
 ## Result budget and expanded hits
 
