@@ -18,7 +18,6 @@
 
 use anyhow::Result;
 use rmcp::{
-    ServiceExt,
     handler::server::router::tool::ToolRouter,
     model::{Tool, ToolAnnotations},
 };
@@ -38,6 +37,7 @@ use crate::session::SessionContext;
 
 mod budget;
 mod indexing;
+mod pre_initialize;
 mod presentation;
 pub(crate) mod readiness;
 mod sync_notifications;
@@ -953,8 +953,10 @@ pub async fn run(cli: &Cli) -> Result<()> {
         async move { server.bind_at_startup().await }
     });
 
+    // `serve_session` keeps the session open when the host sends a request,
+    // such as `server/discover`, before `initialize`.
     let service = server
-        .serve(rmcp::transport::stdio())
+        .serve_session(rmcp::transport::stdio())
         .await
         .map_err(|e| anyhow::anyhow!("rmcp serve: {e}"))?;
 

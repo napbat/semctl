@@ -13,8 +13,6 @@
 
 use tracing::{debug, info, warn};
 
-use rmcp::ServiceExt;
-
 use super::VERSION;
 use super::serve::{ConnectionGuard, Daemon, Sessions};
 use crate::ipc::Stream;
@@ -78,7 +76,7 @@ pub(super) async fn serve(
         async move { server.bind_at_startup().await }
     });
 
-    match server.serve(stream).await {
+    match server.serve_session(stream).await {
         Ok(service) => {
             // The client's end of file, a transport failure, or the drain's
             // abort ends the wait. None of them is a daemon failure: the
