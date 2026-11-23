@@ -26,8 +26,11 @@ use super::{
     tenant_binding_denied,
 };
 
-/// How long loading retries may run when no call deadline applies.
-const LOADING_RETRY_BUDGET: Duration = Duration::from_mins(1);
+/// How long one call waits for a loading projection, inside any call deadline.
+/// Session history showed graph restores that lasted minutes, and a wait until
+/// the call deadline almost never got an answer. A short wait still absorbs a
+/// restore that ends at once.
+const LOADING_RETRY_BUDGET: Duration = Duration::from_secs(5);
 
 /// The time kept before a call deadline. A request never uses it, so the
 /// client can report a typed failure before the caller cuts the call off.

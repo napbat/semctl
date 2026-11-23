@@ -63,6 +63,44 @@ async fn exhausting_the_loading_retry_budget_memoizes_the_typed_failure() {
     );
 }
 
+/// Session history showed graph restores that lasted minutes. A call that waited
+/// until its 25 s deadline almost never got an answer, so the wait stops at the
+/// loading budget even when the deadline leaves more time.
+#[tokio::test(start_paused = true)]
+async fn a_loading_wait_stops_after_five_seconds_while_the_deadline_leaves_time() {
+    let client = Client::for_test_server("http://127.0.0.1:1")
+        .with_deadline(Some(Instant::now() + Duration::from_secs(25)));
+    let mut loading = LoadingRetry::new(&client.loading_memo, GRAPH_A);
+    let loading_answer = || -> anyhow::Error {
+        ApiFailure::new(
+            reqwest::StatusCode::CONFLICT,
+            Some("GraphLoading".into()),
+            Some(Duration::from_secs(1)),
+            "loading".into(),
+        )
+        .into()
+    };
+
+    tokio::time::advance(Duration::from_secs(3)).await;
+    assert_eq!(
+        loading
+            .retry_after(&client, loading_answer())
+            .expect("a retry still fits in the loading budget"),
+        Duration::from_secs(1)
+    );
+
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let error = loading
+        .retry_after(&client, loading_answer())
+        .expect_err("the loading budget is spent, not the deadline");
+    assert_eq!(failure(&error).loading_kind(), Some(LoadingKind::Graph));
+    assert!(
+        client
+            .loading_memo
+            .contains("a", LoadingKind::Graph, Instant::now())
+    );
+}
+
 #[test]
 fn a_call_without_a_deadline_has_no_usable_time_limit() {
     let now = Instant::now();
